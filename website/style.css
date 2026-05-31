@@ -203,8 +203,16 @@ section + section {
   display: flex;
   gap: 1rem;
   justify-content: center;
-  margin-bottom: 3.5rem;
+  margin-bottom: 1.25rem;
   flex-wrap: wrap;
+}
+
+.hero-trust {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-align: center;
+  margin-bottom: 3rem;
 }
 
 .btn {
@@ -543,13 +551,26 @@ section + section {
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: 8px 8px 0 0;
-  cursor: default;
+  cursor: pointer;
+  font-family: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: color 0.15s, background 0.15s;
+}
+
+.install-tab:hover:not(.active) {
+  color: var(--text-secondary);
 }
 
 .install-tab.active {
   color: var(--text-primary);
   background: var(--bg-terminal);
   border-color: var(--border-color);
+  cursor: default;
+}
+
+.install-panel[hidden] {
+  display: none;
 }
 
 .install-note {
@@ -613,6 +634,19 @@ section + section {
 
 .comparison-table .cross {
   color: var(--text-muted);
+}
+
+.comparison-table .cmp-why {
+  display: block;
+  font-size: 0.78em;
+  color: var(--text-muted);
+  margin-top: 0.2rem;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.comparison-table tbody td {
+  vertical-align: top;
 }
 
 /* ── Footer ── */

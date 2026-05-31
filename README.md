@@ -50,12 +50,13 @@ just install              # build + install binaries, systemd, D-Bus, PAM
 ### Post-Install
 
 ```bash
-sudo facelock setup       # download face models (~170MB)
-sudo facelock enroll      # register your face
-sudo facelock test        # verify recognition
+sudo facelock setup       # interactive wizard: camera, models, encryption,
+                          # enrollment, daemon, and PAM for sudo + screen lock
 ```
 
-That's it. Face auth is now active for `sudo`. Keep a root shell open until you've verified it works.
+That's it. Open a new terminal and run `sudo echo "ok"` to confirm face auth fires. Keep a root shell open until you've verified it works.
+
+To re-run individual steps later: `sudo facelock enroll`, `sudo facelock test`, `sudo facelock setup --systemd`, `sudo facelock setup --pam`.
 
 ### GPU Acceleration (Optional)
 
