@@ -4,9 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Facelock - Face Authentication for Linux</title>
-  <meta name="description" content="A modern face authentication system for Linux PAM. Windows Hello-style facial auth with IR anti-spoofing, local ONNX inference, and sub-second latency.">
+  <meta name="description" content="Face unlock for Linux. IR anti-spoofing, sub-second daemon auth, TPM-sealable encryption &mdash; 100% local, no telemetry. Drop-in PAM module for sudo, screen lock, and display managers.">
   <meta property="og:title" content="Facelock - Face Authentication for Linux">
-  <meta property="og:description" content="A modern face authentication system for Linux PAM. Windows Hello-style facial auth with IR anti-spoofing, local ONNX inference, and sub-second latency.">
+  <meta property="og:description" content="Face unlock for Linux. IR anti-spoofing, sub-second daemon auth, TPM-sealable encryption &mdash; 100% local, no telemetry. Drop-in PAM module for sudo, screen lock, and display managers.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://github.com/tyvsmith/facelock">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔒</text></svg>">
@@ -20,8 +20,9 @@
       <a href="#" class="nav-brand">Facelock</a>
       <ul class="nav-links">
         <li><a href="#how-it-works">How It Works</a></li>
-        <li><a href="#features">Features</a></li>
         <li><a href="#security">Security</a></li>
+        <li><a href="#use-cases">Use Cases</a></li>
+        <li><a href="#features">Features</a></li>
         <li><a href="#privacy">Privacy</a></li>
         <li><a href="#install">Install</a></li>
         <li><a href="docs/quickstart.html">Docs</a></li>
@@ -35,12 +36,14 @@
     <div class="container">
       <div class="hero-badge">Open Source / MIT + Apache 2.0</div>
       <h1><span class="accent">Facelock</span></h1>
-      <p class="hero-tagline">Face authentication for Linux. Windows Hello-style facial recognition with IR anti-spoofing, sub-second daemon-mode latency, and complete privacy &mdash; all authentication runs locally on your hardware with no telemetry. After initial model download, Facelock never touches the network.</p>
+      <p class="hero-tagline"><strong>Face unlock for Linux that earns root.</strong><br>IR-enforced anti-spoofing, sub-second daemon auth, optional TPM-sealed encryption. 100% local &mdash; your face never leaves the machine.</p>
 
       <div class="hero-actions">
         <a href="docs/quickstart.html" class="btn btn-primary">Get Started</a>
         <a href="https://github.com/tyvsmith/facelock" class="btn btn-secondary">View on GitHub</a>
       </div>
+
+      <div class="hero-trust">Arch &middot; Debian/Ubuntu &middot; Fedora &middot; NixOS &middot; MIT/Apache 2.0 &middot; No telemetry</div>
 
       <div class="terminal">
         <div class="terminal-bar">
@@ -50,20 +53,27 @@
           <span class="terminal-title">facelock</span>
         </div>
         <div class="terminal-body">
-          <div><span class="prompt">$</span> <span class="command">sudo facelock enroll</span></div>
-          <div><span class="output">Detecting camera...</span></div>
-          <div><span class="output">Found: </span><span class="highlight">Integrated IR Camera (/dev/video2)</span></div>
-          <div><span class="output">Look at the camera. Capturing 5 frames...</span></div>
-          <div><span class="output">Frame 1/5 </span><span class="success">detected</span><span class="output"> (confidence: 0.97)</span></div>
-          <div><span class="output">Frame 2/5 </span><span class="success">detected</span><span class="output"> (confidence: 0.98)</span></div>
-          <div><span class="output">Frame 3/5 </span><span class="success">detected</span><span class="output"> (confidence: 0.96)</span></div>
-          <div><span class="output">Frame 4/5 </span><span class="success">detected</span><span class="output"> (confidence: 0.97)</span></div>
-          <div><span class="output">Frame 5/5 </span><span class="success">detected</span><span class="output"> (confidence: 0.98)</span></div>
-          <div><span class="success">Enrolled face model "default" for user ty</span></div>
+          <div><span class="prompt">$</span> <span class="command">sudo facelock setup</span></div>
+          <div>&nbsp;</div>
+          <div><span class="output">  Facelock v0.1.3</span></div>
+          <div><span class="output">  Linux face authentication</span></div>
+          <div>&nbsp;</div>
+          <div><span class="output">  Detecting camera...</span></div>
+          <div><span class="output">  Auto-selected IR camera: </span><span class="highlight">/dev/video2</span></div>
+          <div>&nbsp;</div>
+          <div><span class="output">  Models:     standard (SCRFD 2.5G + ArcFace R50)</span></div>
+          <div><span class="output">  Inference:  CPU</span></div>
+          <div><span class="output">  Encryption: AES-256-GCM (TPM-sealed key)</span></div>
+          <div><span class="output">  Daemon:     enabled (D-Bus activation)</span></div>
+          <div><span class="output">  PAM:        sudo, hyprlock</span></div>
+          <div><span class="output">  Face:       enrolled</span></div>
+          <div>&nbsp;</div>
+          <div><span class="success">  Setup complete.</span></div>
           <div>&nbsp;</div>
           <div><span class="prompt">$</span> <span class="command">sudo facelock test</span></div>
-          <div><span class="output">Authenticating...</span></div>
-          <div><span class="success">Match</span><span class="output"> (similarity: 0.92, latency: 192ms)</span></div>
+          <div><span class="output">Testing face recognition for user 'ty'...</span></div>
+          <div><span class="output">Look at the camera.</span></div>
+          <div><span class="success">Matched</span><span class="output"> model #1 '2026-05-30-1' (similarity: 0.92) in 0.19s</span></div>
         </div>
       </div>
     </div>
@@ -106,74 +116,13 @@
     </div>
   </section>
 
-  <!-- Features -->
-  <section id="features">
-    <div class="container">
-      <div class="section-header center">
-        <div class="section-label">Features</div>
-        <h2 class="section-title">Built for security and performance</h2>
-        <p class="section-desc">A complete face authentication stack written in Rust, designed for the Linux PAM ecosystem.</p>
-      </div>
-
-      <div class="features-grid">
-        <div class="feature-card">
-          <div class="feature-icon">
-            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-          </div>
-          <h3>IR Anti-Spoofing</h3>
-          <p>Enforces infrared cameras by default. Phone screens and printed photos lack IR skin texture, blocking the most common attack vector.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-icon">
-            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-          </div>
-          <h3>Sub-Second Auth</h3>
-          <p>Persistent daemon keeps ONNX models loaded. ~600ms typical, dropping to ~150ms on back-to-back auths when the camera stays warm.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-icon">
-            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path></svg>
-          </div>
-          <h3>100% Local &amp; Private</h3>
-          <p>All processing happens on-device via ONNX Runtime. No cloud services, no network requests, no telemetry, no analytics. Your face data never leaves your machine, ever.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-icon">
-            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
-          </div>
-          <h3>PAM Integration</h3>
-          <p>Drop-in PAM module for sudo, polkit, and login. Installs as a single <code>pam_facelock.so</code> with one line in your PAM config.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-icon">
-            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-          </div>
-          <h3>TPM Encryption</h3>
-          <p>Optional TPM 2.0 support for encrypting face embeddings at rest. Hardware-bound keys ensure biometric data stays protected.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-icon">
-            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-          </div>
-          <h3>Daemon + Oneshot</h3>
-          <p>Choose persistent daemon mode for speed or oneshot mode for simplicity. The CLI auto-detects which mode is available.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
   <!-- Security -->
   <section id="security">
     <div class="container">
-      <div class="section-header">
+      <div class="section-header center">
         <div class="section-label">Security</div>
-        <h2 class="section-title">Defense in depth</h2>
-        <p class="section-desc">Multiple independent layers protect against spoofing, tampering, and unauthorized access.</p>
+        <h2 class="section-title">Defense in depth, on by default</h2>
+        <p class="section-desc">Multiple independent layers protect against spoofing, tampering, and unauthorized access &mdash; without any configuration after install.</p>
       </div>
 
       <div class="security-grid">
@@ -223,6 +172,104 @@
             <h4>Audit Logging</h4>
             <p>Every authentication attempt is logged to syslog with user, service, and outcome. Full audit trail in journald or /var/log/auth.log.</p>
           </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Use Cases -->
+  <section id="use-cases">
+    <div class="container">
+      <div class="section-header center">
+        <div class="section-label">Use Cases</div>
+        <h2 class="section-title">Where Facelock fits</h2>
+        <p class="section-desc">Three places it pays for itself the first day you install it.</p>
+      </div>
+
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+          </div>
+          <h3>Sudo without typing</h3>
+          <p>Every <code>sudo</code> prompt becomes a glance at the camera. The persistent daemon keeps models warm, so typical auth completes in 150&ndash;200ms.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          </div>
+          <h3>Screen lock unlock</h3>
+          <p>Drop-in PAM for Hyprlock, swaylock, and KDE Plasma's screen locker. Wake the display, look at the camera, you're back in.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><polyline points="10 17 15 12 10 7"></polyline><line x1="15" y1="12" x2="3" y2="12"></line></svg>
+          </div>
+          <h3>Display manager login</h3>
+          <p>GDM, SDDM, and LightDM (experimental). Camera initialization at the login screen is system-dependent &mdash; see <a href="docs/quickstart.html">docs</a> for caveats.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section id="features">
+    <div class="container">
+      <div class="section-header center">
+        <div class="section-label">Features</div>
+        <h2 class="section-title">Engineered for the Linux PAM ecosystem</h2>
+        <p class="section-desc">A complete face authentication stack written in Rust, with sane defaults and the knobs you need when you outgrow them.</p>
+      </div>
+
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+          </div>
+          <h3>IR Anti-Spoofing</h3>
+          <p>Enforces infrared cameras by default. Phone screens and printed photos lack IR skin texture, blocking the most common attack vector.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+          </div>
+          <h3>Sub-Second Auth</h3>
+          <p>Persistent daemon keeps ONNX models loaded. ~600ms typical, dropping to ~150ms on back-to-back auths when the camera stays warm.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path></svg>
+          </div>
+          <h3>100% Local &amp; Private</h3>
+          <p>All processing happens on-device via ONNX Runtime. No cloud services, no network requests, no telemetry, no analytics. Your face data never leaves your machine, ever.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+          </div>
+          <h3>PAM Integration</h3>
+          <p>Drop-in PAM module for sudo, polkit, hyprlock, swaylock, KDE, and login managers. Installs as a single <code>pam_facelock.so</code> &mdash; the wizard wires the rest.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          </div>
+          <h3>TPM Encryption</h3>
+          <p>Optional TPM 2.0 support for encrypting face embeddings at rest. Hardware-bound keys ensure biometric data stays protected even if the disk is copied.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+          </div>
+          <h3>Daemon + Oneshot</h3>
+          <p>Choose persistent daemon mode for speed or oneshot mode for simplicity. The CLI auto-detects which mode is available.</p>
         </div>
       </div>
     </div>
@@ -278,44 +325,126 @@
     <div class="container">
       <div class="section-header center">
         <div class="section-label">Quick Install</div>
-        <h2 class="section-title">Up and running in minutes</h2>
-        <p class="section-desc">Build from source, download models, enroll your face, and enable PAM authentication.</p>
+        <h2 class="section-title">One package. One wizard. Done.</h2>
+        <p class="section-desc">Install the package for your distro and run <code>sudo facelock setup</code>. The wizard detects your camera, downloads models, sets up encryption, enrolls your face, and wires up PAM for sudo and your screen locker. No further commands needed.</p>
       </div>
 
       <div class="install-block">
-        <div class="install-tabs">
-          <span class="install-tab active">Arch Linux</span>
+        <div class="install-tabs" role="tablist">
+          <button class="install-tab active" role="tab" aria-selected="true" data-target="install-arch">Arch Linux</button>
+          <button class="install-tab" role="tab" aria-selected="false" data-target="install-debian">Debian / Ubuntu</button>
+          <button class="install-tab" role="tab" aria-selected="false" data-target="install-fedora">Fedora / RHEL</button>
+          <button class="install-tab" role="tab" aria-selected="false" data-target="install-nixos">NixOS</button>
+          <button class="install-tab" role="tab" aria-selected="false" data-target="install-source">From source</button>
         </div>
-        <div class="terminal">
-          <div class="terminal-bar">
-            <span class="terminal-dot red"></span>
-            <span class="terminal-dot yellow"></span>
-            <span class="terminal-dot green"></span>
-            <span class="terminal-title">terminal</span>
+
+        <div id="install-arch" class="install-panel" role="tabpanel">
+          <div class="terminal">
+            <div class="terminal-bar">
+              <span class="terminal-dot red"></span>
+              <span class="terminal-dot yellow"></span>
+              <span class="terminal-dot green"></span>
+              <span class="terminal-title">terminal</span>
+            </div>
+            <div class="terminal-body">
+              <div><span class="comment"># Install from AUR</span></div>
+              <div><span class="prompt">$</span> <span class="command">yay -S facelock</span>&nbsp;&nbsp;&nbsp;<span class="comment"># or: paru -S facelock</span></div>
+              <div>&nbsp;</div>
+              <div><span class="comment"># Run the interactive setup wizard</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo facelock setup</span></div>
+            </div>
           </div>
-          <div class="terminal-body">
-            <div><span class="comment"># Build and install the package</span></div>
-            <div><span class="prompt">$</span> <span class="command">just install</span></div>
-            <div>&nbsp;</div>
-            <div><span class="comment"># Download face detection models (~170MB)</span></div>
-            <div><span class="prompt">$</span> <span class="command">sudo facelock setup</span></div>
-            <div>&nbsp;</div>
-            <div><span class="comment"># Enroll your face</span></div>
-            <div><span class="prompt">$</span> <span class="command">sudo facelock enroll</span></div>
-            <div>&nbsp;</div>
-            <div><span class="comment"># Test recognition</span></div>
-            <div><span class="prompt">$</span> <span class="command">sudo facelock test</span></div>
-            <div>&nbsp;</div>
-            <div><span class="comment"># Enable daemon with D-Bus activation</span></div>
-            <div><span class="prompt">$</span> <span class="command">sudo facelock setup --systemd</span></div>
-            <div>&nbsp;</div>
-            <div><span class="comment"># Install PAM module for sudo</span></div>
-            <div><span class="prompt">$</span> <span class="command">sudo facelock setup --pam</span></div>
+        </div>
+
+        <div id="install-debian" class="install-panel" role="tabpanel" hidden>
+          <div class="terminal">
+            <div class="terminal-bar">
+              <span class="terminal-dot red"></span>
+              <span class="terminal-dot yellow"></span>
+              <span class="terminal-dot green"></span>
+              <span class="terminal-title">terminal</span>
+            </div>
+            <div class="terminal-body">
+              <div><span class="comment"># Add signing key (Debian trixie+, Ubuntu 25.04+)</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo install -d -m 0755 /etc/apt/keyrings</span></div>
+              <div><span class="prompt">$</span> <span class="command">curl -fsSL https://tysmith.me/facelock/apt/tysmith-archive-keyring.gpg \</span></div>
+              <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="command">| sudo tee /etc/apt/keyrings/tysmith-archive-keyring.gpg &gt;/dev/null</span></div>
+              <div>&nbsp;</div>
+              <div><span class="comment"># Add repository</span></div>
+              <div><span class="prompt">$</span> <span class="command">echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] \</span></div>
+              <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="command">https://tysmith.me/facelock/apt main facelock" \</span></div>
+              <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="command">| sudo tee /etc/apt/sources.list.d/facelock.list</span></div>
+              <div>&nbsp;</div>
+              <div><span class="comment"># Install + run setup wizard</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo apt update &amp;&amp; sudo apt install facelock</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo facelock setup</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="install-fedora" class="install-panel" role="tabpanel" hidden>
+          <div class="terminal">
+            <div class="terminal-bar">
+              <span class="terminal-dot red"></span>
+              <span class="terminal-dot yellow"></span>
+              <span class="terminal-dot green"></span>
+              <span class="terminal-title">terminal</span>
+            </div>
+            <div class="terminal-body">
+              <div><span class="comment"># Enable COPR + install</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo dnf copr enable tyvsmith/facelock</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo dnf install facelock</span></div>
+              <div>&nbsp;</div>
+              <div><span class="comment"># Run the interactive setup wizard</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo facelock setup</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="install-nixos" class="install-panel" role="tabpanel" hidden>
+          <div class="terminal">
+            <div class="terminal-bar">
+              <span class="terminal-dot red"></span>
+              <span class="terminal-dot yellow"></span>
+              <span class="terminal-dot green"></span>
+              <span class="terminal-title">configuration.nix</span>
+            </div>
+            <div class="terminal-body">
+              <div><span class="comment"># Add to flake inputs</span></div>
+              <div><span class="output">inputs.facelock.url = "github:tyvsmith/facelock";</span></div>
+              <div>&nbsp;</div>
+              <div><span class="comment"># Enable the module</span></div>
+              <div><span class="output">services.facelock.enable = true;</span></div>
+              <div>&nbsp;</div>
+              <div><span class="comment"># Rebuild + run setup wizard</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo nixos-rebuild switch</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo facelock setup</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="install-source" class="install-panel" role="tabpanel" hidden>
+          <div class="terminal">
+            <div class="terminal-bar">
+              <span class="terminal-dot red"></span>
+              <span class="terminal-dot yellow"></span>
+              <span class="terminal-dot green"></span>
+              <span class="terminal-title">terminal</span>
+            </div>
+            <div class="terminal-body">
+              <div><span class="comment"># Requires Rust 1.85+, just, libv4l-dev, libpam0g-dev, clang</span></div>
+              <div><span class="prompt">$</span> <span class="command">git clone https://github.com/tyvsmith/facelock</span></div>
+              <div><span class="prompt">$</span> <span class="command">cd facelock</span></div>
+              <div><span class="prompt">$</span> <span class="command">just install</span></div>
+              <div>&nbsp;</div>
+              <div><span class="comment"># Run the interactive setup wizard</span></div>
+              <div><span class="prompt">$</span> <span class="command">sudo facelock setup</span></div>
+            </div>
           </div>
         </div>
       </div>
 
-      <p class="install-note">Also available as <code>.deb</code>, <code>.rpm</code>, and Nix flake. See <a href="docs/quickstart.html">docs</a> for details.</p>
+      <p class="install-note">Need finer control? See <a href="docs/quickstart.html">docs</a> for manual model paths, custom PAM stacks, GPU provider tuning, and <code>--non-interactive</code> automation.</p>
     </div>
   </section>
 
@@ -325,7 +454,7 @@
       <div class="section-header center">
         <div class="section-label">Comparison</div>
         <h2 class="section-title">Facelock vs Howdy</h2>
-        <p class="section-desc">Facelock is a ground-up rewrite of the Howdy concept, built in Rust with security as a first-class concern.</p>
+        <p class="section-desc">Howdy proved face auth on Linux was possible. Facelock is the production rewrite &mdash; Rust, hardened by default, and engineered to be safe to actually deploy.</p>
       </div>
 
       <div class="comparison-wrap">
@@ -339,69 +468,69 @@
           </thead>
           <tbody>
             <tr>
-              <td>Language</td>
+              <td>Language<span class="cmp-why">Memory-safe at compile time; no runtime crashes on bad input.</span></td>
               <td>Rust</td>
               <td>Python</td>
             </tr>
             <tr>
-              <td>Daemon mode</td>
-              <td><span class="check">Yes (~150-600ms auth)</span></td>
+              <td>Daemon mode<span class="cmp-why">Auth completes before you finish typing your password.</span></td>
+              <td><span class="check">Yes (~150&ndash;600ms auth)</span></td>
               <td><span class="cross">No (process per auth)</span></td>
             </tr>
             <tr>
-              <td>IR enforcement</td>
+              <td>IR enforcement<span class="cmp-why">Phone screens and printed photos are rejected without configuration.</span></td>
               <td><span class="check">Default on</span></td>
-              <td><span class="cross">Not enforced</span></td>
+              <td><span class="cross">Supported, not enforced</span></td>
             </tr>
             <tr>
-              <td>Frame variance check</td>
+              <td>Frame variance check<span class="cmp-why">A still photo can't produce two different frames &mdash; rejected automatically.</span></td>
               <td><span class="check">Default on</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>TPM encryption</td>
-              <td><span class="check">Optional</span></td>
+              <td>TPM encryption<span class="cmp-why">A copied disk image can't decrypt your face data.</span></td>
+              <td><span class="check">Optional (sealed key)</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>Model verification</td>
+              <td>Model verification<span class="cmp-why">Swapped or tampered models fail to load instead of mis-authenticating.</span></td>
               <td><span class="check">SHA256 at every load</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>Rate limiting</td>
-              <td><span class="check">5/user/60s</span></td>
+              <td>Rate limiting<span class="cmp-why">Rapid-retry brute force is stopped at the daemon, not the PAM stack.</span></td>
+              <td><span class="check">5/user/60s default</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>D-Bus activation</td>
-              <td><span class="check">D-Bus activation</span></td>
+              <td>D-Bus activation<span class="cmp-why">Daemon only runs when something asks for auth &mdash; zero idle cost.</span></td>
+              <td><span class="check">Yes</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>Constant-time matching</td>
-              <td><span class="check">subtle crate (no timing leaks)</span></td>
+              <td>Constant-time matching<span class="cmp-why">Match scores can't be reconstructed by timing the response.</span></td>
+              <td><span class="check">subtle crate</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>GPU acceleration</td>
+              <td>GPU acceleration<span class="cmp-why">Drop auth latency further on supported hardware &mdash; no rebuild needed.</span></td>
               <td><span class="check">CUDA / ROCm / OpenVINO (runtime)</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>Audit logging</td>
+              <td>Audit logging<span class="cmp-why">Every attempt is grep-able and SIEM-friendly.</span></td>
               <td><span class="check">Structured JSONL + syslog</span></td>
-              <td><span class="cross">No</span></td>
+              <td><span class="cross">syslog only</span></td>
             </tr>
             <tr>
-              <td>systemd hardening</td>
+              <td>systemd hardening<span class="cmp-why">Daemon runs without write access to / and without ambient capabilities.</span></td>
               <td><span class="check">ProtectSystem, NoNewPrivileges, etc.</span></td>
               <td><span class="cross">No</span></td>
             </tr>
             <tr>
-              <td>PAM module size</td>
-              <td>~2MB (no heavy deps)</td>
-              <td>Full Python runtime</td>
+              <td>PAM module size<span class="cmp-why">Tiny PAM module &mdash; no Python runtime in the auth path.</span></td>
+              <td><span class="check">~2MB (libc + toml + zbus)</span></td>
+              <td><span class="cross">Full Python runtime</span></td>
             </tr>
           </tbody>
         </table>
@@ -421,6 +550,24 @@
       </ul>
     </div>
   </footer>
+
+  <script>
+    document.querySelectorAll('.install-tab').forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        var tabs = document.querySelectorAll('.install-tab');
+        var panels = document.querySelectorAll('.install-panel');
+        tabs.forEach(function (t) {
+          t.classList.remove('active');
+          t.setAttribute('aria-selected', 'false');
+        });
+        panels.forEach(function (p) { p.hidden = true; });
+        tab.classList.add('active');
+        tab.setAttribute('aria-selected', 'true');
+        var target = document.getElementById(tab.dataset.target);
+        if (target) target.hidden = false;
+      });
+    });
+  </script>
 
 </body>
 </html>
