@@ -356,7 +356,7 @@ fn wizard_model_quality(theme: &ColorfulTheme, config: &mut Config) -> anyhow::R
 
     let selection = Select::with_theme(theme)
         .with_prompt("Select model quality")
-        .items(&options)
+        .items(&options[..])
         .default(default_idx)
         .interact()?;
 
@@ -411,7 +411,7 @@ fn wizard_execution_provider(theme: &ColorfulTheme, config: &mut Config) -> anyh
 
     let selection = Select::with_theme(theme)
         .with_prompt("Select inference device")
-        .items(&options)
+        .items(&options[..])
         .default(default_idx)
         .interact()?;
 
@@ -631,7 +631,7 @@ fn wizard_encryption_setup(theme: &ColorfulTheme, config: &mut Config) -> anyhow
         ];
         let selection = Select::with_theme(theme)
             .with_prompt("Select encryption key protection")
-            .items(&options)
+            .items(&options[..])
             .default(0)
             .interact()?;
 
@@ -1369,7 +1369,11 @@ fn check_model(path: &Path, expected_sha256: &str) -> anyhow::Result<ModelStatus
     let data = fs::read(path).context("failed to read model file")?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
-    let hex = format!("{:x}", hasher.finalize());
+    let result = hasher.finalize();
+    // Encode the digest by iterating bytes so this works with both sha2 0.10
+    // (`GenericArray`) and sha2 0.11 (`hybrid_array::Array`), since only the
+    // older type implements `LowerHex` directly.
+    let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
 
     if hex == expected_sha256 {
         Ok(ModelStatus::Present)
@@ -1727,7 +1731,11 @@ fn verify_after_download(path: &Path, expected_sha256: &str, name: &str) -> anyh
     let data = fs::read(path).context("failed to read downloaded model")?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
-    let hex = format!("{:x}", hasher.finalize());
+    let result = hasher.finalize();
+    // Encode the digest by iterating bytes so this works with both sha2 0.10
+    // (`GenericArray`) and sha2 0.11 (`hybrid_array::Array`), since only the
+    // older type implements `LowerHex` directly.
+    let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
 
     if hex != expected_sha256 {
         // Remove the bad file
