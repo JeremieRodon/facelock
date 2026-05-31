@@ -15,6 +15,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.1.4] - 2026-05-31
+
+Robustness pass: setup-wizard UX improvements, an `facelock-bin` AUR package, and a sweep of workspace dependency bumps with the cross-cutting API-change fixes they required.
+
+### Added
+
+- **AUR `facelock-bin` package**: prebuilt-binary AUR variant alongside source-build `facelock` and VCS `facelock-git`. The release workflow now publishes all three on tag push.
+- **Setup wizard: PAM edit preview and confirmation**: setup shows exactly which lines will be added to each PAM service file (with top-of-file fallback described) and asks for confirmation before mutating anything on disk.
+- **Setup wizard: display-manager and screen-locker detection**: setup detects installed display managers and lockers (Hyprland, sway, SDDM, GDM, etc.) and offers per-service opt-in via multi-select. SDDM and GDM integrations are marked experimental.
+
+### Changed
+
+- **Workspace dependency bumps**: clap 4.5→4.6, dialoguer 0.11→0.12, indicatif 0.17→0.18, ndarray 0.16→0.17, nix 0.29→0.31, rand 0.9→0.10, reqwest 0.12→0.13, rusqlite 0.32→0.40, sha2 0.10→0.11, signal-hook 0.3→0.4, tokio 1.50→1.52, tracing-subscriber 0.3.22→0.3.23, wayland-client 0.31.13→0.31.14, xkbcommon 0.8→0.9, plus libc, serde_json, toml, and `trixie` container patches.
+- **CI: GitHub Release published via PAT**: switched from `GITHUB_TOKEN` to a PAT so Packit's release-event listener fires reliably for COPR builds.
+- **GitHub Actions versions**: `actions/checkout@v6`, `actions/upload-pages-artifact@v5`, `actions/deploy-pages@v5`, `softprops/action-gh-release@v3`, `cachix/install-nix-action@v31`, plus consolidated GitHub artifact actions.
+
+### Fixed
+
+- **Uninstall cleanup**: closed gaps across all four uninstall paths (deb purge, rpm erase, makepkg/AUR remove, `just uninstall`). The installed systemd unit name is now captured *before* deletion, and user-data handling messaging is clearer.
+- **`facelock clear` requires root before prompting**, not after — previously asked the confirmation question and then errored on missing privileges.
+- **AUR publish script**: distinguishes "AUR repo doesn't exist yet" from other clone failures (previously masked real errors with a fresh `git init`), and derives the GitHub repo name from `GITHUB_REPOSITORY` instead of hardcoding it.
+- **`facelock-git` AUR version display**: bumped the static `pkgver=` (used by AUR's web page because `pkgver()` doesn't run in the SRCINFO container) and extended `just release` to keep it in sync going forward.
+- **Cross-version dependency portability**: SHA256 hex encoding rewritten by-byte (in both `facelock-face::models` and `facelock-cli::commands::setup`) so the code compiles against `sha2 0.10`'s `GenericArray` and `0.11`'s `hybrid_array::Array`. SQLite timestamps in `facelock-store` cast through `i64` to avoid rusqlite 0.40 type mismatches. CLI setup wizard uses `&options[..]` so `Select::items` is correct under both `dialoguer 0.11` (slice arg) and `0.12` (generic `IntoIterator` arg, clippy-clean). TPM crate migrated to `rand` 0.10's `thread_rng → rng` and `RngCore → Rng` rename.
+
 ## [0.1.3] - 2026-05-20
 
 ### Changed
