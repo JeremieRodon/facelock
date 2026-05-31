@@ -56,7 +56,7 @@ sudo facelock setup       # interactive wizard: camera, models, encryption,
 
 That's it. Open a new terminal and run `sudo echo "ok"` to confirm face auth fires. Keep a root shell open until you've verified it works.
 
-To re-run individual steps later: `facelock enroll`, `facelock test`, `facelock setup --systemd`, `facelock setup --pam`.
+To re-run individual steps later: `sudo facelock enroll`, `sudo facelock test`, `sudo facelock setup --systemd`, `sudo facelock setup --pam`.
 
 ### GPU Acceleration (Optional)
 

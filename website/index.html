@@ -58,17 +58,19 @@
           <div><span class="output">  Facelock v0.1.3</span></div>
           <div><span class="output">  Linux face authentication</span></div>
           <div>&nbsp;</div>
-          <div><span class="output">  Detecting camera...</span></div>
-          <div><span class="output">  Auto-selected IR camera: </span><span class="highlight">/dev/video2</span></div>
+          <div><span class="comment">  # 9 interactive steps: camera, models, encryption,</span></div>
+          <div><span class="comment">  # enrollment, recognition test, daemon, PAM ...</span></div>
           <div>&nbsp;</div>
-          <div><span class="output">  Models:     standard (SCRFD 2.5G + ArcFace R50)</span></div>
+          <div><span class="success">  --- Setup Complete ---</span></div>
+          <div>&nbsp;</div>
+          <div><span class="output">  Camera:     /dev/video2</span></div>
+          <div><span class="output">  Models:     /var/lib/facelock/models (standard)</span></div>
           <div><span class="output">  Inference:  CPU</span></div>
+          <div><span class="output">  Database:   /var/lib/facelock/facelock.db</span></div>
           <div><span class="output">  Encryption: AES-256-GCM (TPM-sealed key)</span></div>
-          <div><span class="output">  Daemon:     enabled (D-Bus activation)</span></div>
-          <div><span class="output">  PAM:        sudo, hyprlock</span></div>
-          <div><span class="output">  Face:       enrolled</span></div>
-          <div>&nbsp;</div>
-          <div><span class="success">  Setup complete.</span></div>
+          <div><span class="output">  Daemon:   enabled (D-Bus activation)</span></div>
+          <div><span class="output">  PAM:      sudo, hyprlock</span></div>
+          <div><span class="output">  Face:     enrolled</span></div>
           <div>&nbsp;</div>
           <div><span class="prompt">$</span> <span class="command">sudo facelock test</span></div>
           <div><span class="output">Testing face recognition for user 'ty'...</span></div>
@@ -192,7 +194,7 @@
             <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
           </div>
           <h3>Sudo without typing</h3>
-          <p>Every <code>sudo</code> prompt becomes a glance at the camera. The persistent daemon keeps models warm, so typical auth completes in 150&ndash;200ms.</p>
+          <p>Every <code>sudo</code> prompt becomes a glance at the camera. The daemon keeps ONNX models loaded &mdash; ~600ms on a cold camera, dropping to 150&ndash;200ms on back-to-back unlocks.</p>
         </div>
 
         <div class="feature-card">
@@ -410,10 +412,11 @@
               <span class="terminal-title">configuration.nix</span>
             </div>
             <div class="terminal-body">
-              <div><span class="comment"># Add to flake inputs</span></div>
-              <div><span class="output">inputs.facelock.url = "github:tyvsmith/facelock";</span></div>
+              <div><span class="comment"># flake.nix inputs</span></div>
+              <div><span class="output">inputs.facelock.url = "github:tyvsmith/facelock?dir=dist/nix";</span></div>
               <div>&nbsp;</div>
-              <div><span class="comment"># Enable the module</span></div>
+              <div><span class="comment"># configuration.nix (import the module + enable)</span></div>
+              <div><span class="output">imports = [ inputs.facelock.nixosModules.default ];</span></div>
               <div><span class="output">services.facelock.enable = true;</span></div>
               <div>&nbsp;</div>
               <div><span class="comment"># Rebuild + run setup wizard</span></div>
