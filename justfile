@@ -401,6 +401,15 @@ release version:
         echo "  ✓ dist/PKGBUILD-bin"
     fi
 
+    # 2c. dist/PKGBUILD-git: the runtime pkgver() function computes the real
+    # version from `git describe`, but generate_srcinfo in publish-aur.sh runs
+    # without a git checkout, so AUR's web display falls back to this static
+    # pkgver. Keep it in sync with the release so the AUR page doesn't drift.
+    if [ -f dist/PKGBUILD-git ]; then
+        sed -i "s/^pkgver=.*/pkgver=$VERSION/" dist/PKGBUILD-git
+        echo "  ✓ dist/PKGBUILD-git"
+    fi
+
     # 3. dist/facelock.spec
     if [ -f dist/facelock.spec ]; then
         sed -i "s/^Version:.*/Version:        $VERSION/" dist/facelock.spec
