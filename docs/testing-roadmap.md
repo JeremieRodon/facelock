@@ -166,8 +166,8 @@ production-ready in the justfile install recipe.
 
 ## 4. Deployment Roadmap
 
-### Current state: v0.1.3 released
-- **v0.1.3 released on 2026-05-20** (tag-driven CI)
+### Current state: v0.1.4 released
+- **v0.1.4 released on 2026-05-31** (tag-driven CI)
 - Published packages: `.deb` (APT with signing key), `.rpm` (Fedora COPR via Packit), PKGBUILD (AUR)
 - `just install` / `just uninstall` for local development still available
 
