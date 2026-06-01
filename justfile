@@ -300,69 +300,6 @@ uninstall-files:
     echo "==>   sudo gpasswd -d <username> facelock"
     echo "==>   sudo groupdel facelock"
 
-# Add face auth icon to omarchy hyprlock placeholder text (no root required)
-omarchy-enable:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    HYPRLOCK_CONF="$HOME/.config/hypr/hyprlock.conf"
-
-    if [ ! -d "$HOME/.local/share/omarchy" ]; then
-        echo "Error: omarchy not detected. This target is for omarchy systems only."
-        exit 1
-    fi
-
-    if [ ! -f "$HYPRLOCK_CONF" ]; then
-        echo "Error: $HYPRLOCK_CONF not found."
-        exit 1
-    fi
-
-    if grep -q '󰄀' "$HYPRLOCK_CONF"; then
-        echo "Face auth icon already present in hyprlock config."
-        exit 0
-    fi
-
-    # Preserve fingerprint icon if present
-    if grep -q '󰈷' "$HYPRLOCK_CONF"; then
-        sed -i 's/placeholder_text = .*/placeholder_text = <span> Enter Password 󰄀 󰈷 <\/span>/' "$HYPRLOCK_CONF"
-    else
-        sed -i 's/placeholder_text = .*/placeholder_text = <span> Enter Password 󰄀 <\/span>/' "$HYPRLOCK_CONF"
-    fi
-
-    # Source the faceauth overlay if not already sourced
-    if [ -f "$HOME/.config/hypr/hyprlock-faceauth.conf" ] && ! grep -q 'hyprlock-faceauth.conf' "$HYPRLOCK_CONF"; then
-        echo 'source = ~/.config/hypr/hyprlock-faceauth.conf' >> "$HYPRLOCK_CONF"
-    fi
-
-    echo "Enabled face auth in hyprlock."
-
-# Remove face auth icon from omarchy hyprlock placeholder text (no root required)
-omarchy-disable:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    HYPRLOCK_CONF="$HOME/.config/hypr/hyprlock.conf"
-
-    if [ ! -f "$HYPRLOCK_CONF" ]; then
-        echo "Error: $HYPRLOCK_CONF not found."
-        exit 1
-    fi
-
-    if ! grep -q '󰄀' "$HYPRLOCK_CONF"; then
-        echo "Face auth icon not present in hyprlock config."
-        exit 0
-    fi
-
-    # Preserve fingerprint icon if present
-    if grep -q '󰈷' "$HYPRLOCK_CONF"; then
-        sed -i 's/placeholder_text = .*/placeholder_text = <span> Enter Password 󰈷 <\/span>/' "$HYPRLOCK_CONF"
-    else
-        sed -i 's/placeholder_text = .*/placeholder_text = Enter Password/' "$HYPRLOCK_CONF"
-    fi
-
-    # Remove the faceauth overlay source line
-    sed -i '\|hyprlock-faceauth.conf|d' "$HYPRLOCK_CONF"
-
-    echo "Disabled face auth in hyprlock."
-
 # Bump version and prepare a release commit + tag
 # Usage: just release 0.2.0
 release version:

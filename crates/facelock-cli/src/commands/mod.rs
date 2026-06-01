@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod devices;
 pub mod encrypt;
 pub mod enroll;
+pub mod hyprlock;
 pub mod list;
 pub mod preview;
 pub mod remove;

@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use commands::TpmCommand;
 use commands::bench::BenchCommand;
+use commands::hyprlock::HyprlockCommand;
 
 #[derive(Parser)]
 #[command(name = "facelock", about = "Linux face authentication", version)]
@@ -138,6 +139,11 @@ enum Commands {
         #[command(subcommand)]
         command: TpmCommand,
     },
+    /// Manage hyprlock lock-screen integration (no root required)
+    Hyprlock {
+        #[command(subcommand)]
+        command: HyprlockCommand,
+    },
     /// Encrypt all unencrypted embeddings with AES-256-GCM
     Encrypt {
         /// Generate a new encryption key (does not encrypt)
@@ -226,6 +232,7 @@ fn main() -> anyhow::Result<()> {
                 Commands::Devices => commands::devices::run(),
                 Commands::Bench { command } => commands::bench::run(command),
                 Commands::Tpm { command } => commands::tpm::run(command),
+                Commands::Hyprlock { command } => commands::hyprlock::run(command),
                 Commands::Encrypt { generate_key } => commands::encrypt::run_encrypt(generate_key),
                 Commands::Decrypt => commands::encrypt::run_decrypt(),
                 Commands::Restart => commands::config::restart(),
