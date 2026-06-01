@@ -1,7 +1,6 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
@@ -10,8 +9,6 @@ const FACE_ICON: &str = "\u{f0100}";
 const FP_ICON: &str = "\u{f0237}";
 const BACKUP_SUFFIX: &str = ".facelock-backup";
 const PAM_HYPRLOCK_PATH: &str = "/etc/pam.d/hyprlock";
-/// Hyprlock's stock font and the most common Hyprland/Omarchy default.
-const DEFAULT_HYPRLOCK_FONT: &str = "JetBrainsMono Nerd Font";
 
 #[derive(Subcommand)]
 pub enum HyprlockCommand {
@@ -73,9 +70,8 @@ fn enable(path: &Path, no_icon: bool) -> anyhow::Result<()> {
         println!("Backed up {} -> {}", path.display(), backup_path.display());
     }
 
-    // When --no-icon is passed, leave placeholder_text alone entirely. An existing
-    // face icon stays put (use `disable` to remove it); we only flip the functional
-    // flag. The font check is skipped because no glyph will be rendered by us.
+    // With --no-icon, an existing face icon is preserved (use `disable` to remove it);
+    // we only flip the functional flag.
     let (after_placeholder, placeholder_changed, already_face) = if no_icon {
         (original.clone(), false, false)
     } else {
@@ -108,42 +104,19 @@ fn enable(path: &Path, no_icon: bool) -> anyhow::Result<()> {
         println!("general.ignore_empty_input already false.");
     }
 
-    // Font check only makes sense if we're adding/expecting an icon to render.
-    if !no_icon {
-        let font = extract_font_family(&original)
-            .unwrap_or_else(|| DEFAULT_HYPRLOCK_FONT.to_string());
-        report_font_status(&font, check_font(&font));
+    // Static install hint. We don't probe fontconfig because the result would
+    // just gate this same one-liner — the user either sees the icon (done) or
+    // sees a box (fix described here).
+    if !no_icon && placeholder_changed {
+        println!();
+        println!("Note: the face icon ({FACE_ICON}) requires a Nerd Font.");
+        println!("      If it renders as a missing-glyph box, install one:");
+        println!("      Arch:   sudo pacman -S ttf-jetbrains-mono-nerd");
+        println!("      Debian: sudo apt install fonts-jetbrains-mono");
+        println!("      Or re-run `facelock hyprlock disable && facelock hyprlock enable --no-icon`.");
     }
 
     Ok(())
-}
-
-fn report_font_status(font: &str, status: FontStatus) {
-    match status {
-        FontStatus::Installed => {}
-        FontStatus::Substituted { resolved_to } => {
-            println!();
-            println!(
-                "Note: hyprlock font '{font}' is not installed (fontconfig substituted '{resolved_to}')."
-            );
-            println!(
-                "      The face icon will render as a missing-glyph box until you install a Nerd Font."
-            );
-            println!("      Arch:   sudo pacman -S ttf-jetbrains-mono-nerd");
-            println!("      Debian: sudo apt install fonts-jetbrains-mono");
-            println!("      The functional integration still works; this is cosmetic.");
-            println!("      Re-run with `--no-icon` to skip the icon entirely.");
-        }
-        FontStatus::FcMatchMissing => {
-            println!();
-            println!(
-                "Note: fontconfig (`fc-match`) not found — cannot verify Nerd Font availability."
-            );
-            println!(
-                "      If the face icon renders as a box, install a Nerd Font for your hyprlock font."
-            );
-        }
-    }
 }
 
 fn disable(path: &Path) -> anyhow::Result<()> {
@@ -176,9 +149,8 @@ fn disable(path: &Path) -> anyhow::Result<()> {
     if general_changed {
         println!("Restored general.ignore_empty_input = true.");
     } else if fingerprint_present {
-        // Coexistence note: hyprlock needs ignore_empty_input=false to dispatch empty
-        // Enter to PAM, which is what triggers pam_fprintd / pam_facelock without a
-        // typed password.
+        // hyprlock needs ignore_empty_input=false to dispatch empty Enter to PAM,
+        // which is what triggers pam_fprintd / pam_facelock without a typed password.
         println!(
             "Fingerprint integration detected — leaving ignore_empty_input alone so fingerprint still works."
         );
@@ -243,21 +215,6 @@ fn status(path: &Path) -> anyhow::Result<()> {
         if pam_fp { "yes" } else { "no" }
     );
 
-    let font = extract_font_family(&content).unwrap_or_else(|| DEFAULT_HYPRLOCK_FONT.to_string());
-    match check_font(&font) {
-        FontStatus::Installed => {
-            println!("font ({font}):        installed");
-        }
-        FontStatus::Substituted { resolved_to } => {
-            println!(
-                "font ({font}):        NOT installed (substituted '{resolved_to}'); icon may render as box"
-            );
-        }
-        FontStatus::FcMatchMissing => {
-            println!("font ({font}):        fc-match not available");
-        }
-    }
-
     let backup = backup_path(path);
     if backup.exists() {
         println!("backup file:          {}", backup.display());
@@ -266,198 +223,78 @@ fn status(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolved state of the hyprlock font, as reported by fontconfig.
-#[derive(Debug, PartialEq, Eq)]
-enum FontStatus {
-    /// fontconfig returned a family that matches the requested name.
-    Installed,
-    /// fontconfig substituted a different family — the icon will likely render
-    /// as a missing-glyph box unless that fallback is itself a Nerd Font.
-    Substituted { resolved_to: String },
-    /// `fc-match` not on PATH (fontconfig not installed).
-    FcMatchMissing,
-}
-
-/// Look up the requested font family via `fc-match` and report whether it
-/// actually resolves to itself (installed) or to a different family
-/// (substituted). Tests don't shell out — see `font_resolves_to_match` for
-/// the comparison logic.
-fn check_font(requested: &str) -> FontStatus {
-    let output = match Command::new("fc-match")
-        .args(["-f", "%{family}\n", requested])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return FontStatus::FcMatchMissing,
-    };
-    if !output.status.success() {
-        return FontStatus::FcMatchMissing;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let resolved = stdout.lines().next().unwrap_or("").trim().to_string();
-    if font_resolves_to_match(requested, &resolved) {
-        FontStatus::Installed
-    } else {
-        FontStatus::Substituted {
-            resolved_to: resolved,
-        }
-    }
-}
-
-/// fontconfig may return a comma-separated alias list (e.g.
-/// `"JetBrainsMono Nerd Font,JetBrainsMono NF"`). The font is considered
-/// installed if the requested name matches (case-insensitively) any alias by
-/// word-prefix in either direction. "Word-prefix" means one name is a
-/// prefix of the other at a word boundary (space or end of string). This
-/// handles the common cases:
-///   requested "JetBrains Mono"  resolved "JetBrains Mono NL"             -> match (req prefix of alias)
-///   requested "JetBrains Mono Nerd Font" resolved "JetBrains Mono"       -> match (alias prefix of req)
-///   requested "JetBrainsMono Nerd Font" resolved "JetBrainsMono Nerd Font" -> match (exact)
-///   requested "Sans"            resolved "Liberation Sans"               -> no match
-///   requested "DefinitelyNotAFont"      resolved "Liberation Sans"       -> no match
-fn font_resolves_to_match(requested: &str, resolved: &str) -> bool {
-    if resolved.trim().is_empty() {
-        return false;
-    }
-    let req = requested.trim().to_ascii_lowercase();
-    if req.is_empty() {
-        return false;
-    }
-    resolved
-        .split(',')
-        .map(|s| s.trim().to_ascii_lowercase())
-        .any(|alias| {
-            if alias.is_empty() {
-                return false;
-            }
-            // Exact match
-            if alias == req {
-                return true;
-            }
-            // alias is a word-boundary prefix of req: req starts with alias
-            // followed by a space (e.g. req="JetBrains Mono Nerd Font", alias="JetBrains Mono")
-            if req.starts_with(&alias)
-                && req[alias.len()..].starts_with(' ')
-            {
-                return true;
-            }
-            // req is a word-boundary prefix of alias: alias starts with req
-            // followed by a space (e.g. alias="JetBrains Mono NL", req="JetBrains Mono")
-            if alias.starts_with(&req)
-                && alias[req.len()..].starts_with(' ')
-            {
-                return true;
-            }
-            false
-        })
-}
-
-/// Parse `font_family = X` from hyprlock.conf, preserving any quoting in the
-/// value. Looks inside the first `input-field { ... }` block; ignores
-/// `font_family` keys in other blocks (e.g. `label`). Returns None when no
-/// override is set — callers should default to `DEFAULT_HYPRLOCK_FONT`.
-fn extract_font_family(input: &str) -> Option<String> {
-    let mut in_input_field = false;
-    let mut depth = 0i32;
-    for line in input.lines() {
-        let trimmed = line.trim();
-        if !in_input_field {
-            if trimmed.starts_with("input-field") && trimmed.contains('{') {
-                in_input_field = true;
-                depth = 1;
-            }
-            continue;
-        }
-        // Track nested braces so we don't leave the block prematurely.
-        for ch in trimmed.chars() {
-            if ch == '{' {
-                depth += 1;
-            } else if ch == '}' {
-                depth -= 1;
-            }
-        }
-        if depth <= 0 {
-            return None;
-        }
-        if let Some(rest) = trimmed.strip_prefix("font_family")
-            && let Some(idx) = rest.find('=')
-        {
-            return Some(rest[idx + 1..].trim().to_string());
-        }
-    }
-    None
-}
-
 fn backup_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(BACKUP_SUFFIX);
     PathBuf::from(s)
 }
 
+/// Insert the face icon into the first `placeholder_text` line, preserving any
+/// existing content. If the value ends with `</span>`, insert before it; otherwise
+/// append at end of line. Either way, user customization (custom prompt text,
+/// other icons, span attributes) is left intact.
 fn add_face_icon(input: &str) -> (String, bool, bool) {
-    let mut out = String::with_capacity(input.len());
+    let mut out = String::with_capacity(input.len() + FACE_ICON.len() + 1);
     let mut changed = false;
     let mut already = false;
-    let mut found_any = false;
+    let mut found = false;
 
     for line in input.lines() {
         let trimmed = line.trim_start();
-        if !found_any && trimmed.starts_with("placeholder_text") && trimmed.contains('=') {
-            found_any = true;
-            if trimmed.contains(FACE_ICON) {
+        if !found && trimmed.starts_with("placeholder_text") && trimmed.contains('=') {
+            found = true;
+            if line.contains(FACE_ICON) {
                 already = true;
                 out.push_str(line);
-                out.push('\n');
-                continue;
-            }
-            let has_fp = trimmed.contains(FP_ICON);
-            let indent = &line[..line.len() - trimmed.len()];
-            let new_value = if has_fp {
-                format!("<span> Enter Password {FACE_ICON} {FP_ICON} </span>")
             } else {
-                format!("<span> Enter Password {FACE_ICON} </span>")
-            };
-            out.push_str(indent);
-            out.push_str(&format!("placeholder_text = {new_value}\n"));
-            changed = true;
+                out.push_str(&insert_icon(line));
+                changed = true;
+            }
         } else {
             out.push_str(line);
-            out.push('\n');
         }
+        out.push('\n');
     }
 
     preserve_trailing_newline(input, &mut out);
     (out, changed, already)
 }
 
+fn insert_icon(line: &str) -> String {
+    match line.rfind("</span>") {
+        Some(idx) => {
+            let (before, after) = line.split_at(idx);
+            format!("{} {FACE_ICON} {}", before.trim_end(), after)
+        }
+        None => format!("{} {FACE_ICON}", line.trim_end()),
+    }
+}
+
+/// Splice the face icon out of any line containing it. Strips an adjacent space
+/// so we don't leave a dangling double-space; if the icon is bare (no neighbor
+/// space) we just remove the codepoint.
 fn remove_face_icon(input: &str) -> (String, bool) {
     let mut out = String::with_capacity(input.len());
     let mut changed = false;
 
     for line in input.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("placeholder_text")
-            && trimmed.contains('=')
-            && trimmed.contains(FACE_ICON)
-        {
-            let has_fp = trimmed.contains(FP_ICON);
-            let indent = &line[..line.len() - trimmed.len()];
-            let new_value = if has_fp {
-                format!("<span> Enter Password {FP_ICON} </span>")
-            } else {
-                "Enter Password".to_string()
-            };
-            out.push_str(indent);
-            out.push_str(&format!("placeholder_text = {new_value}\n"));
+        if line.contains(FACE_ICON) {
+            out.push_str(&strip_icon(line));
             changed = true;
         } else {
             out.push_str(line);
-            out.push('\n');
         }
+        out.push('\n');
     }
 
     preserve_trailing_newline(input, &mut out);
     (out, changed)
+}
+
+fn strip_icon(line: &str) -> String {
+    line.replace(&format!(" {FACE_ICON}"), "")
+        .replace(&format!("{FACE_ICON} "), "")
+        .replace(FACE_ICON, "")
 }
 
 fn set_ignore_empty_input(input: &str, value: bool) -> (String, bool) {
@@ -525,10 +362,7 @@ fn inject_into_general_block(input: &str, target: &str) -> Option<String> {
     let close_idx = close_idx?;
 
     let mut out_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
-    out_lines.insert(
-        close_idx,
-        format!("    ignore_empty_input = {target}"),
-    );
+    out_lines.insert(close_idx, format!("    ignore_empty_input = {target}"));
 
     let mut joined = out_lines.join("\n");
     if input.ends_with('\n') {
@@ -636,6 +470,35 @@ mod tests {
     }
 
     #[test]
+    fn enable_preserves_custom_placeholder_text() {
+        // User changed the default prompt — we must not clobber it.
+        let input = "input-field {\n    placeholder_text = <span> Unlock thy domain </span>\n}\n";
+        let (after, _, _) = add_face_icon(input);
+        assert!(after.contains("Unlock thy domain"));
+        assert!(after.contains(FACE_ICON));
+        assert!(after.contains("</span>"));
+    }
+
+    #[test]
+    fn enable_inserts_icon_before_closing_span() {
+        let input = "    placeholder_text = <span> Enter Password </span>\n";
+        let (after, _, _) = add_face_icon(input);
+        let line = after.lines().next().unwrap();
+        // Icon must appear before </span>, not after it.
+        let icon_pos = line.find(FACE_ICON).unwrap();
+        let span_close_pos = line.find("</span>").unwrap();
+        assert!(icon_pos < span_close_pos);
+    }
+
+    #[test]
+    fn enable_appends_icon_when_no_span() {
+        let input = "    placeholder_text = Enter Password\n";
+        let (after, _, _) = add_face_icon(input);
+        assert!(after.contains(FACE_ICON));
+        assert!(after.contains("Enter Password"));
+    }
+
+    #[test]
     fn enable_is_idempotent() {
         let (after, _, _) = add_face_icon(STOCK_OMARCHY);
         let (after2, changed, already) = add_face_icon(&after);
@@ -734,8 +597,11 @@ mod tests {
     fn pam_contains_via_tempfile() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("hyprlock");
-        std::fs::write(&path, "auth required pam_unix.so\nauth sufficient pam_fprintd.so\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "auth required pam_unix.so\nauth sufficient pam_fprintd.so\n",
+        )
+        .unwrap();
         assert!(pam_has_fingerprint(&path));
         assert!(pam_contains(&path, "pam_unix.so"));
         assert!(!pam_contains(&path, "pam_facelock.so"));
@@ -766,102 +632,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_font_family_absent_on_stock_omarchy() {
-        assert_eq!(extract_font_family(STOCK_OMARCHY), None);
-    }
-
-    #[test]
-    fn extract_font_family_with_spaces() {
-        let input = "input-field {\n    font_family = JetBrainsMono Nerd Font\n}\n";
-        assert_eq!(
-            extract_font_family(input),
-            Some("JetBrainsMono Nerd Font".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_font_family_with_quotes_preserved() {
-        let input = "input-field {\n    font_family = \"JetBrainsMono Nerd Font\"\n}\n";
-        assert_eq!(
-            extract_font_family(input),
-            Some("\"JetBrainsMono Nerd Font\"".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_font_family_ignores_other_blocks() {
-        // font_family in a label block should not be returned; input-field has none.
-        let input = "label {\n    font_family = Comic Sans\n    text = hi\n}\n\
-                     input-field {\n    placeholder_text = Enter Password\n}\n";
-        assert_eq!(extract_font_family(input), None);
-    }
-
-    #[test]
-    fn extract_font_family_prefers_input_field_block() {
-        let input = "label {\n    font_family = Comic Sans\n}\n\
-                     input-field {\n    font_family = JetBrainsMono Nerd Font\n}\n";
-        assert_eq!(
-            extract_font_family(input),
-            Some("JetBrainsMono Nerd Font".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_font_family_no_input_field_block() {
-        let input = "general {\n    grace = 0\n}\n";
-        assert_eq!(extract_font_family(input), None);
-    }
-
-    #[test]
-    fn font_match_exact_case_insensitive() {
-        assert!(font_resolves_to_match(
-            "JetBrainsMono Nerd Font",
-            "JetBrainsMono Nerd Font"
-        ));
-        assert!(font_resolves_to_match(
-            "jetbrainsmono nerd font",
-            "JetBrainsMono Nerd Font"
-        ));
-    }
-
-    #[test]
-    fn font_match_alias_list() {
-        // Real fc-match output for installed Nerd Font.
-        assert!(font_resolves_to_match(
-            "JetBrainsMono Nerd Font",
-            "JetBrainsMono Nerd Font,JetBrainsMono NF"
-        ));
-    }
-
-    #[test]
-    fn font_match_substring_either_direction() {
-        // Requested name contains resolved alias.
-        assert!(font_resolves_to_match(
-            "JetBrains Mono Nerd Font",
-            "JetBrains Mono"
-        ));
-        // Resolved alias contains requested.
-        assert!(font_resolves_to_match("JetBrains Mono", "JetBrains Mono NL"));
-    }
-
-    #[test]
-    fn font_no_match_when_substituted() {
-        // Typical "font missing" case: requested random name, fontconfig falls back.
-        assert!(!font_resolves_to_match("Sans", "Liberation Sans"));
-        assert!(!font_resolves_to_match(
-            "JetBrainsMono Nerd Font",
-            "DejaVu Sans"
-        ));
-        assert!(!font_resolves_to_match("DefinitelyNotAFont", "Liberation Sans"));
-    }
-
-    #[test]
-    fn font_no_match_when_empty() {
-        assert!(!font_resolves_to_match("Sans", ""));
-        assert!(!font_resolves_to_match("", "Liberation Sans"));
-    }
-
-    #[test]
     fn enable_with_no_icon_skips_placeholder_flips_flag() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("hyprlock.conf");
@@ -883,14 +653,13 @@ mod tests {
     fn enable_with_no_icon_is_idempotent_and_preserves_existing_icon() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("hyprlock.conf");
-        // Start with face icon already present and ignore_empty_input = false.
         let preexisting = format!(
             "general {{\n    ignore_empty_input = false\n}}\n\n\
              input-field {{\n    placeholder_text = <span> Enter Password {FACE_ICON} </span>\n}}\n"
         );
         std::fs::write(&path, &preexisting).unwrap();
 
-        // --no-icon should NOT remove the existing icon (that's disable's job).
+        // --no-icon must not remove the existing icon (that's disable's job).
         enable(&path, true).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
