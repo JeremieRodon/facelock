@@ -167,11 +167,12 @@ Facelock works with [hyprlock](https://github.com/hyprwm/hyprlock) on Hyprland (
 2. **Lock-screen tweak** in `~/.config/hypr/hyprlock.conf` — set `ignore_empty_input = false` and add a face icon to `placeholder_text`. Run as your normal user:
    ```bash
    facelock hyprlock enable      # add face icon + enable empty-Enter submission
+   facelock hyprlock enable --no-icon  # functional change only (no icon)
    facelock hyprlock disable     # revert (preserves fingerprint setup if present)
    facelock hyprlock status      # show current integration state
    ```
 
-`facelock hyprlock enable` preserves any existing fingerprint integration (icon 󰈷, `fingerprint:enabled = true`, `pam_fprintd.so`) — face and fingerprint can coexist.
+`facelock hyprlock enable` preserves any existing fingerprint integration (icon 󰈷, `fingerprint:enabled = true`, `pam_fprintd.so`) — face and fingerprint can coexist. If your hyprlock font isn't a Nerd Font, run with `--no-icon`; the functional integration still works.
 
 ### Omarchy
 
