@@ -60,8 +60,8 @@ fn locate_hyprlock_conf() -> anyhow::Result<PathBuf> {
 }
 
 fn enable(path: &Path, no_icon: bool) -> anyhow::Result<()> {
-    let original = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let original =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
 
     let backup_path = backup_path(path);
     if !backup_path.exists() {
@@ -113,15 +113,17 @@ fn enable(path: &Path, no_icon: bool) -> anyhow::Result<()> {
         println!("      If it renders as a missing-glyph box, install one:");
         println!("      Arch:   sudo pacman -S ttf-jetbrains-mono-nerd");
         println!("      Debian: sudo apt install fonts-jetbrains-mono");
-        println!("      Or re-run `facelock hyprlock disable && facelock hyprlock enable --no-icon`.");
+        println!(
+            "      Or re-run `facelock hyprlock disable && facelock hyprlock enable --no-icon`."
+        );
     }
 
     Ok(())
 }
 
 fn disable(path: &Path) -> anyhow::Result<()> {
-    let original = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let original =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
 
     let (after_placeholder, placeholder_changed) = remove_face_icon(&original);
 
@@ -168,16 +170,14 @@ fn disable(path: &Path) -> anyhow::Result<()> {
 }
 
 fn status(path: &Path) -> anyhow::Result<()> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
 
     let placeholder = extract_placeholder_text(&content);
     let face_present = placeholder
         .as_deref()
         .is_some_and(|p| p.contains(FACE_ICON));
-    let fp_present = placeholder
-        .as_deref()
-        .is_some_and(|p| p.contains(FP_ICON));
+    let fp_present = placeholder.as_deref().is_some_and(|p| p.contains(FP_ICON));
     let ignore_empty = extract_ignore_empty_input(&content);
     let pam_face = pam_contains(Path::new(PAM_HYPRLOCK_PATH), "pam_facelock.so");
     let pam_fp = pam_contains(Path::new(PAM_HYPRLOCK_PATH), "pam_fprintd.so");
@@ -640,7 +640,10 @@ mod tests {
         enable(&path, true).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(!after.contains(FACE_ICON), "no icon expected with --no-icon");
+        assert!(
+            !after.contains(FACE_ICON),
+            "no icon expected with --no-icon"
+        );
         assert!(
             after.contains("placeholder_text = Enter Password"),
             "placeholder text should be untouched"
