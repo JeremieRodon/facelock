@@ -159,16 +159,31 @@ All keys are optional. Camera is auto-detected if `device.path` is omitted.
 
 Full reference: `config/facelock.toml`.
 
-## Omarchy / Hyprlock Integration
+## Hyprlock Integration
 
-If you use [Omarchy](https://github.com/nicholasgasior/omarchy) (Hyprland desktop environment), Facelock can integrate with hyprlock:
+Facelock works with [hyprlock](https://github.com/hyprwm/hyprlock) on Hyprland (Arch, Omarchy, NixOS, etc.). Two things are needed:
+
+1. **PAM line** in `/etc/pam.d/hyprlock` — `sudo facelock setup` does this automatically when you select hyprlock in the PAM step.
+2. **Lock-screen tweak** in `~/.config/hypr/hyprlock.conf` — set `ignore_empty_input = false` and add a face icon to `placeholder_text`. Run as your normal user:
+   ```bash
+   facelock hyprlock enable      # add face icon + enable empty-Enter submission
+   facelock hyprlock enable --no-icon  # functional change only (no icon)
+   facelock hyprlock disable     # revert (preserves fingerprint setup if present)
+   facelock hyprlock status      # show current integration state
+   ```
+
+`facelock hyprlock enable` preserves any existing fingerprint integration (icon 󰈷, `fingerprint:enabled = true`, `pam_fprintd.so`) — face and fingerprint can coexist. If your hyprlock font isn't a Nerd Font, run with `--no-icon`; the functional integration still works.
+
+### Omarchy
+
+On Omarchy, the same flow is wrapped end-to-end (camera check → setup → enrollment → hyprlock tweak → test):
 
 ```bash
-just omarchy-enable     # add face auth icon to hyprlock placeholder
-just omarchy-disable    # remove face auth from hyprlock
+omarchy-setup-security-face       # everything in one floating-terminal session
+omarchy-remove-security-face      # symmetric removal
 ```
 
-This adds a face icon to the hyprlock password prompt and optionally sources a `hyprlock-faceauth.conf` overlay. No root required.
+These scripts mirror omarchy's own `omarchy-setup-security-fingerprint` pattern. A walker menu entry under Setup → Security → Face is pending upstream.
 
 ## Testing
 

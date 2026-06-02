@@ -81,6 +81,10 @@ install -Dm644 dist/authselect/facelock/password-auth %{buildroot}%{_datadir}/au
 install -Dm644 dist/authselect/facelock/postlogin %{buildroot}%{_datadir}/authselect/vendor/facelock/postlogin
 install -Dm644 dist/authselect/facelock/README %{buildroot}%{_datadir}/authselect/vendor/facelock/README
 
+# Omarchy helper scripts (inert if walker/omarchy isn't installed)
+install -Dm755 dist/omarchy/omarchy-setup-security-face %{buildroot}%{_bindir}/omarchy-setup-security-face
+install -Dm755 dist/omarchy/omarchy-remove-security-face %{buildroot}%{_bindir}/omarchy-remove-security-face
+
 # Bundled CPU ONNX Runtime (if present — added by release CI).
 # Always create %{_libdir}/facelock/ so the %files entry resolves even when ORT
 # is not bundled (the Packit/COPR from-source build, which depends on system
@@ -147,6 +151,8 @@ fi
 %doc config/facelock.toml
 %{_bindir}/facelock
 %{_bindir}/facelock-polkit-agent
+%{_bindir}/omarchy-setup-security-face
+%{_bindir}/omarchy-remove-security-face
 %{_libdir}/security/pam_facelock.so
 %{_libdir}/facelock/
 %config(noreplace) %{_sysconfdir}/facelock/config.toml

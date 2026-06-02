@@ -29,6 +29,7 @@ Stable contracts. Do not change without updating this document.
 | `facelock daemon` | Run persistent daemon |
 | `facelock auth --user X` | One-shot auth (PAM helper) |
 | `facelock tpm status` | TPM status |
+| `facelock hyprlock enable\|disable\|status` | Manage hyprlock lock-screen integration (user, no root); `enable` accepts `--no-icon` to skip the cosmetic face glyph |
 | `facelock encrypt` | Encrypt face database |
 | `facelock decrypt` | Decrypt face database |
 | `facelock audit` | View audit log |

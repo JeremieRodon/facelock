@@ -211,6 +211,10 @@ fn run_wizard() -> anyhow::Result<()> {
         }
     };
 
+    if pam_services.iter().any(|s| s == "hyprlock") {
+        wizard_hyprlock_handoff(&theme);
+    }
+
     print_pam_extension_hint();
 
     // -- Summary --
@@ -1042,6 +1046,69 @@ fn wizard_pam_setup(theme: &ColorfulTheme) -> anyhow::Result<Vec<String>> {
 }
 
 // ---------------------------------------------------------------------------
+// Hyprlock integration handoff
+// ---------------------------------------------------------------------------
+
+fn print_hyprlock_hint() {
+    println!();
+    println!("==> To finish hyprlock integration, run as your normal user:");
+    println!("==>     facelock hyprlock enable");
+}
+
+fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
+    // The wizard runs as root via `sudo facelock setup`, but hyprlock.conf lives
+    // in the invoking user's $HOME — only `runuser -u $SUDO_USER` can touch it.
+    let sudo_user = match std::env::var("SUDO_USER") {
+        Ok(u) if !u.is_empty() && u != "root" => u,
+        _ => {
+            print_hyprlock_hint();
+            return;
+        }
+    };
+
+    let user = match nix::unistd::User::from_name(&sudo_user) {
+        Ok(Some(u)) => u,
+        _ => {
+            print_hyprlock_hint();
+            return;
+        }
+    };
+
+    let hyprlock_conf = user.dir.join(".config").join("hypr").join("hyprlock.conf");
+    if !hyprlock_conf.exists() {
+        print_hyprlock_hint();
+        return;
+    }
+
+    println!();
+    let proceed = Confirm::with_theme(theme)
+        .with_prompt(format!(
+            "Apply hyprlock face-unlock integration for {sudo_user}? (face icon + empty-Enter submit)"
+        ))
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+
+    if !proceed {
+        print_hyprlock_hint();
+        return;
+    }
+
+    let status = Command::new("runuser")
+        .args(["-u", &sudo_user, "--", "facelock", "hyprlock", "enable"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("  hyprlock integration applied for {sudo_user}.");
+        }
+        _ => {
+            print_hyprlock_hint();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Non-interactive setup (original behavior)
 // ---------------------------------------------------------------------------
 
@@ -1117,6 +1184,13 @@ fn run_non_interactive() -> anyhow::Result<()> {
 
     secure_setup_paths(&config, Some(&manifest))?;
     write_setup_marker()?;
+
+    if let Ok(pam_content) = fs::read_to_string(Path::new("/etc/pam.d/hyprlock"))
+        && pam_content.lines().any(is_facelock_pam_line)
+    {
+        print_hyprlock_hint();
+    }
+
     println!("\nSetup complete. Run `facelock enroll` to register your face.");
     Ok(())
 }
