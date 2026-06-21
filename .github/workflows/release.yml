@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, download-ort]
     container:
-      image: debian:trixie-20260518
+      image: debian:trixie-20260610
     steps:
       - uses: actions/checkout@v6
 
