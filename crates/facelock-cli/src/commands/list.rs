@@ -54,8 +54,11 @@ fn print_table(user: &str, models: &[FaceModelInfo]) {
     }
 
     println!("Face models for user '{user}':\n");
-    println!("  {:<6} {:<20} {:<24} Model", "ID", "Label", "Created");
-    println!("  {}", "-".repeat(70));
+    println!(
+        "  {:<6} {:<20} {:<24} {:<22} Camera",
+        "ID", "Label", "Created", "Model"
+    );
+    println!("  {}", "-".repeat(92));
 
     for model in models {
         let created = format_timestamp(model.created_at);
@@ -64,9 +67,15 @@ fn print_table(user: &str, models: &[FaceModelInfo]) {
         } else {
             model.embedder_model.clone()
         };
+        // Device fingerprint of the enrolling camera (Plan 02). "(any)" means a
+        // legacy/uncoupled template that authenticates on any camera.
+        let camera = match model.device_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => "(any)".to_string(),
+        };
         println!(
-            "  {:<6} {:<20} {:<24} {}",
-            model.id, model.label, created, model_name
+            "  {:<6} {:<20} {:<24} {:<22} {}",
+            model.id, model.label, created, model_name, camera
         );
     }
 
@@ -77,9 +86,16 @@ fn print_json(models: &[FaceModelInfo]) {
     println!("[");
     for (i, model) in models.iter().enumerate() {
         let comma = if i + 1 < models.len() { "," } else { "" };
+        let device_id = model.device_id.as_deref().unwrap_or("");
         println!(
-            "  {{\"id\": {}, \"label\": \"{}\", \"user\": \"{}\", \"created_at\": {}, \"embedder_model\": \"{}\"}}{}",
-            model.id, model.label, model.user, model.created_at, model.embedder_model, comma
+            "  {{\"id\": {}, \"label\": \"{}\", \"user\": \"{}\", \"created_at\": {}, \"embedder_model\": \"{}\", \"device_id\": \"{}\"}}{}",
+            model.id,
+            model.label,
+            model.user,
+            model.created_at,
+            model.embedder_model,
+            device_id,
+            comma
         );
     }
     println!("]");

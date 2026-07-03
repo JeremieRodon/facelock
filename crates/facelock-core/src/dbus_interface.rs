@@ -21,6 +21,11 @@ pub struct ModelInfo {
     pub label: String,
     pub created_at: u64,
     pub embedder_model: String,
+    /// Canonical device fingerprint (`"vid:pid:serial"`) of the enrolling
+    /// camera, or empty string for legacy/unidentified templates. D-Bus has no
+    /// Option type, so empty string is the NULL sentinel (matching the
+    /// `AuthResult` convention).
+    pub device_id: String,
 }
 
 /// Info about a detected face in preview.

@@ -8,8 +8,8 @@ use facelock_core::fs_security::{ensure_dir, ensure_private_dir, write_file};
 use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{
-    FaceEmbedding, Frame, MatchResult, best_match, check_frame_variance, zeroize_embedding,
-    zeroize_stored_embeddings,
+    DeviceFingerprint, FaceEmbedding, Frame, MatchResult, best_match, check_frame_variance,
+    device_allowed_model_ids, zeroize_embedding, zeroize_stored_embeddings,
 };
 use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
@@ -110,6 +110,7 @@ pub fn authenticate<C: CameraSource, E: FaceProcessor>(
     config: &Config,
     user: &str,
     device_is_ir: bool,
+    live_fingerprint: &DeviceFingerprint,
 ) -> DaemonResponse {
     let mut stored = match store.get_user_embeddings(user) {
         Ok(v) => v,
@@ -128,11 +129,13 @@ pub fn authenticate<C: CameraSource, E: FaceProcessor>(
         config,
         user,
         device_is_ir,
+        live_fingerprint,
     )
 }
 
 /// Run the camera-based authentication loop with pre-loaded (decrypted) embeddings.
 /// Called by the handler when encryption is active so embeddings are already decrypted.
+#[allow(clippy::too_many_arguments)]
 pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
@@ -141,6 +144,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     config: &Config,
     user: &str,
     device_is_ir: bool,
+    live_fingerprint: &DeviceFingerprint,
 ) -> DaemonResponse {
     let mut stored = stored.to_vec();
     let models = models.to_vec();
@@ -152,6 +156,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
         config,
         user,
         device_is_ir,
+        live_fingerprint,
     )
 }
 
@@ -196,6 +201,7 @@ fn save_snapshot(snapshot_config: &SnapshotConfig, user: &str, similarity: f32, 
     debug!(path = %path.display(), "saved auth snapshot");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
@@ -204,11 +210,49 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     config: &Config,
     user: &str,
     device_is_ir: bool,
+    live_fingerprint: &DeviceFingerprint,
 ) -> DaemonResponse {
     let start = Instant::now();
     let save_snapshots = config.snapshots.mode != facelock_core::config::SnapshotMode::Off;
     let label_for =
         |id: u32| -> Option<String> { models.iter().find(|m| m.id == id).map(|m| m.label.clone()) };
+
+    // Device coupling (Plan 02): restrict the compare set to templates whose
+    // enrolling camera matches the live camera at the configured granularity.
+    // A mismatched template is dropped here so its embeddings are never compared
+    // — the outcome degrades to "no match" → password, never a success and never
+    // a lockout. Fail SOFT by construction.
+    let policy = config.security.device_binding_policy();
+    let allowed = device_allowed_model_ids(models, live_fingerprint, &policy);
+    let mut compare_set: Vec<(u32, FaceEmbedding)> = stored
+        .iter()
+        .filter(|(id, _)| allowed.contains(id))
+        .cloned()
+        .collect();
+    if policy.enabled && compare_set.len() != stored.len() {
+        let skipped = stored.len() - compare_set.len();
+        warn!(
+            user,
+            skipped,
+            total = stored.len(),
+            granularity = ?policy.granularity,
+            "device coupling: skipped templates whose enrolling camera does not match the live camera (falling through to password if no allowed template matches)"
+        );
+    }
+    if policy.enabled
+        && models
+            .iter()
+            .any(|m| m.device_id.as_deref().unwrap_or("").is_empty())
+    {
+        info!(
+            user,
+            "device coupling: authenticating legacy template(s) with no device id (bind_legacy_templates); re-enroll to couple them to this camera"
+        );
+    }
+    // `compare_set` holds independent copies of the allowed embeddings; zero the
+    // original full set now that we no longer need it.
+    zeroize_stored_embeddings(stored);
+    let stored = compare_set.as_mut_slice();
 
     let deadline =
         Instant::now() + std::time::Duration::from_secs(config.recognition.timeout_secs as u64);
@@ -369,6 +413,13 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                         save_snapshot(&config.snapshots, user, best_similarity, snap_frame);
                     }
                 }
+                // Device-coupling invariant: the winning model must be one the
+                // device policy permitted into `compare_set`. If this ever fires,
+                // a mismatched template reached the success branch.
+                debug_assert!(
+                    best_model_id.is_none_or(|id| allowed.contains(&id)),
+                    "device coupling invariant violated: skipped template reached success"
+                );
                 let response = DaemonResponse::AuthResult(MatchResult {
                     matched: true,
                     model_id: best_model_id,

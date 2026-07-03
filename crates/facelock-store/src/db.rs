@@ -52,12 +52,28 @@ impl FaceStore {
     }
 
     /// Add a face model with its embedding. Returns the new model ID.
+    /// Stores a NULL `device_id` (not coupled to any camera); use
+    /// [`FaceStore::add_model_with_device`] to bind the enrolling camera.
     pub fn add_model(
         &self,
         user: &str,
         label: &str,
         embedding: &FaceEmbedding,
         embedder_model: &str,
+    ) -> Result<u32> {
+        self.add_model_with_device(user, label, embedding, embedder_model, None)
+    }
+
+    /// Add a face model with its embedding and the enrolling camera's canonical
+    /// device fingerprint (`Some("vid:pid:serial")`), or `None` when the camera
+    /// exposes no readable USB identity. Returns the new model ID.
+    pub fn add_model_with_device(
+        &self,
+        user: &str,
+        label: &str,
+        embedding: &FaceEmbedding,
+        embedder_model: &str,
+        device_id: Option<&str>,
     ) -> Result<u32> {
         let tx = self.conn.unchecked_transaction().map_err(map_err)?;
 
@@ -70,8 +86,8 @@ impl FaceStore {
             .unwrap_or(0);
 
         tx.execute(
-            "INSERT INTO face_models (user, label, created_at, embedder_model) VALUES (?1, ?2, ?3, ?4)",
-            params![user, label, created_at, embedder_model],
+            "INSERT INTO face_models (user, label, created_at, embedder_model, device_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user, label, created_at, embedder_model, device_id],
         )
         .map_err(map_err)?;
 
@@ -169,7 +185,7 @@ impl FaceStore {
     pub fn list_models(&self, user: &str) -> Result<Vec<FaceModelInfo>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, user, label, created_at, embedder_model FROM face_models WHERE user = ?1")
+            .prepare("SELECT id, user, label, created_at, embedder_model, device_id FROM face_models WHERE user = ?1")
             .map_err(map_err)?;
 
         let rows = stmt
@@ -181,6 +197,8 @@ impl FaceStore {
                     // Read as i64 and widen; rusqlite 0.39 dropped FromSql for u64.
                     created_at: row.get::<_, i64>(3)? as u64,
                     embedder_model: row.get(4)?,
+                    // Nullable column (V6): NULL → None for legacy rows.
+                    device_id: row.get::<_, Option<String>>(5)?,
                 })
             })
             .map_err(map_err)?;
@@ -247,6 +265,8 @@ impl FaceStore {
     }
 
     /// Add a face model with raw bytes and a sealed flag. Returns the new model ID.
+    /// Stores a NULL `device_id`; use [`FaceStore::add_model_raw_with_device`] to
+    /// bind the enrolling camera.
     pub fn add_model_raw(
         &self,
         user: &str,
@@ -254,6 +274,21 @@ impl FaceStore {
         data: &[u8],
         sealed: bool,
         embedder_model: &str,
+    ) -> Result<u32> {
+        self.add_model_raw_with_device(user, label, data, sealed, embedder_model, None)
+    }
+
+    /// Add a face model with raw (possibly encrypted) bytes, a sealed flag, and
+    /// the enrolling camera's canonical device fingerprint. Returns the new
+    /// model ID.
+    pub fn add_model_raw_with_device(
+        &self,
+        user: &str,
+        label: &str,
+        data: &[u8],
+        sealed: bool,
+        embedder_model: &str,
+        device_id: Option<&str>,
     ) -> Result<u32> {
         let tx = self.conn.unchecked_transaction().map_err(map_err)?;
 
@@ -266,8 +301,8 @@ impl FaceStore {
             .unwrap_or(0);
 
         tx.execute(
-            "INSERT INTO face_models (user, label, created_at, embedder_model) VALUES (?1, ?2, ?3, ?4)",
-            params![user, label, created_at, embedder_model],
+            "INSERT INTO face_models (user, label, created_at, embedder_model, device_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user, label, created_at, embedder_model, device_id],
         )
         .map_err(map_err)?;
 
@@ -896,6 +931,121 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&wal_path);
         let _ = std::fs::remove_file(&shm_path);
+    }
+
+    #[test]
+    fn test_add_model_with_device_round_trip() {
+        let store = FaceStore::open_memory().unwrap();
+        let emb = test_embedding();
+        store
+            .add_model_with_device("alice", "front", &emb, "", Some("046d:085e:SER"))
+            .unwrap();
+        let models = store.list_models("alice").unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].device_id.as_deref(), Some("046d:085e:SER"));
+    }
+
+    #[test]
+    fn test_add_model_default_device_id_is_null() {
+        // The back-compat add_model stores NULL device_id (legacy/uncoupled).
+        let store = FaceStore::open_memory().unwrap();
+        let emb = test_embedding();
+        store.add_model("alice", "front", &emb, "").unwrap();
+        let models = store.list_models("alice").unwrap();
+        assert_eq!(models[0].device_id, None);
+    }
+
+    #[test]
+    fn test_add_model_raw_with_device_round_trip() {
+        let store = FaceStore::open_memory().unwrap();
+        store
+            .add_model_raw_with_device("bob", "sealed", &[0x02; 60], true, "", Some("1234:5678:"))
+            .unwrap();
+        let models = store.list_models("bob").unwrap();
+        assert_eq!(models[0].device_id.as_deref(), Some("1234:5678:"));
+    }
+
+    #[test]
+    fn test_migration_v6_device_id_column() {
+        // Fresh DB is at the latest schema; device_id defaults to NULL.
+        let store = FaceStore::open_memory().unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(version >= 6, "schema should be at least V6, got {version}");
+    }
+
+    #[test]
+    fn test_pre_v6_db_migrates_cleanly_without_data_loss() {
+        // Build a pre-V6 database by hand (schema at V5: face_models has
+        // embedder_model but NOT device_id), seed a model + embedding, then
+        // reopen via FaceStore::open to run migrations and confirm the row
+        // survives with a NULL device_id.
+        let db_path = std::env::temp_dir().join(format!(
+            "facelock-prev6-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+                CREATE TABLE face_models (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    embedder_model TEXT NOT NULL DEFAULT '',
+                    UNIQUE(user, label)
+                );
+                CREATE TABLE face_embeddings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_id INTEGER NOT NULL REFERENCES face_models(id) ON DELETE CASCADE,
+                    embedding BLOB NOT NULL,
+                    sealed INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE rate_limit (user TEXT NOT NULL, attempt_time INTEGER NOT NULL);
+                INSERT INTO schema_version (version) VALUES (5);
+                INSERT INTO face_models (user, label, created_at, embedder_model)
+                    VALUES ('legacy', 'old-face', 1700000000, 'w600k_r50.onnx');
+                ",
+            )
+            .unwrap();
+            let emb = test_embedding();
+            let bytes: &[u8] = bytemuck::cast_slice(emb.as_slice());
+            conn.execute(
+                "INSERT INTO face_embeddings (model_id, embedding) VALUES (1, ?1)",
+                params![bytes],
+            )
+            .unwrap();
+        }
+
+        // Reopen: migrations run, adding device_id.
+        let store = FaceStore::open(&db_path).unwrap();
+        let models = store.list_models("legacy").unwrap();
+        assert_eq!(models.len(), 1, "legacy model must survive migration");
+        assert_eq!(models[0].label, "old-face");
+        assert_eq!(models[0].device_id, None, "legacy row keeps NULL device_id");
+
+        // Embedding data must be intact.
+        let embs = store.get_user_embeddings("legacy").unwrap();
+        assert_eq!(embs.len(), 1);
+
+        let version: i64 = store
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(version >= 6);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(sqlite_sidecar_path(&db_path, "-wal"));
+        let _ = std::fs::remove_file(sqlite_sidecar_path(&db_path, "-shm"));
     }
 
     #[test]

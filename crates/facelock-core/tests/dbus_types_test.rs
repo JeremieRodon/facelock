@@ -21,6 +21,7 @@ fn model_info_has_dbus_signature() {
         label: String::new(),
         created_at: 0,
         embedder_model: String::new(),
+        device_id: String::new(),
     };
     let sig = val.signature();
     assert!(!sig.to_string().is_empty());

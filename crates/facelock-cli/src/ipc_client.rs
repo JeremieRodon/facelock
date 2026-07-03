@@ -129,6 +129,8 @@ pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
                         label: m.label,
                         created_at: m.created_at,
                         embedder_model: m.embedder_model,
+                        // Empty string sentinel (D-Bus) maps back to NULL.
+                        device_id: Some(m.device_id).filter(|s| !s.is_empty()),
                     })
                     .collect(),
             ))

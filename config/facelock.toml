@@ -209,6 +209,27 @@
 # Default: 3
 # min_auth_frames = 3
 
+# Device coupling — bind each enrolled template to the camera that captured it.
+# At auth, a template whose enrolling-camera fingerprint does not match the live
+# camera is skipped, so a swapped-in camera degrades to the password fallback
+# (never a match, never a lockout). Advisory defense-in-depth only: the
+# fingerprint is model-granularity (VID:PID) and forgeable by a programmable USB
+# device — NOT attestation. See docs/security.md §1.D.
+#
+# Default: true
+# bind_templates_to_device = true
+#
+# Match granularity: "model" (VID:PID, default — blocks a cross-model swap) or
+# "unit" (VID:PID:serial — also blocks a same-model swap, but requires a camera
+# that exposes a stable serial; enrollment at "unit" is refused otherwise).
+# device_match_granularity = "model"
+#
+# Allow legacy templates (enrolled before device coupling, or on a camera with
+# no readable USB identity — NULL device_id) to authenticate. Default true
+# (allow-with-warn) so upgrades never lock anyone out; set false to require every
+# template to carry a matching device id.
+# bind_legacy_templates = true
+
 # Rate limiting — prevents brute-force attempts.
 #
 # [security.rate_limit]

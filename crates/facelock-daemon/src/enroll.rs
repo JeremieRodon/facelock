@@ -15,6 +15,7 @@ const MIN_CAPTURES: usize = 3;
 const MAX_CAPTURES: usize = 10;
 const INTER_FRAME_DELAY: Duration = Duration::from_millis(200);
 
+#[allow(clippy::too_many_arguments)]
 pub fn enroll<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
@@ -23,6 +24,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
     user: &str,
     label: &str,
     sealer: Option<&SoftwareSealer>,
+    device_id: Option<&str>,
 ) -> DaemonResponse {
     // Clear any previous model with the same label (re-enrollment)
     match store.remove_model_by_label(user, label) {
@@ -119,12 +121,13 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
             match sealer.seal_embedding(embedding) {
                 Ok(encrypted) => match model_id {
                     None => store
-                        .add_model_raw(
+                        .add_model_raw_with_device(
                             user,
                             label,
                             &encrypted,
                             true,
                             &config.recognition.embedder_model,
+                            device_id,
                         )
                         .map(Some),
                     Some(id) => store.add_embedding_raw(id, &encrypted, true).map(|()| None),
@@ -139,7 +142,13 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
         } else {
             match model_id {
                 None => store
-                    .add_model(user, label, embedding, &config.recognition.embedder_model)
+                    .add_model_with_device(
+                        user,
+                        label,
+                        embedding,
+                        &config.recognition.embedder_model,
+                        device_id,
+                    )
                     .map(Some),
                 Some(id) => store.add_embedding(id, embedding).map(|()| None),
             }

@@ -80,7 +80,7 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | `[recognition]` | `threshold`, `timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
 | `[daemon]` | `mode` (DaemonMode enum), `model_dir`, `idle_timeout_secs` |
 | `[storage]` | `db_path` |
-| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
+| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `bind_templates_to_device`, `device_match_granularity`, `bind_legacy_templates`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
 | `[notification]` | `mode` (off/terminal/desktop/both), `notify_prompt`, `notify_on_success`, `notify_on_failure` |
 | `[snapshots]` | `mode` (off/all/failure/success), `dir` |
 | `[encryption]` | `method` (none/keyfile/tpm), `key_path`, `sealed_key_path` |
@@ -105,6 +105,8 @@ CREATE TABLE face_models (
     user TEXT NOT NULL,
     label TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    embedder_model TEXT NOT NULL DEFAULT '',  -- V5: embedder that produced the embeddings
+    device_id TEXT,                           -- V6: enrolling camera fingerprint "vid:pid:serial" (NULL = legacy/uncoupled)
     UNIQUE(user, label)
 );
 
@@ -122,6 +124,10 @@ CREATE TABLE rate_limit (
 ```
 
 Only failed authentication attempts are recorded in `rate_limit`. Daemon mode and oneshot mode share the same SQLite-backed window, so daemon restarts do not clear lockout state.
+
+**Schema version** is tracked in `schema_version`; migrations are additive and forward-only. Current version: **6**. Migration V6 adds the nullable `face_models.device_id` column (Plan 02 device coupling); pre-V6 databases open cleanly, keep their rows, and leave `device_id` NULL. NULL rows are governed by `security.bind_legacy_templates` (default allow-with-warn), so upgrades never lock a user out.
+
+`device_id` is the canonical fingerprint (`"vid:pid:serial"`) of the camera that enrolled the template. It is **model-granularity at best and forgeable by a programmable USB device** — advisory defense-in-depth, NOT attestation. See `docs/security.md` §Device Coupling.
 
 ## IPC Protocol
 
@@ -144,6 +150,8 @@ Method authorization contract:
 
 ### Response types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`
+
+`Models` carries `ModelInfo { id, user, label, created_at, embedder_model, device_id }`. `device_id` (added Plan 02) is the enrolling camera's canonical fingerprint; D-Bus has no Option type, so an **empty string is the NULL sentinel** for legacy/uncoupled templates (same convention as `AuthResult`).
 
 ## PAM Semantics
 

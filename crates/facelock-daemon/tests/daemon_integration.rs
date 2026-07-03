@@ -152,6 +152,145 @@ fn test_config_parses() {
     assert_eq!(config.security.min_auth_frames, 2);
 }
 
+/// Device coupling (Plan 02): a template whose enrolling-camera fingerprint does
+/// not match the live camera must never authenticate, even when the presented
+/// embedding is a perfect match. The mismatch degrades to no-match → password
+/// (fail soft), and the same template on the matching camera still succeeds.
+#[test]
+fn device_mismatch_never_reaches_success() {
+    use facelock_core::types::{DeviceFingerprint, FaceModelInfo};
+    use facelock_daemon::auth::authenticate_with_embeddings;
+
+    let mut config = test_config();
+    // Isolate the device-binding effect from the other liveness gates.
+    config.security.require_frame_variance = false;
+    config.security.require_landmark_liveness = false;
+    config.recognition.threshold = 0.5;
+    config.recognition.timeout_secs = 2;
+    assert!(
+        config.security.bind_templates_to_device,
+        "coupling must default on"
+    );
+
+    let emb = fixtures::known_embedding(7);
+    let stored = vec![(1u32, emb)];
+    let models = vec![FaceModelInfo {
+        id: 1,
+        user: "u".into(),
+        label: "front".into(),
+        created_at: 0,
+        embedder_model: String::new(),
+        device_id: Some("aaaa:bbbb:".into()),
+    }];
+
+    let mismatch = DeviceFingerprint {
+        vid: Some("cccc".into()),
+        pid: Some("dddd".into()),
+        serial: None,
+        by_path: None,
+    };
+    let mut engine = MockFaceEngine::one_face(emb);
+    let mut cam = MockCamera::bright(64, 64, 10);
+    let resp = authenticate_with_embeddings(
+        &mut cam,
+        &mut engine,
+        &stored,
+        &models,
+        &config,
+        "u",
+        false,
+        &mismatch,
+    );
+    match resp {
+        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+            assert!(
+                !matched,
+                "device mismatch must not authenticate a perfect embedding match"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    // Same template, matching camera → authenticates.
+    let matching = DeviceFingerprint {
+        vid: Some("aaaa".into()),
+        pid: Some("bbbb".into()),
+        serial: None,
+        by_path: None,
+    };
+    let mut engine2 = MockFaceEngine::one_face(emb);
+    let mut cam2 = MockCamera::bright(64, 64, 10);
+    let resp2 = authenticate_with_embeddings(
+        &mut cam2,
+        &mut engine2,
+        &stored,
+        &models,
+        &config,
+        "u",
+        false,
+        &matching,
+    );
+    match resp2 {
+        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+            assert!(matched, "matching device must authenticate");
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+/// Legacy templates (NULL device_id) still authenticate under the default
+/// allow-with-warn policy — an upgrade must not lock anyone out.
+#[test]
+fn legacy_null_device_id_still_authenticates() {
+    use facelock_core::types::{DeviceFingerprint, FaceModelInfo};
+    use facelock_daemon::auth::authenticate_with_embeddings;
+
+    let mut config = test_config();
+    config.security.require_frame_variance = false;
+    config.recognition.threshold = 0.5;
+    config.recognition.timeout_secs = 2;
+
+    let emb = fixtures::known_embedding(11);
+    let stored = vec![(1u32, emb)];
+    let models = vec![FaceModelInfo {
+        id: 1,
+        user: "u".into(),
+        label: "legacy".into(),
+        created_at: 0,
+        embedder_model: String::new(),
+        device_id: None,
+    }];
+
+    // Even a fully-identified live camera authenticates a legacy NULL template.
+    let live = DeviceFingerprint {
+        vid: Some("aaaa".into()),
+        pid: Some("bbbb".into()),
+        serial: None,
+        by_path: None,
+    };
+    let mut engine = MockFaceEngine::one_face(emb);
+    let mut cam = MockCamera::bright(64, 64, 10);
+    let resp = authenticate_with_embeddings(
+        &mut cam,
+        &mut engine,
+        &stored,
+        &models,
+        &config,
+        "u",
+        false,
+        &live,
+    );
+    match resp {
+        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+            assert!(
+                matched,
+                "legacy NULL device_id must authenticate (allow-with-warn)"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
 #[test]
 fn warmup_frames_discarded_on_camera_open() {
     use facelock_daemon::handler::Handler;
@@ -184,6 +323,7 @@ fn warmup_frames_discarded_on_camera_open() {
         store,
         rate_limiter,
         false,
+        facelock_core::types::DeviceFingerprint::default(),
         Some(factory),
         None,
     )
@@ -227,6 +367,7 @@ fn warmup_frames_zero_skips_discard() {
         store,
         rate_limiter,
         false,
+        facelock_core::types::DeviceFingerprint::default(),
         Some(factory),
         None,
     )
@@ -275,6 +416,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
             config.security.rate_limit.window_secs,
         ),
         false,
+        facelock_core::types::DeviceFingerprint::default(),
         Some(factory1),
         None,
     )
@@ -301,6 +443,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
             config.security.rate_limit.window_secs,
         ),
         false,
+        facelock_core::types::DeviceFingerprint::default(),
         Some(factory2),
         None,
     )

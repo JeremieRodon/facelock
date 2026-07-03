@@ -128,6 +128,10 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         return 2;
     }
 
+    // Device coupling (Plan 02): fingerprint the live camera so the compare loop
+    // can skip templates enrolled on a different camera.
+    let live_fingerprint = facelock_camera::device_fingerprint(&device_path);
+
     let device_quirk = device_info
         .ok()
         .and_then(|info| quirks.find_match(&info).cloned());
@@ -165,6 +169,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         &config,
         &user,
         device_is_ir,
+        &live_fingerprint,
     );
     let duration_ms = start.elapsed().as_millis() as u64;
 

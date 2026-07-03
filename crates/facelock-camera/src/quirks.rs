@@ -161,20 +161,64 @@ impl QuirksDb {
 /// Read USB vendor:product IDs from sysfs for a video device.
 /// Returns (vendor_id, product_id) as hex strings, or None if unavailable.
 fn read_usb_ids(device_path: &str) -> Option<(String, String)> {
-    // /dev/video0 -> /sys/class/video4linux/video0/device/
-    let dev_name = device_path.strip_prefix("/dev/")?;
-    let sysfs_base = format!("/sys/class/video4linux/{dev_name}/device");
-
-    // Walk up to find the USB device (may be a few levels up)
-    let vendor = try_read_sysfs_attr(&sysfs_base, "idVendor")
-        .or_else(|| try_read_sysfs_attr(&format!("{sysfs_base}/.."), "idVendor"));
-    let product = try_read_sysfs_attr(&sysfs_base, "idProduct")
-        .or_else(|| try_read_sysfs_attr(&format!("{sysfs_base}/.."), "idProduct"));
-
-    match (vendor, product) {
+    let fp = device_fingerprint(device_path);
+    match (fp.vid, fp.pid) {
         (Some(v), Some(p)) => Some((v, p)),
         _ => None,
     }
+}
+
+/// Read a stable-ish hardware fingerprint for a video device from sysfs.
+///
+/// Reads `idVendor`/`idProduct`/`serial` from the same sysfs base used for
+/// quirks matching (walking one level up to reach the USB device node), plus
+/// the `/dev/v4l/by-path` symlink target. **Tolerates every field being
+/// missing** — a camera with no readable USB identity yields an all-`None`
+/// fingerprint, which the enroll path stores as a NULL `device_id` so coupling
+/// never becomes a hard lockout.
+///
+/// This is model-granularity (VID:PID) at best and forgeable by a programmable
+/// USB device: advisory defense-in-depth, not attestation. See
+/// [`facelock_core::types::DeviceFingerprint`].
+pub fn device_fingerprint(device_path: &str) -> facelock_core::types::DeviceFingerprint {
+    use facelock_core::types::DeviceFingerprint;
+
+    let dev_name = match device_path.strip_prefix("/dev/") {
+        Some(n) => n,
+        None => return DeviceFingerprint::default(),
+    };
+    let sysfs_base = format!("/sys/class/video4linux/{dev_name}/device");
+    let parent = format!("{sysfs_base}/..");
+
+    // Vendor/product/serial live on the USB device node, which may be the
+    // `device` symlink target itself or one level up.
+    let read_attr = |attr: &str| {
+        try_read_sysfs_attr(&sysfs_base, attr).or_else(|| try_read_sysfs_attr(&parent, attr))
+    };
+
+    DeviceFingerprint {
+        // Normalize hex ids to lowercase so the canonical form is stable
+        // regardless of sysfs casing.
+        vid: read_attr("idVendor").map(|s| s.to_ascii_lowercase()),
+        pid: read_attr("idProduct").map(|s| s.to_ascii_lowercase()),
+        serial: read_attr("serial"),
+        by_path: read_v4l_by_path(device_path),
+    }
+}
+
+/// Resolve the stable `/dev/v4l/by-path/...` symlink that points at this device.
+/// Returns the symlink filename (bus topology), not the resolved `/dev/videoN`.
+fn read_v4l_by_path(device_path: &str) -> Option<String> {
+    let entries = std::fs::read_dir("/dev/v4l/by-path").ok()?;
+    let target = std::fs::canonicalize(device_path).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        if let Ok(resolved) = std::fs::canonicalize(entry.path()) {
+            if resolved == target {
+                return entry.file_name().into_string().ok();
+            }
+        }
+    }
+    None
 }
 
 fn try_read_sysfs_attr(base: &str, attr: &str) -> Option<String> {
@@ -423,6 +467,23 @@ notes = "Test camera"
         // Empty pattern should match anything (all parts empty after split)
         assert!(name_matches("", "Any Camera"));
         assert!(name_matches(".*", "Any Camera"));
+    }
+
+    #[test]
+    fn device_fingerprint_tolerates_missing_sysfs() {
+        // A path with no sysfs backing degrades to an all-None fingerprint
+        // (canonical "::"), which stores as NULL and is legacy-governed.
+        let fp = device_fingerprint("/dev/nonexistent_test_video");
+        assert!(fp.is_unknown());
+        assert!(!fp.has_serial());
+        assert_eq!(fp.canonical(), "::");
+        assert_eq!(fp.canonical_for_storage(), None);
+    }
+
+    #[test]
+    fn device_fingerprint_rejects_non_dev_path() {
+        let fp = device_fingerprint("relative/path");
+        assert!(fp.is_unknown());
     }
 
     #[test]

@@ -84,5 +84,19 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
         .map_err(|e| FacelockError::Storage(e.to_string()))?;
     }
 
+    if version < 6 {
+        // V6: couple each template to the camera that enrolled it (Plan 02).
+        // Nullable — legacy rows keep NULL and are governed by the
+        // `bind_legacy_templates` policy so upgrades never lock anyone out.
+        // Additive column, mirroring the V5 pattern exactly.
+        conn.execute_batch(
+            "
+            ALTER TABLE face_models ADD COLUMN device_id TEXT;
+            INSERT OR REPLACE INTO schema_version (version) VALUES (6);
+        ",
+        )
+        .map_err(|e| FacelockError::Storage(e.to_string()))?;
+    }
+
     Ok(())
 }

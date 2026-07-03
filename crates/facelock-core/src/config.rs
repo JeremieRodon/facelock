@@ -211,8 +211,39 @@ pub struct SecurityConfig {
     /// drift). Passive anti-photo only; does not defeat video replay.
     #[serde(default = "default_frame_variance_max_similarity")]
     pub frame_variance_max_similarity: f32,
+    /// Couple each enrolled template to the camera that captured it. When true
+    /// (default), the auth path skips any template whose enrolling-camera
+    /// fingerprint does not match the live camera at `device_match_granularity`,
+    /// so a swapped-in camera degrades to password instead of matching.
+    ///
+    /// Advisory defense-in-depth only: the fingerprint is model-granularity
+    /// (VID:PID) and forgeable by a programmable USB device — NOT attestation.
+    #[serde(default = "default_true")]
+    pub bind_templates_to_device: bool,
+    /// How strictly the live camera must match a template's enrolling camera.
+    /// `model` (default) compares VID:PID; `unit` also requires a matching
+    /// serial (and enrollment refuses `unit` on cameras with no serial).
+    #[serde(default)]
+    pub device_match_granularity: crate::types::DeviceMatchGranularity,
+    /// Allow legacy templates that predate device coupling (NULL `device_id`,
+    /// or models enrolled on a camera with no readable USB identity) to
+    /// authenticate. Default true (allow-with-warn) so upgrades don't break;
+    /// set false to require every template to carry a matching device id.
+    #[serde(default = "default_true")]
+    pub bind_legacy_templates: bool,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+}
+
+impl SecurityConfig {
+    /// Resolve the device-binding policy consumed by the auth compare path.
+    pub fn device_binding_policy(&self) -> crate::types::DeviceBindingPolicy {
+        crate::types::DeviceBindingPolicy {
+            enabled: self.bind_templates_to_device,
+            granularity: self.device_match_granularity,
+            allow_legacy: self.bind_legacy_templates,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +278,9 @@ impl Default for SecurityConfig {
             min_auth_frames: default_min_auth_frames(),
             ir_texture_min_stddev: default_ir_texture_min_stddev(),
             frame_variance_max_similarity: default_frame_variance_max_similarity(),
+            bind_templates_to_device: true,
+            device_match_granularity: crate::types::DeviceMatchGranularity::Model,
+            bind_legacy_templates: true,
             rate_limit: RateLimitConfig::default(),
         }
     }
@@ -1075,6 +1109,59 @@ ir_texture_min_stddev = -1.0
 "#;
         let err = Config::parse(toml).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn device_binding_defaults_on_at_model_granularity() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(config.security.bind_templates_to_device);
+        assert_eq!(
+            config.security.device_match_granularity,
+            crate::types::DeviceMatchGranularity::Model
+        );
+        assert!(config.security.bind_legacy_templates);
+
+        let policy = config.security.device_binding_policy();
+        assert!(policy.enabled);
+        assert!(policy.allow_legacy);
+        assert_eq!(
+            policy.granularity,
+            crate::types::DeviceMatchGranularity::Model
+        );
+    }
+
+    #[test]
+    fn device_binding_custom_values_parse() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[security]
+bind_templates_to_device = false
+device_match_granularity = "unit"
+bind_legacy_templates = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(!config.security.bind_templates_to_device);
+        assert_eq!(
+            config.security.device_match_granularity,
+            crate::types::DeviceMatchGranularity::Unit
+        );
+        assert!(!config.security.bind_legacy_templates);
+    }
+
+    #[test]
+    fn device_match_granularity_rejects_unknown() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[security]
+device_match_granularity = "bogus"
+"#;
+        assert!(Config::parse(toml).is_err());
     }
 
     #[test]
