@@ -87,22 +87,31 @@ pub fn cosine_similarity(a: &FaceEmbedding, b: &FaceEmbedding) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-/// Threshold below which consecutive embeddings are considered "varied enough"
-/// to rule out a static photo attack.
-pub const FRAME_VARIANCE_THRESHOLD: f32 = 0.998;
+/// Default maximum consecutive-frame cosine similarity for the passive
+/// frame-variance check. Consecutive matched frames must drift by at least
+/// `1 - this` (≈0.03) to be accepted, aligning with the documented 0.02–0.10
+/// live-face drift range. Configurable via `security.frame_variance_max_similarity`.
+///
+/// NOTE: frame-variance is a *passive* anti-photo heuristic only. It raises the
+/// bar for a *static* image but does NOT defeat a video replay (which contains
+/// real inter-frame motion). IR enforcement remains the load-bearing defense.
+pub const DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY: f32 = 0.97;
 
 /// Check that matched embeddings show sufficient variance (anti-photo-attack).
 /// Compares all consecutive pairs — every pair must differ enough to rule out
 /// a static image. Real faces produce micro-movements between frames.
-pub fn check_frame_variance(embeddings: &[FaceEmbedding]) -> bool {
+///
+/// `max_similarity` is the rejection cutoff: any consecutive pair with cosine
+/// similarity strictly greater than `max_similarity` fails the check (too static).
+pub fn check_frame_variance(embeddings: &[FaceEmbedding], max_similarity: f32) -> bool {
     if embeddings.len() < 2 {
         return false;
     }
-    // Every consecutive pair must show movement (similarity below threshold).
-    // A static photo produces near-identical consecutive embeddings (>0.998).
+    // Every consecutive pair must show movement (similarity at or below the cutoff).
+    // A static photo produces near-identical consecutive embeddings.
     for window in embeddings.windows(2) {
         let sim = cosine_similarity(&window[0], &window[1]);
-        if sim >= FRAME_VARIANCE_THRESHOLD {
+        if sim > max_similarity {
             return false;
         }
     }
@@ -390,6 +399,60 @@ mod tests {
             frame.gray.iter().all(|&b| b == 0),
             "gray data should be zeroed"
         );
+    }
+
+    /// Build a unit embedding pointing mostly along `axis` with a small tilt so
+    /// consecutive frames can be made to drift by a controlled amount.
+    fn tilted_unit(primary: f32, secondary: f32) -> FaceEmbedding {
+        let mut e: FaceEmbedding = [0.0; 512];
+        let norm = (primary * primary + secondary * secondary).sqrt();
+        e[0] = primary / norm;
+        e[1] = secondary / norm;
+        e
+    }
+
+    #[test]
+    fn frame_variance_rejects_near_static_sequence() {
+        // Near-identical consecutive embeddings (drift < 0.03, sim > 0.97) must fail.
+        let a = tilted_unit(1.0, 0.02);
+        let b = tilted_unit(1.0, 0.03);
+        let c = tilted_unit(1.0, 0.04);
+        let seq = [a, b, c];
+        // Sanity: consecutive similarities are all above 0.97.
+        assert!(cosine_similarity(&seq[0], &seq[1]) > 0.97);
+        assert!(
+            !check_frame_variance(&seq, DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+            "near-static sequence must be rejected"
+        );
+    }
+
+    #[test]
+    fn frame_variance_accepts_live_like_sequence() {
+        // Live-like drift (>= 0.03 per step, sim < 0.97) must pass.
+        let a = tilted_unit(1.0, 0.0);
+        let b = tilted_unit(1.0, 0.30);
+        let c = tilted_unit(1.0, 0.60);
+        let seq = [a, b, c];
+        assert!(cosine_similarity(&seq[0], &seq[1]) < 0.97);
+        assert!(cosine_similarity(&seq[1], &seq[2]) < 0.97);
+        assert!(
+            check_frame_variance(&seq, DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+            "live-like sequence must pass"
+        );
+    }
+
+    #[test]
+    fn frame_variance_threshold_is_configurable() {
+        // A sequence that passes at a strict (low) max_similarity still passes,
+        // and one that only just drifts can be tuned by the caller.
+        let a = tilted_unit(1.0, 0.10);
+        let b = tilted_unit(1.0, 0.30);
+        let seq = [a, b];
+        let sim = cosine_similarity(&seq[0], &seq[1]);
+        // With a max just below the actual similarity, it is rejected...
+        assert!(!check_frame_variance(&seq, sim - 0.001));
+        // ...and with a max just above, it is accepted.
+        assert!(check_frame_variance(&seq, sim + 0.001));
     }
 
     #[test]

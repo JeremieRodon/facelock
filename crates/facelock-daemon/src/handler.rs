@@ -401,7 +401,10 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             },
 
             DaemonRequest::ListDevices => {
-                use facelock_camera::{is_ir_camera, list_devices};
+                use facelock_camera::{QuirksDb, is_ir_camera_with_quirks, list_devices};
+                // Consult the quirks DB so the reported is_ir matches the
+                // authoritative decision the auth path makes.
+                let quirks = QuirksDb::load();
                 match list_devices() {
                     Ok(devices) => DaemonResponse::Devices(
                         devices
@@ -410,7 +413,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                                 path: d.path.clone(),
                                 name: d.name.clone(),
                                 driver: d.driver.clone(),
-                                is_ir: is_ir_camera(d),
+                                is_ir: is_ir_camera_with_quirks(d, Some(&quirks)),
                                 formats: d
                                     .formats
                                     .iter()

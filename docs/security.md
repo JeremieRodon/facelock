@@ -38,21 +38,24 @@ Add `security.require_ir` config flag, **default true**:
 require_ir = true  # Refuse to authenticate on RGB-only cameras
 ```
 
-Implementation:
-```rust
-// In camera capture, check if the negotiated format indicates IR
-fn is_ir_camera(device: &DeviceInfo) -> bool {
-    // IR cameras typically support GREY (8-bit grayscale) or Y16 (16-bit)
-    // as their native format. RGB-only cameras are not IR.
-    device.formats.iter().any(|f| {
-        matches!(f.fourcc.as_str(), "GREY" | "Y16 " | "YUYV")
-            && device.name.to_lowercase().contains("ir")
-            || device.name.to_lowercase().contains("infrared")
-    })
-}
+Implementation (`facelock-camera/src/device.rs`, `ir_source_with_quirks`):
 
-// In daemon auth flow, before attempting recognition:
-if config.security.require_ir && !is_ir_camera(&device_info) {
+```rust
+// IR classification is honest about its evidence, surfaced as IrSource:
+//   Quirk  – hardware quirks DB force_ir = true (authoritative, both directions)
+//   Format – native IR format (GREY/Y16) CORROBORATED by an IR name token
+//   Name   – an "ir"/"infrared" name *token* (tokenized, not substring)
+//   None   – not IR
+//
+// Precedence:
+// 1. quirks DB force_ir is authoritative;
+// 2. a native GREY/Y16 format counts ONLY when corroborated by a name token;
+// 3. a name token alone is sufficient;
+// 4. otherwise not-IR.
+pub fn ir_source_with_quirks(device, quirks) -> IrSource { ... }
+
+// In the auth flow (daemon pre_check and oneshot), before recognition:
+if config.security.require_ir && !device_is_ir {
     return DaemonResponse::Error {
         message: "IR camera required for authentication. Set security.require_ir = false to override (NOT RECOMMENDED).".into()
     };
@@ -61,37 +64,50 @@ if config.security.require_ir && !is_ir_camera(&device_info) {
 
 **Rationale**: Phone screens and printed photos do not emit infrared light correctly. An IR camera sees a flat, textureless surface where a real face would have depth and skin texture in IR. This single check eliminates the vast majority of spoofing attacks.
 
-**Limitation**: IR camera detection by format/name is heuristic. Some cameras report YUYV but are actually IR. The `facelock devices` command should display whether each camera is detected as IR.
+**Why mere GREY/Y16 availability is not enough (H1)**: many ordinary RGB UVC webcams *enumerate* a GREY format alongside YUYV/MJPG. The previous heuristic (`contains("ir")` OR any GREY/Y16 format) misclassified those as IR, silently defeating `require_ir = true`. It also matched the substring "ir" inside unrelated names ("Sirius", "AIR-Cam"). The classifier now requires a whole `ir`/`infrared` **token** or a **quirks `force_ir`** entry, and treats a GREY/Y16 format as IR **only when corroborated** by one of those. This is why `require_ir` is now load-bearing rather than trivially bypassable.
+
+**Limitation**: classification is still heuristic without a hardware allow-list. Some genuine IR cameras report neither an IR name token nor a known quirk; add a quirks `force_ir` entry (`/etc/facelock/quirks.d/`) for such hardware. The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is the successor fix (Plan 02).
 
 #### B. Frame Variance Check (Required)
 
-Require minimum variance across consecutive frames during authentication:
+Require minimum variance across consecutive matched frames during authentication.
+Every consecutive pair of matched-frame embeddings must drift by at least
+`1 - frame_variance_max_similarity` (default 0.03), i.e. cosine similarity must be
+at or below the cutoff. The cutoff is configurable
+(`security.frame_variance_max_similarity`, default **0.97**, in
+`facelock-core/src/types.rs` as `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY`):
 
 ```rust
-/// Check that frames have sufficient variance (not a static image)
-fn check_frame_variance(embeddings: &[(Detection, FaceEmbedding)], min_frames: usize) -> bool {
-    if embeddings.len() < min_frames {
-        return false;
-    }
-    // Compute pairwise similarity between consecutive embeddings
-    // Real faces have micro-movements causing slight embedding variation
-    // A static photo produces near-identical embeddings (similarity > 0.99)
-    let mut max_similarity = 0.0f32;
+/// Reject when any consecutive pair is too similar (static image).
+pub fn check_frame_variance(embeddings: &[FaceEmbedding], max_similarity: f32) -> bool {
+    if embeddings.len() < 2 { return false; }
     for window in embeddings.windows(2) {
-        let sim = cosine_similarity(&window[0].1, &window[1].1);
-        max_similarity = max_similarity.max(sim);
+        // Real faces vary by 0.02-0.10 between frames; a static photo is near-identical.
+        if cosine_similarity(&window[0], &window[1]) > max_similarity { return false; }
     }
-    // If ALL consecutive frames are too similar, likely a static image
-    // Real faces typically vary by 0.02-0.10 between frames
-    max_similarity < 0.998  // FRAME_VARIANCE_THRESHOLD in facelock-core/types.rs
+    true
 }
 ```
+
+**Honest scope — this does NOT stop video replay.** Frame-variance only rules out a
+*static* image (printed photo, single frozen frame). A recorded video of the enrolled
+user contains genuine inter-frame motion and will pass this check. Frame-variance is a
+cheap passive filter; **IR enforcement (§A) is the load-bearing anti-spoof defense**, and
+active liveness (opt-in landmark/blink) is the answer to video replay. The default was
+tightened from 0.998 (which accepted almost any drift) to 0.97 so the check actually
+demands the documented 0.02-0.10 live-face drift.
+
+**False-reject tradeoff**: 0.97 is the low end of the live-drift band. Genuinely still
+users under steady lighting can occasionally dip below 0.03 drift; if false rejects rise,
+raise `frame_variance_max_similarity` (toward 0.99) — it is the tuning knob. It stays
+purely passive either way.
 
 Config:
 ```toml
 [security]
-require_frame_variance = true  # Reject static images (photo attack defense)
-min_auth_frames = 3            # Minimum frames before accepting match
+require_frame_variance = true       # Reject static images (photo attack defense)
+frame_variance_max_similarity = 0.97 # Max consecutive-frame similarity (require >=0.03 drift)
+min_auth_frames = 3                 # Minimum matched frames before accepting
 ```
 
 #### C. Dark Frame / IR Texture Validation (Recommended)
@@ -103,17 +119,26 @@ In IR mode, verify that the face region has expected IR texture characteristics:
 - Reject faces with abnormally low texture variance
 
 ```rust
-fn check_ir_texture(gray: &[u8], bbox: &BoundingBox, width: u32) -> bool {
-    // Extract face region pixels
-    let face_pixels = extract_region(gray, bbox, width);
-    // Compute standard deviation
+pub fn check_ir_texture(gray: &[u8], bbox: &BoundingBox, width: u32, min_stddev: f32) -> bool {
+    let face_pixels = extract_bbox_region(gray, bbox, width);
+    if face_pixels.is_empty() { return false; }
     let mean: f32 = face_pixels.iter().map(|&p| p as f32).sum::<f32>() / face_pixels.len() as f32;
     let variance: f32 = face_pixels.iter().map(|&p| (p as f32 - mean).powi(2)).sum::<f32>() / face_pixels.len() as f32;
-    let std_dev = variance.sqrt();
-    // Real IR faces have std_dev > ~15; flat surfaces are < 5
-    std_dev > 10.0
+    variance.sqrt() > min_stddev
 }
 ```
+
+**Run on the RAW frame, not CLAHE (H3)**: this check MUST see the raw grayscale frame.
+The auth loop previously fed a **CLAHE**-equalized frame into `check_ir_texture`. CLAHE
+(Contrast-Limited Adaptive Histogram Equalization) stretches local contrast, which
+*inflates* the std_dev of an otherwise flat photo/screen and pushes it above the cutoff —
+i.e. CLAHE was masking exactly the spoof this check exists to catch. CLAHE now belongs
+only to the recognition/embedding path; texture measurement uses `frame.gray` directly.
+
+**Raw-frame calibration**: on the raw frame, flat surfaces (photos/screens in IR) score
+std_dev **< 5**, real IR skin scores **> 15**. The cutoff `security.ir_texture_min_stddev`
+defaults to **10.0** (between the two bands). Lower it if real faces are being rejected;
+raise it toward 15 to be stricter. Applied on IR devices only (RGB texture is too variable).
 
 ### 2. Model Tampering
 
@@ -298,8 +323,10 @@ systemd-analyze security facelock-daemon.service
 disabled = false
 abort_if_ssh = true          # Refuse face auth over SSH
 abort_if_lid_closed = true   # Refuse if laptop lid closed
-require_ir = true            # CRITICAL: refuse RGB-only cameras (anti-spoof)
-require_frame_variance = true # Reject static images (photo defense)
+require_ir = true            # CRITICAL: refuse non-IR cameras (anti-spoof, load-bearing)
+require_frame_variance = true # Reject static images (photo defense; NOT video replay)
+frame_variance_max_similarity = 0.97 # Max consecutive-frame similarity (require >=0.03 drift)
+ir_texture_min_stddev = 10.0 # Min raw-frame face std_dev for IR texture (flat < 5, real > 15)
 require_landmark_liveness = false # Require landmark movement between frames (off by default)
 min_auth_frames = 3          # Minimum frames before accepting (variance check)
 suppress_unknown = false     # Log unknown faces (true = suppress unknown-face log entries)

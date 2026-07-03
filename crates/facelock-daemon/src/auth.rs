@@ -269,26 +269,19 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
             landmark_tracker.push(det.landmarks);
         }
 
-        // Compute CLAHE-enhanced grayscale only for IR texture checks
-        let clahe_gray = if device_is_ir {
-            Some(facelock_camera::preprocess::clahe(
-                &frame.gray,
-                frame.width,
-                frame.height,
-            ))
-        } else {
-            None
-        };
-
         // IR texture check: when using an IR camera, verify each detected face
         // has real skin texture (not a flat photo/screen replay attack).
         // Only applied to IR frames — RGB texture varies too much and would
         // cause false positives.
+        //
+        // Runs on the RAW grayscale frame. CLAHE is deliberately NOT applied here:
+        // equalizing the frame inflates the std_dev of flat surfaces and masks the
+        // very photo/screen replays this check exists to catch (H3).
+        let ir_texture_min = config.security.ir_texture_min_stddev;
         if device_is_ir {
-            let gray = clahe_gray.as_deref().unwrap_or(&frame.gray);
-            let all_flat = faces
-                .iter()
-                .all(|(det, _)| !check_ir_texture(gray, &det.bbox, frame.width));
+            let all_flat = faces.iter().all(|(det, _)| {
+                !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
+            });
             if all_flat {
                 debug!(
                     frame = frame_count,
@@ -302,11 +295,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         for (det, embedding) in &faces {
             // Skip individual faces that fail IR texture check
             if device_is_ir
-                && !check_ir_texture(
-                    clahe_gray.as_deref().unwrap_or(&frame.gray),
-                    &det.bbox,
-                    frame.width,
-                )
+                && !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
             {
                 debug!(
                     frame = frame_count,
@@ -337,7 +326,10 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         // Frame variance check + landmark liveness check
         if config.security.require_frame_variance {
             if matched_frame_embeddings.len() >= config.security.min_auth_frames as usize
-                && check_frame_variance(&matched_frame_embeddings)
+                && check_frame_variance(
+                    &matched_frame_embeddings,
+                    config.security.frame_variance_max_similarity,
+                )
             {
                 // If landmark liveness is required, check it too
                 if config.security.require_landmark_liveness && !landmark_tracker.check_liveness() {

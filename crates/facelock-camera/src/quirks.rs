@@ -150,6 +150,12 @@ impl QuirksDb {
     pub fn all(&self) -> &[Quirk] {
         &self.quirks
     }
+
+    /// Push a quirk directly (test-only helper for cross-module tests).
+    #[cfg(test)]
+    pub fn push_quirk_for_test(&mut self, quirk: Quirk) {
+        self.quirks.push(quirk);
+    }
 }
 
 /// Read USB vendor:product IDs from sysfs for a video device.

@@ -291,10 +291,13 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
         return Ok(());
     }
 
-    let ir_devices: Vec<_> = devices
-        .iter()
-        .filter(|d| facelock_camera::is_ir_camera(d))
-        .collect();
+    // Consult the quirks DB so IR classification here matches the auth path.
+    let quirks = facelock_camera::QuirksDb::load();
+    let is_ir = |d: &facelock_camera::DeviceInfo| {
+        facelock_camera::is_ir_camera_with_quirks(d, Some(&quirks))
+    };
+
+    let ir_devices: Vec<_> = devices.iter().filter(|d| is_ir(d)).collect();
 
     // If exactly one IR camera, auto-select it
     if ir_devices.len() == 1 {
@@ -308,11 +311,7 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
     let display_items: Vec<String> = devices
         .iter()
         .map(|d| {
-            let ir_tag = if facelock_camera::is_ir_camera(d) {
-                " [IR]"
-            } else {
-                ""
-            };
+            let ir_tag = if is_ir(d) { " [IR]" } else { "" };
             format!("{}{} - {}", d.path, ir_tag, d.name)
         })
         .collect();
@@ -323,7 +322,7 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
         .position(|d| config.device.path.as_ref().is_some_and(|p| d.path == *p))
         .or_else(|| {
             // Default to first IR camera if available
-            devices.iter().position(facelock_camera::is_ir_camera)
+            devices.iter().position(&is_ir)
         })
         .unwrap_or(0);
 

@@ -80,7 +80,7 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | `[recognition]` | `threshold`, `timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
 | `[daemon]` | `mode` (DaemonMode enum), `model_dir`, `idle_timeout_secs` |
 | `[storage]` | `db_path` |
-| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `min_auth_frames`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
+| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
 | `[notification]` | `mode` (off/terminal/desktop/both), `notify_prompt`, `notify_on_success`, `notify_on_failure` |
 | `[snapshots]` | `mode` (off/all/failure/success), `dir` |
 | `[encryption]` | `method` (none/keyfile/tpm), `key_path`, `sealed_key_path` |
@@ -168,11 +168,16 @@ pam_facelock(<service>): <result> for user <username>
 |---------|--------|---------|
 | IR camera enforcement | `security.require_ir` | **true** |
 | Frame variance check | `security.require_frame_variance` | **true** |
+| Frame variance cutoff | `security.frame_variance_max_similarity` | 0.97 |
+| IR texture cutoff (raw frame) | `security.ir_texture_min_stddev` | 10.0 |
 | Landmark liveness | `security.require_landmark_liveness` | **false** |
 | Minimum auth frames | `security.min_auth_frames` | 3 |
-| Variance threshold | `FRAME_VARIANCE_THRESHOLD` | 0.998 |
+| Frame variance default const | `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY` | 0.97 |
 
-These defaults must not be weakened without security review.
+IR classification requires a whole `ir`/`infrared` name token or a quirks `force_ir`
+entry; a GREY/Y16 format alone is not treated as IR. Frame variance is passive
+anti-photo only (does not stop video replay); IR texture is measured on the raw frame,
+never CLAHE. These defaults must not be weakened without security review.
 
 ## Models
 

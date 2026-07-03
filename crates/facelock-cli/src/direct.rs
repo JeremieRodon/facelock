@@ -8,8 +8,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{
-    Camera, DeviceInfo, auto_detect_device, is_ir_camera, is_ir_camera_with_quirks, list_devices,
-    validate_device,
+    Camera, DeviceInfo, auto_detect_device, is_ir_camera_with_quirks, list_devices, validate_device,
 };
 use facelock_core::config::DeviceConfig;
 use facelock_core::config::{Config, EncryptionMethod};
@@ -261,9 +260,16 @@ pub fn list_devices_direct() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Consult the quirks DB so the displayed [IR] tag matches the authoritative
+    // decision the auth path makes (e.g. a quirks `force_ir` camera).
+    let quirks = facelock_camera::QuirksDb::load();
     println!("Available video devices:\n");
     for dev in &devices {
-        let ir_tag = if is_ir_camera(dev) { " [IR]" } else { "" };
+        let ir_tag = if is_ir_camera_with_quirks(dev, Some(&quirks)) {
+            " [IR]"
+        } else {
+            ""
+        };
         println!("  {}{ir_tag}", dev.path);
         println!("    Name:    {}", dev.name);
         println!("    Driver:  {}", dev.driver);
@@ -387,11 +393,12 @@ mod facelock_daemon_auth {
                 landmark_tracker.push(det.landmarks);
             }
 
-            // IR texture check: skip frames where all faces have flat texture
+            // IR texture check on the RAW frame: skip frames where all faces are flat.
+            let ir_texture_min = config.security.ir_texture_min_stddev;
             if device_is_ir {
-                let all_flat = faces
-                    .iter()
-                    .all(|(det, _)| !check_ir_texture(&frame.gray, &det.bbox, frame.width));
+                let all_flat = faces.iter().all(|(det, _)| {
+                    !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
+                });
                 if all_flat {
                     debug!(
                         frame = frame_count,
@@ -404,7 +411,9 @@ mod facelock_daemon_auth {
             let mut frame_matched = false;
             for (det, embedding) in &faces {
                 // Skip individual faces that fail IR texture check
-                if device_is_ir && !check_ir_texture(&frame.gray, &det.bbox, frame.width) {
+                if device_is_ir
+                    && !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
+                {
                     debug!(
                         frame = frame_count,
                         "IR texture check failed for face, skipping"
@@ -425,7 +434,10 @@ mod facelock_daemon_auth {
             // Frame variance check + landmark liveness check
             if config.security.require_frame_variance {
                 if matched_frame_embeddings.len() >= config.security.min_auth_frames as usize
-                    && check_frame_variance(&matched_frame_embeddings)
+                    && check_frame_variance(
+                        &matched_frame_embeddings,
+                        config.security.frame_variance_max_similarity,
+                    )
                 {
                     // If landmark liveness is required, check it too
                     if config.security.require_landmark_liveness

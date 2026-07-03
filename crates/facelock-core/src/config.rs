@@ -200,6 +200,17 @@ pub struct SecurityConfig {
     pub landmark_min_moving: u32,
     #[serde(default = "default_min_auth_frames")]
     pub min_auth_frames: u32,
+    /// Minimum per-face standard deviation (on the RAW grayscale frame) required
+    /// to pass the IR texture check. Flat photos/screens score low in IR; real
+    /// skin has micro-texture. Only applied on IR devices. Default 10.0
+    /// (docs calibration: flat < 5, real > 15 on raw frames).
+    #[serde(default = "default_ir_texture_min_stddev")]
+    pub ir_texture_min_stddev: f32,
+    /// Maximum consecutive matched-frame cosine similarity allowed by the passive
+    /// frame-variance check. Higher = more permissive. Default 0.97 (require ≥0.03
+    /// drift). Passive anti-photo only; does not defeat video replay.
+    #[serde(default = "default_frame_variance_max_similarity")]
+    pub frame_variance_max_similarity: f32,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
 }
@@ -234,6 +245,8 @@ impl Default for SecurityConfig {
             landmark_displacement_px: default_landmark_displacement_px(),
             landmark_min_moving: default_landmark_min_moving(),
             min_auth_frames: default_min_auth_frames(),
+            ir_texture_min_stddev: default_ir_texture_min_stddev(),
+            frame_variance_max_similarity: default_frame_variance_max_similarity(),
             rate_limit: RateLimitConfig::default(),
         }
     }
@@ -451,6 +464,12 @@ fn default_landmark_displacement_px() -> f32 {
 fn default_landmark_min_moving() -> u32 {
     3
 }
+fn default_ir_texture_min_stddev() -> f32 {
+    10.0
+}
+fn default_frame_variance_max_similarity() -> f32 {
+    crate::types::DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY
+}
 fn default_true() -> bool {
     true
 }
@@ -574,6 +593,18 @@ impl Config {
             return Err(ConfigError::Validation(
                 "recognition.timeout_secs must be > 0".into(),
             ));
+        }
+        if !(0.0..=1.0).contains(&self.security.frame_variance_max_similarity) {
+            return Err(ConfigError::Validation(format!(
+                "security.frame_variance_max_similarity must be between 0.0 and 1.0, got {}",
+                self.security.frame_variance_max_similarity
+            )));
+        }
+        if self.security.ir_texture_min_stddev < 0.0 {
+            return Err(ConfigError::Validation(format!(
+                "security.ir_texture_min_stddev must be >= 0.0, got {}",
+                self.security.ir_texture_min_stddev
+            )));
         }
         if let Some(ref sha256) = self.recognition.detector_sha256
             && !is_sha256_hex(sha256)
@@ -992,6 +1023,58 @@ key_path = "/etc/facelock/my.key"
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.encryption.method, super::EncryptionMethod::Keyfile);
         assert_eq!(config.encryption.key_path, "/etc/facelock/my.key");
+    }
+
+    #[test]
+    fn antispoof_thresholds_default() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.security.ir_texture_min_stddev, 10.0);
+        assert_eq!(
+            config.security.frame_variance_max_similarity,
+            crate::types::DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY
+        );
+    }
+
+    #[test]
+    fn antispoof_thresholds_custom() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[security]
+ir_texture_min_stddev = 15.0
+frame_variance_max_similarity = 0.95
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.security.ir_texture_min_stddev, 15.0);
+        assert_eq!(config.security.frame_variance_max_similarity, 0.95);
+    }
+
+    #[test]
+    fn reject_out_of_range_frame_variance_max_similarity() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[security]
+frame_variance_max_similarity = 1.5
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn reject_negative_ir_texture_min_stddev() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[security]
+ir_texture_min_stddev = -1.0
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
     }
 
     #[test]

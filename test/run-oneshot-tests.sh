@@ -96,6 +96,31 @@ run_test_contains "facelock test (oneshot)" \
 run_test "facelock auth authenticates (oneshot)" \
     "timeout --foreground $LIVE_TIMEOUT facelock auth --user testuser --config /etc/facelock/config.toml"
 
+# Anti-spoof (Plan 01, H1 fix): with require_ir = true, a camera that is NOT a
+# confirmed IR device MUST be refused (exit 2). To make this deterministic on any
+# host — including hosts whose test camera is a genuine IR device with a quirks
+# force_ir entry — we temporarily move the system quirks DB aside so the camera is
+# classified by the heuristic alone. Under the fixed heuristic, a camera that only
+# enumerates GREY/YUYV with no "ir"/"infrared" name token is NOT IR (previously it
+# was misclassified as IR by the mere presence of a GREY format), so require_ir
+# refuses. Restores the quirks DB afterward.
+# CAMERA-REQUIRED: only meaningful on a host with /dev/video*; skipped headless.
+QUIRKS_SYS="/usr/share/facelock/quirks.d"
+QUIRKS_BAK="/tmp/facelock-quirks.bak"
+rm -rf "$QUIRKS_BAK"
+[ -d "$QUIRKS_SYS" ] && mv "$QUIRKS_SYS" "$QUIRKS_BAK"
+cp /etc/facelock/config.toml /tmp/facelock-requireir.toml
+if grep -q '^require_ir' /tmp/facelock-requireir.toml; then
+    sed -i 's|^require_ir.*|require_ir = true|' /tmp/facelock-requireir.toml
+else
+    sed -i '/^\[security\]/a require_ir = true' /tmp/facelock-requireir.toml
+fi
+run_test "facelock auth refuses non-IR camera when require_ir=true (anti-spoof, H1)" \
+    "facelock auth --user testuser --config /tmp/facelock-requireir.toml" \
+    2
+# Restore the system quirks DB.
+[ -d "$QUIRKS_BAK" ] && rm -rf "$QUIRKS_SYS" && mv "$QUIRKS_BAK" "$QUIRKS_SYS"
+
 # PAM authentication (the real deal — no daemon)
 run_test "pamtester authenticates (oneshot, no daemon)" \
     "timeout --foreground $LIVE_TIMEOUT pamtester facelock-test testuser authenticate"
