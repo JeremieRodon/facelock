@@ -415,12 +415,12 @@ test-deb: build-release
     podman build -t facelock-deb-test -f test/Containerfile.ubuntu .
     podman run --rm facelock-deb-test
 
-# Package test — build real .deb, install via dpkg, run automated validation
+# Package test — build real .deb, install via dpkg, validate under booted systemd
 test-deb-pkg: build-release
     #!/usr/bin/env bash
     set -euo pipefail
     podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
-    podman run --rm facelock-deb-pkg
+    test/run-pkg-validate-systemd.sh facelock-deb-pkg
 
 # Package test — build real TPM .deb (trixie), install via dpkg, run automated validation
 test-deb-tpm-pkg: build-release
@@ -429,12 +429,12 @@ test-deb-tpm-pkg: build-release
     podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-tpm-pkg -f test/Containerfile.deb-tpm-e2e .
     podman run --rm facelock-deb-tpm-pkg
 
-# Package test — build real .rpm, install via dnf, run automated validation
+# Package test — build real .rpm, install via dnf, validate under booted systemd
 test-rpm-pkg: build-release
     #!/usr/bin/env bash
     set -euo pipefail
     podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
-    podman run --rm facelock-rpm-pkg
+    test/run-pkg-validate-systemd.sh facelock-rpm-pkg
 
 # COPR-equivalent build — Packit SRPM + mock from-source rebuild on a Fedora chroot (slow, opt-in)
 test-copr:

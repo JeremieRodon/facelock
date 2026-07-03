@@ -39,8 +39,40 @@ RestrictSUIDSGID=yes
 # /dev/video* and /dev/tpmrm0, both protected by standard Unix permissions.
 # ProtectSystem=strict already prevents writing to /dev/.
 
-# Deferred: MemoryDenyWriteExecute=yes breaks ONNX Runtime JIT.
-# Phase 3 (seccomp, capabilities, network) deferred to future work.
+# Phase 3: Capabilities, seccomp, and network lockdown
+# The daemon needs no Linux capabilities: /dev/video* and /dev/tpmrm0 are
+# root-owned and opened via standard file permissions, and the daemon also
+# drops all capabilities in-process after initialization. If real-hardware
+# testing ever shows the runuser/su notification privilege-drop needs caps,
+# add back exactly: CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Only local sockets: D-Bus (system bus + per-user session bus for
+# notifications) is AF_UNIX; AF_NETLINK covers kernel device enumeration.
+# No AF_INET/AF_INET6 — all inference is local, nothing talks TCP/IP.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+# Allowlist seccomp filter. @system-service includes ioctl (V4L2 camera),
+# capget/capset (in-process capability drop), and the memory-management
+# syscalls ONNX Runtime needs. Blocked syscalls return EPERM instead of
+# killing the process, so an unexpected syscall degrades to a normal auth
+# error (PAM falls through to password) rather than a crash loop.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# Hide other processes' /proc entries and non-PID /proc contents.
+ProtectProc=invisible
+ProcSubset=pid
+ProtectHostname=yes
+# ProtectClock=yes is intentionally OMITTED: it implies DeviceAllow=char-rtc,
+# which switches the unit to a device-cgroup allowlist and would break
+# /dev/video* access (see Phase 2.5 note above). clock_settime and friends
+# are already denied (EPERM) by SystemCallFilter=@system-service.
+
+# Still deferred: MemoryDenyWriteExecute=yes breaks ONNX Runtime JIT
+# (CUDA/TensorRT execution providers), and User= is not set because the
+# daemon must open the camera/TPM as root and no non-root operation has
+# been validated on real hardware.
 
 [Install]
 WantedBy=multi-user.target
