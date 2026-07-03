@@ -203,31 +203,60 @@ run_test "PreviewDetectFrame returns no raw frame to non-root caller" \
 dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon \
     org.facelock.Daemon.ReleaseCamera > /dev/null 2>&1 || true
 
-# (c) CAMERA-REQUIRED: mutex-DoS guard — while one Authenticate holds the
-# capture path, a second concurrent Authenticate must be rejected
-# immediately with a "busy" error, not queue for the 10s lock timeout.
+# (c) CAMERA-REQUIRED: mutex-DoS guard — race two simultaneous Authenticate
+# calls. Exactly one wins the capture slot; the other must be rejected
+# immediately with a "busy" error (milliseconds), never queued toward the
+# 10s handler-lock timeout.
+timed_authenticate() {
+    # $1 = output file, $2 = meta file (rc + elapsed_ms), $3 = run as user ("" = root)
+    local s e rc
+    s=$(date +%s%N)
+    if [ -n "$3" ]; then
+        runuser -u "$3" -- dbus-send --system --print-reply --reply-timeout=30000 \
+            --dest=org.facelock.Daemon /org/facelock/Daemon \
+            org.facelock.Daemon.Authenticate string:testuser > "$1" 2>&1
+        rc=$?
+    else
+        dbus-send --system --print-reply --reply-timeout=30000 \
+            --dest=org.facelock.Daemon /org/facelock/Daemon \
+            org.facelock.Daemon.Authenticate string:testuser > "$1" 2>&1
+        rc=$?
+    fi
+    e=$(date +%s%N)
+    echo "$rc $(((e - s) / 1000000))" > "$2"
+}
+
 check_concurrent_auth_busy() {
-    timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser \
-        > /tmp/auth-first.log 2>&1 &
-    local auth_pid=$!
-    sleep 1
-    local start end elapsed out rc
-    start=$(date +%s)
     set +e
-    out=$(runuser -u testuser -- dbus-send --system --print-reply \
-        --reply-timeout=20000 \
-        --dest=org.facelock.Daemon /org/facelock/Daemon \
-        org.facelock.Daemon.Authenticate string:testuser 2>&1)
-    rc=$?
+    timed_authenticate /tmp/auth-a.out /tmp/auth-a.meta "" &
+    local pid_a=$!
+    timed_authenticate /tmp/auth-b.out /tmp/auth-b.meta testuser &
+    local pid_b=$!
+    wait "$pid_a" "$pid_b"
     set -e
-    end=$(date +%s)
-    elapsed=$((end - start))
-    wait "$auth_pid" 2>/dev/null || true
-    echo "second call: rc=$rc elapsed=${elapsed}s"
-    echo "$out"
-    [ "$rc" -ne 0 ] || { echo "second call unexpectedly succeeded"; return 1; }
-    echo "$out" | grep -qi "busy" || { echo "no busy error in reply"; return 1; }
-    [ "$elapsed" -lt 5 ] || { echo "busy rejection took ${elapsed}s (stall)"; return 1; }
+
+    local rc_a ms_a rc_b ms_b
+    read -r rc_a ms_a < /tmp/auth-a.meta
+    read -r rc_b ms_b < /tmp/auth-b.meta
+    echo "call A (root):     rc=$rc_a elapsed=${ms_a}ms"
+    echo "call B (testuser): rc=$rc_b elapsed=${ms_b}ms"
+    echo "--- A reply:"
+    cat /tmp/auth-a.out
+    echo "--- B reply:"
+    cat /tmp/auth-b.out
+
+    local busy=0 busy_ms=0
+    if grep -qi "busy" /tmp/auth-a.out; then
+        busy=$((busy + 1))
+        busy_ms=$ms_a
+    fi
+    if grep -qi "busy" /tmp/auth-b.out; then
+        busy=$((busy + 1))
+        busy_ms=$ms_b
+    fi
+    [ "$busy" -eq 1 ] || { echo "expected exactly one busy rejection, got $busy"; return 1; }
+    # Rejected immediately — well under the 10s handler-lock stall
+    [ "$busy_ms" -lt 5000 ] || { echo "busy rejection took ${busy_ms}ms (stall)"; return 1; }
     return 0
 }
 run_test "Concurrent Authenticate rejected immediately with busy" \
