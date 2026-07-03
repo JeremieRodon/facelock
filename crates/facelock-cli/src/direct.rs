@@ -143,6 +143,13 @@ fn init_software_sealer(config: &Config) -> anyhow::Result<Option<facelock_tpm::
     match config.encryption.method {
         EncryptionMethod::Keyfile => {
             let key_path = Path::new(&config.encryption.key_path);
+            // Encrypt-by-default (finding #8): generate the key on first use so
+            // the keyfile default actually encrypts new templates.
+            if !key_path.exists() {
+                facelock_tpm::SoftwareSealer::generate_key_file(key_path)
+                    .context("failed to auto-generate encryption key")?;
+                debug!("generated encryption key at {}", key_path.display());
+            }
             Ok(Some(
                 facelock_tpm::SoftwareSealer::from_key_file(key_path)
                     .context("failed to initialize software encryption sealer")?,
@@ -187,17 +194,18 @@ pub fn load_user_embeddings(
             .context("storage error loading embeddings");
     }
 
-    // Slow path: load raw blobs and decrypt
+    // Slow path: load raw blobs (with device ids for opt-in AAD) and decrypt
     let sealer = software_sealer.unwrap();
     let raw_rows = store
-        .get_user_embeddings_raw(user)
+        .get_user_embeddings_raw_with_device(user)
         .context("storage error loading raw embeddings")?;
 
     let mut results = Vec::with_capacity(raw_rows.len());
-    for (id, blob, sealed) in &raw_rows {
+    for (id, blob, sealed, device_id) in &raw_rows {
         let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
+            let aad = config.security.device_aad(device_id.as_deref());
             sealer
-                .unseal_embedding(blob)
+                .unseal_embedding_with_aad(blob, aad.as_deref())
                 .with_context(|| format!("software decryption failed for embedding {id}"))?
         } else if *sealed {
             #[cfg(feature = "tpm")]
@@ -230,6 +238,11 @@ pub fn load_user_embeddings(
 
 /// Direct enrollment — returns (model_id, embedding_count).
 pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, u32)> {
+    // Refuse to store a plaintext template unless explicitly opted in.
+    config
+        .ensure_enroll_encryption_allowed()
+        .map_err(|m| anyhow::anyhow!(m))?;
+
     let store = open_store(config)?;
     let opened = open_camera_context(config)?;
     let device_id = opened.device_fingerprint.canonical_for_storage();
@@ -697,6 +710,10 @@ mod facelock_daemon_enroll {
             }
         }
 
+        // Opt-in hard device binding (Plan 04): fold device id into the AES-GCM
+        // AAD when enabled; `None` otherwise (default).
+        let device_aad = config.security.device_aad(device_id);
+
         let enroll_secs = (config.recognition.timeout_secs as u64).max(5) * 3;
         let deadline = Instant::now() + Duration::from_secs(enroll_secs);
         let mut stored_count: u32 = 0;
@@ -741,7 +758,7 @@ mod facelock_daemon_enroll {
 
             // When a sealer is provided, encrypt each embedding before storage.
             let store_result = if let Some(sealer) = sealer {
-                match sealer.seal_embedding(embedding) {
+                match sealer.seal_embedding_with_aad(embedding, device_aad.as_deref()) {
                     Ok(encrypted) => match model_id {
                         None => store
                             .add_model_raw_with_device(

@@ -161,11 +161,25 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             }
         };
 
+    // Load embeddings through the decryption-aware path so the oneshot binary
+    // handles encrypted templates (encrypt-by-default, Plan 04) — the bare
+    // `auth::authenticate` helper reads plaintext only. Decrypt failure degrades
+    // to no-match (exit 1 via an empty compare set), never a hard error.
+    let stored = match crate::direct::load_user_embeddings(&store, &config, &user) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(user = %user, "failed to load embeddings: {e}");
+            return 1;
+        }
+    };
+    let models = store.list_models(&user).unwrap_or_default();
+
     let start = std::time::Instant::now();
-    let response = auth::authenticate(
+    let response = auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
-        &store,
+        &stored,
+        &models,
         &config,
         &user,
         device_is_ir,

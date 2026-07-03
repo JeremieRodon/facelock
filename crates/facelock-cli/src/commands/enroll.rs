@@ -37,6 +37,19 @@ pub fn run(
 
     let config = Config::load().context("failed to load config")?;
 
+    // Encryption posture (Plan 04): refuse plaintext enrollment unless opted in;
+    // warn prominently when the opt-in is active.
+    if config.encryption.method == facelock_core::config::EncryptionMethod::None {
+        if config.security.allow_plaintext {
+            eprintln!(
+                "WARNING: encryption.method = \"none\" and security.allow_plaintext = true.\n\
+                 Your face template will be stored UNENCRYPTED (plaintext biometric data at rest)."
+            );
+        } else if let Err(message) = config.ensure_enroll_encryption_allowed() {
+            anyhow::bail!(message);
+        }
+    }
+
     // Check models exist
     let model_dir = std::path::Path::new(&config.daemon.model_dir);
     let detector = model_dir.join(&config.recognition.detector_model);

@@ -38,6 +38,11 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
         }
     }
 
+    // Opt-in hard device binding (Plan 04): when enabled, fold this camera's
+    // device id into the AES-GCM AAD so the template can only be decrypted under
+    // the same camera. `None` when disabled or when no device id is available.
+    let device_aad = config.security.device_aad(device_id);
+
     // Use 3x the auth timeout for enrollment since we need multiple good captures
     let enroll_secs = (config.recognition.timeout_secs as u64).max(5) * 3;
     let deadline = Instant::now() + Duration::from_secs(enroll_secs);
@@ -118,7 +123,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
         // First face: create the model. Subsequent faces: add embeddings.
         // When a sealer is provided, encrypt each embedding before storage.
         let store_result = if let Some(sealer) = sealer {
-            match sealer.seal_embedding(embedding) {
+            match sealer.seal_embedding_with_aad(embedding, device_aad.as_deref()) {
                 Ok(encrypted) => match model_id {
                     None => store
                         .add_model_raw_with_device(

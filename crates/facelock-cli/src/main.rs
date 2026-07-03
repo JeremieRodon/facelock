@@ -152,6 +152,8 @@ enum Commands {
     },
     /// Decrypt all software-encrypted embeddings
     Decrypt,
+    /// Re-seal the TPM AES key under current PCRs (recovery after a firmware/kernel change)
+    Reseal,
     /// Restart the facelock daemon
     Restart,
     /// View structured audit log
@@ -235,6 +237,7 @@ fn main() -> anyhow::Result<()> {
                 Commands::Hyprlock { command } => commands::hyprlock::run(command),
                 Commands::Encrypt { generate_key } => commands::encrypt::run_encrypt(generate_key),
                 Commands::Decrypt => commands::encrypt::run_decrypt(),
+                Commands::Reseal => commands::tpm::run_reseal(),
                 Commands::Restart => commands::config::restart(),
                 Commands::Audit { follow, lines } => commands::audit::run(follow, lines),
                 // Already handled above

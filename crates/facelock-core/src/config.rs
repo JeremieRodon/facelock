@@ -231,6 +231,21 @@ pub struct SecurityConfig {
     /// set false to require every template to carry a matching device id.
     #[serde(default = "default_true")]
     pub bind_legacy_templates: bool,
+    /// Permit storing face embeddings as plaintext (`encryption.method = "none"`).
+    /// Default **false**: embeddings are encrypted at rest, and an explicit
+    /// `method = "none"` is refused at enroll unless this is set true (an
+    /// informed opt-out, warned prominently). Never weakens an already-encrypted
+    /// store; it only governs whether new plaintext enrollment is allowed.
+    #[serde(default)]
+    pub allow_plaintext: bool,
+    /// Opt-in **hard** device binding: fold the enrolling camera's `device_id`
+    /// into the AES-GCM Additional Authenticated Data so a template sealed under
+    /// one camera cannot even be decrypted under a different one. Default
+    /// **false** — hard binding fails closed on unstable/absent device ids
+    /// (unlike the advisory skip-on-mismatch coupling of Plan 02), so it is
+    /// opt-in only. Requires an active encryption method to have any effect.
+    #[serde(default)]
+    pub bind_device_aad: bool,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
 }
@@ -242,6 +257,18 @@ impl SecurityConfig {
             enabled: self.bind_templates_to_device,
             granularity: self.device_match_granularity,
             allow_legacy: self.bind_legacy_templates,
+        }
+    }
+
+    /// AAD bytes to bind an encrypted template to its enrolling camera, when
+    /// opt-in hard device binding (`bind_device_aad`) is enabled. Returns `None`
+    /// when disabled, or when no device id is available — so an unstable/absent
+    /// id degrades to unbound encryption rather than an un-decryptable template.
+    pub fn device_aad(&self, device_id: Option<&str>) -> Option<Vec<u8>> {
+        if self.bind_device_aad {
+            crate::types::device_binding_aad(device_id)
+        } else {
+            None
         }
     }
 }
@@ -281,6 +308,8 @@ impl Default for SecurityConfig {
             bind_templates_to_device: true,
             device_match_granularity: crate::types::DeviceMatchGranularity::Model,
             bind_legacy_templates: true,
+            allow_plaintext: false,
+            bind_device_aad: false,
             rate_limit: RateLimitConfig::default(),
         }
     }
@@ -416,14 +445,16 @@ impl Default for TpmConfig {
 
 /// Method for encrypting face embeddings at rest.
 ///
-/// - `"none"` — no encryption (default, embeddings stored as plaintext)
-/// - `"keyfile"` — AES-256-GCM with a key file
+/// - `"keyfile"` — AES-256-GCM with a key file (**default**)
 /// - `"tpm"` — AES-256-GCM with TPM-sealed key (key sealed by TPM, embeddings encrypted with AES)
+/// - `"none"` — no encryption, embeddings stored as plaintext. Only honored when
+///   `security.allow_plaintext = true`; otherwise enrollment refuses to store
+///   plaintext biometric templates.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EncryptionMethod {
-    #[default]
     None,
+    #[default]
     Keyfile,
     Tpm,
 }
@@ -445,7 +476,7 @@ pub struct EncryptionConfig {
 impl Default for EncryptionConfig {
     fn default() -> Self {
         Self {
-            method: EncryptionMethod::None,
+            method: EncryptionMethod::Keyfile,
             key_path: default_encryption_key_path(),
             sealed_key_path: default_sealed_key_path(),
         }
@@ -584,6 +615,26 @@ impl Config {
             }
         })?;
         Self::parse(&content)
+    }
+
+    /// Whether enrollment may proceed under the current encryption policy.
+    ///
+    /// Refuses to store a plaintext biometric template (`encryption.method =
+    /// "none"`) unless the operator has explicitly opted in via
+    /// `security.allow_plaintext`. This is a config-time guard surfaced as an
+    /// enroll error — it never affects the auth fall-through to password and is
+    /// never a lockout. Returns the reason string on refusal.
+    pub fn ensure_enroll_encryption_allowed(&self) -> Result<(), String> {
+        if self.encryption.method == EncryptionMethod::None && !self.security.allow_plaintext {
+            return Err(
+                "refusing to enroll: encryption.method = \"none\" would store your face \
+                 template as plaintext biometric data. Enable encryption (the default \
+                 \"keyfile\"/\"tpm\"), or, to intentionally store plaintext, set \
+                 security.allow_plaintext = true."
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// Parse config from a TOML string.
@@ -971,8 +1022,75 @@ warmup_frames = 10
 path = "/dev/video0"
 "#;
         let config = Config::parse(toml).unwrap();
-        assert_eq!(config.encryption.method, super::EncryptionMethod::None);
+        // Encrypt-by-default (finding #8): a config with no [encryption] section
+        // now defaults to keyfile encryption, not plaintext.
+        assert_eq!(config.encryption.method, super::EncryptionMethod::Keyfile);
         assert_eq!(config.encryption.key_path, "/etc/facelock/encryption.key");
+    }
+
+    #[test]
+    fn encryption_method_default_is_keyfile() {
+        assert_eq!(super::EncryptionMethod::default(), super::EncryptionMethod::Keyfile);
+    }
+
+    #[test]
+    fn security_plaintext_and_aad_default_off() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(!config.security.allow_plaintext);
+        assert!(!config.security.bind_device_aad);
+    }
+
+    #[test]
+    fn enroll_refused_when_plaintext_not_allowed() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[encryption]
+method = "none"
+"#;
+        let config = Config::parse(toml).unwrap();
+        // method=none without the explicit opt-in must be refused at enroll.
+        assert!(config.ensure_enroll_encryption_allowed().is_err());
+    }
+
+    #[test]
+    fn enroll_allowed_plaintext_with_optin() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[encryption]
+method = "none"
+[security]
+allow_plaintext = true
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(config.ensure_enroll_encryption_allowed().is_ok());
+    }
+
+    #[test]
+    fn enroll_allowed_when_encrypted() {
+        // Default (keyfile) enrollment is always permitted.
+        let config = Config::parse("[device]\npath = \"/dev/video0\"\n").unwrap();
+        assert!(config.ensure_enroll_encryption_allowed().is_ok());
+    }
+
+    #[test]
+    fn device_aad_gated_by_opt_in() {
+        let mut config = Config::parse("[device]\npath = \"/dev/video0\"\n").unwrap();
+        // Off by default → no AAD even with a device id.
+        assert_eq!(config.security.device_aad(Some("046d:085e:X")), None);
+        // Opt-in → AAD derived from the device id.
+        config.security.bind_device_aad = true;
+        assert_eq!(
+            config.security.device_aad(Some("046d:085e:X")),
+            crate::types::device_binding_aad(Some("046d:085e:X"))
+        );
+        // Opt-in but no device id → still None (degrade, never un-decryptable).
+        assert_eq!(config.security.device_aad(None), None);
     }
 
     #[test]

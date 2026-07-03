@@ -119,6 +119,24 @@ set_db_path() {
 
 DB="$(db_path_from_config /etc/facelock/config.toml)"
 
+# --- Encryption at rest (Plan 04, finding #8) ---
+# With encryption defaulting to keyfile, the fresh enroll above must have stored
+# CIPHERTEXT, not a raw 2048-byte f32 embedding. Assert: sealed flag set, the blob
+# starts with the software-encryption version byte 0x02, and its length differs
+# from the 2048-byte raw size. Then a full enroll->auth cycle already round-tripped
+# above (facelock test / facelock auth), proving the decrypt path works.
+# CAMERA-REQUIRED: depends on the live enroll above.
+ENC_SEALED="$(sqlite3 "$DB" "SELECT fe.sealed FROM face_embeddings fe JOIN face_models fm ON fe.model_id=fm.id WHERE fm.user='testuser' LIMIT 1" 2>/dev/null || echo '?')"
+ENC_LEN="$(sqlite3 "$DB" "SELECT LENGTH(fe.embedding) FROM face_embeddings fe JOIN face_models fm ON fe.model_id=fm.id WHERE fm.user='testuser' LIMIT 1" 2>/dev/null || echo 0)"
+ENC_VB="$(sqlite3 "$DB" "SELECT hex(substr(fe.embedding,1,1)) FROM face_embeddings fe JOIN face_models fm ON fe.model_id=fm.id WHERE fm.user='testuser' LIMIT 1" 2>/dev/null || echo '')"
+run_test "fresh enroll stores encrypted blob, not raw f32 (sealed=$ENC_SEALED len=$ENC_LEN vb=$ENC_VB)" \
+    "[ \"$ENC_SEALED\" = 1 ] && [ \"$ENC_VB\" = '02' ] && [ \"$ENC_LEN\" -ne 2048 ]" 0
+# The default key file must exist and be private (0600), created at-mode.
+KEYF="/etc/facelock/encryption.key"
+KEYMODE="$(stat -c '%a' "$KEYF" 2>/dev/null || echo '?')"
+run_test "encryption key auto-generated at 0600 ($KEYF mode=$KEYMODE)" \
+    "[ -f \"$KEYF\" ] && [ \"$KEYMODE\" = 600 ]" 0
+
 # Migration applied on first store open (enroll).
 SCHEMA_VER="$(sqlite3 "$DB" 'SELECT MAX(version) FROM schema_version' 2>/dev/null || echo 0)"
 run_test "V6 schema migration applied (oneshot; db=$DB)" \

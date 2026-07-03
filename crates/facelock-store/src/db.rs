@@ -264,6 +264,44 @@ impl FaceStore {
         Ok(results)
     }
 
+    /// Like [`FaceStore::get_user_embeddings_raw`], but also returns each row's
+    /// enrolling-camera `device_id` (NULL for legacy/unidentified templates).
+    ///
+    /// Used by the decrypt path when opt-in hard device binding
+    /// (`security.bind_device_aad`) is active: the AAD for each blob is derived
+    /// from its own template's `device_id`.
+    #[allow(clippy::type_complexity)]
+    pub fn get_user_embeddings_raw_with_device(
+        &self,
+        user: &str,
+    ) -> Result<Vec<(u32, Vec<u8>, bool, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT fm.id, fe.embedding, fe.sealed, fm.device_id
+                 FROM face_models fm
+                 JOIN face_embeddings fe ON fe.model_id = fm.id
+                 WHERE fm.user = ?1",
+            )
+            .map_err(map_err)?;
+
+        let rows = stmt
+            .query_map(params![user], |row| {
+                let id: u32 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                let sealed: bool = row.get::<_, i64>(2)? != 0;
+                let device_id: Option<String> = row.get(3)?;
+                Ok((id, blob, sealed, device_id))
+            })
+            .map_err(map_err)?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(map_err)?);
+        }
+        Ok(results)
+    }
+
     /// Add a face model with raw bytes and a sealed flag. Returns the new model ID.
     /// Stores a NULL `device_id`; use [`FaceStore::add_model_raw_with_device`] to
     /// bind the enrolling camera.
@@ -866,6 +904,30 @@ mod tests {
         let store = FaceStore::open_memory().unwrap();
         // With max_attempts=0, even zero attempts should block
         assert!(!store.check_rate_limit("alice", 0, 60).unwrap());
+    }
+
+    #[test]
+    fn raw_with_device_returns_device_id_per_row() {
+        let store = FaceStore::open_memory().unwrap();
+        let emb = [0.1f32; 512];
+        // One template bound to a camera, one legacy (NULL device_id).
+        store
+            .add_model_raw_with_device("alice", "cam", b"blob-cam", true, "w600k", Some("046d:085e:S"))
+            .unwrap();
+        store
+            .add_model_raw_with_device("alice", "legacy", b"blob-legacy", true, "w600k", None)
+            .unwrap();
+
+        let mut rows = store.get_user_embeddings_raw_with_device("alice").unwrap();
+        rows.sort_by(|a, b| a.1.cmp(&b.1)); // by blob bytes for determinism
+
+        assert_eq!(rows.len(), 2);
+        // blob-cam sorts before blob-legacy
+        assert_eq!(rows[0].1, b"blob-cam");
+        assert!(rows[0].2, "sealed flag should round-trip");
+        assert_eq!(rows[0].3.as_deref(), Some("046d:085e:S"));
+        assert_eq!(rows[1].1, b"blob-legacy");
+        assert_eq!(rows[1].3, None);
     }
 
     #[test]

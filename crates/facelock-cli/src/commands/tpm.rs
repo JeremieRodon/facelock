@@ -10,7 +10,56 @@ pub fn run(command: TpmCommand) -> Result<()> {
         TpmCommand::Status => status(),
         TpmCommand::SealKey => seal_key(),
         TpmCommand::UnsealKey => unseal_key(),
+        TpmCommand::UnsealCheck => unseal_check(),
         TpmCommand::PcrBaseline => pcr_baseline(),
+    }
+}
+
+/// Read-only verification that the sealed AES key currently unseals.
+///
+/// Exercises the real unseal path (including PolicyPCR replay for PCR-bound
+/// keys) without writing anything or mutating config. Returns an error (non-zero
+/// exit) when unseal fails — e.g. after a bound PCR changed. Used by operators to
+/// confirm whether `facelock reseal` is needed, and by the TPM E2E suite.
+fn unseal_check() -> Result<()> {
+    crate::ipc_client::require_root("sudo facelock tpm unseal-check")?;
+
+    let config = Config::load()?;
+    if config.encryption.method != facelock_core::config::EncryptionMethod::Tpm {
+        anyhow::bail!(
+            "encryption.method is not \"tpm\" (current: {:?}); nothing to unseal.",
+            config.encryption.method
+        );
+    }
+
+    #[cfg(feature = "tpm")]
+    {
+        let sealed_path = Path::new(&config.encryption.sealed_key_path);
+        if !sealed_path.exists() {
+            anyhow::bail!("no sealed key found at {}.", sealed_path.display());
+        }
+        let mut tpm =
+            facelock_tpm::TpmSealer::new(&config.tpm.tcti).context("failed to initialize TPM")?;
+        match tpm.unseal_key_from_file(sealed_path) {
+            Ok(mut key) => {
+                use zeroize::Zeroize;
+                key.zeroize();
+                println!("sealed key unseals OK ({})", sealed_path.display());
+                Ok(())
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "sealed key does NOT unseal ({}): {e}\n\
+                     If a bound PCR changed (firmware/kernel update), run: sudo facelock reseal",
+                    sealed_path.display()
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "tpm"))]
+    {
+        anyhow::bail!("TPM support not compiled in (missing 'tpm' feature).");
     }
 }
 
@@ -205,6 +254,120 @@ fn unseal_key() -> Result<()> {
         println!("Config updated: encryption.method = \"keyfile\"");
         println!("\nEmbeddings remain encrypted with the same AES key — no re-encryption needed.");
 
+        Ok(())
+    }
+
+    #[cfg(not(feature = "tpm"))]
+    {
+        anyhow::bail!(
+            "TPM support not compiled in (missing 'tpm' feature).\n\
+             Rebuild with: cargo build --features tpm"
+        );
+    }
+}
+
+/// Re-seal the AES key under the CURRENT PCR values (`facelock reseal`).
+///
+/// This is the recovery path for TPM PCR binding: a firmware/kernel update that
+/// changes a bound PCR makes the old sealed blob refuse to unseal. Password login
+/// keeps working throughout; running `reseal` restores face auth by re-sealing
+/// the key against the new PCR state. The key is recovered from the existing
+/// sealed blob when PCRs are still valid, otherwise from the plaintext key backup
+/// at `encryption.key_path` if present.
+pub fn run_reseal() -> Result<()> {
+    crate::ipc_client::require_root("sudo facelock reseal")?;
+
+    let config = Config::load()?;
+    if config.encryption.method != facelock_core::config::EncryptionMethod::Tpm {
+        anyhow::bail!(
+            "`facelock reseal` only applies when encryption.method = \"tpm\" \
+             (current: {:?}). Nothing to reseal.",
+            config.encryption.method
+        );
+    }
+
+    #[cfg(feature = "tpm")]
+    {
+        let sealed_path = Path::new(&config.encryption.sealed_key_path);
+        let key_path = Path::new(&config.encryption.key_path);
+
+        if !sealed_path.exists() {
+            anyhow::bail!(
+                "no sealed key found at {} to re-seal.",
+                sealed_path.display()
+            );
+        }
+
+        let mut tpm =
+            facelock_tpm::TpmSealer::new(&config.tpm.tcti).context("failed to initialize TPM")?;
+
+        // Recover the 32-byte AES key. Prefer unsealing the existing blob (works
+        // when PCRs are still valid — e.g. proactively refreshing); fall back to
+        // the plaintext key backup after an actual PCR change.
+        let mut key = match tpm.unseal_key_from_file(sealed_path) {
+            Ok(k) => {
+                println!(
+                    "Unsealed the current key (PCR policy still satisfied); \
+                     re-sealing under current PCRs."
+                );
+                k
+            }
+            Err(e) => {
+                println!("Could not unseal the existing key (likely a PCR change): {e}");
+                if key_path.exists() {
+                    let data = std::fs::read(key_path)
+                        .with_context(|| format!("failed to read key backup {}", key_path.display()))?;
+                    if data.len() != 32 {
+                        anyhow::bail!(
+                            "key backup at {} is {} bytes, expected 32",
+                            key_path.display(),
+                            data.len()
+                        );
+                    }
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&data);
+                    println!(
+                        "Recovered the AES key from the plaintext backup at {}.",
+                        key_path.display()
+                    );
+                    k
+                } else {
+                    anyhow::bail!(
+                        "cannot recover the AES key: the sealed blob no longer unseals under \
+                         the current PCRs and there is no plaintext backup at {}.\n\
+                         Password login still works. Restore a key backup to {}, then re-run \
+                         `sudo facelock reseal`, or clear and re-enroll: sudo facelock clear --yes",
+                        key_path.display(),
+                        key_path.display()
+                    );
+                }
+            }
+        };
+
+        let pcr = if config.tpm.pcr_binding {
+            Some(config.tpm.pcr_indices.as_slice())
+        } else {
+            None
+        };
+
+        let seal_result = tpm
+            .seal_key_to_file(&key, sealed_path, pcr)
+            .context("failed to re-seal key under current PCRs");
+
+        use zeroize::Zeroize;
+        key.zeroize();
+        seal_result?;
+
+        println!(
+            "Re-sealed the AES key to {} under the current PCR state (permissions: 0600).",
+            sealed_path.display()
+        );
+        if pcr.is_none() {
+            println!(
+                "Note: tpm.pcr_binding is disabled, so the key is sealed without a PCR policy."
+            );
+        }
+        println!("Face authentication should work again on this boot.");
         Ok(())
     }
 

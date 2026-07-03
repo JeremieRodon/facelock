@@ -234,7 +234,8 @@ mod tests {
 
     #[test]
     fn encryption_method_default() {
-        assert_eq!(EncryptionMethod::default(), EncryptionMethod::None);
+        // Encrypt-by-default (finding #8): the default method is now keyfile.
+        assert_eq!(EncryptionMethod::default(), EncryptionMethod::Keyfile);
     }
 
     /// Integration test: encrypt embeddings in memory DB, then decrypt them back.
@@ -298,6 +299,48 @@ mod tests {
         for (_, recovered) in &final_embs {
             assert_eq!(*recovered, emb, "decrypted embedding should match original");
         }
+    }
+
+    /// End-to-end opt-in hard device binding (Plan 04 AAD seam): a template
+    /// sealed with AAD from its enrolling device id decrypts only under that
+    /// same id, exercising the store + config + sealer path used by enroll/auth.
+    #[test]
+    fn aad_binding_ties_template_to_device() {
+        use facelock_core::config::Config;
+
+        let store = facelock_store::FaceStore::open_memory().unwrap();
+        let mut config = Config::parse("[device]\npath = \"/dev/video0\"\n").unwrap();
+        config.security.bind_device_aad = true;
+
+        let sealer = facelock_tpm::SoftwareSealer::from_key([0x42u8; 32]);
+        let device_id = "046d:085e:SER";
+        let aad = config.security.device_aad(Some(device_id));
+        assert!(aad.is_some(), "AAD must be derived when opt-in is on");
+
+        let emb = [0.3f32; 512];
+        let sealed = sealer.seal_embedding_with_aad(&emb, aad.as_deref()).unwrap();
+        store
+            .add_model_raw_with_device("alice", "cam", &sealed, true, "w600k", Some(device_id))
+            .unwrap();
+
+        // Load with each row's own device id → decrypts.
+        let rows = store.get_user_embeddings_raw_with_device("alice").unwrap();
+        let (_id, blob, sealed_flag, dev) = &rows[0];
+        assert!(*sealed_flag);
+        let good_aad = config.security.device_aad(dev.as_deref());
+        let dec = sealer
+            .unseal_embedding_with_aad(blob, good_aad.as_deref())
+            .unwrap();
+        assert_eq!(dec, emb);
+
+        // A forged/swapped device id yields a different AAD → decryption fails.
+        let forged_aad = config.security.device_aad(Some("ffff:ffff:forged"));
+        assert!(
+            sealer
+                .unseal_embedding_with_aad(blob, forged_aad.as_deref())
+                .is_err(),
+            "template must not decrypt under a different camera id"
+        );
     }
 
     /// Test filtering logic: mixed encrypted/unencrypted embeddings
