@@ -101,6 +101,104 @@ run_test "Oneshot mode: no enrolled faces returns quickly" \
     "sed -i '/^\[daemon\]/a mode = \"oneshot\"' /etc/facelock/config.toml; timeout 3 pamtester facelock-test testuser authenticate 2>&1; rc=\$?; sed -i '/^mode = \"oneshot\"/d' /etc/facelock/config.toml; test \$rc -ne 124" \
     0
 
+# --- Plan 05: PAM trust-boundary hardening (all camera-free) ---
+
+# (a) A group/world-writable config must be rejected: the module ignores it
+# and fails closed (PAM_IGNORE -> pam_deny). The 'Identifying face' prompt
+# only appears once the config is accepted, so its absence plus an auth
+# failure proves the module rejected the file instead of trusting it.
+run_test "Group-writable config rejected, fails closed" \
+    "chmod 664 /etc/facelock/config.toml; pamtester facelock-test testuser authenticate < /dev/null > /tmp/gw-out 2>&1; rc=\$?; chmod 644 /etc/facelock/config.toml; test \$rc -ne 0 && ! grep -q 'Identifying face' /tmp/gw-out" \
+    0
+
+run_test "World-writable config rejected, fails closed" \
+    "chmod 666 /etc/facelock/config.toml; pamtester facelock-test testuser authenticate < /dev/null > /tmp/ww-out 2>&1; rc=\$?; chmod 644 /etc/facelock/config.toml; test \$rc -ne 0 && ! grep -q 'Identifying face' /tmp/ww-out" \
+    0
+
+run_test "Config accepted again after restoring 644" \
+    "pamtester facelock-test testuser authenticate 2>&1 | grep -q 'Identifying face'" \
+    0
+
+# (b) env_clear: LD_PRELOAD must never reach the spawned oneshot child while
+# SSH_CONNECTION must survive. A constructor-marker .so logs every process it
+# is loaded into; a root-owned capture stub stands in for the auth binary so
+# the exact child environment can be asserted.
+cat > /tmp/preload-marker.c <<'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+__attribute__((constructor)) static void mark(void) {
+    char exe[512] = {0};
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    FILE *f = fopen("/tmp/preload-log", "a");
+    if (f) { fprintf(f, "%s\n", n > 0 ? exe : "?"); fclose(f); }
+}
+EOF
+gcc -shared -fPIC -o /tmp/preload-marker.so /tmp/preload-marker.c
+printf '#!/bin/bash\nenv > /tmp/oneshot-child-env\nexit 2\n' > /usr/local/bin/facelock-env-capture
+chmod 755 /usr/local/bin/facelock-env-capture
+rm -f /tmp/preload-log /tmp/oneshot-child-env
+
+sed -i '/^\[daemon\]/a mode = "oneshot"\nauth_bin = "/usr/local/bin/facelock-env-capture"' /etc/facelock/config.toml
+sed -i '/^\[security\]/a abort_if_ssh = false' /etc/facelock/config.toml
+env LD_PRELOAD=/tmp/preload-marker.so SSH_CONNECTION='192.0.2.1 1111 192.0.2.2 22' \
+    pamtester facelock-test testuser authenticate < /dev/null > /dev/null 2>&1 || true
+sed -i '/^mode = "oneshot"/d;/^auth_bin = /d;/^abort_if_ssh = false/d' /etc/facelock/config.toml
+
+run_test "env_clear: marker was active in the PAM process" \
+    "grep -q pamtester /tmp/preload-log" \
+    0
+
+run_test "env_clear: LD_PRELOAD marker not loaded by oneshot child" \
+    "test -f /tmp/oneshot-child-env && ! grep -q '^LD_PRELOAD=' /tmp/oneshot-child-env && ! grep -q bash /tmp/preload-log" \
+    0
+
+run_test "env_clear: SSH_CONNECTION survives to oneshot child" \
+    "grep -q '^SSH_CONNECTION=192.0.2.1' /tmp/oneshot-child-env" \
+    0
+
+run_test "env_clear: oneshot child PATH pinned to /usr/bin:/bin" \
+    "grep -qx 'PATH=/usr/bin:/bin' /tmp/oneshot-child-env" \
+    0
+
+# (c) Peer-UID check: a non-root process owning org.facelock.Daemon and
+# replying matched=true must never produce PAM_SUCCESS. A deliberately
+# loosened bus policy simulates a broken/compromised policy file.
+cat > /usr/share/dbus-1/system.d/zz-facelock-peer-test.conf <<'EOF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="testuser">
+    <allow own="org.facelock.Daemon"/>
+  </policy>
+  <policy context="default">
+    <allow send_destination="org.facelock.Daemon"/>
+  </policy>
+</busconfig>
+EOF
+mkdir -p /run/dbus
+dbus-uuidgen --ensure=/etc/machine-id > /dev/null 2>&1 || true
+dbus-daemon --system --fork --nopidfile
+runuser -u testuser -- python3 /fake-facelock-daemon.py > /tmp/fake-daemon.log 2>&1 &
+FAKE_PID=$!
+for _ in $(seq 1 40); do
+    dbus-send --system --print-reply --dest=org.freedesktop.DBus \
+        /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+        string:org.facelock.Daemon 2>/dev/null | grep -q 'boolean true' && break
+    sleep 0.25
+done
+
+run_test "Peer-UID harness: fake non-root daemon replies matched=true" \
+    "dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:testuser | grep -q 'boolean true'" \
+    0
+
+run_test "Peer-UID: non-root daemon owner yields no PAM_SUCCESS" \
+    "! timeout 15 pamtester facelock-test testuser authenticate < /dev/null" \
+    0
+
+kill "$FAKE_PID" 2>/dev/null || true
+rm -f /usr/share/dbus-1/system.d/zz-facelock-peer-test.conf
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 

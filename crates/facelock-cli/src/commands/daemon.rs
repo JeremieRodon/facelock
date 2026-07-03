@@ -249,6 +249,25 @@ fn now_secs() -> u64 {
     epoch.elapsed().as_secs()
 }
 
+/// Encode a recoverable authentication error into the `AuthResult` wire
+/// format (`model_id == -2`, `label` = error message) instead of a D-Bus
+/// error.
+///
+/// A D-Bus error reply makes clients treat the daemon as broken: the PAM
+/// module would fall back to a fresh root oneshot attempt, silently
+/// escalating past daemon-side state such as rate limiting. In-band encoding
+/// lets the PAM client classify the error (rate limited → PAM_AUTH_ERR,
+/// everything else → PAM_IGNORE) without retrying.
+/// See docs/contracts.md ("Authenticate error encoding").
+fn recoverable_auth_error(message: String) -> AuthResult {
+    AuthResult {
+        matched: false,
+        model_id: -2,
+        label: message,
+        similarity: 0.0,
+    }
+}
+
 struct FacelockService {
     handler: Arc<Mutex<ProductionHandler>>,
     /// Timestamp of last D-Bus method call (seconds since daemon start).
@@ -381,7 +400,7 @@ impl FacelockService {
                         similarity: 0.0,
                     })
                 }
-                DaemonResponse::Error { message } => Err(fdo::Error::Failed(message)),
+                DaemonResponse::Error { message } => Ok(recoverable_auth_error(message)),
                 other => Err(fdo::Error::Failed(format!(
                     "unexpected response: {other:?}"
                 ))),
@@ -1050,6 +1069,20 @@ mod tests {
     fn bus_name_constants() {
         assert_eq!(BUS_NAME, "org.facelock.Daemon");
         assert_eq!(OBJECT_PATH, "/org/facelock/Daemon");
+    }
+
+    #[test]
+    fn recoverable_auth_errors_are_encoded_in_band() {
+        // Recoverable errors (rate limited, IR required, camera/storage
+        // failures) must travel in the AuthResult wire format with
+        // model_id == -2, not as D-Bus errors: a D-Bus error would make the
+        // PAM client fall back to a fresh root oneshot attempt, silently
+        // bypassing daemon-side state such as rate limiting.
+        let result = recoverable_auth_error("rate limited".to_string());
+        assert!(!result.matched);
+        assert_eq!(result.model_id, -2);
+        assert_eq!(result.label, "rate limited");
+        assert_eq!(result.similarity, 0.0);
     }
 
     #[test]

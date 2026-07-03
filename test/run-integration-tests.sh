@@ -127,6 +127,27 @@ run_test_contains "Authenticate enrolled face (CLI)" \
 run_test "Authenticate enrolled face (PAM)" \
     "timeout --foreground $LIVE_TIMEOUT pamtester facelock-test testuser authenticate"
 
+# --- Plan 05: rate-limited daemon state must never escalate to a fresh oneshot ---
+
+# Force a rate-limited state by inserting failed attempts directly into the
+# shared SQLite window (default: 5 attempts / 60s). Requires enrolled models
+# (rate limiting is checked after the has-models pre-check).
+run_test "Rate limit: seed failed attempts" \
+    "sqlite3 /tmp/facelock-test.db \"INSERT INTO rate_limit (user, attempt_time) SELECT 'testuser', strftime('%s','now') FROM (VALUES (1),(2),(3),(4),(5),(6));\""
+
+run_test_contains "Rate limit: daemon encodes recoverable error in-band (model_id=-2)" \
+    "dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:testuser" \
+    "int32 -2"
+
+# With the in-band encoding the PAM module classifies the error itself
+# (rate limited -> PAM_AUTH_ERR) instead of retrying as a root oneshot.
+# A marker auth_bin proves no oneshot child is ever spawned.
+run_test "Rate limit: PAM fails without oneshot escalation" \
+    "printf '#!/bin/bash\ntouch /tmp/oneshot-invoked\nexit 2\n' > /usr/local/bin/oneshot-marker && chmod 755 /usr/local/bin/oneshot-marker && sed -i '/^\[daemon\]/a auth_bin = \"/usr/local/bin/oneshot-marker\"' /etc/facelock/config.toml && rm -f /tmp/oneshot-invoked; timeout 30 pamtester facelock-test testuser authenticate < /dev/null; rc=\$?; sed -i '/^auth_bin = /d' /etc/facelock/config.toml; test \$rc -ne 0 && test ! -f /tmp/oneshot-invoked"
+
+run_test "Rate limit: clear seeded attempts" \
+    "sqlite3 /tmp/facelock-test.db \"DELETE FROM rate_limit WHERE user = 'testuser';\""
+
 # Clean up
 run_test "Clear enrolled models" \
     "facelock clear --user testuser --yes"

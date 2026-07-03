@@ -145,16 +145,52 @@ Method authorization contract:
 ### Response types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`
 
+### Authenticate error encoding
+
+`Authenticate` returns `AuthResult (matched: b, model_id: i, label: s, similarity: d)`.
+Sentinel `model_id` values (only meaningful with `matched == false`):
+
+| model_id | Meaning |
+|----------|---------|
+| >= 0 | Matched model id (with `matched == true`) |
+| -1 | No match / no enrolled faces |
+| -2 | Recoverable daemon error; `label` carries the error message (rate limited, IR required, camera/storage failure) |
+| -3 | Suppressed: no enrolled models and `security.suppress_unknown = true` |
+
+Recoverable errors travel **in-band** (model_id `-2`), not as D-Bus errors, so
+clients can distinguish "the daemon decided auth cannot proceed" from "the
+daemon is unavailable". D-Bus errors remain for authorization failures,
+daemon-busy, and transport problems. In particular, a rate-limited state is a
+daemon decision and must never make the PAM client retry via a root oneshot.
+
+### Daemon peer verification (PAM client)
+
+Before trusting an `Authenticate` reply, the PAM module resolves the owner of
+`org.facelock.Daemon` (`GetNameOwner`, activating the service first if
+needed), requires the owner UID to be 0 (`GetConnectionUnixUser`), and pins
+the method call to the owner's unique bus name. A non-root owner is refused:
+the module falls through (oneshot fallback / password), never `PAM_SUCCESS`.
+
 ## PAM Semantics
 
 | Outcome | PAM Code |
 |---------|----------|
 | Face matched | `PAM_SUCCESS` (0) |
 | No match | `PAM_AUTH_ERR` (7) |
-| Daemon unavailable / error | `PAM_IGNORE` (25) |
-| Timeout | `PAM_AUTH_ERR` (7) |
+| Rate limited (daemon, model_id -2) | `PAM_AUTH_ERR` (7) — no oneshot fallback |
+| IR required / internal daemon error (model_id -2) | `PAM_IGNORE` (25) — no oneshot fallback |
+| Suppressed (model_id -3) | `PAM_AUTHINFO_UNAVAIL` (9) |
+| Daemon unavailable / untrusted (non-root) peer | oneshot fallback, else `PAM_IGNORE` (25) |
+| Config missing, unparseable, or untrusted (not root-owned / group- or world-writable, incl. parents) | `PAM_IGNORE` (25) |
+| Timeout (structured zbus timeout or overall deadline) | `PAM_AUTH_ERR` (7) |
 
-PAM module never blocks indefinitely. All operations have timeouts.
+PAM module never blocks indefinitely. All operations have timeouts, including
+D-Bus connection establishment (overall deadline on a worker thread).
+
+The oneshot fallback spawns `facelock auth` with a sanitized environment:
+`env_clear()` plus an allow-list of `SSH_CONNECTION`, `SSH_TTY`, and a pinned
+`PATH=/usr/bin:/bin`. No other variables (`LD_*`, `XDG_*`, `DBUS_*`, ...) are
+inherited. Stdin is `/dev/null`.
 
 ### Syslog Format
 

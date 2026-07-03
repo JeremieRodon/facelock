@@ -430,65 +430,185 @@ enum AuthResponse {
     Error { message: String },
 }
 
-/// Authenticate via D-Bus system bus to the facelock daemon.
-fn daemon_authenticate(config: &PamConfig, user: &str) -> Result<AuthResponse, String> {
-    // Timeout = recognition timeout + buffer for camera open/warmup/model load
-    let timeout_secs = config.recognition.timeout_secs as u64 + 5;
+/// Structured timeout classification for zbus errors.
+///
+/// Matches the concrete variants zbus uses for method-call timeouts
+/// (`InputOutput` with `ErrorKind::TimedOut` from `method_timeout`) and the
+/// D-Bus daemon's own reply-timeout errors, instead of fragile substring
+/// matching on the display string.
+fn is_timeout_zbus_error(err: &zbus::Error) -> bool {
+    match err {
+        zbus::Error::InputOutput(io_err) => io_err.kind() == std::io::ErrorKind::TimedOut,
+        zbus::Error::MethodError(name, _, _) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.NoReply"
+                | "org.freedesktop.DBus.Error.Timeout"
+                | "org.freedesktop.DBus.Error.TimedOut"
+        ),
+        zbus::Error::FDO(fdo_err) => is_timeout_fdo_error(fdo_err),
+        _ => false,
+    }
+}
 
+/// Timeout classification for `zbus::fdo::Error` (returned by the
+/// `org.freedesktop.DBus` proxy methods used for peer verification).
+fn is_timeout_fdo_error(err: &zbus::fdo::Error) -> bool {
+    matches!(
+        err,
+        zbus::fdo::Error::NoReply(_) | zbus::fdo::Error::Timeout(_) | zbus::fdo::Error::TimedOut(_)
+    )
+}
+
+fn classify_zbus_error(prefix: &str, err: &zbus::Error) -> String {
+    if is_timeout_zbus_error(err) {
+        format!("dbus_timeout: {err}")
+    } else {
+        format!("{prefix}: {err}")
+    }
+}
+
+fn classify_fdo_error(prefix: &str, err: &zbus::fdo::Error) -> String {
+    if is_timeout_fdo_error(err) {
+        format!("dbus_timeout: {err}")
+    } else {
+        format!("{prefix}: {err}")
+    }
+}
+
+/// Map a raw D-Bus `Authenticate` reply onto an [`AuthResponse`].
+///
+/// Sentinel `model_id` values (with `matched == false`):
+/// - `-2`: recoverable daemon error, `label` carries the error message
+///   (rate limited, IR required, camera/storage failure).
+/// - `-3`: suppressed (no enrolled models + `suppress_unknown`).
+fn parse_auth_reply(matched: bool, model_id: i32, label: String, similarity: f64) -> AuthResponse {
+    if matched {
+        return AuthResponse::Matched {
+            similarity: similarity as f32,
+        };
+    }
+    match model_id {
+        -2 => AuthResponse::Error { message: label },
+        -3 => AuthResponse::Suppressed,
+        _ => AuthResponse::NoMatch {
+            similarity: similarity as f32,
+        },
+    }
+}
+
+/// Verify that the current owner of `org.facelock.Daemon` is running as root
+/// (UID 0) and return its unique bus name.
+///
+/// Trust boundary: the D-Bus policy file is supposed to prevent unprivileged
+/// processes from owning the daemon name, but the PAM module must not have a
+/// single point of failure on that file. The caller pins the `Authenticate`
+/// call to the returned unique name, so the owner cannot change between the
+/// UID check and the method call.
+fn verify_daemon_peer(
+    connection: &zbus::blocking::Connection,
+) -> Result<zbus::names::OwnedUniqueName, String> {
+    let dbus_proxy = zbus::blocking::fdo::DBusProxy::new(connection)
+        .map_err(|e| classify_zbus_error("dbus_proxy_failed", &e))?;
+
+    let bus_name = zbus::names::BusName::try_from(DBUS_BUS_NAME)
+        .map_err(|e| format!("dbus_proxy_failed: invalid bus name: {e}"))?;
+
+    // Resolve the owner, triggering D-Bus activation first if the daemon is
+    // not running yet (GetNameOwner alone does not activate services).
+    let owner = match dbus_proxy.get_name_owner(bus_name.clone()) {
+        Ok(owner) => owner,
+        Err(_) => {
+            let well_known = zbus::names::WellKnownName::try_from(DBUS_BUS_NAME)
+                .map_err(|e| format!("dbus_proxy_failed: invalid bus name: {e}"))?;
+            dbus_proxy
+                .start_service_by_name(well_known, 0)
+                .map_err(|e| classify_fdo_error("dbus_connect_failed", &e))?;
+            dbus_proxy
+                .get_name_owner(bus_name)
+                .map_err(|e| classify_fdo_error("dbus_connect_failed", &e))?
+        }
+    };
+
+    let owner_uid = dbus_proxy
+        .get_connection_unix_user(zbus::names::BusName::from(owner.inner().clone()))
+        .map_err(|e| classify_fdo_error("dbus_call_failed", &e))?;
+
+    if owner_uid != 0 {
+        // Refuse to trust the reply of a non-root peer. The caller falls
+        // through (oneshot fallback / password), never PAM_SUCCESS.
+        return Err(format!(
+            "dbus_untrusted_peer: {DBUS_BUS_NAME} owned by uid {owner_uid} (require root)"
+        ));
+    }
+
+    Ok(owner)
+}
+
+/// Authenticate via D-Bus system bus to the facelock daemon.
+///
+/// Runs the blocking D-Bus work on a worker thread with an overall deadline,
+/// so that even connection establishment against a hung bus cannot stall the
+/// PAM stack (zbus `method_timeout` only bounds method calls, not connect).
+fn daemon_authenticate(config: &PamConfig, user: &str) -> Result<AuthResponse, String> {
+    // Method timeout = recognition timeout + buffer for camera open/warmup/model load
+    let method_timeout_secs = config.recognition.timeout_secs as u64 + 5;
+    // Overall deadline adds a further buffer for connection establishment,
+    // D-Bus activation, and peer verification round-trips.
+    let overall_timeout = std::time::Duration::from_secs(method_timeout_secs + 5);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let user_owned = user.to_string();
+    std::thread::Builder::new()
+        .name("pam-facelock-dbus".into())
+        .spawn(move || {
+            let _ = tx.send(daemon_authenticate_blocking(
+                method_timeout_secs,
+                &user_owned,
+            ));
+        })
+        .map_err(|e| format!("dbus_call_failed: worker thread spawn failed: {e}"))?;
+
+    match rx.recv_timeout(overall_timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // The worker is stuck (most likely in connection establishment).
+            // Abandon it; never block the PAM stack.
+            Err("dbus_timeout: connection or method call exceeded overall deadline".into())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("dbus_call_failed: worker thread terminated unexpectedly".into())
+        }
+    }
+}
+
+fn daemon_authenticate_blocking(
+    method_timeout_secs: u64,
+    user: &str,
+) -> Result<AuthResponse, String> {
     let connection = zbus::blocking::connection::Builder::system()
         .map_err(|e| format!("dbus_connect_failed: {e}"))?
-        .method_timeout(std::time::Duration::from_secs(timeout_secs))
+        .method_timeout(std::time::Duration::from_secs(method_timeout_secs))
         .build()
         .map_err(|e| format!("dbus_connect_failed: {e}"))?;
 
+    // Verify the daemon peer is root and pin the call to its unique name.
+    let daemon_peer = verify_daemon_peer(&connection)?;
+
     let proxy = zbus::blocking::Proxy::new(
         &connection,
-        DBUS_BUS_NAME,
+        zbus::names::BusName::from(daemon_peer.inner().clone()),
         DBUS_OBJECT_PATH,
         DBUS_INTERFACE_NAME,
     )
-    .map_err(|e| format!("dbus_proxy_failed: {e}"))?;
+    .map_err(|e| classify_zbus_error("dbus_proxy_failed", &e))?;
 
     // D-Bus method returns (matched: bool, model_id: i32, label: String, similarity: f64)
-    let reply: (bool, i32, String, f64) =
-        proxy
-            .call("Authenticate", &(user,))
-            .map_err(|e: zbus::Error| {
-                let msg = e.to_string();
-                // Check if this is a timeout or connection error for fallback
-                if msg.contains("timed out") || msg.contains("Timeout") {
-                    format!("dbus_timeout: {msg}")
-                } else {
-                    format!("dbus_call_failed: {msg}")
-                }
-            })?;
+    let reply: (bool, i32, String, f64) = proxy
+        .call("Authenticate", &(user,))
+        .map_err(|e: zbus::Error| classify_zbus_error("dbus_call_failed", &e))?;
 
     let (matched, model_id, label, similarity) = reply;
-
-    // Check for D-Bus error responses encoded in the return value
-    // model_id == -2 with matched == false signals a daemon error, label contains the error message
-    if !matched && model_id == -2 {
-        return Ok(AuthResponse::Error { message: label });
-    }
-
-    // model_id == -3 with matched == false signals suppress_unknown
-    // (no enrolled models, config says to let PAM stack fall through)
-    if !matched && model_id == -3 {
-        return Ok(AuthResponse::Suppressed);
-    }
-
-    if matched {
-        Ok(AuthResponse::Matched {
-            similarity: similarity as f32,
-        })
-    } else if similarity == 0.0 && model_id == -1 {
-        // No enrolled faces
-        Ok(AuthResponse::NoMatch { similarity: 0.0 })
-    } else {
-        Ok(AuthResponse::NoMatch {
-            similarity: similarity as f32,
-        })
-    }
+    Ok(parse_auth_reply(matched, model_id, label, similarity))
 }
 
 // ---------------------------------------------------------------------------
@@ -496,11 +616,53 @@ fn daemon_authenticate(config: &PamConfig, user: &str) -> Result<AuthResponse, S
 // ---------------------------------------------------------------------------
 
 fn load_config() -> Result<PamConfig, String> {
-    let config_path = DEFAULT_CONFIG_PATH;
-
-    let content = std::fs::read_to_string(config_path).map_err(|e| format!("read config: {e}"))?;
+    let content = read_trusted_config(DEFAULT_CONFIG_PATH)?;
 
     toml::from_str(&content).map_err(|e| format!("parse config: {e}"))
+}
+
+/// Read a config file only if it is trustworthy: the file and every parent
+/// directory must be root-owned and not group- or world-writable. Anything
+/// else is rejected and the module fails closed (falls through to password).
+///
+/// The file's own check uses `fstat` on the opened descriptor so the
+/// validated inode is exactly the one whose contents are read (no TOCTOU
+/// between a path-based stat and the read).
+fn read_trusted_config(path: &str) -> Result<String, String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("read config: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("failed to stat config {path}: {e}"))?;
+        validate_root_owned_nonwritable(
+            metadata.uid(),
+            metadata.permissions().mode(),
+            &format!("config {path}"),
+        )?;
+
+        let mut current = Path::new(path).parent();
+        while let Some(dir) = current {
+            let meta = std::fs::metadata(dir)
+                .map_err(|e| format!("failed to stat config parent {}: {e}", dir.display()))?;
+            validate_root_owned_nonwritable(
+                meta.uid(),
+                meta.permissions().mode(),
+                &format!("config parent dir {}", dir.display()),
+            )?;
+            current = dir.parent();
+        }
+    }
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("read config: {e}"))?;
+    Ok(content)
 }
 
 fn validate_auth_bin(path: &str) -> Result<PathBuf, String> {
@@ -562,6 +724,25 @@ fn validate_root_owned_nonwritable(uid: u32, mode: u32, label: &str) -> Result<(
 // One-shot authentication (daemonless)
 // ---------------------------------------------------------------------------
 
+/// Build the sanitized environment for the spawned oneshot child.
+///
+/// Allow-list only: `SSH_CONNECTION`/`SSH_TTY` are forwarded because the
+/// child re-runs its own SSH-abort check (`facelock auth`). `PATH` is pinned
+/// to trusted system directories. Everything else — `LD_*`, `XDG_*`,
+/// `DBUS_*`, etc. — is dropped; the notification path constructs its own
+/// session-bus address from the target UID and needs no inherited XDG vars.
+fn oneshot_child_env(
+    parent: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    const KEEP: &[&str] = &["SSH_CONNECTION", "SSH_TTY"];
+
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = parent
+        .filter(|(key, _)| KEEP.iter().any(|keep| key.as_os_str() == *keep))
+        .collect();
+    env.push(("PATH".into(), "/usr/bin:/bin".into()));
+    env
+}
+
 /// Run facelock auth as a subprocess for daemonless authentication.
 /// Exit codes: 0 = matched, 1 = no match, 2+ = error.
 fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_int {
@@ -588,6 +769,12 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
         .arg(user)
         .arg("--config")
         .arg(DEFAULT_CONFIG_PATH)
+        // Sanitize the child environment: the PAM caller may be fully root
+        // (no AT_SECURE), so inherited LD_PRELOAD/LD_* would be honored by
+        // the dynamic linker in the spawned root child. Start from an empty
+        // environment and re-add only the vetted allow-list.
+        .env_clear()
+        .envs(oneshot_child_env(std::env::vars_os()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -657,6 +844,21 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
 // ---------------------------------------------------------------------------
 // Core authentication logic
 // ---------------------------------------------------------------------------
+
+/// Map a recoverable daemon error message onto a PAM return code plus a
+/// syslog reason. Every branch degrades (PAM_AUTH_ERR / PAM_IGNORE); a
+/// daemon error can never map to PAM_SUCCESS.
+fn pam_code_for_daemon_error(message: &str) -> (libc::c_int, &'static str) {
+    if message.contains("rate_limit") || message.contains("rate limited") {
+        // Deliberate failure, not fall-through: the user has exhausted the
+        // face-auth budget; the password modules still run after us.
+        (PAM_AUTH_ERR, "rate_limited")
+    } else if message.contains("IR camera required") || message.contains("ir_required") {
+        (PAM_IGNORE, "ir_required")
+    } else {
+        (PAM_IGNORE, "error: internal")
+    }
+}
 
 fn identify(pamh: *mut libc::c_void) -> libc::c_int {
     // 0. Get PAM service name for logging
@@ -757,17 +959,13 @@ fn identify(pamh: *mut libc::c_void) -> libc::c_int {
             PAM_AUTHINFO_UNAVAIL
         }
         Ok(AuthResponse::Error { message }) => {
-            // Map specific daemon errors to appropriate PAM codes
-            if message.contains("rate_limit") || message.contains("rate limited") {
-                log_auth(&service, "rate_limited", &user, LOG_WARNING);
-                PAM_AUTH_ERR
-            } else if message.contains("IR camera required") || message.contains("ir_required") {
-                log_auth(&service, "ir_required", &user, LOG_WARNING);
-                PAM_IGNORE
-            } else {
-                log_auth(&service, "error: internal", &user, LOG_WARNING);
-                PAM_IGNORE
-            }
+            // The daemon answered with a recoverable error (model_id == -2).
+            // It is running and made a decision, so never fall back to a
+            // fresh root oneshot attempt (which would bypass daemon-side
+            // state such as rate limiting). Degrade to password instead.
+            let (code, reason) = pam_code_for_daemon_error(&message);
+            log_auth(&service, reason, &user, LOG_WARNING);
+            code
         }
         Err(e) => {
             // D-Bus connection/call failed -- fall back to oneshot mode
@@ -945,5 +1143,195 @@ db_path = "/tmp/test.db"
         let err = validate_root_owned_nonwritable(1000, 0o100755, "auth_bin /usr/bin/facelock")
             .unwrap_err();
         assert!(err.contains("owned by root"));
+    }
+
+    // --- Plan 05: oneshot child environment sanitization ---
+
+    fn env_pairs(pairs: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+            .collect()
+    }
+
+    #[test]
+    fn oneshot_child_env_drops_ld_preload_and_keeps_ssh_vars() {
+        let parent = env_pairs(&[
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("LD_LIBRARY_PATH", "/tmp"),
+            ("SSH_CONNECTION", "192.0.2.1 1111 192.0.2.2 22"),
+            ("SSH_TTY", "/dev/pts/3"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/bus"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("PATH", "/tmp/evil:/usr/bin"),
+        ]);
+        let child = oneshot_child_env(parent.into_iter());
+
+        let keys: Vec<&str> = child.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+        assert!(!keys.contains(&"LD_PRELOAD"));
+        assert!(!keys.contains(&"LD_LIBRARY_PATH"));
+        assert!(!keys.contains(&"DBUS_SESSION_BUS_ADDRESS"));
+        assert!(!keys.contains(&"XDG_RUNTIME_DIR"));
+        assert!(keys.contains(&"SSH_CONNECTION"));
+        assert!(keys.contains(&"SSH_TTY"));
+    }
+
+    #[test]
+    fn oneshot_child_env_pins_path() {
+        let parent = env_pairs(&[("PATH", "/tmp/evil:/usr/bin")]);
+        let child = oneshot_child_env(parent.into_iter());
+        let path = child
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .unwrap();
+        assert_eq!(path, "/usr/bin:/bin");
+    }
+
+    #[test]
+    fn oneshot_child_env_without_ssh_vars_is_path_only() {
+        let parent = env_pairs(&[("HOME", "/root"), ("TERM", "xterm")]);
+        let child = oneshot_child_env(parent.into_iter());
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].0, "PATH");
+    }
+
+    // --- Plan 05: config trust validation ---
+
+    #[test]
+    fn read_trusted_config_missing_file_is_an_error() {
+        let err = read_trusted_config("/definitely/missing/facelock-config.toml").unwrap_err();
+        assert!(err.contains("read config"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_trusted_config_rejects_untrusted_file() {
+        // Create a config in a tmp dir. When running unprivileged the file is
+        // not root-owned; when running as root the world-writable tmp parent
+        // fails the parent-directory check. Either way it must be rejected.
+        let dir = std::env::temp_dir().join(format!("pam-facelock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[daemon]\nmode = \"daemon\"\n").unwrap();
+
+        let result = read_trusted_config(path.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("owned by root") || err.contains("group- or world-writable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // --- Plan 05: daemon reply decoding (dead -2 contract made live) ---
+
+    #[test]
+    fn parse_auth_reply_decodes_recoverable_error() {
+        match parse_auth_reply(false, -2, "rate limited".into(), 0.0) {
+            AuthResponse::Error { message } => assert_eq!(message, "rate limited"),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_reply_decodes_suppressed() {
+        assert!(matches!(
+            parse_auth_reply(false, -3, String::new(), 0.0),
+            AuthResponse::Suppressed
+        ));
+    }
+
+    #[test]
+    fn parse_auth_reply_decodes_match() {
+        assert!(matches!(
+            parse_auth_reply(true, 4, "me".into(), 0.93),
+            AuthResponse::Matched { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_auth_reply_decodes_no_match() {
+        match parse_auth_reply(false, -1, String::new(), 0.4) {
+            AuthResponse::NoMatch { similarity } => assert!((similarity - 0.4).abs() < 1e-6),
+            _ => panic!("expected NoMatch"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_reply_error_sentinel_requires_unmatched() {
+        // A matched=true reply always wins over sentinel model ids: the
+        // daemon never sends this, but decoding must not invent an error.
+        assert!(matches!(
+            parse_auth_reply(true, -2, "x".into(), 0.9),
+            AuthResponse::Matched { .. }
+        ));
+    }
+
+    // --- Plan 05: daemon error → PAM code routing ---
+
+    #[test]
+    fn daemon_error_rate_limited_maps_to_auth_err() {
+        let (code, reason) = pam_code_for_daemon_error("rate limited");
+        assert_eq!(code, PAM_AUTH_ERR);
+        assert_eq!(reason, "rate_limited");
+    }
+
+    #[test]
+    fn daemon_error_ir_required_maps_to_ignore() {
+        let (code, reason) =
+            pam_code_for_daemon_error("IR camera required for authentication. ...");
+        assert_eq!(code, PAM_IGNORE);
+        assert_eq!(reason, "ir_required");
+    }
+
+    #[test]
+    fn daemon_error_never_maps_to_success() {
+        for message in [
+            "rate limited",
+            "IR camera required",
+            "camera error: device busy",
+            "storage error: disk io",
+            "",
+        ] {
+            let (code, _) = pam_code_for_daemon_error(message);
+            assert_ne!(code, PAM_SUCCESS, "fail-open for message: {message}");
+        }
+    }
+
+    // --- Plan 05: structured timeout classification ---
+
+    #[test]
+    fn timeout_classification_matches_io_timed_out() {
+        let err = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout waiting for reply",
+        )));
+        assert!(is_timeout_zbus_error(&err));
+    }
+
+    #[test]
+    fn timeout_classification_matches_fdo_variants() {
+        for fdo_err in [
+            zbus::fdo::Error::NoReply("no reply".into()),
+            zbus::fdo::Error::Timeout("timeout".into()),
+            zbus::fdo::Error::TimedOut("timed out".into()),
+        ] {
+            let err = zbus::Error::FDO(Box::new(fdo_err));
+            assert!(is_timeout_zbus_error(&err), "not classified: {err}");
+        }
+    }
+
+    #[test]
+    fn timeout_classification_rejects_other_errors() {
+        assert!(!is_timeout_zbus_error(&zbus::Error::Failure(
+            "something timed out-ish but is not a timeout variant".into()
+        )));
+        let io_err = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        )));
+        assert!(!is_timeout_zbus_error(&io_err));
     }
 }
