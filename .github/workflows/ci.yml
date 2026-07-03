@@ -65,6 +65,31 @@ jobs:
             target/release/libpam_facelock.so
           retention-days: 1
 
+  cargo-audit:
+    name: Supply-chain Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm \
+            git \
+            rust
+
+      - uses: actions/checkout@v6
+
+      - name: Cache cargo registry and cargo-audit build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Ignore policy (with justifications) lives in .cargo/audit.toml.
+      # Deny policy matches `just audit`: fail on any vulnerability (default),
+      # unmaintained, or unsound advisory that is not explicitly ignored.
+      - name: Run cargo audit
+        run: cargo audit --deny unmaintained --deny unsound
+
   tpm-tests:
     name: TPM Tests (swtpm)
     runs-on: ubuntu-latest

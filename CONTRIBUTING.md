@@ -47,6 +47,19 @@ The PAM module (`pam-facelock`) must stay lightweight: **libc, toml, serde, zbus
 
 Each crate has a defined dependency boundary. See `AGENTS.md` for the full table.
 
+### Supply-chain auditing
+
+```bash
+just audit  # cargo audit --deny unmaintained --deny unsound
+```
+
+`just audit` scans the full `Cargo.lock` for RustSec advisories and mirrors the
+CI `cargo-audit` job. It fails on any vulnerability, unmaintained, or unsound
+advisory that is not explicitly ignored. The ignore list, with a justification
+per entry, lives in `.cargo/audit.toml`; add a new entry (with a reason) only
+when an advisory is genuinely non-exploitable here and cannot yet be fixed by a
+dependency bump. Requires `cargo install cargo-audit --locked`.
+
 ## Testing
 
 ### Tier 1: Unit tests (no hardware)
@@ -88,7 +101,7 @@ Only after tiers 3--4 pass. Always keep a root shell open. Start with `sudo` onl
 ### All checks at once
 
 ```bash
-just check  # runs test + clippy + fmt
+just check  # runs test + clippy + fmt + audit
 ```
 
 ## Security considerations
