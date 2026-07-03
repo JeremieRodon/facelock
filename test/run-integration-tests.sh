@@ -158,6 +158,24 @@ run_test "AuthAttempted payload carries no similarity score" \
 run_test "Unprivileged user receives no AuthAttempted signal" \
     "! grep -q 'member=AuthAttempted' /tmp/sig-unpriv.log"
 
+# Policy: the default context explicitly denies owning the daemon name —
+# only root may own org.facelock.Daemon.
+check_own_denied() {
+    local out rc
+    set +e
+    out=$(runuser -u sigwatcher -- dbus-send --system --print-reply \
+        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.RequestName string:org.facelock.Daemon uint32:0 2>&1)
+    rc=$?
+    set -e
+    echo "$out"
+    [ "$rc" -ne 0 ] || { echo "RequestName unexpectedly succeeded"; return 1; }
+    echo "$out" | grep -qiE "not allowed to own|AccessDenied" || return 1
+    return 0
+}
+run_test "Unprivileged user cannot own org.facelock.Daemon" \
+    "check_own_denied"
+
 # (b) PreviewDetectFrame authz parity — a facelock-group non-root caller may
 # call it for itself, but the reply must not contain raw frame bytes
 # (dbus-send renders non-empty byte arrays as hex; a JPEG starts with ff d8).
@@ -215,10 +233,26 @@ check_concurrent_auth_busy() {
 run_test "Concurrent Authenticate rejected immediately with busy" \
     "check_concurrent_auth_busy"
 
-# The busy guard must not starve legitimate sequential auth
-run_test_contains "Sequential auth still succeeds after busy rejection" \
-    "timeout --foreground $LIVE_TIMEOUT facelock test --user testuser" \
-    "Matched model"
+# The busy guard must not starve legitimate sequential auth: once the
+# concurrent capture finished, a new Authenticate must run a full capture
+# (match or no-match depending on who is in front of the camera), and must
+# NOT be rejected with a busy error.
+check_sequential_auth_not_starved() {
+    local out rc
+    set +e
+    out=$(timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser 2>&1)
+    rc=$?
+    set -e
+    echo "$out"
+    if echo "$out" | grep -qi "busy"; then
+        echo "sequential auth was rejected as busy (starved by the guard)"
+        return 1
+    fi
+    echo "$out" | grep -qE "Matched model|No match" || return 1
+    return 0
+}
+run_test "Sequential auth not starved after busy rejection" \
+    "check_sequential_auth_not_starved"
 
 # Clean up
 run_test "Clear enrolled models" \
