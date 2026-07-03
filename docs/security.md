@@ -291,6 +291,30 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 systemd-analyze security facelock-daemon.service
 ```
 
+### 7. Polkit Agent Scoping (Implemented)
+
+The `facelock-polkit-agent` lets a face match satisfy polkit authorization
+requests. Two hardening rules keep this from becoming a universal root key:
+
+**Action allowlist.** Face auth is offered only for polkit `action_id`s in
+`polkit.face_eligible_actions`. The default is a single low-risk action
+(`org.freedesktop.login1.lock-sessions`). High-risk actions — pkexec
+(`org.freedesktop.policykit.exec`), PackageKit install/remove, udisks mount, and
+accounts-service user administration — are **excluded by default**, so a single
+face match cannot authorize arbitrary privileged operations. Users may extend the
+list deliberately (like widening a fingerprint reader's reach); an empty list
+disables face for all actions.
+
+When an action is not eligible, the agent **declines** (returns a D-Bus
+`Failed` error) so polkit falls through to the password dialog handled by another
+agent. This is a fall-through, never an outright denial — password auth always
+remains available.
+
+**Fail closed on unresolved user.** When responding to the polkit authority, the
+agent resolves the target username to a uid. If the name does not resolve, the
+agent refuses to respond. It never substitutes UID 0 — the previous
+`unwrap_or(0)` behavior would have authenticated an unresolvable name as root.
+
 ## Security Configuration Reference
 
 ```toml
@@ -314,6 +338,11 @@ denied_services = ["login", "sshd"]
 [security.rate_limit]
 max_attempts = 5             # Max auth attempts per user
 window_secs = 60             # Rate limit window
+
+[polkit]
+# Polkit actions eligible for face auth. Non-listed actions fall through to
+# the password dialog. High-risk actions excluded by default. Empty = face off.
+face_eligible_actions = ["org.freedesktop.login1.lock-sessions"]
 ```
 
 ## Summary: Security Implementation Priority

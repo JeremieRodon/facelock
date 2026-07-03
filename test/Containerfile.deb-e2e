@@ -32,6 +32,7 @@ WORKDIR /build
 
 # Copy host-built release binaries
 COPY target/release/facelock /build/target/release/facelock
+COPY target/release/facelock-polkit-agent /build/target/release/facelock-polkit-agent
 COPY target/release/libpam_facelock.so /build/target/release/libpam_facelock.so
 
 # Copy project files needed by build-deb.sh
@@ -43,8 +44,9 @@ COPY .github/workflows/scripts/build-deb.sh /build/.github/workflows/scripts/bui
 
 # Copy test validation script and PAM test config
 COPY test/pkg-validate.sh /pkg-validate.sh
+COPY test/polkit-agent-validate.sh /polkit-agent-validate.sh
 COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
-RUN chmod +x /pkg-validate.sh
+RUN chmod +x /pkg-validate.sh /polkit-agent-validate.sh
 
 # Download portable CPU-only ONNX Runtime (same as CI bundles in release packages).
 # Detect version from host binary's linked ORT, fall back to 1.20.1.

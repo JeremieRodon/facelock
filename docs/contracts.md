@@ -86,6 +86,14 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | `[encryption]` | `method` (none/keyfile/tpm), `key_path`, `sealed_key_path` |
 | `[audit]` | `enabled`, `path`, `rotate_size_mb` |
 | `[tpm]` | `pcr_binding`, `pcr_indices`, `tcti` |
+| `[polkit]` | `face_eligible_actions` |
+
+`[polkit].face_eligible_actions` is the allowlist of polkit `action_id`s for which
+the face authentication agent may offer face auth. Default:
+`["org.freedesktop.login1.lock-sessions"]`. Any action not in the list is declined
+by the agent so polkit falls through to the password dialog (never denied). An empty
+list disables face for all actions. High-risk actions (pkexec, PackageKit,
+udisks mount, accounts-service) are excluded by default.
 
 ### Camera Auto-Detection
 
@@ -161,6 +169,21 @@ PAM module never blocks indefinitely. All operations have timeouts.
 ```
 pam_facelock(<service>): <result> for user <username>
 ```
+
+## Polkit Agent Semantics
+
+The `facelock-polkit-agent` offers face authentication for polkit actions, but
+scoped to an allowlist — face is **not** a universal key for every privileged action.
+
+| Outcome | Agent behavior |
+|---------|----------------|
+| `action_id` not in `polkit.face_eligible_actions` | Declines (returns `org.freedesktop.DBus.Error.Failed`) → polkit falls through to the password dialog |
+| Allowlisted action, face matches | Responds success to polkit authority |
+| Allowlisted action, no match / daemon error | Declines → password fall-through |
+| Username cannot be resolved to a uid | Refuses to respond; **never** sends UID 0 for an unresolved name |
+
+A decline is a **fall-through**, not a denial: another polkit agent (password) still
+handles the request. The agent never denies outright and never fails open to root.
 
 ## Anti-Spoofing
 
