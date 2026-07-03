@@ -142,6 +142,27 @@ Method authorization contract:
 - `ReleaseCamera`: root or the Unix user that owns the active preview camera session.
 - `ListDevices`, `Ping`: resolve caller UID before replying and rely on the system bus policy for admission control.
 
+Raw camera frames are root-only: `PreviewDetectFrame` returns an **empty**
+`jpeg_data` payload to non-root callers — they receive detection and
+recognition metadata (bounding boxes, confidence, similarity, recognized)
+only. Only root receives the frame bytes.
+
+Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and
+`PreviewDetectFrame` are serialized by an in-flight capture guard. While one
+capture is in progress, a concurrent call to any of these methods fails
+**immediately** with an `org.freedesktop.DBus.Error.Failed` error whose
+message contains `daemon busy` (no queuing on the internal handler lock).
+Clients (PAM included) must treat this like any other daemon error — degrade
+to the next auth mechanism (password), never a lockout.
+
+### Signals
+- `AuthAttempted(user: s, matched: b)` — emitted after each authentication
+  attempt. The payload intentionally carries **no similarity score** (the raw
+  biometric score is an information leak / spoof-tuning oracle). The system
+  bus policy (`dbus/org.facelock.Daemon.conf`) denies signal reception from
+  the daemon by default; only root and members of the `facelock` group may
+  receive it.
+
 ### Response types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`
 

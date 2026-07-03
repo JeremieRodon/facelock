@@ -127,6 +127,13 @@ D-Bus system bus (`org.facelock.Daemon`). Only used in daemon mode. The daemon e
 ### Methods
 `Authenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
 
+Raw camera frames are root-only: `PreviewDetectFrame` returns an **empty** `jpeg_data` payload to non-root callers — they receive detection and recognition metadata only.
+
+Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and `PreviewDetectFrame` fail immediately with a `daemon busy` error while another capture is in flight. Clients treat this like any other daemon error and degrade to password auth.
+
+### Signals
+`AuthAttempted(user: s, matched: b)` — emitted after each authentication attempt. Carries no similarity score. Bus policy restricts reception to root and the `facelock` group.
+
 ### Return Types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`
 

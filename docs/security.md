@@ -200,6 +200,30 @@ The daemon must also verify the caller UID via `GetConnectionUnixUser` on every 
 - `ReleaseCamera`: root or the Unix user that owns the active preview camera session
 - `ListDevices`: root or a caller in the `facelock` group
 
+The policy also self-contains two explicit defaults rather than relying on system-wide bus defaults:
+- `<deny own="org.facelock.Daemon"/>` in the default context (name-squatting protection; only root may own the name).
+- `<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>` in the default context, with explicit allows for root and the `facelock` group (see below).
+
+#### A2. Auth-Attempt Signal Hygiene (Implemented)
+
+**Attack**: Any local user adds a match rule (or runs `dbus-monitor`) and passively observes `AuthAttempted` broadcast signals to learn who authenticates when — and, if the payload carried the raw similarity score, uses it as a spoof-tuning oracle (iterate on a photo/mask until the score climbs).
+
+**Mitigations**:
+- The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to the authorized caller.
+- The bus policy denies delivery of the daemon's signals in the default context; only root and `facelock`-group members may receive them.
+
+#### A3. Raw Frame Access Parity (Implemented)
+
+**Attack**: `PreviewFrame` is root-only, but a `facelock`-group member pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead.
+
+**Mitigation**: `PreviewDetectFrame` strips the `jpeg_data` frame bytes for non-root callers and returns detection/recognition metadata only (bounding boxes, confidence, similarity, recognized). Raw frames remain root-only across both preview variants.
+
+#### A4. Capture Contention Guard (Implemented)
+
+**Attack**: Local DoS — an authorized caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request.
+
+**Mitigation**: A cheap in-flight capture guard is checked *before* the expensive handler lock. If a capture is already in flight, a concurrent `Authenticate`/`Enroll`/`PreviewFrame`/`PreviewDetectFrame` call is rejected **immediately** with a `daemon busy` error instead of queueing. PAM treats this like any daemon error (`PAM_IGNORE`) and falls through to password — degraded, never locked out. Per-user rate limiting is unchanged and orthogonal.
+
 #### B. D-Bus Message Size Limits (Enforced by Bus)
 
 The D-Bus bus daemon enforces message size limits (typically 128MB by default, configurable in the bus configuration). This prevents oversized messages from consuming daemon memory without requiring application-level size checks.

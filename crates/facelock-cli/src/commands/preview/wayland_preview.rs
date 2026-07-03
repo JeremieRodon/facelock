@@ -218,6 +218,13 @@ fn render_frame(
 ) {
     let stride = width * 4;
 
+    if jpeg_data.is_empty() {
+        // The daemon strips raw frame bytes for non-root callers and returns
+        // detection metadata only. Show the detection summary without imagery.
+        render_metadata_only(canvas, width, height, fps, faces);
+        return;
+    }
+
     match decode_jpeg(jpeg_data) {
         Ok((rgb, img_w, img_h)) => {
             let (disp_w, disp_h) = fit_dimensions(img_w, img_h, width, height);
@@ -284,6 +291,34 @@ fn render_frame(
             render_error(canvas, width, height, "JPEG decode error");
         }
     }
+}
+
+/// Render detection metadata without camera imagery (non-root callers).
+fn render_metadata_only(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    fps: f32,
+    faces: &[PreviewFace],
+) {
+    let stride = width * 4;
+
+    for chunk in canvas.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&[0, 0, 0, 0xFF]);
+    }
+
+    super::font::draw_text(
+        canvas,
+        stride,
+        8,
+        height / 2,
+        "camera frame hidden (run as root to view)",
+        render::COLOR_WHITE,
+    );
+
+    let recognized = faces.iter().filter(|f| f.recognized).count() as u32;
+    let unrecognized = faces.len() as u32 - recognized;
+    render::draw_info_bar(canvas, stride, width, height, fps, recognized, unrecognized);
 }
 
 /// Render an error message on a dark red background.
