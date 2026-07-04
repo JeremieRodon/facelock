@@ -461,9 +461,9 @@ fn still_then_moving_frames_recover_and_authenticate() {
         still,
         still,
         still,
-        unit_at_angle(0.15), // pair drift cos(0.15) ~= 0.9888 <= 0.995
-        unit_at_angle(0.30),
-        unit_at_angle(0.45),
+        unit_at_angle(0.20), // pair drift cos(0.20) ~= 0.9801 <= 0.985
+        unit_at_angle(0.40),
+        unit_at_angle(0.60),
     ];
     let mut camera = MockCamera::bright(64, 64, 16);
     let mut engine = MockFaceEngine::cycling(frames);
