@@ -129,10 +129,11 @@ run_test_contains "facelock list (oneshot)" \
     "facelock list --user testuser" \
     "test-face"
 
-# Test auth via CLI (direct)
+# Test auth via CLI (direct). The success line is
+# "Matched (similarity: X.XX) in Y.YYs" — match the stable prefix.
 run_test_contains "facelock test (oneshot)" \
     "timeout --foreground $LIVE_TIMEOUT facelock test --user testuser" \
-    "Matched in"
+    "Matched (similarity:"
 
 # --- Device coupling (Plan 02, oneshot/direct path) ---
 # The template enrolled above records the live camera's fingerprint in
