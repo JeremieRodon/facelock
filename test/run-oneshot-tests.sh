@@ -100,9 +100,11 @@ if echo "$DEVICES_OUT" | grep -qi "BRIO"; then
 
     # Auto-detection must select the IR (GREY) node, not the RGB sibling.
     # `facelock auth --user nobody` logs the auto-detected device before it
-    # exits (2) on the unknown user — no live face needed.
+    # exits (2) on the unknown user — no live face needed. RUST_LOG is set
+    # explicitly: the auth subcommand's default filter has never emitted logs
+    # (it names the package, facelock_cli, not the bin crate, facelock).
     run_test "auto-detect selects the IR (GREY) node" \
-        "facelock auth --user nobody --config /etc/facelock/config.toml 2>&1 | grep 'auto-detected camera' | grep -q -- \"$IR_NODE\""
+        "RUST_LOG=info facelock auth --user nobody --config /etc/facelock/config.toml 2>&1 | grep 'auto-detected camera' | grep -q -- \"$IR_NODE\""
 
     # The negotiated capture format on the auto-detected node must be GREY.
     # A timed-out enroll still opens the camera and logs the negotiated format;
