@@ -43,13 +43,26 @@ RestrictSUIDSGID=yes
 # /dev/video* and /dev/tpmrm0.
 
 # Phase 3: Capabilities, seccomp, and network lockdown
-# The daemon needs no Linux capabilities: /dev/video* and /dev/tpmrm0 are
-# root-owned and opened via standard file permissions, and the daemon also
-# drops all capabilities in-process after initialization. If real-hardware
-# testing ever shows the runuser/su notification privilege-drop needs caps,
-# add back exactly: CapabilityBoundingSet=CAP_SETUID CAP_SETGID
-CapabilityBoundingSet=
-AmbientCapabilities=
+# The daemon needs exactly two Linux capabilities: CAP_SETUID and CAP_SETGID.
+# /dev/video* and /dev/tpmrm0 are root-owned and opened via standard file
+# permissions, so device access needs no caps — but the desktop-notification
+# path execs `runuser -u <user>` to drop into the user's session bus, and
+# runuser calls setgroups()/setuid(), which require CAP_SETGID + CAP_SETUID.
+# These are declared as Ambient (not just in the bounding set) so the caps
+# survive the exec into the non-setuid `runuser` under NoNewPrivileges=yes.
+# The daemon further narrows its in-process capability set to exactly these
+# two after initialization (see daemon.rs::drop_capabilities); everything else
+# stays denied.
+#
+# NOTE (empirically required): an earlier revision set both of these empty on
+# the theory that "the daemon needs no capabilities." That was wrong — it broke
+# notifications on real hardware with `runuser: cannot set groups: Operation not
+# permitted`. Connecting to the user session bus directly as root (no setuid)
+# is NOT a viable alternative: dbus-broker rejects UID 0 on a user session bus
+# ("Broken pipe"), so the setuid-via-runuser path — and thus these two caps —
+# is required.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_SETUID CAP_SETGID
 # Only local sockets: D-Bus (system bus + per-user session bus for
 # notifications) is AF_UNIX. AF_NETLINK is retained conservatively: no
 # workspace code opens a netlink socket directly (device enumeration uses

@@ -811,11 +811,31 @@ pub fn run(config_path: Option<String>) -> anyhow::Result<()> {
     rt.block_on(run_dbus_server(handler, idle_timeout_secs, config_mtime))
 }
 
-/// Drop all Linux capabilities and set PR_SET_NO_NEW_PRIVS.
+/// Bitmask (low 32-bit word, caps 0-31) of the capabilities the daemon keeps
+/// after startup: CAP_SETUID (bit 7) and CAP_SETGID (bit 6).
+///
+/// These two are required for the desktop-notification privilege-drop: the
+/// daemon runs as root and execs `runuser`/`su` to `setgroups()` + `setuid()`
+/// into the user's session bus (see `notifications.rs::send_as_user`). Under
+/// `NoNewPrivileges` that exec cannot regain privilege, so the caps must be
+/// retained — and held in the inheritable set so systemd `AmbientCapabilities`
+/// survives the exec into the non-setuid `runuser`. Every other capability is
+/// dropped. Factored into a pure `const fn` so the mask can be unit-tested
+/// without calling `capset` (which needs privilege and may fail in CI).
+const fn retained_capability_mask() -> u32 {
+    // CAP_SETGID = 6, CAP_SETUID = 7.
+    (1 << 7) | (1 << 6)
+}
+
+/// Drop all Linux capabilities except CAP_SETUID + CAP_SETGID, and set
+/// PR_SET_NO_NEW_PRIVS.
 ///
 /// After initialization the daemon has already opened the camera fd, loaded
-/// models, connected to D-Bus, and opened the database. It no longer needs
-/// any elevated capabilities, so we clear them all.
+/// models, connected to D-Bus, and opened the database. It no longer needs any
+/// elevated capabilities EXCEPT the two required to drop privilege for desktop
+/// notifications (`runuser` → `setgroups`/`setuid`); those are retained via
+/// [`retained_capability_mask`] in the effective, permitted, AND inheritable
+/// sets, and everything else is cleared.
 ///
 /// Returns `Ok(())` on success. Errors are non-fatal — the caller should
 /// warn and continue.
@@ -848,17 +868,24 @@ fn drop_capabilities() -> std::result::Result<(), String> {
             ));
         }
 
-        // Clear all capability sets (effective, permitted, inheritable).
-        // V3 uses two CapData structs (for caps 0-31 and 32-63).
+        // Retain exactly CAP_SETUID + CAP_SETGID (needed for the runuser/su
+        // notification privilege-drop); clear every other capability. The
+        // retained bits go in effective, permitted, AND inheritable — the
+        // inheritable set is what lets systemd AmbientCapabilities keep these
+        // caps across the exec into the non-setuid `runuser` under
+        // NoNewPrivileges. V3 uses two CapData structs (caps 0-31 and 32-63);
+        // the retained caps (6, 7) live in the low word, so the high word
+        // stays fully zeroed.
+        let keep = retained_capability_mask();
         let mut header = CapHeader {
             version: LINUX_CAP_V3,
             pid: 0,
         };
         let mut data = [
             CapData {
-                effective: 0,
-                permitted: 0,
-                inheritable: 0,
+                effective: keep,
+                permitted: keep,
+                inheritable: keep,
             },
             CapData {
                 effective: 0,
@@ -905,7 +932,9 @@ async fn run_dbus_server(
     // Drop capabilities now that initialization is complete — camera fd is
     // open, models are loaded, D-Bus is connected, database is open.
     match drop_capabilities() {
-        Ok(()) => info!("dropped all capabilities and set no-new-privs"),
+        Ok(()) => info!(
+            "retained CAP_SETUID+CAP_SETGID for notification privilege-drop; dropped all others and set no-new-privs"
+        ),
         Err(e) => warn!("failed to drop capabilities (continuing): {e}"),
     }
 
@@ -1106,5 +1135,42 @@ mod tests {
             require_camera_owner_or_root(&caller(1001, Some("bob")), Some(1000), "ReleaseCamera")
                 .unwrap_err();
         assert!(matches!(err, fdo::Error::AccessDenied(_)));
+    }
+
+    #[test]
+    fn retained_capability_mask_is_exactly_setuid_and_setgid() {
+        // Cap bit numbers per <linux/capability.h>.
+        const CAP_SETGID: u32 = 6;
+        const CAP_SETUID: u32 = 7;
+        const CAP_DAC_OVERRIDE: u32 = 1;
+        const CAP_NET_RAW: u32 = 13;
+        const CAP_SYS_ADMIN: u32 = 21;
+
+        let mask = retained_capability_mask();
+
+        // Exactly the two caps required for the runuser/su notification
+        // privilege-drop are retained.
+        assert_eq!(mask, (1 << CAP_SETUID) | (1 << CAP_SETGID));
+        assert_eq!(mask, 0b1100_0000);
+
+        // The two we want are present.
+        assert_ne!(mask & (1 << CAP_SETUID), 0, "CAP_SETUID must be retained");
+        assert_ne!(mask & (1 << CAP_SETGID), 0, "CAP_SETGID must be retained");
+
+        // Dangerous caps are NOT retained.
+        assert_eq!(
+            mask & (1 << CAP_SYS_ADMIN),
+            0,
+            "CAP_SYS_ADMIN must be dropped"
+        );
+        assert_eq!(mask & (1 << CAP_NET_RAW), 0, "CAP_NET_RAW must be dropped");
+        assert_eq!(
+            mask & (1 << CAP_DAC_OVERRIDE),
+            0,
+            "CAP_DAC_OVERRIDE must be dropped"
+        );
+
+        // Exactly two bits set, and none in the high word (caps 32-63).
+        assert_eq!(mask.count_ones(), 2);
     }
 }

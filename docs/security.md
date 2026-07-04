@@ -286,18 +286,29 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 
 **Phase 3 (shipped — capabilities, seccomp, network):**
 
-- `CapabilityBoundingSet=` / `AmbientCapabilities=` (both **empty**) — the daemon needs no
-  Linux capabilities: `/dev/video*` and `/dev/tpmrm0` are root-owned and opened via standard
-  file permissions, and the daemon additionally drops all capabilities in-process after
-  initialization (`drop_capabilities()` in `facelock-cli`), independent of this unit's
-  `CapabilityBoundingSet=`. Capabilities were already dropped in-process, and
-  `NoNewPrivileges=yes` was already set, before this hardening pass — an empty bounding set is
-  expected to layer on top without changing the `runuser`/`su` notification privilege-drop path.
-  That expectation is **not empirically verified**: no test (old or new) asserts that a
-  notification actually reaches the user's session under this unit. Confirm with a real
-  `notify-send` on real hardware before relying on this. If that check ever shows the
-  `runuser`/`su` path needs capabilities, the documented relaxation is
-  `CapabilityBoundingSet=CAP_SETUID CAP_SETGID`.
+- `CapabilityBoundingSet=CAP_SETUID CAP_SETGID` / `AmbientCapabilities=CAP_SETUID CAP_SETGID` —
+  the daemon retains **exactly** these two capabilities and no others. Device access needs no
+  caps (`/dev/video*` and `/dev/tpmrm0` are root-owned and opened via standard file
+  permissions), but the desktop-notification path execs `runuser -u <user> -- notify-send` to
+  drop into the user's session bus, and `runuser` calls `setgroups()`/`setuid()`, which require
+  `CAP_SETGID` + `CAP_SETUID`. They are declared **Ambient** (not merely in the bounding set) so
+  the caps survive the exec into the non-setuid `runuser` under `NoNewPrivileges=yes`. The daemon
+  also narrows its in-process capability set to exactly these two after initialization
+  (`drop_capabilities()` in `facelock-cli`, holding them in effective/permitted/inheritable);
+  everything else is dropped.
+  - **This was empirically required.** An earlier revision set both directives **empty** on the
+    theory that the daemon needs no capabilities. That was wrong: on real hardware it broke
+    notifications with `runuser: cannot set groups: Operation not permitted`.
+  - **Direct-D-Bus-as-root is NOT a viable alternative.** Having root connect straight to the
+    user's session bus (skipping setuid entirely) does not work under `dbus-broker`, which rejects
+    UID 0 on a user session bus — `sudo DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+    notify-send test` fails with `Error sending data: Broken pipe`. The setuid-via-`runuser`
+    path — and therefore these two capabilities — is required for notification delivery.
+  - Notifications remain best-effort/fire-and-forget: they never block or fail the auth path, so
+    even if delivery fails the biometric result and PAM fall-through are unaffected.
+  - **End-to-end delivery is validated only on the maintainer's real hardware under systemd.**
+    The unit tests assert the retained capability mask and `systemctl show` asserts the directive
+    set; neither proves a notification actually pops.
 - `RestrictAddressFamilies=AF_UNIX AF_NETLINK` + `IPAddressDeny=any` — the daemon only talks
   local sockets (system D-Bus, per-user session bus for notifications, kernel netlink). All
   inference is local; a compromised daemon cannot open TCP/IP sockets or exfiltrate over the
@@ -323,8 +334,11 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 - `User=` — the daemon must open the camera/TPM as root; non-root operation has not been
   validated on real hardware.
 
-**Exposure score:** `systemd-analyze security --offline=true` reports **2.2 (OK)** for the
-Phase 1–3 unit, down from 7.1 (MEDIUM) with Phase 1–2 only. Verify with:
+**Exposure score:** `systemd-analyze security --offline=true` reports **2.6 (OK)** for the
+Phase 1–3 unit, down from 7.1 (MEDIUM) with Phase 1–2 only. (The score rose from 2.2 to 2.6
+when the empty capability sets were corrected to `CAP_SETUID CAP_SETGID` — the two caps the
+notification privilege-drop genuinely needs; the small increase is the honest cost of a working
+notification path.) Verify with:
 ```bash
 systemd-analyze security facelock-daemon.service
 ```
