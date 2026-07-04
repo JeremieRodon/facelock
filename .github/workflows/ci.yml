@@ -69,6 +69,12 @@ jobs:
     name: Supply-chain Audit (cargo-audit)
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    # Override the workflow-level -Dwarnings: this job compiles cargo-audit's
+    # own third-party dependency tree, which we don't control. A future
+    # warning upstream shouldn't fail this job for reasons unrelated to the
+    # audit itself. The real build/test/clippy jobs above keep -Dwarnings.
+    env:
+      RUSTFLAGS: ""
     steps:
       - name: Install system dependencies
         run: |
