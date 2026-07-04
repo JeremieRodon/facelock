@@ -85,26 +85,52 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
         ipc_client::require_root("sudo facelock test")?;
         let start = Instant::now();
         match crate::direct::authenticate(&config, &user) {
-            Ok(true) => {
+            Ok(result) if result.matched => {
                 let elapsed = start.elapsed();
-                println!("Matched in {:.2}s", elapsed.as_secs_f64());
+                println!(
+                    "Matched (similarity: {:.2}) in {:.2}s",
+                    result.similarity,
+                    elapsed.as_secs_f64()
+                );
                 notify_if_enabled(
                     notif_config,
                     &NotifyEvent::Success {
-                        label: None,
-                        similarity: 0.0,
+                        label: result.label.clone(),
+                        similarity: result.similarity,
                     },
                 );
             }
-            Ok(false) => {
+            Ok(result) => {
                 let elapsed = start.elapsed();
-                println!("No match after {:.1}s", elapsed.as_secs_f64());
-                notify_if_enabled(
-                    notif_config,
-                    &NotifyEvent::Failure {
-                        reason: "no match".to_string(),
-                    },
-                );
+                if result.failure_reason
+                    == Some(facelock_core::types::AuthFailureReason::VarianceNotSatisfied)
+                {
+                    println!(
+                        "Face matched (best: {:.2}) but the liveness variance check was not \
+                         satisfied after {:.1}s — try moving slightly, or tune \
+                         security.frame_variance_max_similarity",
+                        result.similarity,
+                        elapsed.as_secs_f64()
+                    );
+                    notify_if_enabled(
+                        notif_config,
+                        &NotifyEvent::Failure {
+                            reason: "face matched but liveness variance not satisfied".to_string(),
+                        },
+                    );
+                } else {
+                    println!(
+                        "No match (best: {:.2}) after {:.1}s",
+                        result.similarity,
+                        elapsed.as_secs_f64()
+                    );
+                    notify_if_enabled(
+                        notif_config,
+                        &NotifyEvent::Failure {
+                            reason: format!("no match (best similarity: {:.2})", result.similarity),
+                        },
+                    );
+                }
             }
             Err(e) => {
                 notify_if_enabled(
@@ -140,6 +166,25 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
                     &NotifyEvent::Success {
                         label: result.label.clone(),
                         similarity: result.similarity,
+                    },
+                );
+            } else if config.security.require_frame_variance
+                && result.similarity >= config.recognition.threshold
+            {
+                // The D-Bus AuthResult contract carries no failure reason, but
+                // matched=false with similarity above the recognition threshold
+                // means a liveness gate (frame variance) blocked the attempt.
+                println!(
+                    "Face matched (best: {:.2}) but the liveness variance check was not \
+                     satisfied after {:.1}s — try moving slightly, or tune \
+                     security.frame_variance_max_similarity",
+                    result.similarity,
+                    elapsed.as_secs_f64()
+                );
+                notify_if_enabled(
+                    notif_config,
+                    &NotifyEvent::Failure {
+                        reason: "face matched but liveness variance not satisfied".to_string(),
                     },
                 );
             } else {

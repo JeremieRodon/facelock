@@ -173,12 +173,16 @@
 # Default: true
 # require_frame_variance = true
 
-# Maximum cosine similarity allowed between consecutive matched frames.
-# Consecutive frames must drift by at least (1 - this) to pass, so a lower value
-# is stricter. Passive anti-photo only — it does NOT stop a video replay.
-# If genuine faces are being rejected, raise this toward 0.99.
-# Default: 0.97
-# frame_variance_max_similarity = 0.97
+# Maximum cosine similarity allowed between consecutive matched frames,
+# evaluated over a sliding window of the most recent min_auth_frames matches.
+# Lower is stricter. Passive anti-photo only — it does NOT stop a video replay.
+# Field-measured: truly static input (photo, paused replay) sits at >= ~0.999;
+# a frozen, non-blinking live human sits at 0.98–0.995. The default sits at the
+# top of the frozen-human band so a still user at a login prompt always passes
+# while perfectly static input never does. Lowering below 0.995 risks locking
+# out users who hold naturally still.
+# Default: 0.995
+# frame_variance_max_similarity = 0.995
 
 # Minimum per-face standard deviation (measured on the RAW grayscale frame) for
 # the IR texture check. Flat photos/screens score < 5 in IR; real skin > 15.
@@ -204,7 +208,9 @@
 # Default: false
 # suppress_unknown = false
 
-# Minimum number of matching frames required before accepting.
+# Minimum number of matching frames required before accepting. Also the size
+# of the sliding window the frame-variance check evaluates: the most recent
+# min_auth_frames matched frames must all drift pairwise.
 # Only applies when require_frame_variance is true.
 # Default: 3
 # min_auth_frames = 3
