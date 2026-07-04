@@ -252,7 +252,19 @@ run_test "facelock auth authenticates (oneshot)" \
 # CAMERA-REQUIRED: only meaningful on a host with /dev/video*; skipped headless.
 QUIRKS_SYS="/usr/share/facelock/quirks.d"
 QUIRKS_BAK="/tmp/facelock-quirks.bak"
+# Restore the system quirks DB. Idempotent: a no-op once the DB is back in place,
+# so it is safe to call both inline (happy path) and from the EXIT trap.
+restore_quirks() {
+    if [ -d "$QUIRKS_BAK" ]; then
+        rm -rf "$QUIRKS_SYS"
+        mv "$QUIRKS_BAK" "$QUIRKS_SYS"
+    fi
+}
 rm -rf "$QUIRKS_BAK"
+# Guarantee restoration on ANY exit: under `set -euo pipefail` a failing test below
+# aborts the script before the inline restore runs, which would leave the quirks DB
+# moved aside and corrupt shared state for later tests in the same CI job.
+trap restore_quirks EXIT
 [ -d "$QUIRKS_SYS" ] && mv "$QUIRKS_SYS" "$QUIRKS_BAK"
 cp /etc/facelock/config.toml /tmp/facelock-requireir.toml
 if grep -q '^require_ir' /tmp/facelock-requireir.toml; then
@@ -263,8 +275,10 @@ fi
 run_test "facelock auth refuses non-IR camera when require_ir=true (anti-spoof, H1)" \
     "facelock auth --user testuser --config /tmp/facelock-requireir.toml" \
     2
-# Restore the system quirks DB.
-[ -d "$QUIRKS_BAK" ] && rm -rf "$QUIRKS_SYS" && mv "$QUIRKS_BAK" "$QUIRKS_SYS"
+# Restore the system quirks DB inline so the remaining tests see it, then drop the
+# trap now that shared state is consistent again.
+restore_quirks
+trap - EXIT
 
 # PAM authentication (the real deal — no daemon)
 run_test "pamtester authenticates (oneshot, no daemon)" \
