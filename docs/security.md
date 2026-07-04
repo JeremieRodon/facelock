@@ -306,9 +306,16 @@ list deliberately (like widening a fingerprint reader's reach); an empty list
 disables face for all actions.
 
 When an action is not eligible, the agent **declines** (returns a D-Bus
-`Failed` error) so polkit falls through to the password dialog handled by another
-agent. This is a fall-through, never an outright denial — password auth always
-remains available.
+`Failed` error).
+
+> **NOTE (under review):** polkit registers a single authentication agent per
+> session and does not chain agents. When this agent declines a non-allowlisted
+> action it returns an error, which — depending on the desktop's agent
+> registration — may present as an authorization denial rather than a
+> fallthrough to a password dialog. The intended UX (non-eligible actions
+> handled by the desktop's normal password agent) is unverified pending
+> live-desktop testing and may require a design change. Behavior here is
+> fail-closed: a non-eligible action is never face-authorized.
 
 **Fail closed on unresolved user.** When responding to the polkit authority, the
 agent resolves the target username to a uid. If the name does not resolve, the
@@ -340,8 +347,10 @@ max_attempts = 5             # Max auth attempts per user
 window_secs = 60             # Rate limit window
 
 [polkit]
-# Polkit actions eligible for face auth. Non-listed actions fall through to
-# the password dialog. High-risk actions excluded by default. Empty = face off.
+# Polkit actions eligible for face auth. Non-listed actions are declined by
+# the agent (see "Polkit Agent Scoping" above — whether this presents as a
+# password fallthrough or an authorization denial is unverified pending
+# live-desktop testing). High-risk actions excluded by default. Empty = face off.
 face_eligible_actions = ["org.freedesktop.login1.lock-sessions"]
 ```
 

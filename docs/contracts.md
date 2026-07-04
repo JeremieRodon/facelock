@@ -91,9 +91,17 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 `[polkit].face_eligible_actions` is the allowlist of polkit `action_id`s for which
 the face authentication agent may offer face auth. Default:
 `["org.freedesktop.login1.lock-sessions"]`. Any action not in the list is declined
-by the agent so polkit falls through to the password dialog (never denied). An empty
-list disables face for all actions. High-risk actions (pkexec, PackageKit,
-udisks mount, accounts-service) are excluded by default.
+by the agent. An empty list disables face for all actions. High-risk actions
+(pkexec, PackageKit, udisks mount, accounts-service) are excluded by default.
+
+**NOTE (under review):** polkit registers a single authentication agent per
+session and does not chain agents. When this agent declines a non-allowlisted
+action it returns an error, which — depending on the desktop's agent
+registration — may present as an authorization denial rather than a
+fallthrough to a password dialog. The intended UX (non-eligible actions
+handled by the desktop's normal password agent) is unverified pending
+live-desktop testing and may require a design change. Behavior here is
+fail-closed: a non-eligible action is never face-authorized.
 
 ### Camera Auto-Detection
 
@@ -177,13 +185,23 @@ scoped to an allowlist — face is **not** a universal key for every privileged 
 
 | Outcome | Agent behavior |
 |---------|----------------|
-| `action_id` not in `polkit.face_eligible_actions` | Declines (returns `org.freedesktop.DBus.Error.Failed`) → polkit falls through to the password dialog |
+| `action_id` not in `polkit.face_eligible_actions` | Declines (returns `org.freedesktop.DBus.Error.Failed`) — see fallthrough-vs-denial caveat below |
 | Allowlisted action, face matches | Responds success to polkit authority |
-| Allowlisted action, no match / daemon error | Declines → password fall-through |
+| Allowlisted action, no match / daemon error | Declines (same caveat) |
 | Username cannot be resolved to a uid | Refuses to respond; **never** sends UID 0 for an unresolved name |
 
-A decline is a **fall-through**, not a denial: another polkit agent (password) still
-handles the request. The agent never denies outright and never fails open to root.
+**NOTE (under review):** polkit registers a single authentication agent per
+session and does not chain agents. When this agent declines, the decline
+returns an error, which — depending on the desktop's agent registration — may
+present as an authorization denial rather than a fallthrough to a password
+dialog. The intended UX (non-eligible actions handled by the desktop's normal
+password agent) is unverified pending live-desktop testing and may require a
+design change. Behavior here is fail-closed: a non-eligible action is never
+face-authorized.
+
+A decline never fails open to root, and never causes this agent itself to grant
+authorization it should not — but see the caveat above on whether polkit
+treats a decline as a fall-through to another agent or as an outright denial.
 
 ## Anti-Spoofing
 
