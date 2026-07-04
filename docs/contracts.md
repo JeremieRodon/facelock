@@ -92,8 +92,14 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 When `device.path` is omitted:
 1. Enumerate `/dev/video0` through `/dev/video63`
 2. Filter to VIDEO_CAPTURE devices
-3. Prefer IR cameras (name contains "ir"/"infrared", or supports GREY/Y16 format)
-4. Fall back to first available device
+3. Classify every node's IR provenance (quirks `force_ir` authoritative; name
+   token / format-corroboration heuristic otherwise), with node-level
+   disambiguation for multi-node USB devices: when several nodes share one
+   quirk-matched VID:PID and at least one has an IR-like format (GREY/Y16 or
+   the quirk's `format_preference`), only the format-bearing node(s) are IR
+4. Prefer a quirks-confirmed IR node with a native IR format, then any
+   quirks-confirmed IR node, then a name-token IR node
+5. Fall back to first available device
 
 ## Database Schema
 
@@ -183,7 +189,10 @@ pam_facelock(<service>): <result> for user <username>
 | Frame variance default const | `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY` | 0.97 |
 
 IR classification requires a whole `ir`/`infrared` name token or a quirks `force_ir`
-entry; a GREY/Y16 format alone is not treated as IR. Frame variance is passive
+entry; a GREY/Y16 format alone is not treated as IR. A `force_ir` quirk is
+device-level ("this USB device has an IR sensor"): when the device exposes multiple
+capture nodes and at least one has an IR-like format, only the format-bearing
+node(s) classify IR (see `docs/security.md` §A). Frame variance is passive
 anti-photo only (does not stop video replay); IR texture is measured on the raw frame,
 never CLAHE. These defaults must not be weakened without security review.
 

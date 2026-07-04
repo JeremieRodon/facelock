@@ -111,6 +111,13 @@ impl<'a> Camera<'a> {
         let width = fmt.width;
         let height = fmt.height;
         let format_str = fmt.fourcc.to_string();
+        tracing::info!(
+            device = %device_path,
+            format = %format_str.trim(),
+            width,
+            height,
+            "camera format negotiated"
+        );
 
         // Create MMAP stream with 4 buffers and a capture timeout
         let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)

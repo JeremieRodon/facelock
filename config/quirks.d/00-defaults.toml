@@ -51,11 +51,16 @@ notes = "ThinkPad integrated IR camera (various models)"
 
 # --- Logitech BRIO ---
 
+# The BRIO exposes multiple V4L2 capture nodes under one VID:PID: an RGB node
+# (YUYV/MJPG) and an IR node (native GREY). force_ir means "this USB device has
+# an IR sensor"; format_preference = "GREY" marks the IR sensor node so
+# classification and auto-detection pick the GREY-native node, not the RGB one.
 [[quirk]]
 vendor_id = "046d"
 product_id = "085e"
 force_ir = true
 warmup_frames = 1
+format_preference = "GREY"
 notes = "Logitech BRIO 4K with IR sensor"
 
 # --- Microsoft Surface cameras ---

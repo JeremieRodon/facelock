@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use facelock_camera::quirks::QuirksDb;
-use facelock_camera::{Camera, auto_detect_device, is_ir_camera_with_quirks, validate_device};
+use facelock_camera::{Camera, auto_detect_device, is_ir_camera_resolved, validate_device};
 use facelock_core::config::Config;
 use facelock_core::ipc::DaemonResponse;
 use facelock_core::types::MatchResult;
@@ -118,9 +118,11 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     let device_path = config.device.path.clone().unwrap();
     let quirks = QuirksDb::load();
     let device_info = validate_device(&device_path);
+    // Sibling-aware classification: on multi-node USB cameras (e.g. BRIO) only
+    // the actual IR sensor node counts as IR, not every node of the device.
     let device_is_ir = device_info
         .as_ref()
-        .map(|dev| is_ir_camera_with_quirks(dev, Some(&quirks)))
+        .map(|dev| is_ir_camera_resolved(dev, Some(&quirks)))
         .unwrap_or(false);
 
     if config.security.require_ir && !device_is_ir {
