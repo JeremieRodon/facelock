@@ -68,8 +68,21 @@ pub fn should_use_direct(config: &facelock_core::Config) -> bool {
     }
 }
 
-/// Create a blocking D-Bus proxy to the daemon with a 15-second method timeout.
+/// Process-wide daemon proxy, built once and reused for every request.
+static PROXY: std::sync::OnceLock<Proxy<'static>> = std::sync::OnceLock::new();
+
+/// Get the blocking D-Bus proxy to the daemon (15-second method timeout).
+///
+/// The underlying connection is created once per process and reused: the
+/// daemon keys its polkit frame authorization (`org.facelock.preview-frames`)
+/// on the caller's unique bus name, so a preview session must keep a single
+/// connection for its grant to apply across frames. Failures are not cached —
+/// the next call retries the connection.
 fn create_proxy() -> anyhow::Result<Proxy<'static>> {
+    if let Some(proxy) = PROXY.get() {
+        return Ok(proxy.clone());
+    }
+
     let connection = zbus::blocking::connection::Builder::system()
         .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?
         .method_timeout(std::time::Duration::from_secs(15))
@@ -79,7 +92,7 @@ fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     let proxy = Proxy::new_owned(connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
         .map_err(|e| anyhow::anyhow!("D-Bus proxy failed: {e}"))?;
 
-    Ok(proxy)
+    Ok(PROXY.get_or_init(|| proxy).clone())
 }
 
 /// Send a request to the daemon via D-Bus, translating to/from the old

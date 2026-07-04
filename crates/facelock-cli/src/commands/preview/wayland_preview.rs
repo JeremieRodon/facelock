@@ -219,8 +219,10 @@ fn render_frame(
     let stride = width * 4;
 
     if jpeg_data.is_empty() {
-        // The daemon strips raw frame bytes for non-root callers and returns
-        // detection metadata only. Show the detection summary without imagery.
+        // The daemon strips raw frame bytes until the caller is authorized
+        // via polkit (org.facelock.preview-frames); the first frame request
+        // triggers the agent prompt. Show the detection summary without
+        // imagery while unauthorized.
         render_metadata_only(canvas, width, height, fps, faces);
         return;
     }
@@ -312,7 +314,7 @@ fn render_metadata_only(
         stride,
         8,
         height / 2,
-        "camera frame hidden (run as root to view)",
+        "authorize in the system prompt to view camera frames",
         render::COLOR_WHITE,
     );
 

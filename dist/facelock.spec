@@ -74,6 +74,9 @@ install -Dm644 dist/facelock.tmpfiles %{buildroot}%{_tmpfilesdir}/facelock.conf
 install -Dm644 dbus/org.facelock.Daemon.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.facelock.Daemon.conf
 install -Dm644 dbus/org.facelock.Daemon.service %{buildroot}%{_datadir}/dbus-1/system-services/org.facelock.Daemon.service
 
+# Polkit action (interactive authorization for preview frame bytes)
+install -Dm644 dbus/org.facelock.policy %{buildroot}%{_datadir}/polkit-1/actions/org.facelock.policy
+
 # authselect profile
 install -dm755 %{buildroot}%{_datadir}/authselect/vendor/facelock
 install -Dm644 dist/authselect/facelock/system-auth %{buildroot}%{_datadir}/authselect/vendor/facelock/system-auth
@@ -162,6 +165,7 @@ fi
 %{_tmpfilesdir}/facelock.conf
 %{_datadir}/dbus-1/system.d/org.facelock.Daemon.conf
 %{_datadir}/dbus-1/system-services/org.facelock.Daemon.service
+%{_datadir}/polkit-1/actions/org.facelock.policy
 %{_datadir}/authselect/vendor/facelock/
 
 %changelog

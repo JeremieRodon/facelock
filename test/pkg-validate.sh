@@ -58,6 +58,8 @@ run_test "PAM module exists in supported path" "[ -n \"$PAM_MODULE_PATH\" ]"
 run_test "config exists" "[ -f /etc/facelock/config.toml ]"
 run_test "D-Bus policy exists" "[ -f /usr/share/dbus-1/system.d/org.facelock.Daemon.conf ]"
 run_test "D-Bus activation exists" "[ -f /usr/share/dbus-1/system-services/org.facelock.Daemon.service ]"
+run_test "polkit action policy exists" "[ -f /usr/share/polkit-1/actions/org.facelock.policy ]"
+run_test "polkit action policy declares preview-frames action" "grep -q 'org.facelock.preview-frames' /usr/share/polkit-1/actions/org.facelock.policy"
 run_test "sysusers file exists" "[ -f /usr/lib/sysusers.d/facelock.conf ] || [ -f /usr/share/sysusers.d/facelock.conf ]"
 run_test "tmpfiles file exists" "[ -f /usr/lib/tmpfiles.d/facelock.conf ] || [ -f /usr/share/tmpfiles.d/facelock.conf ]"
 
@@ -74,6 +76,10 @@ run_test "facelock --version exits successfully" "/usr/bin/facelock --version >/
 run_test "facelock --help exits successfully" "/usr/bin/facelock --help >/dev/null"
 
 run_test "D-Bus policy XML is valid" "if command -v xmllint >/dev/null 2>&1; then xmllint --noout \"$DBUS_POLICY_FILE\"; else python3 -c \"import os, xml.etree.ElementTree as ET; ET.parse(os.environ.get(\\\"DBUS_POLICY_FILE\\\"))\"; fi"
+
+POLKIT_POLICY_FILE="/usr/share/polkit-1/actions/org.facelock.policy"
+export POLKIT_POLICY_FILE
+run_test "polkit action policy XML is valid" "if command -v xmllint >/dev/null 2>&1; then xmllint --noout \"$POLKIT_POLICY_FILE\"; else python3 -c \"import os, xml.etree.ElementTree as ET; ET.parse(os.environ.get(\\\"POLKIT_POLICY_FILE\\\"))\"; fi"
 
 run_test "facelock group exists (sysusers)" "if command -v systemd-sysusers >/dev/null 2>&1; then systemd-sysusers >/dev/null 2>&1 || true; fi; getent group facelock >/dev/null"
 

@@ -212,11 +212,15 @@ The policy also self-contains two explicit defaults rather than relying on syste
 - The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to the authorized caller.
 - The bus policy denies delivery of the daemon's signals in the default context; only root and `facelock`-group members may receive them.
 
-#### A3. Raw Frame Access Parity (Implemented)
+#### A3. Raw Frame Access Parity (Implemented — polkit-authorized)
 
-**Attack**: `PreviewFrame` is root-only, but a `facelock`-group member pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead.
+**Attack**: `PreviewFrame` is root-only, but a `facelock`-group member pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead — silently, with no user consent.
 
-**Mitigation**: `PreviewDetectFrame` strips the `jpeg_data` frame bytes for non-root callers and returns detection/recognition metadata only (bounding boxes, confidence, similarity, recognized). Raw frames remain root-only across both preview variants.
+**Mitigation**: `PreviewFrame` stays root-only. `PreviewDetectFrame` serves the `jpeg_data` frame bytes to root unconditionally; for a non-root caller the daemon requires an **interactive polkit authorization** for `org.facelock.preview-frames` (defaults: `allow_any=no`, `allow_inactive=no`, `allow_active=auth_self_keep` — the caller must type their own password in an active local session, and polkit keeps the grant only ~5 minutes). The daemon calls `CheckAuthorization` with `AllowUserInteraction=true` on the caller's unique bus name; the check runs in the background and never blocks the reply or holds the capture slot, so a pending prompt cannot starve `Authenticate`.
+
+**Fail closed**: while the verdict is pending, denied, timed out, or polkit is unreachable (any D-Bus error), the frame bytes are stripped and the caller gets detection/recognition metadata only (bounding boxes, confidence, similarity, recognized). Verdicts are cached per caller connection — granted for at most 120 s, denied for 15 s — and evicted the moment the caller's bus connection closes (`NameOwnerChanged`), so a grant can never outlive the connection it was issued to. This preserves the enroll/preview UX (the preview window prompts once via the user's polkit agent, then shows live frames) without ever handing out camera/IR imagery silently.
+
+`auth_self_keep` rather than `auth_admin`: the resource is the caller's *own* camera preview (the bus policy already restricts daemon access to root/`facelock` group, and `PreviewDetectFrame` to the matching Unix user). Requiring the user's own password is proportionate consent for camera imagery; `auth_admin` would lock non-admin users out of enroll feedback entirely, which is the UX regression this design fixes.
 
 #### A4. Capture Contention Guard (Implemented)
 

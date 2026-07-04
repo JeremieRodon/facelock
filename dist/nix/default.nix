@@ -66,6 +66,9 @@ rustPlatform.buildRustPackage {
     install -Dm644 dbus/org.facelock.Daemon.conf $out/share/dbus-1/system.d/org.facelock.Daemon.conf
     install -Dm644 dbus/org.facelock.Daemon.service $out/share/dbus-1/system-services/org.facelock.Daemon.service
 
+    # Polkit action (interactive authorization for preview frame bytes)
+    install -Dm644 dbus/org.facelock.policy $out/share/polkit-1/actions/org.facelock.policy
+
     # sysusers.d and tmpfiles.d
     install -Dm644 dist/facelock.sysusers $out/lib/sysusers.d/facelock.conf
     install -Dm644 dist/facelock.tmpfiles $out/lib/tmpfiles.d/facelock.conf

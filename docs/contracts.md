@@ -142,10 +142,27 @@ Method authorization contract:
 - `ReleaseCamera`: root or the Unix user that owns the active preview camera session.
 - `ListDevices`, `Ping`: resolve caller UID before replying and rely on the system bus policy for admission control.
 
-Raw camera frames are root-only: `PreviewDetectFrame` returns an **empty**
-`jpeg_data` payload to non-root callers — they receive detection and
+Raw camera frames require privilege. `PreviewFrame` remains root-only.
+`PreviewDetectFrame` returns the `jpeg_data` frame bytes to root
+unconditionally; a non-root caller receives them **only** after an
+interactive polkit authorization for the action
+**`org.facelock.preview-frames`** (shipped in `dbus/org.facelock.policy`,
+installed to `/usr/share/polkit-1/actions/org.facelock.policy`; defaults
+`allow_any=no`, `allow_inactive=no`, `allow_active=auth_self_keep`). The
+daemon checks the caller via
+`org.freedesktop.PolicyKit1.Authority.CheckAuthorization` (subject = the
+caller's unique bus name, `AllowUserInteraction=true`); the first frame
+request triggers the caller's polkit agent prompt. While unauthorized —
+denied, prompt pending, polkit unreachable, or any D-Bus error — the daemon
+**fails closed**: `jpeg_data` is empty and the caller receives detection and
 recognition metadata (bounding boxes, confidence, similarity, recognized)
-only. Only root receives the frame bytes.
+only.
+
+The polkit verdict is cached per caller **connection** (keyed by unique bus
+name): granted verdicts for at most 120 s, denied/errored verdicts for 15 s,
+and every cached verdict dies when the caller's bus connection closes
+(whichever comes first). Clients that want frames across a preview session
+must therefore keep one D-Bus connection open for the whole session.
 
 Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and
 `PreviewDetectFrame` are serialized by an in-flight capture guard. While one
