@@ -318,7 +318,9 @@ mod tests {
         assert!(aad.is_some(), "AAD must be derived when opt-in is on");
 
         let emb = [0.3f32; 512];
-        let sealed = sealer.seal_embedding_with_aad(&emb, aad.as_deref()).unwrap();
+        let sealed = sealer
+            .seal_embedding_with_aad(&emb, aad.as_deref())
+            .unwrap();
         store
             .add_model_raw_with_device("alice", "cam", &sealed, true, "w600k", Some(device_id))
             .unwrap();

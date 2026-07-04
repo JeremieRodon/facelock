@@ -322,8 +322,9 @@ pub fn run_reseal() -> Result<()> {
             Err(e) => {
                 println!("Could not unseal the existing key (likely a PCR change): {e}");
                 if key_path.exists() {
-                    let data = std::fs::read(key_path)
-                        .with_context(|| format!("failed to read key backup {}", key_path.display()))?;
+                    let data = std::fs::read(key_path).with_context(|| {
+                        format!("failed to read key backup {}", key_path.display())
+                    })?;
                     if data.len() != 32 {
                         anyhow::bail!(
                             "key backup at {} is {} bytes, expected 32",

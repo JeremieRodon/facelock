@@ -1034,7 +1034,10 @@ path = "/dev/video0"
 
     #[test]
     fn encryption_method_default_is_keyfile() {
-        assert_eq!(super::EncryptionMethod::default(), super::EncryptionMethod::Keyfile);
+        assert_eq!(
+            super::EncryptionMethod::default(),
+            super::EncryptionMethod::Keyfile
+        );
     }
 
     #[test]

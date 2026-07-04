@@ -912,7 +912,14 @@ mod tests {
         let emb = [0.1f32; 512];
         // One template bound to a camera, one legacy (NULL device_id).
         store
-            .add_model_raw_with_device("alice", "cam", b"blob-cam", true, "w600k", Some("046d:085e:S"))
+            .add_model_raw_with_device(
+                "alice",
+                "cam",
+                b"blob-cam",
+                true,
+                "w600k",
+                Some("046d:085e:S"),
+            )
             .unwrap();
         store
             .add_model_raw_with_device("alice", "legacy", b"blob-legacy", true, "w600k", None)

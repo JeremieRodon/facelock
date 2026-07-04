@@ -645,8 +645,7 @@ fn parse_sealed_blob(sealed: &[u8]) -> Result<(Option<Vec<u32>>, &[u8], &[u8])> 
 
     match sealed[0] {
         SEALED_VERSION_BYTE => {
-            let pub_len =
-                u32::from_le_bytes([sealed[1], sealed[2], sealed[3], sealed[4]]) as usize;
+            let pub_len = u32::from_le_bytes([sealed[1], sealed[2], sealed[3], sealed[4]]) as usize;
             let body = &sealed[5..];
             if body.len() < pub_len {
                 return Err(FacelockError::Tpm("sealed blob truncated (public)".into()));

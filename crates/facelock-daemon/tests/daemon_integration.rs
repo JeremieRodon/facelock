@@ -570,9 +570,9 @@ fn keyfile_sealer_init_failure_fails_enroll_closed_no_plaintext() {
                 "enroll must fail with a clear keyfile/plaintext message, got: {message}"
             );
         }
-        other => panic!(
-            "enroll must fail CLOSED when the keyfile sealer is unavailable, got: {other:?}"
-        ),
+        other => {
+            panic!("enroll must fail CLOSED when the keyfile sealer is unavailable, got: {other:?}")
+        }
     }
 
     // Security invariant: NO plaintext (sealed=false) embedding was ever written
