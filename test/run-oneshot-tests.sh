@@ -108,9 +108,11 @@ if echo "$DEVICES_OUT" | grep -qi "BRIO"; then
 
     # The negotiated capture format on the auto-detected node must be GREY.
     # A timed-out enroll still opens the camera and logs the negotiated format;
-    # no live face is needed (exit code intentionally ignored).
+    # no live face is needed (exit code intentionally ignored). The log line
+    # contains ANSI styling between field names and values, so match the
+    # message and the bare format value rather than 'format=GREY'.
     run_test "negotiated capture format is GREY on auto-detected node" \
-        "RUST_LOG=info timeout --foreground 10 facelock enroll --user formatprobe --label probe --skip-setup-check > /tmp/format-probe.log 2>&1 || true; grep 'camera format negotiated' /tmp/format-probe.log | grep -q 'format=GREY'"
+        "RUST_LOG=info timeout --foreground 10 facelock enroll --user formatprobe --label probe --skip-setup-check > /tmp/format-probe.log 2>&1 || true; grep 'camera format negotiated' /tmp/format-probe.log | grep -q 'GREY'"
     facelock clear --user formatprobe --yes > /dev/null 2>&1 || true
 else
     echo "SKIP: no BRIO present — multi-node IR classification assertions skipped"
