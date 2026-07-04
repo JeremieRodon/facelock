@@ -1091,10 +1091,22 @@ face_eligible_actions = [
 ]
 "#;
         let config = Config::parse(toml).unwrap();
-        assert!(config.polkit.is_face_eligible("org.freedesktop.udisks2.filesystem-mount"));
-        assert!(config.polkit.is_face_eligible("org.freedesktop.login1.lock-sessions"));
+        assert!(
+            config
+                .polkit
+                .is_face_eligible("org.freedesktop.udisks2.filesystem-mount")
+        );
+        assert!(
+            config
+                .polkit
+                .is_face_eligible("org.freedesktop.login1.lock-sessions")
+        );
         // Still excludes anything the user did not add.
-        assert!(!config.polkit.is_face_eligible("org.freedesktop.policykit.exec"));
+        assert!(
+            !config
+                .polkit
+                .is_face_eligible("org.freedesktop.policykit.exec")
+        );
     }
 
     #[test]
@@ -1107,7 +1119,11 @@ face_eligible_actions = []
 "#;
         let config = Config::parse(toml).unwrap();
         // An explicitly empty list means "never offer face" — no fail-open.
-        assert!(!config.polkit.is_face_eligible("org.freedesktop.login1.lock-sessions"));
+        assert!(
+            !config
+                .polkit
+                .is_face_eligible("org.freedesktop.login1.lock-sessions")
+        );
     }
 
     #[test]
