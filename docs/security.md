@@ -289,11 +289,15 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 - `CapabilityBoundingSet=` / `AmbientCapabilities=` (both **empty**) — the daemon needs no
   Linux capabilities: `/dev/video*` and `/dev/tpmrm0` are root-owned and opened via standard
   file permissions, and the daemon additionally drops all capabilities in-process after
-  initialization (`drop_capabilities()` in `facelock-cli`). If real-hardware testing shows the
-  `runuser`/`su` notification privilege-drop path needs capabilities, the documented relaxation
-  is `CapabilityBoundingSet=CAP_SETUID CAP_SETGID` (note: with `NoNewPrivileges=yes` the
-  in-process capability drop already prevents child processes from regaining capabilities, so
-  the bounding set contents do not change post-drop behavior).
+  initialization (`drop_capabilities()` in `facelock-cli`), independent of this unit's
+  `CapabilityBoundingSet=`. Capabilities were already dropped in-process, and
+  `NoNewPrivileges=yes` was already set, before this hardening pass — an empty bounding set is
+  expected to layer on top without changing the `runuser`/`su` notification privilege-drop path.
+  That expectation is **not empirically verified**: no test (old or new) asserts that a
+  notification actually reaches the user's session under this unit. Confirm with a real
+  `notify-send` on real hardware before relying on this. If that check ever shows the
+  `runuser`/`su` path needs capabilities, the documented relaxation is
+  `CapabilityBoundingSet=CAP_SETUID CAP_SETGID`.
 - `RestrictAddressFamilies=AF_UNIX AF_NETLINK` + `IPAddressDeny=any` — the daemon only talks
   local sockets (system D-Bus, per-user session bus for notifications, kernel netlink). All
   inference is local; a compromised daemon cannot open TCP/IP sockets or exfiltrate over the

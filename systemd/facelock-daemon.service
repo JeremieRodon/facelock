@@ -37,7 +37,10 @@ RestrictSUIDSGID=yes
 # DevicePolicy=closed/auto both use cgroup device ACLs which hide /dev/video*
 # from stat(), breaking camera auto-detection. Omitted — the daemon only needs
 # /dev/video* and /dev/tpmrm0, both protected by standard Unix permissions.
-# ProtectSystem=strict already prevents writing to /dev/.
+# Note: ProtectSystem=strict does NOT cover /dev/ — it only remounts /usr,
+# /etc, and /boot read-only. Device access here is restricted solely by
+# standard Unix file permissions (root:facelock ownership/mode) on
+# /dev/video* and /dev/tpmrm0.
 
 # Phase 3: Capabilities, seccomp, and network lockdown
 # The daemon needs no Linux capabilities: /dev/video* and /dev/tpmrm0 are
@@ -48,7 +51,12 @@ RestrictSUIDSGID=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 # Only local sockets: D-Bus (system bus + per-user session bus for
-# notifications) is AF_UNIX; AF_NETLINK covers kernel device enumeration.
+# notifications) is AF_UNIX. AF_NETLINK is retained conservatively: no
+# workspace code opens a netlink socket directly (device enumeration uses
+# Path::exists, not netlink), but glibc NSS / name-resolution paths
+# (getaddrinfo and friends) may use NETLINK_ROUTE under the hood. Whether
+# AF_NETLINK can be safely dropped here is unverified — treat this as a
+# deferred, test-first hardening step rather than drop it blind.
 # No AF_INET/AF_INET6 — all inference is local, nothing talks TCP/IP.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 IPAddressDeny=any
