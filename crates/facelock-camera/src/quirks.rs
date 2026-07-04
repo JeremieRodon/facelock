@@ -106,10 +106,21 @@ impl QuirksDb {
     /// Find a matching quirk for the given device.
     /// Matches by USB vendor:product ID first, then by name pattern.
     pub fn find_match(&self, device: &DeviceInfo) -> Option<&Quirk> {
-        let usb_ids = read_usb_ids(&device.path);
+        self.find_match_with_ids(device, read_usb_ids(&device.path).as_ref())
+    }
 
+    /// Like [`find_match`](Self::find_match) but with the device's USB
+    /// vendor:product IDs supplied by the caller instead of read from sysfs.
+    /// This keeps the sysfs read at the call boundary so classification is
+    /// testable and so callers that already resolved the identity (e.g.
+    /// multi-node sibling grouping) don't re-read sysfs per lookup.
+    pub fn find_match_with_ids(
+        &self,
+        device: &DeviceInfo,
+        usb_ids: Option<&(String, String)>,
+    ) -> Option<&Quirk> {
         // First pass: match by USB vendor:product ID (most specific)
-        if let Some((vendor, product)) = &usb_ids {
+        if let Some((vendor, product)) = usb_ids {
             for quirk in &self.quirks {
                 if let (Some(qv), Some(qp)) = (&quirk.vendor_id, &quirk.product_id) {
                     if qv.eq_ignore_ascii_case(vendor) && qp.eq_ignore_ascii_case(product) {
@@ -160,7 +171,7 @@ impl QuirksDb {
 
 /// Read USB vendor:product IDs from sysfs for a video device.
 /// Returns (vendor_id, product_id) as hex strings, or None if unavailable.
-fn read_usb_ids(device_path: &str) -> Option<(String, String)> {
+pub(crate) fn read_usb_ids(device_path: &str) -> Option<(String, String)> {
     // /dev/video0 -> /sys/class/video4linux/video0/device/
     let dev_name = device_path.strip_prefix("/dev/")?;
     let sysfs_base = format!("/sys/class/video4linux/{dev_name}/device");

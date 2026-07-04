@@ -77,6 +77,44 @@ run_test_contains "facelock devices (oneshot)" \
     "facelock devices" \
     "/dev/video" || exit 1
 
+# --- Multi-node IR classification regression gate (BRIO fix) ---
+# A force_ir quirk means "this USB device HAS an IR sensor", not "every capture
+# node of it is IR". The Logitech BRIO (046d:085e) exposes an RGB node
+# (YUYV/MJPG) and an IR node (native GREY) under one VID:PID; previously BOTH
+# classified [IR], breaking setup auto-select and making auto-detect capture
+# from the RGB sensor. These assertions prove node-level disambiguation.
+# CAMERA-REQUIRED: BRIO-conditional; skipped when no BRIO is mounted.
+DEVICES_OUT="$(facelock devices)"
+if echo "$DEVICES_OUT" | grep -qi "BRIO"; then
+    echo "BRIO detected — running multi-node IR classification assertions"
+
+    run_test "exactly one [IR] node for multi-node quirk camera (BRIO)" \
+        "test \"\$(facelock devices | grep -c '\[IR\]')\" -eq 1"
+
+    # The single [IR] node must be the GREY-native sensor node.
+    run_test "the [IR] node is the GREY-native node" \
+        "facelock devices | awk '/\[IR\]/{f=1} f && NF==0{f=0} f' | grep -q 'GREY'"
+
+    IR_NODE="$(echo "$DEVICES_OUT" | awk '/\[IR\]/{print $1}')"
+    echo "IR node: $IR_NODE"
+
+    # Auto-detection must select the IR (GREY) node, not the RGB sibling.
+    # `facelock auth --user nobody` logs the auto-detected device before it
+    # exits (2) on the unknown user — no live face needed.
+    run_test "auto-detect selects the IR (GREY) node" \
+        "facelock auth --user nobody --config /etc/facelock/config.toml 2>&1 | grep 'auto-detected camera' | grep -q -- \"$IR_NODE\""
+
+    # The negotiated capture format on the auto-detected node must be GREY.
+    # A timed-out enroll still opens the camera and logs the negotiated format;
+    # no live face is needed (exit code intentionally ignored).
+    run_test "negotiated capture format is GREY on auto-detected node" \
+        "RUST_LOG=info timeout --foreground 10 facelock enroll --user formatprobe --label probe --skip-setup-check > /tmp/format-probe.log 2>&1 || true; grep 'camera format negotiated' /tmp/format-probe.log | grep -q 'format=GREY'"
+    facelock clear --user formatprobe --yes > /dev/null 2>&1 || true
+else
+    echo "SKIP: no BRIO present — multi-node IR classification assertions skipped"
+fi
+# --- End multi-node IR regression gate ---
+
 # Enrollment (direct, no daemon)
 run_test_contains "facelock enroll (oneshot)" \
     "timeout --foreground $LIVE_TIMEOUT facelock enroll --user testuser --label test-face --skip-setup-check" \
