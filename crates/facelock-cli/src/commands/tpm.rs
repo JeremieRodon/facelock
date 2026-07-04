@@ -189,11 +189,18 @@ fn seal_key() -> Result<()> {
         );
         println!("Config updated: encryption.method = \"tpm\"");
         println!(
-            "\nThe plaintext key at {} is no longer needed for auth.",
+            "\nKeep the plaintext key backup at {}: it lets `sudo facelock reseal`\n\
+             recover face auth after a firmware/kernel PCR change (and roll back to the\n\
+             keyfile method) WITHOUT re-enrolling.",
             key_path.display()
         );
-        println!("You may remove it: sudo rm {}", key_path.display());
-        println!("(Keep a backup if you want the ability to rollback without TPM)");
+        println!(
+            "Tradeoff: while that backup exists, the tpm method's at-rest confidentiality\n\
+             against anyone who can read the file reduces to its 0600 (root-only) protection.\n\
+             PCR binding stays off by default (tpm.pcr_binding = false); enabling it commits\n\
+             you to running `reseal` after each bound-PCR change, so keeping the backup is the\n\
+             recommended setup. Remove it only if you accept re-enrolling to recover."
+        );
 
         Ok(())
     }

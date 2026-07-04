@@ -389,5 +389,8 @@
 # refuse to unseal (face auth degrades to password — never a lockout). RECOVERY:
 # after such a change, run `sudo facelock reseal` to re-seal the key under the new
 # PCR state. Keep a backup of encryption.key so reseal can recover the key even
-# after the PCRs change. Default is false; enable only once you know the reseal
+# after the PCRs change — this is the recommended setup, since recovery then needs
+# no re-enrollment. Honest tradeoff: while that backup exists, the tpm method's
+# at-rest confidentiality against anyone who can read the file reduces to its 0600
+# (root-only) protection. Default is false; enable only once you know the reseal
 # workflow, since every bound-PCR change then needs a reseal.

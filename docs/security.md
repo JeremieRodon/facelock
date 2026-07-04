@@ -324,8 +324,12 @@ blob (version byte `0x03`). Unseal starts a *real* policy session and replays `P
 against the current PCRs, so a firmware/kernel change to a bound PCR makes the key refuse to
 unseal (face auth then falls through to password). Recovery is `sudo facelock reseal`, which
 re-seals the key under the current PCR state (recovering the key from the existing blob if the
-PCRs still match, otherwise from the `encryption.key` backup). `pcr_binding` remains **default
-false** — enabling it is a deliberate operator choice that commits to the reseal workflow. See
+PCRs still match, otherwise from the `encryption.key` backup). **Keeping that plaintext
+`encryption.key` backup is the recommended setup**: it makes reseal recovery painless — no
+re-enrollment after a firmware/kernel PCR change. The honest tradeoff is that, while the backup
+exists, the `tpm` method's at-rest confidentiality against anyone who can read the file reduces
+to that keyfile's `0600` (root-only) protection. `pcr_binding` remains **default false** —
+enabling it is a deliberate operator choice that commits to the reseal workflow. See
 `docs/configuration.md` for the `[encryption]` and `[tpm]` sections.
 
 ### 4. D-Bus IPC Security
