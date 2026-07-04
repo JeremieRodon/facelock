@@ -177,12 +177,13 @@
 # evaluated over a sliding window of the most recent min_auth_frames matches.
 # Lower is stricter. Passive anti-photo only — it does NOT stop a video replay.
 # Field-measured: truly static input (photo, paused replay) sits at >= ~0.999;
-# a frozen, non-blinking live human sits at 0.98–0.995. The default sits at the
-# top of the frozen-human band so a still user at a login prompt always passes
-# while perfectly static input never does. Lowering below 0.995 risks locking
-# out users who hold naturally still.
-# Default: 0.995
-# frame_variance_max_similarity = 0.995
+# a frozen, non-blinking live human sits at 0.98–0.995. The default (0.985) sits
+# inside the frozen-human band for extra margin against static replays: a fully
+# frozen user may be briefly delayed, but the sliding window recovers as soon as
+# they move slightly (and password fallback always remains). Loosen toward 0.995
+# if false rejects annoy you; tighten toward 0.97 for paranoia.
+# Default: 0.985
+# frame_variance_max_similarity = 0.985
 
 # Minimum per-face standard deviation (measured on the RAW grayscale frame) for
 # the IR texture check. Flat photos/screens score < 5 in IR; real skin > 15.

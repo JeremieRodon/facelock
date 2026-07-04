@@ -208,9 +208,11 @@ pub struct SecurityConfig {
     pub ir_texture_min_stddev: f32,
     /// Maximum consecutive matched-frame cosine similarity allowed by the passive
     /// frame-variance check, evaluated over a sliding window of the most recent
-    /// `min_auth_frames` matches. Higher = more permissive. Default 0.995: truly
-    /// static input sits ≳0.999, a frozen live human at 0.98–0.995. Passive
-    /// anti-photo only; does not defeat video replay.
+    /// `min_auth_frames` matches. Higher = more permissive. Default 0.985: truly
+    /// static input sits ≳0.999, a frozen live human at 0.98–0.995; the default
+    /// sits inside the frozen-human band for margin against static replays (a
+    /// fully frozen user recovers via the sliding window as soon as they move).
+    /// Passive anti-photo only; does not defeat video replay.
     #[serde(default = "default_frame_variance_max_similarity")]
     pub frame_variance_max_similarity: f32,
     #[serde(default)]
