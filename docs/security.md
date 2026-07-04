@@ -47,12 +47,25 @@ Implementation (`facelock-camera/src/device.rs`, `ir_source_with_quirks`):
 //   Name   – an "ir"/"infrared" name *token* (tokenized, not substring)
 //   None   – not IR
 //
-// Precedence:
+// Per-node precedence:
 // 1. quirks DB force_ir is authoritative;
 // 2. a native GREY/Y16 format counts ONLY when corroborated by a name token;
 // 3. a name token alone is sufficient;
 // 4. otherwise not-IR.
 pub fn ir_source_with_quirks(device, quirks) -> IrSource { ... }
+
+// Node-level disambiguation for multi-node USB devices: force_ir means "this
+// USB device HAS an IR sensor", not "every capture node of it is IR". One
+// physical camera can expose several V4L2 nodes under one VID:PID (Logitech
+// BRIO 046d:085e: /dev/video0 = RGB YUYV/MJPG, /dev/video2 = IR native GREY).
+// When multiple nodes share a quirk-matched USB identity AND at least one has
+// an IR-like format (GREY/Y16, or the quirk's format_preference), only the
+// node(s) with that format classify IR; siblings fall back to the quirk-free
+// heuristic. If NO node has an IR-like format, force_ir is trusted for all
+// (some quirk entries exist precisely because the camera advertises no
+// IR-like format). Anything gating require_ir uses these sibling-aware forms:
+pub fn classify_ir_sources(devices, quirks) -> Vec<IrSource> { ... }
+pub fn ir_source_resolved(device, quirks) -> IrSource { ... } // enumerates siblings
 
 // In the auth flow (daemon pre_check and oneshot), before recognition:
 if config.security.require_ir && !device_is_ir {
@@ -66,7 +79,9 @@ if config.security.require_ir && !device_is_ir {
 
 **Why mere GREY/Y16 availability is not enough (H1)**: many ordinary RGB UVC webcams *enumerate* a GREY format alongside YUYV/MJPG. The previous heuristic (`contains("ir")` OR any GREY/Y16 format) misclassified those as IR, silently defeating `require_ir = true`. It also matched the substring "ir" inside unrelated names ("Sirius", "AIR-Cam"). The classifier now requires a whole `ir`/`infrared` **token** or a **quirks `force_ir`** entry, and treats a GREY/Y16 format as IR **only when corroborated** by one of those. This is why `require_ir` is now load-bearing rather than trivially bypassable.
 
-**Limitation**: classification is still heuristic without a hardware allow-list. Some genuine IR cameras report neither an IR name token nor a known quirk; add a quirks `force_ir` entry (`/etc/facelock/quirks.d/`) for such hardware. The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
+**Why `force_ir` is device-level, not node-level (hardware-verified regression)**: on a real Logitech BRIO, treating every quirk-matched node as IR made *both* `/dev/video0` (the RGB sensor) and `/dev/video2` (the IR sensor) classify IR — so setup stopped auto-selecting and auto-detect captured from the RGB sensor (white LED) instead of the IR sensor. The sibling-format disambiguation above restores per-node honesty: exactly one BRIO node is `[IR]`, and auto-detection prefers the format-corroborated IR node.
+
+**Limitation**: classification is still heuristic without a hardware allow-list. Some genuine IR cameras report neither an IR name token nor a known quirk; add a quirks `force_ir` entry (`/etc/facelock/quirks.d/`) for such hardware (and set `format_preference` to the IR node's native format, e.g. `"GREY"`, when the camera exposes multiple capture nodes). The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
 
 #### B. Frame Variance Check (Required)
 

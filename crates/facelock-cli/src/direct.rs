@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{
-    Camera, DeviceInfo, auto_detect_device, is_ir_camera_with_quirks, list_devices, validate_device,
+    Camera, DeviceInfo, auto_detect_device, is_ir_camera_resolved, list_devices, validate_device,
 };
 use facelock_core::config::DeviceConfig;
 use facelock_core::config::{Config, EncryptionMethod};
@@ -47,7 +47,9 @@ fn build_resolved_camera_device(
     ResolvedCameraDevice {
         device_fingerprint: facelock_camera::device_fingerprint(&device_info.path),
         device_quirk: quirks.find_match(&device_info).cloned(),
-        device_is_ir: is_ir_camera_with_quirks(&device_info, Some(quirks)),
+        // Sibling-aware: on multi-node USB cameras only the IR sensor node
+        // counts as IR, not every node sharing the quirk's VID:PID.
+        device_is_ir: is_ir_camera_resolved(&device_info, Some(quirks)),
         device,
     }
 }
@@ -283,11 +285,13 @@ pub fn list_devices_direct() -> anyhow::Result<()> {
     }
 
     // Consult the quirks DB so the displayed [IR] tag matches the authoritative
-    // decision the auth path makes (e.g. a quirks `force_ir` camera).
+    // decision the auth path makes (e.g. a quirks `force_ir` camera), with
+    // node-level disambiguation for multi-node USB devices.
     let quirks = facelock_camera::QuirksDb::load();
+    let sources = facelock_camera::classify_ir_sources(&devices, Some(&quirks));
     println!("Available video devices:\n");
-    for dev in &devices {
-        let ir_tag = if is_ir_camera_with_quirks(dev, Some(&quirks)) {
+    for (dev, source) in devices.iter().zip(&sources) {
+        let ir_tag = if *source != facelock_camera::IrSource::None {
             " [IR]"
         } else {
             ""
