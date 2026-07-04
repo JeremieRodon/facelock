@@ -305,16 +305,19 @@ pub fn cosine_similarity(a: &FaceEmbedding, b: &FaceEmbedding) -> f32 {
 /// - a frozen, non-blinking live human: (0.98, 0.995]
 /// - a naturally moving live human: well below 0.98
 ///
-/// The check's honest job is rejecting *perfectly static* input as
-/// defense-in-depth, so the default sits at the top of the frozen-human band:
-/// a live user always passes, a static image never does. (The earlier 0.97
-/// default assumed 0.02–0.10 live drift, which is empirically wrong for a
-/// still user and caused hard false-reject lockups.)
+/// The default (0.985) sits inside the frozen-human band, stricter than the
+/// top of the band (0.995) for extra margin against static replays. A fully
+/// frozen user may not pass at 0.985, but the sliding-window gate recovers as
+/// soon as they move slightly — the worst case is a brief delay, never a
+/// lockout, and password fallback always remains. Loosen the knob toward
+/// 0.995 if false rejects annoy; tighten toward 0.97 for paranoia. (The
+/// earlier 0.97 default assumed 0.02–0.10 live drift, which is empirically
+/// wrong for a still user and caused hard false-reject lockups.)
 ///
 /// NOTE: frame-variance is a *passive* anti-photo heuristic only. It raises the
 /// bar for a *static* image but does NOT defeat a video replay (which contains
 /// real inter-frame motion). IR enforcement remains the load-bearing defense.
-pub const DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY: f32 = 0.995;
+pub const DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY: f32 = 0.985;
 
 /// Check that matched embeddings show sufficient variance (anti-photo-attack).
 /// Compares all consecutive pairs — every pair must differ enough to rule out
@@ -744,13 +747,13 @@ mod tests {
 
     #[test]
     fn frame_variance_rejects_near_static_sequence() {
-        // Near-identical consecutive embeddings (sim > 0.995, static-like) must fail.
+        // Near-identical consecutive embeddings (sim > 0.985, static-like) must fail.
         let a = tilted_unit(1.0, 0.02);
         let b = tilted_unit(1.0, 0.03);
         let c = tilted_unit(1.0, 0.04);
         let seq = [a, b, c];
-        // Sanity: consecutive similarities are all above the 0.995 default.
-        assert!(cosine_similarity(&seq[0], &seq[1]) > 0.995);
+        // Sanity: consecutive similarities are all above the 0.985 default.
+        assert!(cosine_similarity(&seq[0], &seq[1]) > 0.985);
         assert!(
             !check_frame_variance(&seq, DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
             "near-static sequence must be rejected"
@@ -759,13 +762,13 @@ mod tests {
 
     #[test]
     fn frame_variance_accepts_live_like_sequence() {
-        // Live-like drift (sim well below the 0.995 default) must pass.
+        // Live-like drift (sim well below the 0.985 default) must pass.
         let a = tilted_unit(1.0, 0.0);
         let b = tilted_unit(1.0, 0.30);
         let c = tilted_unit(1.0, 0.60);
         let seq = [a, b, c];
-        assert!(cosine_similarity(&seq[0], &seq[1]) < 0.995);
-        assert!(cosine_similarity(&seq[1], &seq[2]) < 0.995);
+        assert!(cosine_similarity(&seq[0], &seq[1]) < 0.985);
+        assert!(cosine_similarity(&seq[1], &seq[2]) < 0.985);
         assert!(
             check_frame_variance(&seq, DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
             "live-like sequence must pass"
@@ -1029,8 +1032,8 @@ mod tests {
                 "still frames must never satisfy the variance gate"
             );
         }
-        // Now the user moves: consecutive drift cos(0.15) ~= 0.9888 <= 0.995.
-        for (i, theta) in [0.15f32, 0.30, 0.45].iter().enumerate() {
+        // Now the user moves: consecutive drift cos(0.20) ~= 0.9801 <= 0.985.
+        for (i, theta) in [0.20f32, 0.40, 0.60].iter().enumerate() {
             w.push(unit_at_angle(*theta));
             if i >= 2 {
                 assert!(
@@ -1061,7 +1064,7 @@ mod tests {
     #[test]
     fn variance_window_near_static_replay_never_passes() {
         // A paused replay / photo with sensor noise sits at pair similarity
-        // >= ~0.999 — still above the 0.995 default, so it must never pass.
+        // >= ~0.999 — still above the 0.985 default, so it must never pass.
         let mut w = FrameVarianceWindow::new(3);
         for i in 0..50 {
             // steps of 0.02 rad: consecutive similarity cos(0.02) ~= 0.9998
@@ -1075,29 +1078,32 @@ mod tests {
 
     #[test]
     fn variance_window_boundary_at_default() {
-        assert_eq!(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY, 0.995);
+        assert_eq!(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY, 0.985);
 
-        // Just above the default (pair sim ~0.9965 > 0.995): rejected.
+        // Just above the default (pair sim ~0.9888 > 0.985): rejected. This is
+        // inside the field-measured frozen-human band (0.98, 0.995] — a fully
+        // frozen user is deliberately held until they move slightly, at which
+        // point the sliding window recovers (see recovery test above).
         let mut too_still = FrameVarianceWindow::new(2);
         too_still.push(unit_at_angle(0.0));
-        too_still.push(unit_at_angle(0.0837)); // cos ~= 0.9965
+        too_still.push(unit_at_angle(0.15)); // cos ~= 0.9888
         let (mn, _) = too_still.min_max_pair_similarity().unwrap();
         assert!(
-            mn > 0.995,
+            mn > 0.985,
             "sanity: pair must sit above the cutoff, got {mn}"
         );
         assert!(!too_still.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY));
 
-        // Frozen-but-live human range (field-measured (0.98, 0.995]): accepted.
-        let mut frozen_human = FrameVarianceWindow::new(2);
-        frozen_human.push(unit_at_angle(0.0));
-        frozen_human.push(unit_at_angle(0.1415)); // cos ~= 0.9900
-        let (mn, mx) = frozen_human.min_max_pair_similarity().unwrap();
+        // Barely-moving live human just under the cutoff ((0.98, 0.985]): accepted.
+        let mut barely_moving = FrameVarianceWindow::new(2);
+        barely_moving.push(unit_at_angle(0.0));
+        barely_moving.push(unit_at_angle(0.19)); // cos ~= 0.9820
+        let (mn, mx) = barely_moving.min_max_pair_similarity().unwrap();
         assert!(
-            mn > 0.98 && mx <= 0.995,
-            "sanity: pair in frozen-human band, got {mn}..{mx}"
+            mn > 0.98 && mx <= 0.985,
+            "sanity: pair just below the cutoff, got {mn}..{mx}"
         );
-        assert!(frozen_human.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY));
+        assert!(barely_moving.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY));
     }
 
     #[test]

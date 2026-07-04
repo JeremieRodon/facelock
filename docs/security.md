@@ -90,7 +90,7 @@ The check is evaluated over a **sliding window** of the most recent
 `min_auth_frames` matched-frame embeddings (`FrameVarianceWindow` in
 `facelock-core/src/types.rs`): the gate passes only when the window is full AND
 every consecutive pair inside it has cosine similarity at or below the cutoff
-(`security.frame_variance_max_similarity`, default **0.995**,
+(`security.frame_variance_max_similarity`, default **0.985**,
 `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY`).
 
 **Why a sliding window**: an earlier version accumulated every matched frame for
@@ -110,11 +110,18 @@ session length. Embeddings evicted from the window are zeroized at eviction.
 | Frozen, non-blinking live human | 0.98 – 0.995 |
 | Naturally moving live human | well below 0.98 |
 
-The default cutoff (0.995) sits at the top of the frozen-human band: a live user
-holding naturally still at a login prompt passes, perfectly static input never
-does. (An earlier default of 0.97 assumed a 0.02–0.10 live-drift range that is
-empirically wrong for a still user — it caused hard false-reject lockups where
-auth reported "no match" despite 0.91–0.98 recognition similarity.)
+The default cutoff (0.985) sits *inside* the frozen-human band — deliberately
+stricter than the top of the band (0.995) for extra margin against static
+replays that carry sensor-noise-level drift. The honest tradeoff: a fully
+frozen, non-blinking user may not pass at 0.985, but because the gate is a
+sliding window it recovers the moment they move slightly — the worst case is a
+brief delay, never a lockout, and the PAM stack falls through to password
+regardless. (An earlier default of 0.97 assumed a 0.02–0.10 live-drift range
+that is empirically wrong for a still user — it caused hard false-reject
+lockups where auth reported "no match" despite 0.91–0.98 recognition
+similarity. The window-less design of that era turned stillness into a
+permanent failure; the sliding window is what makes the stricter 0.985 default
+safe to ship.)
 
 **Honest scope — this does NOT stop video replay.** Frame-variance only rules out a
 *static* image (printed photo, single frozen frame). A recorded video of the enrolled
@@ -124,10 +131,12 @@ input; **IR enforcement plus the raw-frame texture check (§A, §C) are the load
 anti-spoof defenses**, and active liveness (opt-in landmark/blink) is the answer to
 video replay.
 
-**False-reject tradeoff**: lowering the cutoff below 0.995 rejects users who hold
-naturally still; raising it above ~0.998 starts admitting sensor-noise-level drift.
-`frame_variance_max_similarity` is the tuning knob and stays purely passive either
-way. When the timeout expires with matching frames but an unsatisfied variance gate,
+**False-reject tradeoff**: `frame_variance_max_similarity` is the user-tunable
+knob and stays purely passive either way. Loosen toward 0.995 (top of the
+frozen-human band) if a very still user finds the delay annoying; tighten toward
+0.97 for paranoia, accepting that holding still delays auth until you move.
+Raising it above ~0.998 starts admitting sensor-noise-level drift and defeats
+the check. When the timeout expires with matching frames but an unsatisfied variance gate,
 `facelock test` says so explicitly, and per-window min/max pair similarities are
 logged at debug level (values only, never embeddings) for tuning.
 
@@ -135,7 +144,7 @@ Config:
 ```toml
 [security]
 require_frame_variance = true         # Reject static images (photo attack defense)
-frame_variance_max_similarity = 0.995 # Max consecutive-frame similarity in the window
+frame_variance_max_similarity = 0.985 # Max consecutive-frame similarity in the window
 min_auth_frames = 3                   # Matched frames required = variance window size
 ```
 
@@ -407,7 +416,7 @@ abort_if_ssh = true          # Refuse face auth over SSH
 abort_if_lid_closed = true   # Refuse if laptop lid closed
 require_ir = true            # CRITICAL: refuse non-IR cameras (anti-spoof, load-bearing)
 require_frame_variance = true # Reject static images (photo defense; NOT video replay)
-frame_variance_max_similarity = 0.995 # Max pair similarity in the sliding window (static >= ~0.999)
+frame_variance_max_similarity = 0.985 # Max pair similarity in the sliding window (static >= ~0.999)
 ir_texture_min_stddev = 10.0 # Min raw-frame face std_dev for IR texture (flat < 5, real > 15)
 require_landmark_liveness = false # Require landmark movement between frames (off by default)
 min_auth_frames = 3          # Minimum frames before accepting (variance check)
