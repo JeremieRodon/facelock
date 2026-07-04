@@ -86,43 +86,57 @@ if config.security.require_ir && !device_is_ir {
 #### B. Frame Variance Check (Required)
 
 Require minimum variance across consecutive matched frames during authentication.
-Every consecutive pair of matched-frame embeddings must drift by at least
-`1 - frame_variance_max_similarity` (default 0.03), i.e. cosine similarity must be
-at or below the cutoff. The cutoff is configurable
-(`security.frame_variance_max_similarity`, default **0.97**, in
-`facelock-core/src/types.rs` as `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY`):
+The check is evaluated over a **sliding window** of the most recent
+`min_auth_frames` matched-frame embeddings (`FrameVarianceWindow` in
+`facelock-core/src/types.rs`): the gate passes only when the window is full AND
+every consecutive pair inside it has cosine similarity at or below the cutoff
+(`security.frame_variance_max_similarity`, default **0.995**,
+`DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY`).
 
-```rust
-/// Reject when any consecutive pair is too similar (static image).
-pub fn check_frame_variance(embeddings: &[FaceEmbedding], max_similarity: f32) -> bool {
-    if embeddings.len() < 2 { return false; }
-    for window in embeddings.windows(2) {
-        // Real faces vary by 0.02-0.10 between frames; a static photo is near-identical.
-        if cosine_similarity(&window[0], &window[1]) > max_similarity { return false; }
-    }
-    true
-}
-```
+**Why a sliding window**: an earlier version accumulated every matched frame for
+the whole session and required *all* consecutive pairs to drift. One too-still
+pair at any moment then made success permanently unreachable — a user who
+started still and then moved could never recover (hardware-verified lockout).
+The window forgets old frames: once it fills with moving frames the gate passes.
+The anti-photo property is preserved because a truly static input keeps *every*
+pair above the cutoff in *every* window, so no window ever passes, regardless of
+session length. Embeddings evicted from the window are zeroized at eviction.
+
+**Field-measured consecutive-pair similarity** (Logitech BRIO IR node, real user):
+
+| Input | Consecutive-pair cosine similarity |
+|-------|-----------------------------------|
+| Truly static (photo on a stand, paused replay) | ≳ 0.999 |
+| Frozen, non-blinking live human | 0.98 – 0.995 |
+| Naturally moving live human | well below 0.98 |
+
+The default cutoff (0.995) sits at the top of the frozen-human band: a live user
+holding naturally still at a login prompt passes, perfectly static input never
+does. (An earlier default of 0.97 assumed a 0.02–0.10 live-drift range that is
+empirically wrong for a still user — it caused hard false-reject lockups where
+auth reported "no match" despite 0.91–0.98 recognition similarity.)
 
 **Honest scope — this does NOT stop video replay.** Frame-variance only rules out a
 *static* image (printed photo, single frozen frame). A recorded video of the enrolled
 user contains genuine inter-frame motion and will pass this check. Frame-variance is a
-cheap passive filter; **IR enforcement (§A) is the load-bearing anti-spoof defense**, and
-active liveness (opt-in landmark/blink) is the answer to video replay. The default was
-tightened from 0.998 (which accepted almost any drift) to 0.97 so the check actually
-demands the documented 0.02-0.10 live-face drift.
+cheap passive defense-in-depth filter whose honest job is rejecting perfectly-static
+input; **IR enforcement plus the raw-frame texture check (§A, §C) are the load-bearing
+anti-spoof defenses**, and active liveness (opt-in landmark/blink) is the answer to
+video replay.
 
-**False-reject tradeoff**: 0.97 is the low end of the live-drift band. Genuinely still
-users under steady lighting can occasionally dip below 0.03 drift; if false rejects rise,
-raise `frame_variance_max_similarity` (toward 0.99) — it is the tuning knob. It stays
-purely passive either way.
+**False-reject tradeoff**: lowering the cutoff below 0.995 rejects users who hold
+naturally still; raising it above ~0.998 starts admitting sensor-noise-level drift.
+`frame_variance_max_similarity` is the tuning knob and stays purely passive either
+way. When the timeout expires with matching frames but an unsatisfied variance gate,
+`facelock test` says so explicitly, and per-window min/max pair similarities are
+logged at debug level (values only, never embeddings) for tuning.
 
 Config:
 ```toml
 [security]
-require_frame_variance = true       # Reject static images (photo attack defense)
-frame_variance_max_similarity = 0.97 # Max consecutive-frame similarity (require >=0.03 drift)
-min_auth_frames = 3                 # Minimum matched frames before accepting
+require_frame_variance = true         # Reject static images (photo attack defense)
+frame_variance_max_similarity = 0.995 # Max consecutive-frame similarity in the window
+min_auth_frames = 3                   # Matched frames required = variance window size
 ```
 
 #### C. Dark Frame / IR Texture Validation (Recommended)
@@ -340,7 +354,7 @@ abort_if_ssh = true          # Refuse face auth over SSH
 abort_if_lid_closed = true   # Refuse if laptop lid closed
 require_ir = true            # CRITICAL: refuse non-IR cameras (anti-spoof, load-bearing)
 require_frame_variance = true # Reject static images (photo defense; NOT video replay)
-frame_variance_max_similarity = 0.97 # Max consecutive-frame similarity (require >=0.03 drift)
+frame_variance_max_similarity = 0.995 # Max pair similarity in the sliding window (static >= ~0.999)
 ir_texture_min_stddev = 10.0 # Min raw-frame face std_dev for IR texture (flat < 5, real > 15)
 require_landmark_liveness = false # Require landmark movement between frames (off by default)
 min_auth_frames = 3          # Minimum frames before accepting (variance check)
