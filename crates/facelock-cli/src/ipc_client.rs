@@ -105,6 +105,9 @@ pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
                     Some(result.label)
                 },
                 similarity: result.similarity as f32,
+                // Not part of the D-Bus AuthResult contract; derived client-side
+                // where needed (see test_cmd).
+                failure_reason: None,
             }))
         }
         DaemonRequest::Enroll { user, label } => {

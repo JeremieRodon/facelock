@@ -214,9 +214,17 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         DaemonResponse::AuthResult(MatchResult {
             matched: false,
             similarity,
+            failure_reason,
             ..
         }) => {
-            info!(user = %user, similarity = format!("{similarity:.4}"), "no match");
+            // Exit code stays 1 (PAM falls through to password); the reason is
+            // diagnostic only.
+            info!(
+                user = %user,
+                similarity = format!("{similarity:.4}"),
+                variance_blocked = failure_reason.is_some(),
+                "no match"
+            );
             1
         }
         DaemonResponse::Error { message } if message.contains("all frames dark") => {

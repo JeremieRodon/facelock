@@ -202,19 +202,22 @@ pam_facelock(<service>): <result> for user <username>
 |---------|--------|---------|
 | IR camera enforcement | `security.require_ir` | **true** |
 | Frame variance check | `security.require_frame_variance` | **true** |
-| Frame variance cutoff | `security.frame_variance_max_similarity` | 0.97 |
+| Frame variance cutoff | `security.frame_variance_max_similarity` | 0.995 |
 | IR texture cutoff (raw frame) | `security.ir_texture_min_stddev` | 10.0 |
 | Landmark liveness | `security.require_landmark_liveness` | **false** |
-| Minimum auth frames | `security.min_auth_frames` | 3 |
-| Frame variance default const | `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY` | 0.97 |
+| Minimum auth frames (= variance window size) | `security.min_auth_frames` | 3 |
+| Frame variance default const | `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY` | 0.995 |
 
 IR classification requires a whole `ir`/`infrared` name token or a quirks `force_ir`
 entry; a GREY/Y16 format alone is not treated as IR. A `force_ir` quirk is
 device-level ("this USB device has an IR sensor"): when the device exposes multiple
 capture nodes and at least one has an IR-like format, only the format-bearing
 node(s) classify IR (see `docs/security.md` §A). Frame variance is passive
-anti-photo only (does not stop video replay); IR texture is measured on the raw frame,
-never CLAHE. These defaults must not be weakened without security review.
+anti-photo only (does not stop video replay); it is evaluated over a sliding window
+of the most recent `min_auth_frames` matched frames (see `docs/security.md` §B), with
+a 0.995 cutoff separating truly static input (≳0.999) from a frozen live human
+(0.98–0.995). IR texture is measured on the raw frame, never CLAHE. These defaults
+must not be weakened without security review.
 
 ## Models
 

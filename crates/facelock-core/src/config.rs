@@ -207,8 +207,10 @@ pub struct SecurityConfig {
     #[serde(default = "default_ir_texture_min_stddev")]
     pub ir_texture_min_stddev: f32,
     /// Maximum consecutive matched-frame cosine similarity allowed by the passive
-    /// frame-variance check. Higher = more permissive. Default 0.97 (require ≥0.03
-    /// drift). Passive anti-photo only; does not defeat video replay.
+    /// frame-variance check, evaluated over a sliding window of the most recent
+    /// `min_auth_frames` matches. Higher = more permissive. Default 0.995: truly
+    /// static input sits ≳0.999, a frozen live human at 0.98–0.995. Passive
+    /// anti-photo only; does not defeat video replay.
     #[serde(default = "default_frame_variance_max_similarity")]
     pub frame_variance_max_similarity: f32,
     /// Couple each enrolled template to the camera that captured it. When true
