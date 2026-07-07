@@ -32,6 +32,9 @@ Stable contracts. Do not change without updating this document.
 | `facelock hyprlock enable\|disable\|status` | Manage hyprlock lock-screen integration (user, no root); `enable` accepts `--no-icon` to skip the cosmetic face glyph |
 | `facelock encrypt` | Encrypt face database |
 | `facelock decrypt` | Decrypt face database |
+| `facelock reseal` | Re-seal the TPM AES key under current PCRs (recovery after a firmware/kernel change) |
+| `facelock tpm seal-key` / `unseal-key` | Migrate keyfile↔tpm key protection |
+| `facelock tpm unseal-check` | Read-only: verify the sealed key still unseals (PCR policy satisfied) |
 | `facelock audit` | View audit log |
 | `facelock bench` | Benchmarks |
 | `facelock restart` | Restart daemon |
@@ -80,12 +83,29 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | `[recognition]` | `threshold`, `timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
 | `[daemon]` | `mode` (DaemonMode enum), `model_dir`, `idle_timeout_secs` |
 | `[storage]` | `db_path` |
-| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `bind_templates_to_device`, `device_match_granularity`, `bind_legacy_templates`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
+| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `bind_templates_to_device`, `device_match_granularity`, `bind_legacy_templates`, `bind_device_aad`, `allow_plaintext`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
 | `[notification]` | `mode` (off/terminal/desktop/both), `notify_prompt`, `notify_on_success`, `notify_on_failure` |
 | `[snapshots]` | `mode` (off/all/failure/success), `dir` |
-| `[encryption]` | `method` (none/keyfile/tpm), `key_path`, `sealed_key_path` |
+| `[encryption]` | `method` (keyfile/tpm/none — **default keyfile**), `key_path`, `sealed_key_path` |
 | `[audit]` | `enabled`, `path`, `rotate_size_mb` |
-| `[tpm]` | `pcr_binding`, `pcr_indices`, `tcti` |
+| `[tpm]` | `seal_database`, `pcr_binding`, `pcr_indices`, `tcti` |
+
+**Encryption defaults (Plan 04).** `encryption.method` defaults to `keyfile`: face
+templates are encrypted at rest by default. The keyfile is auto-generated at mode `0600`
+on first use if absent. `method = "none"` (plaintext) is **refused at enrollment** unless
+`security.allow_plaintext = true`. Auth always degrades to password on a decrypt failure —
+never a lockout.
+
+**Hard device binding (opt-in).** `security.bind_device_aad = true` folds the enrolling
+camera's `device_id` into the AES-GCM AAD, so a template cannot be decrypted under a
+different camera. Default false (fails closed on unstable ids). Complements the advisory
+device coupling of Plan 02.
+
+**TPM sealed-key format & unseal semantics (Plan 04).** The sealed-key blob is versioned:
+`0x01` = no PCR policy; `0x03` = PCR-bound, and self-describes its PCR index list. A
+PCR-bound object is created with `userWithAuth = false`, and unseal starts a real policy
+session and replays `PolicyPCR` — so a changed bound PCR makes unseal **fail** (finding #5).
+`facelock reseal` re-seals the key under the current PCRs (recovery path).
 
 ### Camera Auto-Detection
 

@@ -39,6 +39,10 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
     #[cfg(feature = "tpm")]
     tpm_sealer: Option<facelock_tpm::TpmSealer>,
     software_sealer: Option<facelock_tpm::SoftwareSealer>,
+    /// Why the software sealer could not be initialized for a configured
+    /// encryption method. `Some` means enroll must fail CLOSED rather than
+    /// silently downgrade to plaintext biometric storage (auth is unaffected).
+    sealer_init_error: Option<String>,
 }
 
 impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
@@ -69,10 +73,33 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             None
         };
 
-        // Initialize software sealer based on encryption method
+        // Initialize software sealer based on encryption method. On failure for a
+        // method that requires encryption, we record `sealer_init_error` and leave
+        // the sealer `None` so ENROLL can fail closed (see `handle`). We do NOT
+        // fail the whole handler here: that would take the daemon down and block
+        // the auth path, which must keep falling through to password as before.
+        let mut sealer_init_error: Option<String> = None;
         let software_sealer = match config.encryption.method {
             EncryptionMethod::Keyfile => {
                 let key_path = std::path::Path::new(&config.encryption.key_path);
+                // Encrypt-by-default (finding #8): auto-generate the key on first
+                // use so a keyfile default actually encrypts. Safe — if a key was
+                // lost, any prior encrypted rows were already unreadable, and a new
+                // key only affects future writes; plaintext rows stay readable.
+                if !key_path.exists() {
+                    match facelock_tpm::SoftwareSealer::generate_key_file(key_path) {
+                        Ok(()) => info!(
+                            "generated encryption key at {} (encrypt-by-default)",
+                            key_path.display()
+                        ),
+                        // Not necessarily fatal on its own; the read-back below is
+                        // the authoritative check for whether encryption works.
+                        Err(e) => warn!(
+                            "failed to auto-generate encryption key at {}: {e}",
+                            key_path.display()
+                        ),
+                    }
+                }
                 match facelock_tpm::SoftwareSealer::from_key_file(key_path) {
                     Ok(sealer) => {
                         info!(
@@ -82,7 +109,18 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                         Some(sealer)
                     }
                     Err(e) => {
-                        warn!("failed to initialize software encryption sealer: {e}");
+                        // Fail CLOSED on enroll: record the cause so `handle`
+                        // refuses to enroll rather than silently storing the
+                        // biometric template as plaintext (finding: silent
+                        // plaintext downgrade).
+                        let msg = format!(
+                            "{} keyfile could not be created/read: {e}",
+                            key_path.display()
+                        );
+                        warn!(
+                            "software encryption sealer unavailable — enroll will be refused: {msg}"
+                        );
+                        sealer_init_error = Some(msg);
                         None
                     }
                 }
@@ -130,6 +168,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             #[cfg(feature = "tpm")]
             tpm_sealer,
             software_sealer,
+            sealer_init_error,
         })
     }
 
@@ -202,16 +241,17 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 });
         }
 
-        // Slow path: load raw blobs and decrypt as needed
-        let raw_rows =
-            self.store
-                .get_user_embeddings_raw(user)
-                .map_err(|e| DaemonResponse::Error {
-                    message: format!("storage error: {e}"),
-                })?;
+        // Slow path: load raw blobs (with each template's device id, for opt-in
+        // AAD binding) and decrypt as needed.
+        let raw_rows = self
+            .store
+            .get_user_embeddings_raw_with_device(user)
+            .map_err(|e| DaemonResponse::Error {
+                message: format!("storage error: {e}"),
+            })?;
 
         let mut results = Vec::with_capacity(raw_rows.len());
-        for (id, blob, sealed) in &raw_rows {
+        for (id, blob, sealed, device_id) in &raw_rows {
             let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
                 // Software-encrypted (version byte 0x02)
                 let sealer =
@@ -222,8 +262,11 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                                 "embedding {id} is software-encrypted but no key is configured"
                             ),
                         })?;
+                // Hard device binding (opt-in): derive AAD from this template's
+                // own device id. `None` when disabled — matching enroll.
+                let aad = self.config.security.device_aad(device_id.as_deref());
                 sealer
-                    .unseal_embedding(blob)
+                    .unseal_embedding_with_aad(blob, aad.as_deref())
                     .map_err(|e| DaemonResponse::Error {
                         message: format!("software decryption failed for embedding {id}: {e}"),
                     })?
@@ -365,6 +408,33 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             }
 
             DaemonRequest::Enroll { user, label } => {
+                // Refuse to enroll a plaintext template unless explicitly opted in.
+                if let Err(message) = self.config.ensure_enroll_encryption_allowed() {
+                    warn!(user, "enroll refused: {message}");
+                    return DaemonResponse::Error { message };
+                }
+                // Fail CLOSED: an encryption method is configured but its sealer
+                // could not be initialized (e.g. keyfile IO/permission error).
+                // Refuse to enroll rather than silently storing the biometric
+                // template as plaintext. This is enroll-only — the auth path is
+                // untouched and keeps falling through to password as before. The
+                // legitimate `method = "none"` + `allow_plaintext` path is handled
+                // above and never reaches here (its sealer is intentionally None).
+                if self.config.encryption.method != EncryptionMethod::None
+                    && self.software_sealer.is_none()
+                {
+                    let cause = self.sealer_init_error.clone().unwrap_or_else(|| {
+                        "the configured encryption sealer could not be initialized".to_string()
+                    });
+                    let message = format!(
+                        "refusing to enroll: {cause}. Storing your face would otherwise fall \
+                         back to plaintext. Fix the keyfile path/permissions (or set \
+                         encryption.method = \"none\" with security.allow_plaintext = true to \
+                         intentionally store plaintext)."
+                    );
+                    warn!(user, "enroll refused (encryption unavailable): {message}");
+                    return DaemonResponse::Error { message };
+                }
                 if let Err(resp) = self.acquire_camera() {
                     return resp;
                 }

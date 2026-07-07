@@ -494,6 +494,99 @@ fn still_then_moving_frames_recover_and_authenticate() {
     }
 }
 
+/// FIX B regression gate (Plan 04, storage & crypto honesty): with an encryption
+/// method configured (`keyfile`), a sealer-init failure must make ENROLL fail
+/// CLOSED. It must NOT silently downgrade to plaintext biometric storage.
+///
+/// Previously the daemon only `warn!`-logged the keyfile error and dropped the
+/// sealer (`software_sealer = None`); enroll then stored the embedding as
+/// plaintext (`sealed = false`), defeating encrypt-by-default. This test injects
+/// a guaranteed keyfile-init failure (key path whose parent is a regular file, so
+/// both key generation and the subsequent read fail — deterministic, uid-agnostic)
+/// and asserts that enroll returns an error and writes NO plaintext row.
+///
+/// It also asserts the handler still BUILDS: the fix is enroll-only, so the auth
+/// path stays up and continues to fall through to password as before.
+#[test]
+fn keyfile_sealer_init_failure_fails_enroll_closed_no_plaintext() {
+    use facelock_core::config::EncryptionMethod;
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    // A keyfile path whose parent is a *regular file*: create_dir_all(parent)
+    // fails with ENOTDIR during key generation, and the read-back also fails.
+    let blocker = temp_db_path("keyfile-blocker");
+    cleanup_db(&blocker);
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let bad_key_path = blocker.join("facelock.key");
+
+    let mut config = test_config();
+    config.encryption.method = EncryptionMethod::Keyfile;
+    config.encryption.key_path = bad_key_path.to_string_lossy().into_owned();
+
+    // In-memory store so we can inspect exactly what enroll persisted.
+    let store = FaceStore::open_memory().unwrap();
+    let rate_limiter = RateLimiter::new(
+        config.security.rate_limit.max_attempts,
+        config.security.rate_limit.window_secs,
+    );
+
+    // A camera + engine that WOULD drive a valid enrollment, so the pre-fix code
+    // path reaches plaintext storage (proving the downgrade the fix closes).
+    let factory: Box<
+        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
+    > = Box::new(move |_cfg| Ok(MockCamera::bright(640, 480, 40)));
+    let engine = MockFaceEngine::cycling(vec![
+        fixtures::known_embedding(0),
+        fixtures::known_embedding(40),
+        fixtures::known_embedding(80),
+        fixtures::known_embedding(120),
+    ]);
+
+    // The handler MUST still build even though the keyfile sealer failed —
+    // otherwise the whole daemon (including auth) would be taken down.
+    let mut handler = Handler::new(
+        config,
+        engine,
+        store,
+        rate_limiter,
+        false,
+        facelock_core::types::DeviceFingerprint::default(),
+        Some(factory),
+        None,
+    )
+    .expect("handler must build even when the keyfile sealer fails (auth stays up)");
+
+    let resp = handler.handle(DaemonRequest::Enroll {
+        user: "u".into(),
+        label: "front".into(),
+    });
+
+    match resp {
+        DaemonResponse::Error { ref message } => {
+            let m = message.to_lowercase();
+            assert!(
+                m.contains("keyfile") || m.contains("plaintext"),
+                "enroll must fail with a clear keyfile/plaintext message, got: {message}"
+            );
+        }
+        other => {
+            panic!("enroll must fail CLOSED when the keyfile sealer is unavailable, got: {other:?}")
+        }
+    }
+
+    // Security invariant: NO plaintext (sealed=false) embedding was ever written
+    // (and no sealed row either, since the sealer was unavailable).
+    let (sealed, unsealed) = handler.store.count_sealed().unwrap();
+    assert_eq!(
+        unsealed, 0,
+        "a plaintext biometric embedding must never be stored when method=keyfile"
+    );
+    assert_eq!(sealed, 0, "no embedding should have been stored at all");
+
+    cleanup_db(&blocker);
+}
+
 #[test]
 fn failed_auth_rate_limit_persists_across_handler_restart() {
     use facelock_daemon::handler::Handler;

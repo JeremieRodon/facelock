@@ -18,6 +18,10 @@ RUN apt-get update && \
     libxkbcommon0 \
     ${TSS2_ESYS_PKG} \
     ${TSS2_TCTILDR_PKG} \
+    libtss2-tcti-swtpm0 \
+    swtpm \
+    swtpm-tools \
+    tpm2-tools \
     ca-certificates \
     libssl3t64 \
     python3 \
@@ -46,10 +50,11 @@ COPY dbus/ /build/dbus/
 COPY dist/ /build/dist/
 COPY .github/workflows/scripts/build-deb.sh /build/.github/workflows/scripts/build-deb.sh
 
-# Copy test validation script and PAM test config
+# Copy test validation scripts and PAM test config
 COPY test/pkg-validate.sh /pkg-validate.sh
+COPY test/tpm-pcr-e2e.sh /tpm-pcr-e2e.sh
 COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
-RUN chmod +x /pkg-validate.sh
+RUN chmod +x /pkg-validate.sh /tpm-pcr-e2e.sh
 
 # Download portable CPU-only ONNX Runtime (same as CI bundles in release packages)
 ARG ORT_VERSION=1.20.1
@@ -66,4 +71,6 @@ RUN bash /build/.github/workflows/scripts/build-deb.sh "0.0.0-test" "tpm" && \
     apt-get update && apt-get install -f -y && \
     rm -rf facelock_0.0.0-test-1_amd64 facelock_0.0.0-test-1_amd64.deb
 
-CMD ["/pkg-validate.sh"]
+# Run the TPM PCR-binding regression first (needs the installed package + a
+# config file), then the package validation (which removes the package last).
+CMD ["/bin/bash", "-c", "/tpm-pcr-e2e.sh && /pkg-validate.sh"]

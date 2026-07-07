@@ -26,6 +26,9 @@ pub enum TpmCommand {
     SealKey,
     /// Unseal the AES key from TPM back to a plaintext keyfile (migrate tpm → keyfile)
     UnsealKey,
+    /// Read-only check that the sealed AES key currently unseals (verifies PCR
+    /// policy is satisfied). Writes nothing; exits non-zero if unseal fails.
+    UnsealCheck,
     /// Display current PCR values for configured indices
     PcrBaseline,
 }

@@ -101,41 +101,14 @@ pub fn pre_check(
     None
 }
 
-/// Run the camera-based authentication loop.
-/// Called after pre_check returns None.
-/// Loads embeddings from the store (plaintext only — does not handle encryption).
-pub fn authenticate<C: CameraSource, E: FaceProcessor>(
-    camera: &mut C,
-    engine: &mut E,
-    store: &FaceStore,
-    config: &Config,
-    user: &str,
-    device_is_ir: bool,
-    live_fingerprint: &DeviceFingerprint,
-) -> DaemonResponse {
-    let mut stored = match store.get_user_embeddings(user) {
-        Ok(v) => v,
-        Err(e) => {
-            return DaemonResponse::Error {
-                message: format!("storage error: {e}"),
-            };
-        }
-    };
-    let models = store.list_models(user).unwrap_or_default();
-    authenticate_inner(
-        camera,
-        engine,
-        &mut stored,
-        &models,
-        config,
-        user,
-        device_is_ir,
-        live_fingerprint,
-    )
-}
-
 /// Run the camera-based authentication loop with pre-loaded (decrypted) embeddings.
-/// Called by the handler when encryption is active so embeddings are already decrypted.
+///
+/// This is the only entry point: callers MUST load embeddings through their
+/// decryption-aware path (the daemon handler and the oneshot `facelock auth`
+/// binary both do), because embeddings are encrypted at rest by default
+/// (Plan 04). There is deliberately no store-reading variant here — reading
+/// `get_user_embeddings` directly would treat an encrypted blob as a raw
+/// embedding and fail.
 #[allow(clippy::too_many_arguments)]
 pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,

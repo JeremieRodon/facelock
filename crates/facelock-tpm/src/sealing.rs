@@ -7,11 +7,20 @@ use tracing::warn;
 #[cfg(feature = "tpm")]
 use tracing::{debug, info};
 
-/// Version byte prefixed to TPM-sealed blobs.
+/// Version byte prefixed to TPM-sealed blobs with no PCR policy (unseal needs
+/// only the object's userWithAuth, replayed via a null-auth session).
 const SEALED_VERSION_BYTE: u8 = 0x01;
 
 /// Version byte prefixed to software-encrypted blobs (AES-256-GCM).
 const SOFTWARE_ENCRYPTED_VERSION_BYTE: u8 = 0x02;
+
+/// Version byte prefixed to TPM-sealed blobs bound to a PCR policy. The blob is
+/// self-describing: it records the PCR index list so unseal can rebuild and
+/// replay the exact `PolicyPCR` selection, and the object is created with
+/// `userWithAuth = false` so unseal MUST satisfy that policy (finding #5).
+///
+/// Layout: `0x03 | pcr_count(u8) | pcr_index(u32 LE) * pcr_count | pub_len(u32 LE) | pub | priv`
+const SEALED_PCR_VERSION_BYTE: u8 = 0x03;
 
 /// AES-256-GCM nonce size in bytes.
 const AES_NONCE_SIZE: usize = 12;
@@ -108,15 +117,23 @@ impl TpmSealer {
         let sensitive_data = SensitiveData::try_from(data.to_vec())
             .map_err(|e| FacelockError::Tpm(format!("data too large for TPM seal: {e}")))?;
 
-        // Build a sealed object (keyedhash with no sign/decrypt)
+        // Build a sealed object (keyedhash with no sign/decrypt).
+        //
+        // Finding #5: for a PCR-bound object we set userWithAuth = FALSE so the
+        // only way to satisfy USER-role auth (required by TPM2_Unseal) is to run
+        // the authPolicy — i.e. replay PolicyPCR over the same selection. With
+        // userWithAuth = true (the old behaviour) the empty object auth value
+        // alone satisfied unseal and the PCR policy was never enforced.
         let mut obj_attrs = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
-            .with_fixed_parent(true)
-            .with_user_with_auth(true);
+            .with_fixed_parent(true);
 
-        // If PCR indices specified, do not set no_da so policy is enforced
         if pcr_indices.is_none() {
-            obj_attrs = obj_attrs.with_no_da(true);
+            // No policy: empty-auth object, exempt from dictionary-attack lockout.
+            obj_attrs = obj_attrs.with_user_with_auth(true).with_no_da(true);
+        } else {
+            // Policy-bound: force USER-role auth through the policy session.
+            obj_attrs = obj_attrs.with_user_with_auth(false);
         }
 
         let obj_attrs = obj_attrs
@@ -159,17 +176,34 @@ impl TpmSealer {
             .map_err(|e| FacelockError::Tpm(format!("TPM seal failed: {e}")))
             .map(|result| (result.out_private, result.out_public))?;
 
-        // Serialize: version byte + public_size(u32) + public_bytes + private_bytes
+        // Serialize. The no-PCR format stays byte-compatible with existing 0x01
+        // blobs; PCR-bound objects use 0x03 and additionally record the index
+        // list so unseal can rebuild the selection without external config.
         let pub_bytes = serialize_public(&public_out)?;
         let priv_bytes = serialize_private(&private)?;
 
-        let mut blob = Vec::with_capacity(1 + 4 + pub_bytes.len() + priv_bytes.len());
-        blob.push(SEALED_VERSION_BYTE);
+        let mut blob = Vec::with_capacity(8 + pub_bytes.len() + priv_bytes.len());
+        match pcr_indices {
+            None => {
+                blob.push(SEALED_VERSION_BYTE);
+            }
+            Some(indices) => {
+                blob.push(SEALED_PCR_VERSION_BYTE);
+                blob.push(indices.len() as u8);
+                for &idx in indices {
+                    blob.extend_from_slice(&idx.to_le_bytes());
+                }
+            }
+        }
         blob.extend_from_slice(&(pub_bytes.len() as u32).to_le_bytes());
         blob.extend_from_slice(&pub_bytes);
         blob.extend_from_slice(&priv_bytes);
 
-        debug!(sealed_size = blob.len(), "sealed embedding");
+        debug!(
+            sealed_size = blob.len(),
+            pcr_bound = pcr_indices.is_some(),
+            "sealed data"
+        );
         Ok(blob)
     }
 
@@ -179,8 +213,10 @@ impl TpmSealer {
             return Err(FacelockError::Tpm("empty sealed blob".into()));
         }
 
-        // Format detection: version byte 0x01 = TPM-sealed
-        if sealed[0] == SEALED_VERSION_BYTE && sealed.len() > 5 {
+        // Format detection: version byte 0x01 (no PCR) or 0x03 (PCR-bound) = TPM-sealed
+        if (sealed[0] == SEALED_VERSION_BYTE || sealed[0] == SEALED_PCR_VERSION_BYTE)
+            && sealed.len() > 5
+        {
             return self.unseal_bytes(sealed);
         }
 
@@ -197,21 +233,15 @@ impl TpmSealer {
         )))
     }
 
-    /// Unseal a version-prefixed TPM blob.
+    /// Unseal a version-prefixed TPM blob (0x01 no-PCR, or 0x03 PCR-bound).
+    ///
+    /// For a PCR-bound blob this starts a *real* (non-trial) policy session,
+    /// replays `PolicyPCR` over the recorded selection against the CURRENT PCR
+    /// values, and unseals under that session. If any bound PCR has changed
+    /// since sealing, the session's policy digest no longer matches the object's
+    /// authPolicy and `TPM2_Unseal` fails — the enforcement finding #5 requires.
     pub fn unseal_bytes(&mut self, sealed: &[u8]) -> Result<Vec<u8>> {
-        if sealed.len() < 5 {
-            return Err(FacelockError::Tpm("sealed blob too short".into()));
-        }
-
-        // Skip version byte
-        let pub_len = u32::from_le_bytes([sealed[1], sealed[2], sealed[3], sealed[4]]) as usize;
-
-        if sealed.len() < 5 + pub_len {
-            return Err(FacelockError::Tpm("sealed blob truncated (public)".into()));
-        }
-
-        let pub_bytes = &sealed[5..5 + pub_len];
-        let priv_bytes = &sealed[5 + pub_len..];
+        let (pcr_indices, pub_bytes, priv_bytes) = parse_sealed_blob(sealed)?;
 
         let public = deserialize_public(pub_bytes)?;
         let private = deserialize_private(priv_bytes)?;
@@ -220,15 +250,109 @@ impl TpmSealer {
             .context
             .execute_with_nullauth_session(|ctx| ctx.load(self.primary_key, private, public))
             .map_err(|e| FacelockError::Tpm(format!("TPM load failed: {e}")))?;
+        let object: tss_esapi::handles::ObjectHandle = loaded.into();
 
-        let unsealed = self
-            .context
-            .execute_with_nullauth_session(|ctx| ctx.unseal(loaded.into()))
-            .map_err(|e| FacelockError::Tpm(format!("TPM unseal failed: {e}")))?;
+        let unseal_result = match pcr_indices {
+            None => self
+                .context
+                .execute_with_nullauth_session(|ctx| ctx.unseal(object))
+                .map_err(|e| FacelockError::Tpm(format!("TPM unseal failed: {e}"))),
+            Some(ref indices) => self.unseal_with_pcr_policy(object, indices),
+        };
 
+        // Always flush the transiently-loaded object.
+        let _ = self.context.flush_context(object);
+
+        let unsealed = unseal_result?;
         let data: Vec<u8> = unsealed.as_slice().to_vec();
-        debug!(unsealed_size = data.len(), "unsealed embedding");
+        debug!(
+            unsealed_size = data.len(),
+            pcr_bound = pcr_indices.is_some(),
+            "unsealed data"
+        );
         Ok(data)
+    }
+
+    /// Unseal an object whose USER-role auth is gated by a PCR policy.
+    ///
+    /// Starts a real policy session and replays `PolicyPCR` against the current
+    /// PCR state. Unlike the trial session used at seal time, a real session's
+    /// policy digest is what the TPM checks against the object's authPolicy at
+    /// `TPM2_Unseal`, so a changed PCR makes the unseal fail rather than silently
+    /// succeed.
+    fn unseal_with_pcr_policy(
+        &mut self,
+        object: tss_esapi::handles::ObjectHandle,
+        indices: &[u32],
+    ) -> Result<tss_esapi::structures::SensitiveData> {
+        use tss_esapi::{
+            attributes::SessionAttributesBuilder,
+            constants::SessionType,
+            handles::SessionHandle,
+            interface_types::{algorithm::HashingAlgorithm, session_handles::PolicySession},
+            structures::SymmetricDefinition,
+        };
+
+        let (pcr_digest, pcr_selection_list) = self.current_pcr_digest(indices)?;
+
+        let session = self
+            .context
+            .start_auth_session(
+                None,
+                None,
+                None,
+                SessionType::Policy,
+                SymmetricDefinition::AES_256_CFB,
+                HashingAlgorithm::Sha256,
+            )
+            .map_err(|e| FacelockError::Tpm(format!("failed to start policy session: {e}")))?
+            .ok_or_else(|| FacelockError::Tpm("policy session returned None".into()))?;
+
+        let (attrs, mask) = SessionAttributesBuilder::new()
+            .with_decrypt(true)
+            .with_encrypt(true)
+            .build();
+
+        let cleanup = |ctx: &mut tss_esapi::Context| {
+            let _ = ctx.flush_context(SessionHandle::from(session).into());
+        };
+
+        if let Err(e) = self.context.tr_sess_set_attributes(session, attrs, mask) {
+            cleanup(&mut self.context);
+            return Err(FacelockError::Tpm(format!(
+                "failed to set policy session attributes: {e}"
+            )));
+        }
+
+        let policy_session = match PolicySession::try_from(session) {
+            Ok(s) => s,
+            Err(e) => {
+                cleanup(&mut self.context);
+                return Err(FacelockError::Tpm(format!(
+                    "failed to convert to policy session: {e}"
+                )));
+            }
+        };
+
+        if let Err(e) = self
+            .context
+            .policy_pcr(policy_session, pcr_digest, pcr_selection_list)
+        {
+            cleanup(&mut self.context);
+            return Err(FacelockError::Tpm(format!(
+                "policy_pcr replay failed during unseal: {e}"
+            )));
+        }
+
+        let result = self
+            .context
+            .execute_with_session(Some(session), |ctx| ctx.unseal(object))
+            .map_err(|e| {
+                FacelockError::Tpm(format!("TPM unseal failed (PCR policy not satisfied): {e}"))
+            });
+
+        cleanup(&mut self.context);
+        result
     }
 
     /// Create an ECC P-256 primary key under the storage hierarchy.
@@ -288,39 +412,35 @@ impl TpmSealer {
 
     /// Seal a 32-byte AES key to a file using TPM.
     ///
-    /// The sealed blob is written with 0600 permissions.
+    /// The sealed blob is written to a file created at mode 0600 in a single
+    /// `open(2)` (no create-then-`chmod` window, finding #11) and flushed with
+    /// `sync_all`. An existing file at `path` is truncated in place, so this is
+    /// safe to use for re-sealing (`facelock reseal`).
     pub fn seal_key_to_file(
         &mut self,
         key: &[u8; 32],
         path: &Path,
         pcr_indices: Option<&[u32]>,
     ) -> Result<()> {
+        use std::io::Write;
+
         let sealed = self.seal_bytes(key.as_slice(), pcr_indices)?;
 
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+        let mut file =
+            facelock_core::fs_security::create_truncate_file(path, 0o600).map_err(|e| {
                 FacelockError::Tpm(format!(
-                    "failed to create directory {}: {e}",
-                    parent.display()
+                    "failed to create sealed key file {}: {e}",
+                    path.display()
                 ))
             })?;
-        }
-
-        std::fs::write(path, &sealed).map_err(|e| {
-            FacelockError::Tpm(format!(
-                "failed to write sealed key to {}: {e}",
-                path.display()
-            ))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| FacelockError::Tpm(format!("failed to set sealed key permissions: {e}")),
-            )?;
-        }
+        file.write_all(&sealed)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| {
+                FacelockError::Tpm(format!(
+                    "failed to write sealed key to {}: {e}",
+                    path.display()
+                ))
+            })?;
 
         info!("sealed AES key to {}", path.display());
         Ok(())
@@ -349,28 +469,24 @@ impl TpmSealer {
         Ok(key)
     }
 
-    /// Build a PCR policy digest for the given PCR indices (SHA-256).
+    /// Read the current PCR values for `indices` and return
+    /// `(aggregated_digest, selection_list)`, where `aggregated_digest` is the
+    /// SHA-256 of the concatenated PCR digests as `TPM2_PolicyPCR` expects.
     ///
-    /// Creates a trial policy session on the TPM, extends it with a PolicyPCR
-    /// command for the specified indices bound to the current PCR values, then
-    /// retrieves the accumulated policy digest. This digest is used as the
-    /// `authPolicy` on sealed objects so that unsealing requires the same PCR
-    /// state.
-    fn build_pcr_policy_digest(
+    /// Shared by seal (trial session) and unseal (real session) so both derive
+    /// the policy from an identical selection and digest formation.
+    fn current_pcr_digest(
         &mut self,
         indices: &[u32],
-    ) -> Result<tss_esapi::structures::Digest> {
+    ) -> Result<(
+        tss_esapi::structures::Digest,
+        tss_esapi::structures::PcrSelectionList,
+    )> {
         use tss_esapi::{
-            attributes::SessionAttributesBuilder,
-            constants::SessionType,
-            interface_types::{
-                algorithm::HashingAlgorithm, reserved_handles::Hierarchy,
-                session_handles::PolicySession,
-            },
-            structures::{MaxBuffer, PcrSelectionListBuilder, SymmetricDefinition},
+            interface_types::{algorithm::HashingAlgorithm, reserved_handles::Hierarchy},
+            structures::{MaxBuffer, PcrSelectionListBuilder},
         };
 
-        // Convert u32 indices to PcrSlot values
         let slots: Vec<tss_esapi::structures::PcrSlot> = indices
             .iter()
             .map(|&i| crate::pcr::pcr_index_to_slot(i))
@@ -381,13 +497,11 @@ impl TpmSealer {
             .build()
             .map_err(|e| FacelockError::Tpm(format!("failed to build PCR selection list: {e}")))?;
 
-        // Read current PCR values so the policy binds to the current state
         let (_update_counter, _pcr_selection_out, pcr_digests) = self
             .context
             .execute_without_session(|ctx| ctx.pcr_read(pcr_selection_list.clone()))
             .map_err(|e| FacelockError::Tpm(format!("PCR read failed: {e}")))?;
 
-        // Concatenate all PCR digests and hash them (as required by TPM2_PolicyPCR)
         let concatenated: Vec<u8> = pcr_digests
             .value()
             .iter()
@@ -411,6 +525,32 @@ impl TpmSealer {
             .map_err(|e| {
                 FacelockError::Tpm(format!("failed to hash concatenated PCR values: {e}"))
             })?;
+
+        Ok((hashed_pcr_values, pcr_selection_list))
+    }
+
+    /// Build a PCR policy digest for the given PCR indices (SHA-256).
+    ///
+    /// Creates a trial policy session on the TPM, extends it with a PolicyPCR
+    /// command for the specified indices bound to the current PCR values, then
+    /// retrieves the accumulated policy digest. This digest is used as the
+    /// `authPolicy` on sealed objects so that unsealing requires the same PCR
+    /// state.
+    fn build_pcr_policy_digest(
+        &mut self,
+        indices: &[u32],
+    ) -> Result<tss_esapi::structures::Digest> {
+        use tss_esapi::{
+            attributes::SessionAttributesBuilder,
+            constants::SessionType,
+            interface_types::{algorithm::HashingAlgorithm, session_handles::PolicySession},
+            structures::SymmetricDefinition,
+        };
+
+        // Read the current PCR state and its aggregated digest. The same helper
+        // is replayed on a real session at unseal time, so seal and unseal agree
+        // on exactly how the selection and digest are formed.
+        let (hashed_pcr_values, pcr_selection_list) = self.current_pcr_digest(indices)?;
 
         // Start a trial policy session
         let trial_session = self
@@ -490,6 +630,65 @@ impl TpmSealer {
 // ---------------------------------------------------------------------------
 // Serialization helpers (TPM feature only)
 // ---------------------------------------------------------------------------
+
+/// Parse a version-prefixed sealed blob into `(pcr_indices, pub_bytes, priv_bytes)`.
+///
+/// - `0x01`: no PCR policy — `pcr_indices` is `None`.
+/// - `0x03`: PCR-bound — `pcr_indices` carries the recorded selection so unseal
+///   can rebuild and replay the exact `PolicyPCR`.
+#[cfg(feature = "tpm")]
+#[allow(clippy::type_complexity)]
+fn parse_sealed_blob(sealed: &[u8]) -> Result<(Option<Vec<u32>>, &[u8], &[u8])> {
+    if sealed.len() < 5 {
+        return Err(FacelockError::Tpm("sealed blob too short".into()));
+    }
+
+    match sealed[0] {
+        SEALED_VERSION_BYTE => {
+            let pub_len = u32::from_le_bytes([sealed[1], sealed[2], sealed[3], sealed[4]]) as usize;
+            let body = &sealed[5..];
+            if body.len() < pub_len {
+                return Err(FacelockError::Tpm("sealed blob truncated (public)".into()));
+            }
+            Ok((None, &body[..pub_len], &body[pub_len..]))
+        }
+        SEALED_PCR_VERSION_BYTE => {
+            // 0x03 | pcr_count(u8) | index(u32 LE)*count | pub_len(u32 LE) | pub | priv
+            let count = sealed[1] as usize;
+            let idx_start = 2;
+            let idx_end = idx_start + count * 4;
+            let len_end = idx_end + 4;
+            if sealed.len() < len_end {
+                return Err(FacelockError::Tpm(
+                    "PCR-sealed blob truncated (header)".into(),
+                ));
+            }
+            let indices: Vec<u32> = (0..count)
+                .map(|i| {
+                    let o = idx_start + i * 4;
+                    u32::from_le_bytes([sealed[o], sealed[o + 1], sealed[o + 2], sealed[o + 3]])
+                })
+                .collect();
+            let pub_len = u32::from_le_bytes([
+                sealed[idx_end],
+                sealed[idx_end + 1],
+                sealed[idx_end + 2],
+                sealed[idx_end + 3],
+            ]) as usize;
+            let body = &sealed[len_end..];
+            if body.len() < pub_len {
+                return Err(FacelockError::Tpm(
+                    "PCR-sealed blob truncated (public)".into(),
+                ));
+            }
+            Ok((Some(indices), &body[..pub_len], &body[pub_len..]))
+        }
+        other => Err(FacelockError::Tpm(format!(
+            "unrecognized sealed blob version byte: 0x{other:02x}"
+        ))),
+    }
+}
+
 #[cfg(feature = "tpm")]
 fn serialize_public(public: &tss_esapi::structures::Public) -> Result<Vec<u8>> {
     use tss_esapi::traits::Marshall;
@@ -550,9 +749,9 @@ impl TpmSealer {
 
     /// In passthrough mode, interprets bytes directly as an embedding.
     pub fn unseal_embedding(&mut self, sealed: &[u8]) -> Result<FaceEmbedding> {
-        // Handle format detection: version byte 0x01 = TPM-sealed (cannot unseal without TPM)
+        // Handle format detection: version byte 0x01/0x03 = TPM-sealed (cannot unseal without TPM)
         if !sealed.is_empty()
-            && sealed[0] == SEALED_VERSION_BYTE
+            && (sealed[0] == SEALED_VERSION_BYTE || sealed[0] == SEALED_PCR_VERSION_BYTE)
             && sealed.len() != RAW_EMBEDDING_SIZE
         {
             return Err(FacelockError::Tpm(
@@ -645,40 +844,41 @@ impl SoftwareSealer {
         Self { key }
     }
 
-    /// Generate a new random 256-bit key and write it to a file.
-    /// Sets file permissions to 0600 (owner read/write only).
+    /// Generate a new random 256-bit key and write it to a file at 0600.
+    ///
+    /// The file is created at mode 0600 in the same `open(2)` that creates it
+    /// (via `fs_security::create_truncate_file`), so it is never momentarily
+    /// world/group-readable — closing the create-then-`chmod` TOCTOU window
+    /// (finding #11). The key material is flushed to disk with `sync_all` and
+    /// zeroized from memory before returning.
     pub fn generate_key_file(path: &std::path::Path) -> Result<()> {
         use rand::Rng;
+        use std::io::Write;
+        use zeroize::Zeroize;
 
         let mut key = [0u8; AES_KEY_SIZE];
         rand::rng().fill_bytes(&mut key);
 
-        // Write atomically: write to temp file, then rename
-        let dir = path.parent().ok_or_else(|| {
-            FacelockError::Encryption("key file path has no parent directory".into())
-        })?;
-        std::fs::create_dir_all(dir).map_err(|e| {
-            FacelockError::Encryption(format!("failed to create directory {}: {e}", dir.display()))
-        })?;
+        let write_result = (|| -> Result<()> {
+            let mut file =
+                facelock_core::fs_security::create_truncate_file(path, 0o600).map_err(|e| {
+                    FacelockError::Encryption(format!(
+                        "failed to create key file {}: {e}",
+                        path.display()
+                    ))
+                })?;
+            file.write_all(&key)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| {
+                    FacelockError::Encryption(format!(
+                        "failed to write key file {}: {e}",
+                        path.display()
+                    ))
+                })
+        })();
 
-        std::fs::write(path, key).map_err(|e| {
-            FacelockError::Encryption(format!("failed to write key file {}: {e}", path.display()))
-        })?;
-
-        // Set restrictive permissions (0600 = owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| FacelockError::Encryption(format!("failed to set key file permissions: {e}")),
-            )?;
-        }
-
-        // Zeroize the in-memory copy
-        use zeroize::Zeroize;
         key.zeroize();
-
-        Ok(())
+        write_result
     }
 
     /// Encrypt an embedding using AES-256-GCM.
@@ -695,10 +895,47 @@ impl SoftwareSealer {
         bytes_to_embedding(&raw)
     }
 
-    /// Encrypt arbitrary bytes.
-    #[allow(deprecated)] // aes-gcm uses deprecated generic-array API
+    /// Encrypt an embedding, binding it to `aad` (Additional Authenticated Data).
+    ///
+    /// When `aad` is `Some`, the ciphertext can only be decrypted by supplying
+    /// the exact same AAD. Used for opt-in *hard* device binding (Plan 04): the
+    /// caller passes `types::device_binding_aad(device_id)` so a template sealed
+    /// under one camera cannot be decrypted under a different one. The AAD is NOT
+    /// stored in the blob — it is re-derived at decrypt time.
+    pub fn seal_embedding_with_aad(
+        &self,
+        embedding: &FaceEmbedding,
+        aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let raw = embedding_to_bytes(embedding);
+        self.seal_bytes_with_aad(&raw, aad)
+    }
+
+    /// Decrypt an embedding sealed with [`Self::seal_embedding_with_aad`].
+    /// Decryption fails if `aad` differs from the value used at seal time.
+    pub fn unseal_embedding_with_aad(
+        &self,
+        sealed: &[u8],
+        aad: Option<&[u8]>,
+    ) -> Result<FaceEmbedding> {
+        let raw = self.unseal_bytes_with_aad(sealed, aad)?;
+        bytes_to_embedding(&raw)
+    }
+
+    /// Encrypt arbitrary bytes (no AAD).
     pub fn seal_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
-        use aes_gcm::aead::Aead;
+        self.seal_bytes_with_aad(data, None)
+    }
+
+    /// Decrypt a software-encrypted blob (no AAD).
+    pub fn unseal_bytes(&self, sealed: &[u8]) -> Result<Vec<u8>> {
+        self.unseal_bytes_with_aad(sealed, None)
+    }
+
+    /// Encrypt arbitrary bytes, optionally binding to `aad`.
+    #[allow(deprecated)] // aes-gcm uses deprecated generic-array API
+    pub fn seal_bytes_with_aad(&self, data: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
+        use aes_gcm::aead::{Aead, Payload};
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
         use rand::Rng;
 
@@ -709,11 +946,16 @@ impl SoftwareSealer {
         rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
+        let payload = Payload {
+            msg: data,
+            aad: aad.unwrap_or(&[]),
+        };
         let ciphertext = cipher
-            .encrypt(nonce, data)
+            .encrypt(nonce, payload)
             .map_err(|e| FacelockError::Encryption(format!("AES-GCM encryption failed: {e}")))?;
 
-        // Format: version byte + nonce + ciphertext (includes 16-byte tag)
+        // Format: version byte + nonce + ciphertext (includes 16-byte tag).
+        // The AAD is authenticated but not stored — it is re-derived at decrypt.
         let mut blob = Vec::with_capacity(1 + AES_NONCE_SIZE + ciphertext.len());
         blob.push(SOFTWARE_ENCRYPTED_VERSION_BYTE);
         blob.extend_from_slice(&nonce_bytes);
@@ -722,10 +964,10 @@ impl SoftwareSealer {
         Ok(blob)
     }
 
-    /// Decrypt a software-encrypted blob.
+    /// Decrypt a software-encrypted blob, optionally requiring `aad`.
     #[allow(deprecated)] // aes-gcm uses deprecated generic-array API
-    pub fn unseal_bytes(&self, sealed: &[u8]) -> Result<Vec<u8>> {
-        use aes_gcm::aead::Aead;
+    pub fn unseal_bytes_with_aad(&self, sealed: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
+        use aes_gcm::aead::{Aead, Payload};
         use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
         let min_size = 1 + AES_NONCE_SIZE + 16; // version + nonce + tag (minimum)
@@ -746,9 +988,13 @@ impl SoftwareSealer {
         let cipher = Aes256Gcm::new_from_slice(&self.key)
             .map_err(|e| FacelockError::Encryption(format!("failed to create AES cipher: {e}")))?;
 
-        cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        let payload = Payload {
+            msg: ciphertext,
+            aad: aad.unwrap_or(&[]),
+        };
+        cipher.decrypt(nonce, payload).map_err(|e| {
             FacelockError::Encryption(format!(
-                "AES-GCM decryption failed (wrong key or corrupted data): {e}"
+                "AES-GCM decryption failed (wrong key, AAD, or corrupted data): {e}"
             ))
         })
     }
@@ -827,9 +1073,12 @@ impl Drop for ZeroizingBytes {
     }
 }
 
-/// Detect whether a blob is TPM-sealed (version byte 0x01) or raw.
+/// Detect whether a blob is TPM-sealed (version byte 0x01 no-PCR, or 0x03
+/// PCR-bound) rather than a raw 2048-byte embedding.
 pub fn is_sealed(data: &[u8]) -> bool {
-    !data.is_empty() && data[0] == SEALED_VERSION_BYTE && data.len() != RAW_EMBEDDING_SIZE
+    !data.is_empty()
+        && (data[0] == SEALED_VERSION_BYTE || data[0] == SEALED_PCR_VERSION_BYTE)
+        && data.len() != RAW_EMBEDDING_SIZE
 }
 
 /// Detect whether a blob is software-encrypted (version byte 0x02).
@@ -1144,6 +1393,137 @@ mod tests {
             err.contains("version"),
             "error should mention version byte: {err}"
         );
+    }
+
+    #[test]
+    fn software_seal_with_aad_round_trip() {
+        let key = [0x42u8; 32];
+        let sealer = SoftwareSealer::from_key(key);
+        let aad = b"facelock-device:046d:085e:ABC";
+
+        let mut emb = [0.0f32; 512];
+        emb[0] = 1.0;
+        emb[7] = -0.5;
+        let sealed = sealer.seal_embedding_with_aad(&emb, Some(aad)).unwrap();
+        let unsealed = sealer
+            .unseal_embedding_with_aad(&sealed, Some(aad))
+            .unwrap();
+        assert_eq!(emb, unsealed);
+    }
+
+    #[test]
+    fn software_seal_with_wrong_aad_fails() {
+        let key = [0x42u8; 32];
+        let sealer = SoftwareSealer::from_key(key);
+        let emb = [0.25f32; 512];
+
+        let sealed = sealer
+            .seal_embedding_with_aad(&emb, Some(b"facelock-device:AAAA"))
+            .unwrap();
+
+        // Correct key but different AAD (different enrolling camera) must fail.
+        assert!(
+            sealer
+                .unseal_embedding_with_aad(&sealed, Some(b"facelock-device:BBBB"))
+                .is_err(),
+            "decryption under a different AAD must fail (hard device binding)"
+        );
+        // Missing AAD must also fail once bound.
+        assert!(
+            sealer.unseal_embedding_with_aad(&sealed, None).is_err(),
+            "decryption without the bound AAD must fail"
+        );
+    }
+
+    #[test]
+    fn software_seal_aad_none_is_compatible_with_plain() {
+        // seal_bytes (no AAD) and unseal_bytes_with_aad(None) must interoperate,
+        // so the default (unbound) path is unchanged by the AAD plumbing.
+        let key = [0x42u8; 32];
+        let sealer = SoftwareSealer::from_key(key);
+        let data = b"unbound blob";
+
+        let sealed = sealer.seal_bytes(data).unwrap();
+        let via_aad = sealer.unseal_bytes_with_aad(&sealed, None).unwrap();
+        assert_eq!(via_aad, data);
+
+        let sealed2 = sealer.seal_bytes_with_aad(data, None).unwrap();
+        let via_plain = sealer.unseal_bytes(&sealed2).unwrap();
+        assert_eq!(via_plain, data);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_key_file_never_group_or_world_readable() {
+        // Finding #11 (keyfile TOCTOU): a concurrent observer polling the key
+        // path while it is repeatedly (re)generated must NEVER see it at a mode
+        // wider than 0600. create-at-mode closes the create-then-chmod window.
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("facelock_toctou_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("encryption.key");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed_bad = Arc::new(AtomicBool::new(false));
+        let watch_path = key_path.clone();
+        let stop_w = stop.clone();
+        let bad_w = observed_bad.clone();
+        let watcher = std::thread::spawn(move || {
+            while !stop_w.load(Ordering::Relaxed) {
+                if let Ok(meta) = std::fs::metadata(&watch_path) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    // Any group/other bit set means the key was briefly exposed.
+                    if mode & 0o077 != 0 {
+                        bad_w.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+
+        for _ in 0..2000 {
+            SoftwareSealer::generate_key_file(&key_path).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+
+        assert!(
+            !observed_bad.load(Ordering::Relaxed),
+            "key file was observed with group/other permission bits during generation"
+        );
+        let final_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(final_mode, 0o600, "final key file mode must be 0600");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "tpm")]
+    #[test]
+    fn parse_sealed_blob_round_trips_both_formats() {
+        // 0x01 (no PCR): 0x01 | pub_len(u32) | pub | priv
+        let mut v1 = vec![super::SEALED_VERSION_BYTE];
+        v1.extend_from_slice(&3u32.to_le_bytes());
+        v1.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // pub
+        v1.extend_from_slice(&[0x11, 0x22]); // priv
+        let (idx, pubb, privb) = super::parse_sealed_blob(&v1).unwrap();
+        assert!(idx.is_none());
+        assert_eq!(pubb, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(privb, &[0x11, 0x22]);
+
+        // 0x03 (PCR-bound): 0x03 | count | idx*count | pub_len(u32) | pub | priv
+        let mut v3 = vec![super::SEALED_PCR_VERSION_BYTE, 2];
+        v3.extend_from_slice(&0u32.to_le_bytes());
+        v3.extend_from_slice(&7u32.to_le_bytes());
+        v3.extend_from_slice(&2u32.to_le_bytes()); // pub_len
+        v3.extend_from_slice(&[0xDE, 0xAD]); // pub
+        v3.extend_from_slice(&[0xBE, 0xEF, 0x00]); // priv
+        let (idx, pubb, privb) = super::parse_sealed_blob(&v3).unwrap();
+        assert_eq!(idx, Some(vec![0, 7]));
+        assert_eq!(pubb, &[0xDE, 0xAD]);
+        assert_eq!(privb, &[0xBE, 0xEF, 0x00]);
     }
 
     #[test]

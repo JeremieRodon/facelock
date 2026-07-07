@@ -144,6 +144,17 @@ SCHEMA_VER="$(sqlite3 "$DB" 'SELECT MAX(version) FROM schema_version' 2>/dev/nul
 run_test "V6 schema migration applied on daemon startup (db=$DB)" \
     "[ \"$SCHEMA_VER\" -ge 6 ]" 0
 
+# --- Encryption at rest (Plan 04, finding #8) ---
+# Encryption defaults to keyfile, so the daemon enroll above must have stored
+# ciphertext (sealed=1, version byte 0x02, length != raw 2048), and the auth
+# tests above already round-tripped enroll->auth through the decrypt path.
+# CAMERA-REQUIRED: depends on the live daemon enroll above.
+ENC_SEALED="$(sqlite3 "$DB" "SELECT fe.sealed FROM face_embeddings fe JOIN face_models fm ON fe.model_id=fm.id WHERE fm.user='testuser' LIMIT 1" 2>/dev/null || echo '?')"
+ENC_LEN="$(sqlite3 "$DB" "SELECT LENGTH(fe.embedding) FROM face_embeddings fe JOIN face_models fm ON fe.model_id=fm.id WHERE fm.user='testuser' LIMIT 1" 2>/dev/null || echo 0)"
+ENC_VB="$(sqlite3 "$DB" "SELECT hex(substr(fe.embedding,1,1)) FROM face_embeddings fe JOIN face_models fm ON fe.model_id=fm.id WHERE fm.user='testuser' LIMIT 1" 2>/dev/null || echo '')"
+run_test "fresh enroll stores encrypted blob, not raw f32 (sealed=$ENC_SEALED len=$ENC_LEN vb=$ENC_VB)" \
+    "[ \"$ENC_SEALED\" = 1 ] && [ \"$ENC_VB\" = '02' ] && [ \"$ENC_LEN\" -ne 2048 ]" 0
+
 DEVID="$(sqlite3 "$DB" "SELECT COALESCE(device_id,'') FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo '')"
 if [ -n "$DEVID" ]; then
     run_test "enrolled template has non-null device_id (daemon, camera-fingerprinted): '$DEVID'" "true" 0
