@@ -94,7 +94,13 @@ the face authentication agent may offer face auth. Default:
 by the agent. An empty list disables face for all actions. High-risk actions
 (pkexec, PackageKit, udisks mount, accounts-service) are excluded by default.
 
-**NOTE (under review):** polkit registers a single authentication agent per
+**Scope:** this allowlist governs the **agent model** only. Under the **PAM model**
+(`pam_facelock.so` as `auth sufficient` in `/etc/pam.d/*`, the common Howdy-style
+deployment that also covers `sudo`), the list is ignored: face is attempted for
+every action in that PAM stack, always with password fallback because the line is
+`sufficient`, never `required`. See `docs/security.md` §7a/§7b for the two models.
+
+**NOTE (agent model only):** polkit registers a single authentication agent per
 session and does not chain agents. When this agent declines a non-allowlisted
 action it returns an error, which — depending on the desktop's agent
 registration — may present as an authorization denial rather than a
@@ -190,14 +196,14 @@ scoped to an allowlist — face is **not** a universal key for every privileged 
 | Allowlisted action, no match / daemon error | Declines (same caveat) |
 | Username cannot be resolved to a uid | Refuses to respond; **never** sends UID 0 for an unresolved name |
 
-**NOTE (under review):** polkit registers a single authentication agent per
+**NOTE (agent model only):** polkit registers a single authentication agent per
 session and does not chain agents. When this agent declines, the decline
 returns an error, which — depending on the desktop's agent registration — may
 present as an authorization denial rather than a fallthrough to a password
 dialog. The intended UX (non-eligible actions handled by the desktop's normal
-password agent) is unverified pending live-desktop testing and may require a
-design change. Behavior here is fail-closed: a non-eligible action is never
-face-authorized.
+password agent) is unverified pending live-desktop testing. Behavior here is
+fail-closed: a non-eligible action is never face-authorized. Does not apply to
+the PAM model, which always falls through to the password prompt.
 
 A decline never fails open to root, and never causes this agent itself to grant
 authorization it should not — but see the caveat above on whether polkit
