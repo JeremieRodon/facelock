@@ -2,7 +2,9 @@
 # Uses host-built release binaries (from `just build-release`); no Rust compilation in container.
 FROM fedora:latest
 
-RUN dnf -y install pam dbus rpm-build systemd binutils glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 && dnf clean all
+# dbus-daemon (Fedora ships dbus-broker by default) is needed for the runtime
+# D-Bus tests in pkg-validate.sh, including the polkit agent boundary check.
+RUN dnf -y install pam dbus dbus-daemon rpm-build systemd binutils glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 && dnf clean all
 
 # Build pamtester from source (not in Fedora repos)
 RUN dnf -y install gcc gcc-c++ pam-devel make curl && \
@@ -18,6 +20,7 @@ WORKDIR /build
 
 # Copy host-built release binaries
 COPY target/release/facelock /build/target/release/facelock
+COPY target/release/facelock-polkit-agent /build/target/release/facelock-polkit-agent
 COPY target/release/libpam_facelock.so /build/target/release/libpam_facelock.so
 
 # Copy project files needed for RPM packaging
@@ -31,12 +34,9 @@ COPY LICENSE-APACHE /build/LICENSE-APACHE
 # Copy helper script, test validation, and PAM test config
 COPY test/build-rpm-prebuilt.sh /build/test/build-rpm-prebuilt.sh
 COPY test/pkg-validate.sh /pkg-validate.sh
+COPY test/polkit-agent-validate.sh /polkit-agent-validate.sh
 COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
-RUN chmod +x /build/test/build-rpm-prebuilt.sh /pkg-validate.sh
-
-# Patch spec to remove polkit agent from %files (not built from host binaries).
-# Only remove the standalone %files entry, not the install command.
-RUN sed -i '/^%{_bindir}\/facelock-polkit-agent$/d' /build/dist/facelock.spec
+RUN chmod +x /build/test/build-rpm-prebuilt.sh /pkg-validate.sh /polkit-agent-validate.sh
 
 # Download portable CPU-only ONNX Runtime (same as CI bundles in release packages)
 ARG ORT_VERSION=1.20.1

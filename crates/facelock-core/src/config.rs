@@ -35,6 +35,8 @@ pub struct Config {
     pub encryption: EncryptionConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub polkit: PolkitConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,6 +577,48 @@ impl Default for AuditConfig {
             rotate_size_mb: default_audit_rotate_size(),
         }
     }
+}
+
+/// Configuration for the polkit authentication agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolkitConfig {
+    /// polkit `action_id`s for which face authentication may be offered.
+    ///
+    /// A single face match must NOT authorize every polkit action (pkexec,
+    /// package install, disk mount, user admin). Any action not in this list
+    /// is declined by the agent so polkit falls through to the password
+    /// dialog handled by another agent — it is never denied outright.
+    ///
+    /// The default is a small vetted set of low/moderate-sensitivity actions.
+    /// Users may extend it deliberately (like a fingerprint reader's reach),
+    /// but high-risk actions are excluded by default.
+    #[serde(default = "default_face_eligible_actions")]
+    pub face_eligible_actions: Vec<String>,
+}
+
+impl Default for PolkitConfig {
+    fn default() -> Self {
+        Self {
+            face_eligible_actions: default_face_eligible_actions(),
+        }
+    }
+}
+
+impl PolkitConfig {
+    /// Whether the given polkit `action_id` may be authorized by face auth.
+    pub fn is_face_eligible(&self, action_id: &str) -> bool {
+        self.face_eligible_actions.iter().any(|a| a == action_id)
+    }
+}
+
+/// Default polkit actions eligible for face authentication.
+///
+/// Deliberately small and low-risk. High-risk actions — pkexec
+/// (`org.freedesktop.policykit.exec`), PackageKit install/remove, udisks
+/// mount, and accounts-service user admin — are intentionally EXCLUDED so a
+/// single face match cannot become a universal root key.
+fn default_face_eligible_actions() -> Vec<String> {
+    vec!["org.freedesktop.login1.lock-sessions".to_string()]
 }
 
 fn default_audit_path() -> String {
@@ -1287,6 +1331,94 @@ path = "/dev/video0"
 device_match_granularity = "bogus"
 "#;
         assert!(Config::parse(toml).is_err());
+    }
+
+    #[test]
+    fn polkit_config_default_allowlist_is_low_risk() {
+        let config = PolkitConfig::default();
+        // Default must offer face only for the vetted low-risk action.
+        assert_eq!(
+            config.face_eligible_actions,
+            vec!["org.freedesktop.login1.lock-sessions".to_string()]
+        );
+        assert!(config.is_face_eligible("org.freedesktop.login1.lock-sessions"));
+    }
+
+    #[test]
+    fn polkit_config_default_excludes_high_risk_actions() {
+        let config = PolkitConfig::default();
+        // High-risk actions must NOT be face-eligible by default.
+        for action in [
+            "org.freedesktop.policykit.exec",
+            "org.freedesktop.packagekit.package-install",
+            "org.freedesktop.udisks2.filesystem-mount",
+            "org.freedesktop.accounts.user-administration",
+        ] {
+            assert!(
+                !config.is_face_eligible(action),
+                "{action} must not be face-eligible by default"
+            );
+        }
+    }
+
+    #[test]
+    fn polkit_config_defaults_when_section_absent() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(
+            config.polkit.face_eligible_actions,
+            vec!["org.freedesktop.login1.lock-sessions".to_string()]
+        );
+    }
+
+    #[test]
+    fn polkit_config_allowlist_is_configurable() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[polkit]
+face_eligible_actions = [
+    "org.freedesktop.login1.lock-sessions",
+    "org.freedesktop.udisks2.filesystem-mount",
+]
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(
+            config
+                .polkit
+                .is_face_eligible("org.freedesktop.udisks2.filesystem-mount")
+        );
+        assert!(
+            config
+                .polkit
+                .is_face_eligible("org.freedesktop.login1.lock-sessions")
+        );
+        // Still excludes anything the user did not add.
+        assert!(
+            !config
+                .polkit
+                .is_face_eligible("org.freedesktop.policykit.exec")
+        );
+    }
+
+    #[test]
+    fn polkit_config_empty_allowlist_declines_everything() {
+        let toml = r#"
+[device]
+path = "/dev/video0"
+[polkit]
+face_eligible_actions = []
+"#;
+        let config = Config::parse(toml).unwrap();
+        // An explicitly empty list means "never offer face" — no fail-open.
+        assert!(
+            !config
+                .polkit
+                .is_face_eligible("org.freedesktop.login1.lock-sessions")
+        );
     }
 
     #[test]

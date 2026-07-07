@@ -95,6 +95,12 @@ if command -v dbus-daemon >/dev/null 2>&1; then
     elif command -v dbus-send >/dev/null 2>&1; then
         run_test "D-Bus facelock service activatable" "dbus-send --system --dest=org.freedesktop.DBus --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListActivatableNames 2>/dev/null | grep -q org.facelock.Daemon"
     fi
+
+    # Polkit agent D-Bus boundary: non-allowlisted actions decline (fall
+    # through to password), allowlisted actions pass the allowlist gate.
+    if [ -x /polkit-agent-validate.sh ]; then
+        run_test "polkit agent allowlist gate (D-Bus boundary)" "/polkit-agent-validate.sh"
+    fi
 fi
 
 # Package removal test — must come last since it removes the package

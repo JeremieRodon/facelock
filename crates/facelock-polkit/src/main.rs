@@ -7,6 +7,7 @@ use zbus::connection::Builder;
 use zbus::zvariant::Value;
 use zbus::{Connection, fdo, interface};
 
+use facelock_core::config::PolkitConfig;
 use facelock_core::dbus_interface::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
 
 /// Polkit authentication agent that attempts face authentication via the
@@ -14,6 +15,9 @@ use facelock_core::dbus_interface::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
 /// password auth).
 struct PolkitAgent {
     system_conn: Connection,
+    /// Actions eligible for face authentication. Any action not in this list
+    /// is declined so polkit falls through to the password dialog.
+    polkit_config: PolkitConfig,
     /// Tracks in-flight authentication attempts by cookie.
     /// Sending on the oneshot signals cancellation.
     active_auths: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
@@ -31,6 +35,17 @@ impl PolkitAgent {
         identities: Vec<(String, HashMap<String, Value<'_>>)>,
     ) -> fdo::Result<()> {
         tracing::info!(action_id, message, "polkit auth request received");
+
+        // Scope face auth to an allowlist. A single face match must not
+        // authorize every polkit action. If this action is not eligible,
+        // decline (return Err) so polkit routes to a password agent —
+        // this is a fall-through, NOT a denial.
+        if !self.polkit_config.is_face_eligible(action_id) {
+            tracing::info!(action_id, "not eligible for face auth, declining");
+            return Err(fdo::Error::Failed(format!(
+                "action '{action_id}' not eligible for face authentication"
+            )));
+        }
 
         let user = extract_username(&identities).unwrap_or_else(current_username);
 
@@ -147,9 +162,10 @@ async fn respond_to_polkit(
     .await
     .context("failed to build polkit authority proxy")?;
 
-    let uid = nix::unistd::User::from_name(user)?
-        .map(|u| u.uid.as_raw())
-        .unwrap_or(0);
+    // Fail closed: an unresolvable username must NEVER be sent to polkit as
+    // UID 0. Resolve the name, then refuse if it does not map to a real uid.
+    let resolved = nix::unistd::User::from_name(user)?.map(|u| u.uid.as_raw());
+    let uid = uid_from_resolution(user, resolved)?;
 
     let _: () = proxy
         .call("AuthenticationAgentResponse2", &(uid, cookie))
@@ -157,6 +173,15 @@ async fn respond_to_polkit(
         .context("AuthenticationAgentResponse2 failed")?;
 
     Ok(())
+}
+
+/// Map a resolved uid to a value to send to polkit, refusing when the name did
+/// not resolve. Never substitutes UID 0 for an unresolved name (which would be
+/// a fail-open to root).
+fn uid_from_resolution(user: &str, resolved: Option<u32>) -> anyhow::Result<u32> {
+    resolved.ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve user '{user}'; refusing to respond to polkit")
+    })
 }
 
 /// Register this process as a polkit authentication agent.
@@ -199,20 +224,50 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to connect to system D-Bus")?;
 
+    // Load the face-eligible action allowlist from config. If config is
+    // missing or unreadable, fall back to the safe (restrictive) default —
+    // never to an open policy.
+    let polkit_config = match facelock_core::config::Config::load() {
+        Ok(config) => config.polkit,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not load config; using default face-eligible action allowlist");
+            PolkitConfig::default()
+        }
+    };
+    tracing::info!(
+        actions = ?polkit_config.face_eligible_actions,
+        "face authentication scoped to allowlisted polkit actions"
+    );
+
     let agent = PolkitAgent {
         system_conn: system_conn.clone(),
+        polkit_config,
         active_auths: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    // Test hook: skip polkit registration and claim a well-known session-bus
+    // name so the agent's D-Bus boundary can be exercised in a container
+    // without a live polkit authority. Never used in production.
+    let skip_register = std::env::var_os("FACELOCK_POLKIT_SKIP_REGISTER").is_some();
+
     // Build a session bus connection that serves the agent interface.
-    let _session_conn = Builder::session()?
-        .serve_at("/org/facelock/PolkitAgent", agent)?
+    let mut builder = Builder::session()?.serve_at("/org/facelock/PolkitAgent", agent)?;
+    if skip_register {
+        builder = builder.name("org.facelock.PolkitAgent")?;
+    }
+    let _session_conn = builder
         .build()
         .await
         .context("failed to build session D-Bus connection")?;
 
     // Register with polkit on the system bus.
-    register_agent(&system_conn).await?;
+    if skip_register {
+        tracing::warn!(
+            "FACELOCK_POLKIT_SKIP_REGISTER set: not registering with polkit (test mode)"
+        );
+    } else {
+        register_agent(&system_conn).await?;
+    }
 
     tracing::info!("facelock polkit agent running, waiting for auth requests");
 
@@ -257,5 +312,36 @@ mod tests {
     fn current_username_returns_nonempty() {
         let name = current_username();
         assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn uid_resolution_refuses_unresolved_name() {
+        // An unresolved username (from_name returned Ok(None)) must produce a
+        // refusal — never fall open to UID 0.
+        let err = uid_from_resolution("ghost", None).unwrap_err();
+        assert!(err.to_string().contains("cannot resolve user 'ghost'"));
+    }
+
+    #[test]
+    fn uid_resolution_never_emits_uid_zero_for_unresolved_name() {
+        // Explicitly assert the fail-open-to-root regression cannot recur:
+        // no unresolved name may map to uid 0.
+        assert!(uid_from_resolution("nonexistent-user", None).is_err());
+    }
+
+    #[test]
+    fn uid_resolution_passes_through_resolved_uid() {
+        // A genuinely resolved uid (including 0 for real root) is returned.
+        assert_eq!(uid_from_resolution("root", Some(0)).unwrap(), 0);
+        assert_eq!(uid_from_resolution("alice", Some(1000)).unwrap(), 1000);
+    }
+
+    #[test]
+    fn allowlist_gates_face_eligibility() {
+        // The agent offers face only for allowlisted actions; everything else
+        // is declined (falls through to password).
+        let config = PolkitConfig::default();
+        assert!(config.is_face_eligible("org.freedesktop.login1.lock-sessions"));
+        assert!(!config.is_face_eligible("org.freedesktop.policykit.exec"));
     }
 }

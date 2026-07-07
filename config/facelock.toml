@@ -372,6 +372,28 @@
 # dir = "/var/log/facelock/snapshots"
 
 
+# ── Polkit ─────────────────────────────────────────────────────────
+#
+# Controls the facelock polkit authentication agent. Face auth is SCOPED,
+# not universal: a single face match must not authorize every privileged
+# polkit action (pkexec, package install, disk mount, user admin).
+#
+# `face_eligible_actions` lists the polkit action_ids for which face auth
+# may be offered. Any action NOT in the list is declined by the agent so
+# polkit falls through to the password dialog (another agent handles it) —
+# it is never denied outright.
+#
+# The default is a small, low-risk set. High-risk actions — pkexec
+# (org.freedesktop.policykit.exec), PackageKit install/remove, udisks mount,
+# accounts-service user administration — are intentionally EXCLUDED. Extend
+# the list deliberately if you want face to reach further (like a fingerprint
+# reader), then restart the agent. An empty list disables face for all
+# actions.
+#
+# [polkit]
+# face_eligible_actions = ["org.freedesktop.login1.lock-sessions"]
+
+
 # ── TPM ────────────────────────────────────────────────────────────
 #
 # TPM 2.0 settings for sealing the AES encryption key.

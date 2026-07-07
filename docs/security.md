@@ -439,6 +439,84 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 systemd-analyze security facelock-daemon.service
 ```
 
+### 7. Polkit / sudo Face Auth (Implemented)
+
+Face auth can satisfy polkit and `sudo` authorization through **two independent
+deployment models**. They have different scoping semantics, so it matters which
+one a given host uses:
+
+| Model | How it's wired | Scoping | Fallback |
+|-------|----------------|---------|----------|
+| **Agent model** | `facelock-polkit-agent` registers as the session's polkit authentication agent | `polkit.face_eligible_actions` allowlist (below) | Agent declines non-eligible actions |
+| **PAM model** (Howdy-style) | `pam_facelock.so` added as `auth sufficient` in `/etc/pam.d/{sudo,polkit-1,…}` | **None** — face is attempted for *every* action under that PAM stack | Password, always (see below) |
+
+Most real installs (including the Omarchy/hyprlock setup this project targets)
+use the **PAM model**, because it is the only one that also covers `sudo` and
+login. On those hosts the agent allowlist does **not** apply — it is an
+agent-only control and `pam_facelock.so` never consults it.
+
+#### 7a. PAM model — accepted posture (unscoped, password-backed)
+
+When `pam_facelock.so` is placed as `auth sufficient` in a PAM stack, **any**
+action routed through that stack (every `pkexec`/polkit prompt, every `sudo`)
+will attempt a face match first. This is the same posture as a fingerprint
+reader or Howdy: the biometric is a convenience factor across the board, not a
+per-action capability.
+
+This is **accepted by design**, and safe, because of two invariants the module
+guarantees:
+
+- **`sufficient`, never `required`.** A failed or unavailable face match (camera
+  busy, no IR, timeout, spoof rejection, rate-limited) falls through to the next
+  line in the stack — normally `pam_unix.so` / the password prompt. Face auth can
+  only ever *add* a way in, never *remove* the password. Verified on this host:
+  `pkexec echo hello` face-authorized; covering the camera fell back to the
+  password dialog.
+- **All the anti-spoof and trust-boundary defenses still apply** on every one of
+  those attempts — `require_ir`, frame-variance liveness, rate limiting, SSH/lid
+  abort, and the PAM service allowlist (`security.pam_policy.allowed_services`,
+  which *does* gate the PAM path). So "unscoped across actions" does not mean
+  "unscoped across defenses."
+
+Operators who want face auth for only some actions under the PAM model should
+control it at the PAM layer (which service files include `pam_facelock.so`), not
+via `polkit.face_eligible_actions` (which the PAM path ignores). Per-action
+scoping *inside* a single PAM stack is not offered; if you need it, use the agent
+model instead, or omit `pam_facelock.so` from the stacks you want password-only.
+
+#### 7b. Agent model — action allowlist
+
+The `facelock-polkit-agent` lets a face match satisfy polkit authorization
+requests. Two hardening rules keep this from becoming a universal root key:
+
+**Action allowlist.** Face auth is offered only for polkit `action_id`s in
+`polkit.face_eligible_actions`. The default is a single low-risk action
+(`org.freedesktop.login1.lock-sessions`). High-risk actions — pkexec
+(`org.freedesktop.policykit.exec`), PackageKit install/remove, udisks mount, and
+accounts-service user administration — are **excluded by default**, so a single
+face match cannot authorize arbitrary privileged operations. Users may extend the
+list deliberately (like widening a fingerprint reader's reach); an empty list
+disables face for all actions.
+
+When an action is not eligible, the agent **declines** (returns a D-Bus
+`Failed` error).
+
+> **NOTE (agent model only):** polkit registers a single authentication agent
+> per session and does not chain agents. When this agent declines a
+> non-allowlisted action it returns an error, which — depending on the desktop's
+> agent registration — may present as an authorization denial rather than a
+> fallthrough to a password dialog. The intended UX (non-eligible actions handled
+> by the desktop's normal password agent) is unverified pending live-desktop
+> testing. Behavior is fail-closed: a non-eligible action is never
+> face-authorized. This caveat does **not** apply to the PAM model (§7a), which
+> always falls through to the password prompt. If the fallthrough UX matters to
+> you and is unverified on your desktop, prefer the PAM model.
+
+**Fail closed on unresolved user.** When responding to the polkit authority, the
+agent resolves the target username to a uid. If the name does not resolve, the
+agent refuses to respond. It never substitutes UID 0 — the previous
+`unwrap_or(0)` behavior would have authenticated an unresolvable name as root.
+
 ## Security Configuration Reference
 
 ```toml
@@ -464,6 +542,14 @@ denied_services = ["login", "sshd"]
 [security.rate_limit]
 max_attempts = 5             # Max auth attempts per user
 window_secs = 60             # Rate limit window
+
+[polkit]
+# Polkit actions eligible for face auth *under the agent model only*. Non-listed
+# actions are declined by the agent. High-risk actions excluded by default;
+# empty = face off. NOTE: this list is ignored under the PAM model (pam_facelock.so
+# in /etc/pam.d/*), where face is attempted for every action with password fallback.
+# See "Polkit / sudo Face Auth" §7a/§7b above for the two models.
+face_eligible_actions = ["org.freedesktop.login1.lock-sessions"]
 ```
 
 ## Summary: Security Implementation Priority

@@ -89,6 +89,28 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | `[encryption]` | `method` (keyfile/tpm/none — **default keyfile**), `key_path`, `sealed_key_path` |
 | `[audit]` | `enabled`, `path`, `rotate_size_mb` |
 | `[tpm]` | `seal_database`, `pcr_binding`, `pcr_indices`, `tcti` |
+| `[polkit]` | `face_eligible_actions` |
+
+`[polkit].face_eligible_actions` is the allowlist of polkit `action_id`s for which
+the face authentication agent may offer face auth. Default:
+`["org.freedesktop.login1.lock-sessions"]`. Any action not in the list is declined
+by the agent. An empty list disables face for all actions. High-risk actions
+(pkexec, PackageKit, udisks mount, accounts-service) are excluded by default.
+
+**Scope:** this allowlist governs the **agent model** only. Under the **PAM model**
+(`pam_facelock.so` as `auth sufficient` in `/etc/pam.d/*`, the common Howdy-style
+deployment that also covers `sudo`), the list is ignored: face is attempted for
+every action in that PAM stack, always with password fallback because the line is
+`sufficient`, never `required`. See `docs/security.md` §7a/§7b for the two models.
+
+**NOTE (agent model only):** polkit registers a single authentication agent per
+session and does not chain agents. When this agent declines a non-allowlisted
+action it returns an error, which — depending on the desktop's agent
+registration — may present as an authorization denial rather than a
+fallthrough to a password dialog. The intended UX (non-eligible actions
+handled by the desktop's normal password agent) is unverified pending
+live-desktop testing and may require a design change. Behavior here is
+fail-closed: a non-eligible action is never face-authorized.
 
 **Encryption defaults (Plan 04).** `encryption.method` defaults to `keyfile`: face
 templates are encrypted at rest by default. The keyfile is auto-generated at mode `0600`
@@ -195,6 +217,31 @@ PAM module never blocks indefinitely. All operations have timeouts.
 ```
 pam_facelock(<service>): <result> for user <username>
 ```
+
+## Polkit Agent Semantics
+
+The `facelock-polkit-agent` offers face authentication for polkit actions, but
+scoped to an allowlist — face is **not** a universal key for every privileged action.
+
+| Outcome | Agent behavior |
+|---------|----------------|
+| `action_id` not in `polkit.face_eligible_actions` | Declines (returns `org.freedesktop.DBus.Error.Failed`) — see fallthrough-vs-denial caveat below |
+| Allowlisted action, face matches | Responds success to polkit authority |
+| Allowlisted action, no match / daemon error | Declines (same caveat) |
+| Username cannot be resolved to a uid | Refuses to respond; **never** sends UID 0 for an unresolved name |
+
+**NOTE (agent model only):** polkit registers a single authentication agent per
+session and does not chain agents. When this agent declines, the decline
+returns an error, which — depending on the desktop's agent registration — may
+present as an authorization denial rather than a fallthrough to a password
+dialog. The intended UX (non-eligible actions handled by the desktop's normal
+password agent) is unverified pending live-desktop testing. Behavior here is
+fail-closed: a non-eligible action is never face-authorized. Does not apply to
+the PAM model, which always falls through to the password prompt.
+
+A decline never fails open to root, and never causes this agent itself to grant
+authorization it should not — but see the caveat above on whether polkit
+treats a decline as a fall-through to another agent or as an outright denial.
 
 ## Anti-Spoofing
 
