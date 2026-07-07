@@ -26,6 +26,9 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
     pub store: FaceStore,
     pub rate_limiter: RateLimiter,
     pub device_is_ir: bool,
+    /// Live camera fingerprint used to couple templates to their enrolling
+    /// camera (Plan 02). Computed once at handler build from the resolved device.
+    pub device_fingerprint: facelock_core::types::DeviceFingerprint,
     pub shutdown_requested: bool,
     camera: Option<C>,
     camera_factory: Option<CameraFactory<C>>,
@@ -39,12 +42,14 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
 }
 
 impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         engine: E,
         store: FaceStore,
         rate_limiter: RateLimiter,
         device_is_ir: bool,
+        device_fingerprint: facelock_core::types::DeviceFingerprint,
         camera_factory: Option<CameraFactory<C>>,
         warmup_frames_override: Option<u32>,
     ) -> Result<Self, String> {
@@ -115,6 +120,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             store,
             rate_limiter,
             device_is_ir,
+            device_fingerprint,
             shutdown_requested: false,
             camera: None,
             camera_factory,
@@ -343,6 +349,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     &self.config,
                     &user,
                     self.device_is_ir,
+                    &self.device_fingerprint,
                 );
                 self.camera = Some(camera);
                 self.camera_last_used = Instant::now();
@@ -363,6 +370,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
 
                 let mut camera = self.camera.take().unwrap();
+                let device_id = self.device_fingerprint.canonical_for_storage();
                 let result = enroll::enroll(
                     &mut camera,
                     &mut self.engine,
@@ -371,6 +379,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     &user,
                     &label,
                     self.software_sealer.as_ref(),
+                    device_id.as_deref(),
                 );
                 self.camera = Some(camera);
                 self.camera_last_used = Instant::now();

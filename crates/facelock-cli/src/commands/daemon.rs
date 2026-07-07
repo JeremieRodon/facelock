@@ -460,6 +460,8 @@ impl FacelockService {
                         label: m.label,
                         created_at: m.created_at,
                         embedder_model: m.embedder_model,
+                        // D-Bus has no Option: empty string == NULL/legacy.
+                        device_id: m.device_id.unwrap_or_default(),
                     })
                     .collect()),
                 DaemonResponse::Error { message } => Err(fdo::Error::Failed(message)),
@@ -762,6 +764,16 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
         Camera::open(&config.device, quirk_for_factory.as_ref()).map_err(|e| e.to_string())
     });
 
+    // Device coupling (Plan 02): fingerprint the resolved camera once so enroll
+    // can record it and auth can require it. Advisory only (model-granularity,
+    // spoofable) — see facelock_core::types::DeviceFingerprint.
+    let device_fingerprint = facelock_camera::device_fingerprint(&device_path);
+    info!(
+        device = %device_path,
+        device_id = %device_fingerprint.canonical(),
+        "camera device fingerprint"
+    );
+
     let idle_timeout_secs = config.daemon.idle_timeout_secs;
     let warmup_override = device_quirk.and_then(|q| q.warmup_frames);
     let handler = Handler::new(
@@ -770,6 +782,7 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
         store,
         rate_limiter,
         device_is_ir,
+        device_fingerprint,
         Some(camera_factory),
         warmup_override,
     )?;

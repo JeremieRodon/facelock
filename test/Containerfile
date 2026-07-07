@@ -2,7 +2,9 @@
 FROM archlinux:latest
 
 # Install dependencies
-RUN pacman -Syu --noconfirm pam sudo base-devel libxkbcommon just dbus onnxruntime-cpu protobuf && pacman -Scc --noconfirm
+# `sqlite` provides the sqlite3 CLI used by the device-coupling E2E assertions
+# (Plan 02) to inspect/seed face_models.device_id deterministically.
+RUN pacman -Syu --noconfirm pam sudo base-devel libxkbcommon just dbus onnxruntime-cpu protobuf sqlite && pacman -Scc --noconfirm
 
 # Build pamtester from upstream source
 RUN curl -sL https://sourceforge.net/projects/pamtester/files/pamtester/0.1.2/pamtester-0.1.2.tar.gz/download | tar xz -C /tmp && \

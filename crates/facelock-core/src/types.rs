@@ -71,6 +71,202 @@ pub struct FaceModelInfo {
     /// Which ONNX embedder model generated this enrollment's embeddings.
     /// Empty string means legacy/unknown (pre-migration).
     pub embedder_model: String,
+    /// Canonical device fingerprint (`"vid:pid:serial"`) of the camera that
+    /// enrolled this model, or `None` for legacy rows (schema < V6) and models
+    /// enrolled on a camera with no readable USB identity.
+    ///
+    /// See [`DeviceFingerprint`] for the honest threat framing: this is
+    /// model-granularity at best and forgeable by a programmable USB device —
+    /// advisory defense-in-depth, NOT an attested root of trust.
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+/// Stable-ish hardware identity of a capture device.
+///
+/// Assembled from sysfs USB attributes (`idVendor`/`idProduct`/`serial`) plus
+/// the `/dev/v4l/by-path` symlink target. **This is not attestation.**
+///
+/// - `vid:pid` is **model granularity** — every unit of the same camera model
+///   shares it.
+/// - `serial` is unit-unique *when present*, but is frequently absent or
+///   duplicated across units by vendors.
+/// - A **programmable USB device can forge any of these fields.** Consumer UVC
+///   cameras have no signed-frame attestation.
+///
+/// So device coupling built on this raises the bar against the realistic
+/// attacker (who plugs in a commodity or different-model camera) but is
+/// **advisory defense-in-depth**, not a cryptographic identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceFingerprint {
+    /// USB vendor ID (lowercase hex, e.g. `"046d"`).
+    pub vid: Option<String>,
+    /// USB product ID (lowercase hex, e.g. `"085e"`).
+    pub pid: Option<String>,
+    /// USB `iSerial` string, when the device exposes one.
+    pub serial: Option<String>,
+    /// Stable `/dev/v4l/by-path/...` symlink target (bus topology). Advisory
+    /// only; not part of the canonical id, but recorded for diagnostics.
+    pub by_path: Option<String>,
+}
+
+impl DeviceFingerprint {
+    /// Canonical string form `"vid:pid:serial"` (each missing field rendered
+    /// empty). This is what is persisted in `face_models.device_id`.
+    pub fn canonical(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.vid.as_deref().unwrap_or(""),
+            self.pid.as_deref().unwrap_or(""),
+            self.serial.as_deref().unwrap_or(""),
+        )
+    }
+
+    /// Canonical id to persist at enrollment, or `None` when the camera exposes
+    /// no usable identity (no vid **and** no pid). A `None` here is stored as a
+    /// NULL `device_id` and governed by the legacy-template policy, so coupling
+    /// never turns an unidentifiable camera into a hard lockout.
+    pub fn canonical_for_storage(&self) -> Option<String> {
+        if self.is_unknown() {
+            None
+        } else {
+            Some(self.canonical())
+        }
+    }
+
+    /// True when neither vendor nor product id could be read — the device has no
+    /// identity we can enforce against.
+    pub fn is_unknown(&self) -> bool {
+        self.vid.is_none() && self.pid.is_none()
+    }
+
+    /// True when a unit-unique serial is available.
+    pub fn has_serial(&self) -> bool {
+        self.serial.as_deref().is_some_and(|s| !s.is_empty())
+    }
+}
+
+/// Granularity at which a live camera must match a template's enrolling camera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceMatchGranularity {
+    /// Compare `vid:pid` only. Blocks a cross-model camera swap; identical
+    /// same-model cameras are accepted. The invisible-to-single-camera default.
+    #[default]
+    Model,
+    /// Require `vid:pid:serial` to match. Blocks even a same-model swap, but only
+    /// works on cameras that expose a stable serial.
+    Unit,
+}
+
+/// Resolved device-binding policy for the auth compare path (derived from config).
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceBindingPolicy {
+    /// Master switch (`security.bind_templates_to_device`).
+    pub enabled: bool,
+    /// Match granularity (`security.device_match_granularity`).
+    pub granularity: DeviceMatchGranularity,
+    /// Whether legacy NULL-`device_id` templates are allowed to authenticate
+    /// (`security.bind_legacy_templates`). Default allow-with-warn so upgrades
+    /// don't break.
+    pub allow_legacy: bool,
+}
+
+/// Compare a stored canonical device id against the live camera fingerprint at
+/// the given granularity.
+///
+/// A match requires the compared fields to be present and equal on **both**
+/// sides: an unknown live camera (no vid/pid) never matches a non-empty stored
+/// id, and `Unit` never matches when either side lacks a serial. This is the
+/// property that makes a mismatch fall through to password instead of ever
+/// reaching a success.
+pub fn device_ids_match(
+    stored_canonical: &str,
+    live: &DeviceFingerprint,
+    granularity: DeviceMatchGranularity,
+) -> bool {
+    // Parse the stored "vid:pid:serial" form. splitn keeps a serial that itself
+    // contains ':' intact in the third field.
+    let mut parts = stored_canonical.splitn(3, ':');
+    let s_vid = parts.next().unwrap_or("");
+    let s_pid = parts.next().unwrap_or("");
+    let s_serial = parts.next().unwrap_or("");
+
+    let l_vid = live.vid.as_deref().unwrap_or("");
+    let l_pid = live.pid.as_deref().unwrap_or("");
+    let l_serial = live.serial.as_deref().unwrap_or("");
+
+    // Model-level identity must always be present and equal.
+    let model_ok = !s_vid.is_empty()
+        && !s_pid.is_empty()
+        && s_vid.eq_ignore_ascii_case(l_vid)
+        && s_pid.eq_ignore_ascii_case(l_pid);
+    if !model_ok {
+        return false;
+    }
+
+    match granularity {
+        DeviceMatchGranularity::Model => true,
+        DeviceMatchGranularity::Unit => {
+            // Unit match additionally needs a serial present and equal on both sides.
+            !s_serial.is_empty() && !l_serial.is_empty() && s_serial == l_serial
+        }
+    }
+}
+
+/// Decide whether a candidate template may be compared against the live camera.
+///
+/// Returns `true` when the template's embeddings are allowed into the compare
+/// set, `false` when the model must be **skipped** (so the outcome degrades to
+/// "no match" → password). Never panics; the caller treats `false` as skip, not
+/// as an error or a lockout.
+pub fn device_binding_allows(
+    device_id: Option<&str>,
+    live: &DeviceFingerprint,
+    policy: &DeviceBindingPolicy,
+) -> bool {
+    if !policy.enabled {
+        return true;
+    }
+    match device_id {
+        // Legacy rows (pre-V6) and models enrolled on an unidentifiable camera
+        // carry a NULL / empty id — governed by the legacy policy.
+        None | Some("") => policy.allow_legacy,
+        Some(stored) => device_ids_match(stored, live, policy.granularity),
+    }
+}
+
+/// Model ids whose enrolling camera permits comparison against the live camera.
+///
+/// The auth compare loop must restrict `best_match` to embeddings whose model id
+/// is in this set. Any template failing the device binding is omitted, so its
+/// embeddings are never compared and a device mismatch can only ever produce
+/// "no match" → password, never a success.
+pub fn device_allowed_model_ids(
+    models: &[FaceModelInfo],
+    live: &DeviceFingerprint,
+    policy: &DeviceBindingPolicy,
+) -> std::collections::HashSet<u32> {
+    models
+        .iter()
+        .filter(|m| device_binding_allows(m.device_id.as_deref(), live, policy))
+        .map(|m| m.id)
+        .collect()
+}
+
+/// AAD seam for Plan 04 (opt-in *hard* device binding).
+///
+/// Plan 02 binds templates advisorily (skip-on-mismatch in the compare loop).
+/// Plan 04 may additionally fold the enrolling camera's identity into the
+/// AES-GCM Additional Authenticated Data so a sealed embedding cannot even be
+/// decrypted under a different device id. This helper defines the canonical AAD
+/// bytes for that future wiring; it is intentionally not yet consumed by the
+/// seal/unseal path (doing so now would fail *hard* on unstable ids, which
+/// Plan 02 must not).
+pub fn device_binding_aad(device_id: Option<&str>) -> Option<Vec<u8>> {
+    device_id
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("facelock-device:{s}").into_bytes())
 }
 
 /// Why an authentication attempt that saw matching frames still failed.
@@ -591,6 +787,226 @@ mod tests {
         assert!(!check_frame_variance(&seq, sim - 0.001));
         // ...and with a max just above, it is accepted.
         assert!(check_frame_variance(&seq, sim + 0.001));
+    }
+
+    fn fp(vid: Option<&str>, pid: Option<&str>, serial: Option<&str>) -> DeviceFingerprint {
+        DeviceFingerprint {
+            vid: vid.map(String::from),
+            pid: pid.map(String::from),
+            serial: serial.map(String::from),
+            by_path: None,
+        }
+    }
+
+    #[test]
+    fn fingerprint_canonical_string_form() {
+        assert_eq!(
+            fp(Some("046d"), Some("085e"), Some("ABC")).canonical(),
+            "046d:085e:ABC"
+        );
+        assert_eq!(
+            fp(Some("046d"), Some("085e"), None).canonical(),
+            "046d:085e:"
+        );
+        assert_eq!(fp(None, None, None).canonical(), "::");
+    }
+
+    #[test]
+    fn fingerprint_canonical_for_storage_is_none_when_unidentifiable() {
+        // No vid/pid → no identity → stored as NULL (legacy-governed), never a lockout.
+        assert_eq!(fp(None, None, None).canonical_for_storage(), None);
+        assert_eq!(fp(None, None, Some("SER")).canonical_for_storage(), None);
+        assert_eq!(
+            fp(Some("046d"), Some("085e"), None).canonical_for_storage(),
+            Some("046d:085e:".to_string())
+        );
+    }
+
+    #[test]
+    fn device_match_model_granularity_compares_vid_pid_only() {
+        let live = fp(Some("046d"), Some("085e"), Some("SERIAL-A"));
+        // Same model, different serial → matches at model granularity.
+        assert!(device_ids_match(
+            "046d:085e:SERIAL-B",
+            &live,
+            DeviceMatchGranularity::Model
+        ));
+        // Different model → no match.
+        assert!(!device_ids_match(
+            "1234:5678:SERIAL-A",
+            &live,
+            DeviceMatchGranularity::Model
+        ));
+    }
+
+    #[test]
+    fn device_match_is_case_insensitive_on_ids() {
+        let live = fp(Some("046D"), Some("085E"), None);
+        assert!(device_ids_match(
+            "046d:085e:",
+            &live,
+            DeviceMatchGranularity::Model
+        ));
+    }
+
+    #[test]
+    fn device_match_unit_granularity_requires_serial() {
+        let live = fp(Some("046d"), Some("085e"), Some("SERIAL-A"));
+        // Same unit → match.
+        assert!(device_ids_match(
+            "046d:085e:SERIAL-A",
+            &live,
+            DeviceMatchGranularity::Unit
+        ));
+        // Same model, different serial → NO match at unit granularity.
+        assert!(!device_ids_match(
+            "046d:085e:SERIAL-B",
+            &live,
+            DeviceMatchGranularity::Unit
+        ));
+        // Stored has serial but live lacks one → no unit match.
+        let live_no_serial = fp(Some("046d"), Some("085e"), None);
+        assert!(!device_ids_match(
+            "046d:085e:SERIAL-A",
+            &live_no_serial,
+            DeviceMatchGranularity::Unit
+        ));
+    }
+
+    #[test]
+    fn device_match_unknown_live_never_matches_nonempty_stored() {
+        let unknown = fp(None, None, None);
+        assert!(!device_ids_match(
+            "046d:085e:",
+            &unknown,
+            DeviceMatchGranularity::Model
+        ));
+        assert!(!device_ids_match(
+            "046d:085e:SER",
+            &unknown,
+            DeviceMatchGranularity::Unit
+        ));
+    }
+
+    #[test]
+    fn device_binding_disabled_allows_everything() {
+        let policy = DeviceBindingPolicy {
+            enabled: false,
+            granularity: DeviceMatchGranularity::Unit,
+            allow_legacy: false,
+        };
+        let unknown = fp(None, None, None);
+        assert!(device_binding_allows(
+            Some("046d:085e:X"),
+            &unknown,
+            &policy
+        ));
+        assert!(device_binding_allows(None, &unknown, &policy));
+    }
+
+    #[test]
+    fn device_binding_legacy_null_follows_allow_legacy() {
+        let live = fp(Some("046d"), Some("085e"), None);
+        let allow = DeviceBindingPolicy {
+            enabled: true,
+            granularity: DeviceMatchGranularity::Model,
+            allow_legacy: true,
+        };
+        let deny = DeviceBindingPolicy {
+            allow_legacy: false,
+            ..allow
+        };
+        assert!(device_binding_allows(None, &live, &allow));
+        assert!(device_binding_allows(Some(""), &live, &allow));
+        assert!(!device_binding_allows(None, &live, &deny));
+    }
+
+    /// Regression gate: a template whose device id does not match the live
+    /// camera must NEVER be allowed into the compare set. If this ever returns
+    /// true, a device mismatch could reach the success branch.
+    #[test]
+    fn device_mismatch_is_never_allowed() {
+        let live = fp(Some("046d"), Some("085e"), Some("REAL"));
+        let policy = DeviceBindingPolicy {
+            enabled: true,
+            granularity: DeviceMatchGranularity::Model,
+            allow_legacy: true,
+        };
+        // A different-model attacker camera template must be skipped.
+        assert!(!device_binding_allows(
+            Some("ffff:ffff:FAKE"),
+            &live,
+            &policy
+        ));
+        // Even with a matching-looking serial but wrong model.
+        assert!(!device_binding_allows(
+            Some("1234:5678:REAL"),
+            &live,
+            &policy
+        ));
+        // And at unit granularity, a same-model different-serial template is skipped.
+        let unit = DeviceBindingPolicy {
+            granularity: DeviceMatchGranularity::Unit,
+            ..policy
+        };
+        assert!(!device_binding_allows(
+            Some("046d:085e:OTHER"),
+            &live,
+            &unit
+        ));
+    }
+
+    fn model(id: u32, device_id: Option<&str>) -> FaceModelInfo {
+        FaceModelInfo {
+            id,
+            user: "alice".into(),
+            label: format!("m{id}"),
+            created_at: 0,
+            embedder_model: String::new(),
+            device_id: device_id.map(String::from),
+        }
+    }
+
+    #[test]
+    fn allowed_model_ids_excludes_device_mismatch() {
+        let live = fp(Some("046d"), Some("085e"), Some("REAL"));
+        let policy = DeviceBindingPolicy {
+            enabled: true,
+            granularity: DeviceMatchGranularity::Model,
+            allow_legacy: true,
+        };
+        let models = vec![
+            model(1, Some("046d:085e:REAL")), // same camera → allowed
+            model(2, Some("ffff:ffff:FAKE")), // attacker camera → excluded
+            model(3, None),                   // legacy → allowed
+        ];
+        let allowed = device_allowed_model_ids(&models, &live, &policy);
+        assert!(allowed.contains(&1));
+        assert!(!allowed.contains(&2), "mismatched model must be excluded");
+        assert!(allowed.contains(&3));
+    }
+
+    #[test]
+    fn allowed_model_ids_all_when_disabled() {
+        let live = fp(None, None, None);
+        let policy = DeviceBindingPolicy {
+            enabled: false,
+            granularity: DeviceMatchGranularity::Unit,
+            allow_legacy: false,
+        };
+        let models = vec![model(1, Some("046d:085e:X")), model(2, None)];
+        let allowed = device_allowed_model_ids(&models, &live, &policy);
+        assert_eq!(allowed.len(), 2);
+    }
+
+    #[test]
+    fn device_binding_aad_seam_shape() {
+        assert_eq!(
+            device_binding_aad(Some("046d:085e:X")),
+            Some(b"facelock-device:046d:085e:X".to_vec())
+        );
+        assert_eq!(device_binding_aad(None), None);
+        assert_eq!(device_binding_aad(Some("")), None);
     }
 
     /// Unit embedding at a planar angle: cosine similarity between two of these

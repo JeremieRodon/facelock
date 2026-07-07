@@ -81,7 +81,7 @@ if config.security.require_ir && !device_is_ir {
 
 **Why `force_ir` is device-level, not node-level (hardware-verified regression)**: on a real Logitech BRIO, treating every quirk-matched node as IR made *both* `/dev/video0` (the RGB sensor) and `/dev/video2` (the IR sensor) classify IR — so setup stopped auto-selecting and auto-detect captured from the RGB sensor (white LED) instead of the IR sensor. The sibling-format disambiguation above restores per-node honesty: exactly one BRIO node is `[IR]`, and auto-detection prefers the format-corroborated IR node.
 
-**Limitation**: classification is still heuristic without a hardware allow-list. Some genuine IR cameras report neither an IR name token nor a known quirk; add a quirks `force_ir` entry (`/etc/facelock/quirks.d/`) for such hardware (and set `format_preference` to the IR node's native format, e.g. `"GREY"`, when the camera exposes multiple capture nodes). The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is the successor fix (Plan 02).
+**Limitation**: classification is still heuristic without a hardware allow-list. Some genuine IR cameras report neither an IR name token nor a known quirk; add a quirks `force_ir` entry (`/etc/facelock/quirks.d/`) for such hardware (and set `format_preference` to the IR node's native format, e.g. `"GREY"`, when the camera exposes multiple capture nodes). The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
 
 #### B. Frame Variance Check (Required)
 
@@ -177,6 +177,59 @@ only to the recognition/embedding path; texture measurement uses `frame.gray` di
 std_dev **< 5**, real IR skin scores **> 15**. The cutoff `security.ir_texture_min_stddev`
 defaults to **10.0** (between the two bands). Lower it if real faces are being rejected;
 raise it toward 15 to be stricter. Applied on IR devices only (RGB texture is too variable).
+
+#### D. Device Coupling — Template↔Camera Binding (Plan 02, default on)
+
+**Attack it addresses**: the realistic attacker unplugs the enrolled IR camera and plugs
+in *their own* camera — a commodity RGB webcam or a different-model unit — to feed a spoof
+frame into the recognition path. The IR heuristics above (§A–C) are capability checks on
+*whatever camera is currently attached*; they do not verify it is the *same* camera the
+user enrolled on. Device coupling closes that gap by **identity** rather than capability.
+
+Each enrolled template records a fingerprint of the camera that captured it — the canonical
+string `"vid:pid:serial"` read from sysfs (`idVendor`/`idProduct`/`serial`), stored in
+`face_models.device_id` (schema V6). At auth, the live camera is fingerprinted once and every
+candidate template whose fingerprint does not match at the configured granularity is
+**skipped before its embeddings are ever compared**. A skipped template can only produce
+"no match", so a swapped-in camera **degrades to the password fallback** — it can never
+reach a success, and it never causes a lockout (fail SOFT, matching the biometric-is-
+`sufficient`-never-`required` contract).
+
+Config (`[security]`):
+
+```toml
+bind_templates_to_device = true      # default; skip templates from a non-matching camera
+device_match_granularity = "model"   # "model" = VID:PID (default), "unit" = VID:PID:serial
+bind_legacy_templates    = true      # default; allow-with-warn for pre-V6 / NULL-device rows
+```
+
+- **`model`** (default) compares VID:PID only. Invisible to single-camera users; blocks a
+  cross-model swap. Identical same-model cameras are accepted (documented behavior).
+- **`unit`** additionally requires a matching serial. Blocks even a same-model swap, but only
+  works on cameras that expose a stable serial — enrollment at `unit` on a serial-less camera
+  is refused with an explanatory error rather than silently downgrading.
+- **Legacy / unidentifiable cameras**: a pre-V6 template (NULL `device_id`) or one enrolled
+  on a camera exposing no USB identity is stored NULL and governed by `bind_legacy_templates`.
+  Default allow-with-warn so an upgrade never breaks existing enrollments; a one-line log
+  nudges re-enrollment. Set it `false` to require every template to carry a matching id.
+- **Enroll per camera**: enrolling the same user on a second camera creates a *second* template
+  with its own `device_id` (the store already allows multiple models per user). Each template
+  then authenticates only on its own camera. `facelock list` shows each template's camera.
+
+**Honest threat framing — this is advisory defense-in-depth, NOT attestation.** `VID:PID` is
+**model granularity**: every unit of the same model shares it. `serial` is unit-unique *when
+present*, but vendors frequently omit or duplicate it. Most importantly, a **programmable USB
+device can forge any of these fields** — consumer UVC cameras have no signed-frame
+attestation, so there is no cryptographic root of trust to bind to. Device coupling raises the
+bar against the attacker who buys/plugs a *commodity* camera; it does not stop an attacker who
+builds a USB device that impersonates the enrolled camera's descriptors. It is one layer, not
+a guarantee.
+
+**Plan 04 seam**: `facelock_core::types::device_binding_aad()` defines the AAD bytes for
+optionally folding `device_id` into the AES-GCM Additional Authenticated Data (opt-in *hard*
+binding). Plan 02 deliberately does not wire it in — hard binding would fail closed on the
+unstable/absent ids described above, violating the never-lockout rule. That trade-off is
+Plan 04's to make.
 
 ### 2. Model Tampering
 

@@ -127,6 +127,49 @@ run_test_contains "Authenticate enrolled face (CLI)" \
 run_test "Authenticate enrolled face (PAM)" \
     "timeout --foreground $LIVE_TIMEOUT pamtester facelock-test testuser authenticate"
 
+# --- Device coupling (Plan 02, daemon path) ---
+# The daemon runs migrations at startup and records the live camera fingerprint
+# in face_models.device_id at enroll. Verify V6 applied, enroll recorded a
+# device_id, a forged/mismatched id falls through to no-match, and a legacy NULL
+# id still authenticates. (Reads/writes go through the WAL, which the daemon's
+# own connection sees on its next query.)
+# Resolve the DB path the daemon actually uses (config db_path if uncommented,
+# else the compiled default /var/lib/facelock/facelock.db).
+# `grep` exiting 1 on no-match must not abort the script (set -e + pipefail), so
+# tolerate it; fall back to the compiled default when db_path is unset.
+DB="$({ grep -E '^[[:space:]]*db_path[[:space:]]*=' /etc/facelock/config.toml 2>/dev/null || true; } | tail -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+[ -n "$DB" ] || DB="/var/lib/facelock/facelock.db"
+
+SCHEMA_VER="$(sqlite3 "$DB" 'SELECT MAX(version) FROM schema_version' 2>/dev/null || echo 0)"
+run_test "V6 schema migration applied on daemon startup (db=$DB)" \
+    "[ \"$SCHEMA_VER\" -ge 6 ]" 0
+
+DEVID="$(sqlite3 "$DB" "SELECT COALESCE(device_id,'') FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo '')"
+if [ -n "$DEVID" ]; then
+    run_test "enrolled template has non-null device_id (daemon, camera-fingerprinted): '$DEVID'" "true" 0
+else
+    echo "TEST: enrolled template device_id ... SKIP (live camera exposed no USB identity in-container; coupling degrades to legacy-allow)"
+fi
+
+# Swap-in regression gate: a forged, non-matching device_id must fall through to
+# no-match, never authenticate.
+sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id='ffff:ffff:forged' WHERE user='testuser'" || true
+echo -n "TEST: facelock test reports no match on forged device_id (coupling; no success) ... "
+set +o pipefail
+timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser > /tmp/test-output 2>&1 || true
+set -o pipefail
+if grep -q "No match" /tmp/test-output; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL"; cat /tmp/test-output; FAIL=$((FAIL + 1))
+fi
+
+# Legacy NULL device_id still authenticates (allow-with-warn; no lockout).
+sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id=NULL WHERE user='testuser'" || true
+run_test_contains "facelock test matches again on legacy NULL device_id (daemon)" \
+    "timeout --foreground $LIVE_TIMEOUT facelock test --user testuser" \
+    "Matched"
+
 # Clean up
 run_test "Clear enrolled models" \
     "facelock clear --user testuser --yes"

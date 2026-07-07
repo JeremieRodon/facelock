@@ -27,11 +27,13 @@ struct ResolvedCameraDevice {
     device: DeviceConfig,
     device_quirk: Option<facelock_camera::quirks::Quirk>,
     device_is_ir: bool,
+    device_fingerprint: facelock_core::types::DeviceFingerprint,
 }
 
 struct OpenedCamera {
     camera: Camera<'static>,
     device_is_ir: bool,
+    device_fingerprint: facelock_core::types::DeviceFingerprint,
 }
 
 fn build_resolved_camera_device(
@@ -43,11 +45,12 @@ fn build_resolved_camera_device(
     device.path = Some(device_info.path.clone());
 
     ResolvedCameraDevice {
-        device,
+        device_fingerprint: facelock_camera::device_fingerprint(&device_info.path),
         device_quirk: quirks.find_match(&device_info).cloned(),
         // Sibling-aware: on multi-node USB cameras only the IR sensor node
         // counts as IR, not every node sharing the quirk's VID:PID.
         device_is_ir: is_ir_camera_resolved(&device_info, Some(quirks)),
+        device,
     }
 }
 
@@ -85,6 +88,7 @@ fn open_camera_context(config: &Config) -> anyhow::Result<OpenedCamera> {
     Ok(OpenedCamera {
         camera,
         device_is_ir: resolved.device_is_ir,
+        device_fingerprint: resolved.device_fingerprint,
     })
 }
 
@@ -116,6 +120,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
     let OpenedCamera {
         mut camera,
         device_is_ir,
+        device_fingerprint,
     } = open_camera_context(config)?;
     let mut engine = load_engine(config)?;
 
@@ -131,6 +136,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         config,
         user,
         device_is_ir,
+        &device_fingerprint,
     );
 
     match response {
@@ -234,7 +240,9 @@ pub fn load_user_embeddings(
 /// Direct enrollment — returns (model_id, embedding_count).
 pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, u32)> {
     let store = open_store(config)?;
-    let mut camera = open_camera_context(config)?.camera;
+    let opened = open_camera_context(config)?;
+    let device_id = opened.device_fingerprint.canonical_for_storage();
+    let mut camera = opened.camera;
     let mut engine = load_engine(config)?;
 
     // Initialize sealer if encryption is configured
@@ -248,6 +256,7 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
         user,
         label,
         software_sealer.as_ref(),
+        device_id.as_deref(),
     );
 
     match response {
@@ -328,13 +337,14 @@ mod facelock_daemon_auth {
     use facelock_core::ipc::DaemonResponse;
     use facelock_core::traits::{CameraSource, FaceProcessor};
     use facelock_core::types::{
-        AuthFailureReason, FaceEmbedding, FaceModelInfo, FrameVarianceWindow, MatchResult,
-        best_match, zeroize_stored_embeddings,
+        AuthFailureReason, DeviceFingerprint, FaceEmbedding, FaceModelInfo, FrameVarianceWindow,
+        MatchResult, best_match, device_allowed_model_ids, zeroize_stored_embeddings,
     };
     use facelock_daemon::liveness::LandmarkTracker;
     use std::time::Instant;
     use tracing::{debug, info, warn};
 
+    #[allow(clippy::too_many_arguments)]
     pub fn authenticate<C: CameraSource, E: FaceProcessor>(
         camera: &mut C,
         engine: &mut E,
@@ -343,11 +353,36 @@ mod facelock_daemon_auth {
         config: &Config,
         user: &str,
         device_is_ir: bool,
+        live_fingerprint: &DeviceFingerprint,
     ) -> DaemonResponse {
         let start = Instant::now();
 
-        // Make a mutable copy so we can zeroize on all exit paths
-        let mut stored = stored.to_vec();
+        // Device coupling (Plan 02): restrict the compare set to templates whose
+        // enrolling camera matches the live camera. Mismatches are dropped so a
+        // swapped camera degrades to "no match" → password, never a success.
+        let policy = config.security.device_binding_policy();
+        let allowed = device_allowed_model_ids(models, live_fingerprint, &policy);
+        if policy.enabled {
+            let skipped = stored
+                .iter()
+                .filter(|(id, _)| !allowed.contains(id))
+                .count();
+            if skipped > 0 {
+                warn!(
+                    user,
+                    skipped,
+                    total = stored.len(),
+                    granularity = ?policy.granularity,
+                    "device coupling: skipped templates whose enrolling camera does not match the live camera"
+                );
+            }
+        }
+        // Make a mutable, device-filtered copy so we can zeroize on all exit paths.
+        let mut stored: Vec<(u32, FaceEmbedding)> = stored
+            .iter()
+            .filter(|(id, _)| allowed.contains(id))
+            .cloned()
+            .collect();
 
         let label_for = |id: u32| -> Option<String> {
             models.iter().find(|m| m.id == id).map(|m| m.label.clone())
@@ -482,6 +517,11 @@ mod facelock_daemon_auth {
                         frames = frame_count,
                         duration_ms = duration.as_millis() as u64,
                         "authentication succeeded"
+                    );
+                    // Device-coupling invariant: winning model must be allowed.
+                    debug_assert!(
+                        best_model_id.is_none_or(|id| allowed.contains(&id)),
+                        "device coupling invariant violated: skipped template reached success"
                     );
                     let response = DaemonResponse::AuthResult(MatchResult {
                         matched: true,
@@ -670,6 +710,7 @@ mod facelock_daemon_enroll {
     const MAX_CAPTURES: usize = 10;
     const INTER_FRAME_DELAY: Duration = Duration::from_millis(200);
 
+    #[allow(clippy::too_many_arguments)]
     pub fn enroll<C: CameraSource, E: FaceProcessor>(
         camera: &mut C,
         engine: &mut E,
@@ -678,6 +719,7 @@ mod facelock_daemon_enroll {
         user: &str,
         label: &str,
         sealer: Option<&SoftwareSealer>,
+        device_id: Option<&str>,
     ) -> DaemonResponse {
         match store.remove_model_by_label(user, label) {
             Ok(true) => info!(user, label, "removed existing model for re-enrollment"),
@@ -736,12 +778,13 @@ mod facelock_daemon_enroll {
                 match sealer.seal_embedding(embedding) {
                     Ok(encrypted) => match model_id {
                         None => store
-                            .add_model_raw(
+                            .add_model_raw_with_device(
                                 user,
                                 label,
                                 &encrypted,
                                 true,
                                 &config.recognition.embedder_model,
+                                device_id,
                             )
                             .map(Some),
                         Some(id) => store.add_embedding_raw(id, &encrypted, true).map(|()| None),
@@ -756,7 +799,13 @@ mod facelock_daemon_enroll {
             } else {
                 match model_id {
                     None => store
-                        .add_model(user, label, embedding, &config.recognition.embedder_model)
+                        .add_model_with_device(
+                            user,
+                            label,
+                            embedding,
+                            &config.recognition.embedder_model,
+                            device_id,
+                        )
                         .map(Some),
                     Some(id) => store.add_embedding(id, embedding).map(|()| None),
                 }
