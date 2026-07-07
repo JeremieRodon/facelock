@@ -1,0 +1,56 @@
+# cargo-audit configuration — supply-chain CVE scanning policy.
+#
+# cargo-audit auto-reads this file from `.cargo/audit.toml`. Run it locally
+# with `just audit`, which uses the exact same flags as the CI `cargo-audit`
+# job so local and CI results match.
+#
+# Failure policy (set via CLI flags in `just audit` and CI, NOT here, because
+# cargo-audit's `[output]` config table requires a complete field set):
+#
+#     cargo audit --deny unmaintained --deny unsound
+#
+# That fails the build on any vulnerability (always denied by default), any
+# unmaintained advisory, or any unsound advisory that is NOT explicitly listed
+# in `[advisories] ignore` below. A new advisory of these kinds fails CI until
+# it is either fixed (bump the offending dependency) or triaged into the ignore
+# list with a justification. This is what keeps the policy from being
+# "warnings-only".
+#
+# Yanked crates are reported as informational warnings only, not build
+# failures: a plain yanked crate carries no RustSec advisory ID, so it cannot
+# be individually justified/ignored here (ignores are keyed by advisory ID).
+# Anything genuinely dangerous about a yanked crate surfaces as a separate
+# vulnerability / unmaintained / unsound advisory, which IS denied. Currently
+# yanked (informational only): core2 0.4.0 (also covered by RUSTSEC-2026-0105
+# below) and uds_windows 1.2.0 (Windows-only zbus transport, `cfg(windows)`,
+# never compiled on facelock's Linux targets).
+#
+# Every ignore entry MUST carry an inline justification. Do not blanket-ignore.
+# When a fix ships (a dependency bump that drops the advisory), delete the
+# ignore rather than leaving it to rot.
+
+[advisories]
+ignore = [
+    # quick-xml 0.39.x — quadratic parse time / unbounded namespace allocation
+    # DoS. Fixed in >=0.41.0, but our only path to quick-xml is the build-time
+    # proc-macro `wayland-scanner` (v0.31.10 pins quick-xml ^0.39, so
+    # `cargo update` cannot lift it). wayland-scanner parses the trusted Wayland
+    # protocol XML shipped inside the wayland-* crates at compile time; it never
+    # sees attacker-controlled runtime input, and no quick-xml code runs in the
+    # auth path or any shipped binary. Revisit when smithay-client-toolkit /
+    # wayland-scanner ship a release built on quick-xml >=0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # core2 0.4.0 — unmaintained (all versions yanked). Transitive via
+    # image -> ravif -> rav1e -> bitstream-io, i.e. the AVIF *encoder*. facelock
+    # only decodes camera frames; the AVIF encode path is never exercised at
+    # runtime. No maintained successor is wired up upstream. Revisit when
+    # image / rav1e drop the core2 dependency.
+    "RUSTSEC-2026-0105",
+
+    # paste 1.0.15 — unmaintained proc-macro (build-time only). Transitive via
+    # rav1e. Runs only at compile time and ships no runtime code; rav1e has not
+    # migrated to a maintained replacement yet. Revisit when rav1e drops paste.
+    "RUSTSEC-2024-0436",
+]

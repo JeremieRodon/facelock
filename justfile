@@ -30,8 +30,14 @@ fmt-check:
 fmt:
     cargo fmt --all
 
-# Run all checks (test + lint + format)
-check: test lint fmt-check
+# Scan the dependency tree for RustSec advisories (mirrors the CI cargo-audit job).
+# Ignore policy lives in .cargo/audit.toml; deny policy is set here so CI matches.
+# Requires cargo-audit: cargo install cargo-audit --locked
+audit:
+    cargo audit --deny unmaintained --deny unsound
+
+# Run all checks (test + lint + format + audit)
+check: test lint fmt-check audit
 
 # Build the PAM test container image (uses host-built release binaries)
 _build-test-container: build-release
