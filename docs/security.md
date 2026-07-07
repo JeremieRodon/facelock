@@ -348,6 +348,31 @@ The daemon must also verify the caller UID via `GetConnectionUnixUser` on every 
 - `ReleaseCamera`: root or the Unix user that owns the active preview camera session
 - `ListDevices`: root or a caller in the `facelock` group
 
+#### A2. PAM Peer-UID Verification (Required)
+
+The trust check runs in both directions: before trusting an `Authenticate`
+reply, the PAM module resolves the owner of `org.facelock.Daemon` via
+`GetNameOwner`, verifies that owner's UID is 0 via `GetConnectionUnixUser`,
+and pins the method call to the owner's *unique* bus name so the owner cannot
+change between check and call. If the name is owned by a non-root process
+(e.g. because the bus policy file was misconfigured or replaced), the module
+refuses the reply and degrades — it never returns `PAM_SUCCESS` on the word
+of an unverified peer. This removes the single point of failure on the
+`org.facelock.Daemon.conf` policy file.
+
+#### A3. In-Band Recoverable Error Encoding (Required)
+
+Recoverable authentication errors (rate limited, IR required, camera or
+storage failure) are returned in-band as `AuthResult { model_id: -2, label:
+<message> }` rather than as D-Bus errors. A D-Bus error reply is
+indistinguishable from "daemon broken", which would make the PAM module fall
+back to a fresh root oneshot attempt — silently escalating past daemon-side
+state such as the rate-limit window. With in-band encoding the PAM module
+classifies the error itself: rate limited maps to `PAM_AUTH_ERR` (face-auth
+budget exhausted, password modules still run), everything else to
+`PAM_IGNORE`. D-Bus errors remain reserved for authorization failures and
+transport-level problems, which do fall back to the oneshot path.
+
 #### B. D-Bus Message Size Limits (Enforced by Bus)
 
 The D-Bus bus daemon enforces message size limits (typically 128MB by default, configurable in the bus configuration). This prevents oversized messages from consuming daemon memory without requiring application-level size checks.
@@ -375,6 +400,33 @@ Implementation note:
 - Restarting the daemon must not reset a user's lockout state
 
 ### 5. PAM Module Hardening
+
+#### A0. Config File Trust (Required)
+
+The PAM module runs in a root context, so `/etc/facelock/config.toml` is an
+attack vector: a writable config could redirect `auth_bin`, disable
+anti-spoofing knobs, or change the daemon mode. Before parsing, the module
+verifies that the config file **and every parent directory** are root-owned
+and not group- or world-writable. The file check uses `fstat` on the opened
+descriptor so the validated inode is exactly the one read (no TOCTOU). An
+untrusted config is treated like a missing config: the module logs the
+reason and returns `PAM_IGNORE` (fail closed, fall through to password).
+
+#### A1. Sanitized Oneshot Child Environment (Required)
+
+The oneshot fallback spawns `facelock auth` as root. When the PAM caller is
+fully root (euid == uid, no `AT_SECURE`), the dynamic linker honors
+`LD_PRELOAD`/`LD_*` from the inherited environment — allowing arbitrary code
+injection into a root process. The module therefore spawns the child with
+`env_clear()` and an allow-list:
+
+- `SSH_CONNECTION` / `SSH_TTY` — forwarded so the child's own SSH-abort
+  check keeps working
+- `PATH=/usr/bin:/bin` — pinned, never inherited
+
+Everything else (`LD_*`, `XDG_*`, `DBUS_*`, ...) is dropped. The desktop
+notification path constructs its own session-bus address from the target UID
+and does not need inherited XDG variables. The child's stdin is `/dev/null`.
 
 #### A. Audit Logging (Required)
 

@@ -92,6 +92,17 @@ pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
             let result: AuthResult = proxy
                 .call("Authenticate", &(user.as_str(),))
                 .context("D-Bus Authenticate call failed")?;
+            // Sentinel model_id values (see docs/contracts.md):
+            // -2 = recoverable daemon error (label carries the message),
+            // -3 = suppressed (no enrolled models + suppress_unknown).
+            if !result.matched && result.model_id == -2 {
+                return Ok(DaemonResponse::Error {
+                    message: result.label,
+                });
+            }
+            if !result.matched && result.model_id == -3 {
+                return Ok(DaemonResponse::Suppressed);
+            }
             Ok(DaemonResponse::AuthResult(MatchResult {
                 matched: result.matched,
                 model_id: if result.model_id >= 0 {
