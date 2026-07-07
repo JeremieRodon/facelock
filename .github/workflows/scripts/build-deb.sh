@@ -107,6 +107,10 @@ install -m644 systemd/facelock-daemon.service "${PKG_DIR}/usr/lib/systemd/system
 install -m644 dbus/org.facelock.Daemon.conf "${PKG_DIR}/usr/share/dbus-1/system.d/org.facelock.Daemon.conf"
 install -m644 dbus/org.facelock.Daemon.service "${PKG_DIR}/usr/share/dbus-1/system-services/org.facelock.Daemon.service"
 
+# Polkit action (interactive authorization for preview frame bytes)
+mkdir -p "${PKG_DIR}/usr/share/polkit-1/actions"
+install -m644 dbus/org.facelock.policy "${PKG_DIR}/usr/share/polkit-1/actions/org.facelock.policy"
+
 # sysusers.d and tmpfiles.d
 install -m644 dist/facelock.sysusers "${PKG_DIR}/usr/lib/sysusers.d/facelock.conf"
 install -m644 dist/facelock.tmpfiles "${PKG_DIR}/usr/lib/tmpfiles.d/facelock.conf"

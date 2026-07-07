@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,333 @@ fn lock_handler_with_timeout(
             }
         }
     }
+}
+
+/// Tracks whether a camera-capture operation is currently in flight.
+///
+/// Camera captures serialize on the handler mutex; without this guard a
+/// second caller would queue on that mutex for up to `HANDLER_LOCK_TIMEOUT`
+/// (10s), letting any authorized caller stall others (local DoS). The slot
+/// lets capture methods reject concurrent requests immediately with a
+/// "daemon busy" error instead. Callers (PAM, CLI) treat that like any other
+/// daemon error and degrade to password auth — never a lockout. Per-user
+/// rate limiting is unaffected; this is orthogonal contention control.
+#[derive(Debug, Default)]
+struct CaptureSlot {
+    busy: AtomicBool,
+}
+
+impl CaptureSlot {
+    /// Try to claim the capture slot. Returns a RAII guard on success, or an
+    /// immediate "daemon busy" error if another capture is already in flight.
+    fn try_acquire(self: &Arc<Self>, operation: &str) -> fdo::Result<CaptureGuard> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Ok(CaptureGuard(Arc::clone(self)))
+        } else {
+            warn!(
+                operation = operation,
+                "capture already in flight — rejecting immediately with busy"
+            );
+            Err(fdo::Error::Failed(format!(
+                "daemon busy: another capture operation is in progress ({operation} rejected)"
+            )))
+        }
+    }
+}
+
+/// RAII guard for [`CaptureSlot`]; releases the slot when dropped
+/// (including on panic unwind inside a blocking task).
+#[derive(Debug)]
+struct CaptureGuard(Arc<CaptureSlot>);
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Raw camera frames require privilege: root gets them unconditionally (the
+/// `PreviewFrame` contract), and a non-root caller only after an interactive
+/// polkit authorization for `org.facelock.preview-frames`. When frames are
+/// not allowed the bytes are stripped — the caller gets detection and
+/// recognition metadata only, never raw camera/IR imagery.
+fn sanitize_preview_jpeg(jpeg_data: Vec<u8>, allow_frames: bool) -> Vec<u8> {
+    if allow_frames { jpeg_data } else { Vec::new() }
+}
+
+/// Polkit action a non-root caller must be authorized for to receive raw
+/// preview frame bytes. Shipped in `dbus/org.facelock.policy`
+/// (installed to /usr/share/polkit-1/actions/).
+const PREVIEW_FRAMES_ACTION_ID: &str = "org.facelock.preview-frames";
+
+/// `AllowUserInteraction` flag for `CheckAuthorization` — lets the caller's
+/// polkit agent prompt interactively on the first frame request.
+const POLKIT_ALLOW_USER_INTERACTION: u32 = 0x1;
+
+/// How long a *granted* frame authorization is cached per caller connection.
+/// The polkit grant itself (`auth_self_keep`) is what bounds the real
+/// authorization lifetime (~5 min); this cache only saves the per-frame
+/// round-trip and dies with the caller's bus connection or this TTL,
+/// whichever comes first.
+const AUTHZ_GRANTED_TTL: Duration = Duration::from_secs(120);
+
+/// How long a *denied* (or errored) polkit verdict is cached. Short, so a
+/// dismissed prompt can be retried quickly — but long enough that a caller
+/// polling frames doesn't re-trigger an agent prompt on every frame.
+const AUTHZ_DENIED_TTL: Duration = Duration::from_secs(15);
+
+/// Upper bound on cached caller connections (DoS control).
+const AUTHZ_CACHE_MAX_ENTRIES: usize = 64;
+
+/// Give up on a polkit interaction (user typing a password) after this long.
+const POLKIT_INTERACTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cached authorization state for one caller connection (unique bus name).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AuthzEntry {
+    /// A `CheckAuthorization` round-trip is in flight for this caller.
+    InFlight,
+    /// Polkit answered; valid until `expires_at`.
+    Decided {
+        authorized: bool,
+        expires_at: Instant,
+    },
+}
+
+/// Result of a frame-authorization cache lookup.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FrameAuthz {
+    /// Polkit authorized this caller connection (cached, unexpired).
+    Granted,
+    /// Polkit denied this caller (or the check errored) — fail closed.
+    Refused,
+    /// A polkit check is already in flight — metadata only for now.
+    Pending,
+    /// No usable cache entry; the caller was marked in-flight and a polkit
+    /// check must be started.
+    NeedsCheck,
+}
+
+/// The single authorization decision point for raw preview frame bytes:
+/// root always gets frames; a non-root caller only with a fresh polkit
+/// grant. Denied, pending, errored, or unknown states all FAIL CLOSED.
+fn allow_preview_jpeg(caller_is_root: bool, authz: FrameAuthz) -> bool {
+    caller_is_root || authz == FrameAuthz::Granted
+}
+
+/// Per-connection cache of polkit frame-authorization verdicts, keyed by the
+/// caller's unique bus name (`:1.42`). Entries die with the caller's bus
+/// connection (see [`watch_bus_disconnects`]) or their TTL, whichever first.
+#[derive(Debug, Default)]
+struct PreviewAuthzCache {
+    entries: Mutex<HashMap<String, AuthzEntry>>,
+}
+
+impl PreviewAuthzCache {
+    /// Look up the cached verdict for `caller`. If there is none (or it
+    /// expired), atomically mark the caller in-flight and return
+    /// [`FrameAuthz::NeedsCheck`] so that exactly one polkit round-trip is
+    /// started per caller connection.
+    fn begin_or_lookup(&self, caller: &str, now: Instant) -> FrameAuthz {
+        let Ok(mut entries) = self.entries.lock() else {
+            // Poisoned cache: fail closed without starting new checks.
+            return FrameAuthz::Refused;
+        };
+
+        match entries.get(caller) {
+            Some(AuthzEntry::InFlight) => return FrameAuthz::Pending,
+            Some(AuthzEntry::Decided {
+                authorized,
+                expires_at,
+            }) if *expires_at > now => {
+                return if *authorized {
+                    FrameAuthz::Granted
+                } else {
+                    FrameAuthz::Refused
+                };
+            }
+            _ => {}
+        }
+
+        // Missing or expired — bound the cache before inserting.
+        entries.retain(|_, entry| match entry {
+            AuthzEntry::InFlight => true,
+            AuthzEntry::Decided { expires_at, .. } => *expires_at > now,
+        });
+        if entries.len() >= AUTHZ_CACHE_MAX_ENTRIES {
+            // Evict the decided entry closest to expiry; never evict
+            // in-flight entries (their completion handler expects them).
+            let victim = entries
+                .iter()
+                .filter_map(|(name, entry)| match entry {
+                    AuthzEntry::Decided { expires_at, .. } => Some((name.clone(), *expires_at)),
+                    AuthzEntry::InFlight => None,
+                })
+                .min_by_key(|(_, expires_at)| *expires_at);
+            match victim {
+                Some((name, _)) => {
+                    entries.remove(&name);
+                }
+                None => {
+                    // Cache full of in-flight checks — refuse to start
+                    // another one (fail closed, no polkit storm).
+                    warn!(caller, "frame authz cache full of in-flight checks");
+                    return FrameAuthz::Pending;
+                }
+            }
+        }
+
+        entries.insert(caller.to_string(), AuthzEntry::InFlight);
+        FrameAuthz::NeedsCheck
+    }
+
+    /// Record the outcome of a polkit round-trip. `Ok(true)` caches a grant,
+    /// `Ok(false)` a denial, and `Err` (polkit unreachable, D-Bus error,
+    /// timeout) is treated as a denial — FAIL CLOSED. The result is dropped
+    /// if the caller's entry vanished (connection already closed).
+    fn complete(&self, caller: &str, verdict: Result<bool, String>, now: Instant) {
+        let authorized = match verdict {
+            Ok(authorized) => authorized,
+            Err(e) => {
+                warn!(caller, error = %e, "polkit frame authorization check failed — failing closed");
+                false
+            }
+        };
+        let ttl = if authorized {
+            AUTHZ_GRANTED_TTL
+        } else {
+            AUTHZ_DENIED_TTL
+        };
+
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        // Only settle an in-flight check; if the entry is gone the caller
+        // disconnected and the verdict must not outlive the connection.
+        if let Some(entry @ AuthzEntry::InFlight) = entries.get_mut(caller) {
+            *entry = AuthzEntry::Decided {
+                authorized,
+                expires_at: now + ttl,
+            };
+        }
+    }
+
+    /// Drop all cached state for a caller (its bus connection went away).
+    fn evict(&self, caller: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(caller);
+        }
+    }
+}
+
+/// Reply shape of `org.freedesktop.PolicyKit1.Authority.CheckAuthorization`.
+#[derive(Debug, serde::Deserialize, zbus::zvariant::Type)]
+struct PolkitAuthorizationResult {
+    is_authorized: bool,
+    #[allow(dead_code)]
+    is_challenge: bool,
+    #[allow(dead_code)]
+    details: HashMap<String, String>,
+}
+
+async fn polkit_authority_proxy(
+    connection: &zbus::Connection,
+) -> std::result::Result<zbus::Proxy<'static>, String> {
+    zbus::Proxy::new(
+        connection,
+        "org.freedesktop.PolicyKit1",
+        "/org/freedesktop/PolicyKit1/Authority",
+        "org.freedesktop.PolicyKit1.Authority",
+    )
+    .await
+    .map_err(|e| format!("polkit authority proxy: {e}"))
+}
+
+/// Ask polkit whether the caller connection is authorized for
+/// [`PREVIEW_FRAMES_ACTION_ID`], allowing interactive agent prompts.
+/// The caller's unique bus name doubles as the cancellation id.
+async fn check_polkit_frame_authorization(
+    connection: &zbus::Connection,
+    caller: &str,
+) -> std::result::Result<bool, String> {
+    let proxy = polkit_authority_proxy(connection).await?;
+
+    let mut subject_details: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    subject_details.insert("name", zbus::zvariant::Value::from(caller));
+    let details: HashMap<&str, &str> = HashMap::new();
+
+    let result: PolkitAuthorizationResult = proxy
+        .call(
+            "CheckAuthorization",
+            &(
+                ("system-bus-name", subject_details),
+                PREVIEW_FRAMES_ACTION_ID,
+                details,
+                POLKIT_ALLOW_USER_INTERACTION,
+                caller,
+            ),
+        )
+        .await
+        .map_err(|e| format!("CheckAuthorization failed: {e}"))?;
+
+    Ok(result.is_authorized)
+}
+
+/// Background task: run one polkit check for `caller` and settle the cache.
+/// Never blocks a D-Bus method reply and never holds the capture slot, so a
+/// pending agent prompt cannot starve `Authenticate`.
+async fn run_frame_authz_check(
+    connection: zbus::Connection,
+    cache: Arc<PreviewAuthzCache>,
+    caller: String,
+) {
+    let verdict = match tokio::time::timeout(
+        POLKIT_INTERACTION_TIMEOUT,
+        check_polkit_frame_authorization(&connection, &caller),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // Best effort: tell polkit to tear down the pending prompt.
+            if let Ok(proxy) = polkit_authority_proxy(&connection).await {
+                let _: std::result::Result<(), _> = proxy
+                    .call("CancelCheckAuthorization", &(caller.as_str(),))
+                    .await;
+            }
+            Err("polkit authorization timed out".to_string())
+        }
+    };
+
+    if let Ok(authorized) = &verdict {
+        info!(caller = %caller, authorized, "polkit frame authorization verdict");
+    }
+    cache.complete(&caller, verdict, Instant::now());
+}
+
+/// Evict cached frame authorizations when their bus connection disappears
+/// (`NameOwnerChanged` with no new owner for a unique name), so a grant can
+/// never outlive the caller's connection.
+async fn watch_bus_disconnects(
+    connection: zbus::Connection,
+    cache: Arc<PreviewAuthzCache>,
+) -> zbus::Result<()> {
+    let proxy = fdo::DBusProxy::new(&connection).await?;
+    let mut stream = proxy.receive_name_owner_changed().await?;
+    while let Some(signal) = stream.next().await {
+        let Ok(args) = signal.args() else { continue };
+        if args.new_owner().is_none() {
+            let name = args.name().to_string();
+            if name.starts_with(':') {
+                cache.evict(&name);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +605,10 @@ struct FacelockService {
     config_mtime: Arc<Mutex<Option<std::time::SystemTime>>>,
     /// UID of the caller that currently owns preview camera cleanup rights.
     camera_owner_uid: Arc<Mutex<Option<u32>>>,
+    /// In-flight guard for camera-capture operations (DoS control).
+    capture_slot: Arc<CaptureSlot>,
+    /// Per-connection polkit frame-authorization cache (PreviewDetectFrame).
+    preview_authz: Arc<PreviewAuthzCache>,
 }
 
 impl FacelockService {
@@ -356,6 +688,7 @@ impl FacelockService {
         self.maybe_reload_handler();
         verify_caller_authorized(&hdr, connection, user, "Authenticate").await?;
         self.clear_camera_owner();
+        let capture_guard = self.capture_slot.try_acquire("Authenticate")?;
         let handler = self.handler.clone();
         let user = user.to_string();
         let signal_user = user.clone();
@@ -364,6 +697,9 @@ impl FacelockService {
             let request = DaemonRequest::Authenticate { user: user.clone() };
             let response = handler.handle(request);
             drop(handler);
+            // Capture finished — free the slot before slower follow-up work
+            // (notifications) so the next auth isn't rejected needlessly.
+            drop(capture_guard);
             match response {
                 DaemonResponse::AuthResult(result) => {
                     // Send desktop notification (fire-and-forget, runs as root → setpriv)
@@ -409,15 +745,12 @@ impl FacelockService {
         .await
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?;
 
-        // Emit auth_attempted signal (best-effort, don't fail auth if signal fails)
+        // Emit auth_attempted signal (best-effort, don't fail auth if signal
+        // fails). The payload deliberately carries no similarity score — the
+        // raw biometric score is a spoof-tuning oracle for anyone able to
+        // receive the broadcast; `matched` + user is enough for consumers.
         if let Ok(ref auth_result) = result {
-            let _ = Self::auth_attempted(
-                &ctxt,
-                &signal_user,
-                auth_result.matched,
-                auth_result.similarity,
-            )
-            .await;
+            let _ = Self::auth_attempted(&ctxt, &signal_user, auth_result.matched).await;
         }
 
         result
@@ -434,10 +767,12 @@ impl FacelockService {
         self.maybe_reload_handler();
         verify_caller_is_root(&hdr, connection, "Enroll").await?;
         self.clear_camera_owner();
+        let capture_guard = self.capture_slot.try_acquire("Enroll")?;
         let handler = self.handler.clone();
         let user = user.to_string();
         let label = label.to_string();
         tokio::task::spawn_blocking(move || {
+            let _capture_guard = capture_guard;
             let mut handler = lock_handler_with_timeout(&handler)?;
             let request = DaemonRequest::Enroll { user, label };
             let response = handler.handle(request);
@@ -554,8 +889,10 @@ impl FacelockService {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         let caller = resolve_caller_identity(&hdr, connection).await?;
         require_root(&caller, "PreviewFrame")?;
+        let capture_guard = self.capture_slot.try_acquire("PreviewFrame")?;
         let handler = self.handler.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let _capture_guard = capture_guard;
             let mut handler = lock_handler_with_timeout(&handler)?;
             let request = DaemonRequest::PreviewFrame;
             let response = handler.handle(request);
@@ -584,14 +921,43 @@ impl FacelockService {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         let caller = resolve_caller_identity(&hdr, connection).await?;
         require_user_authorized(&caller, user, "PreviewDetectFrame")?;
+        let caller_is_root = caller.uid == 0;
+
+        // Frame-byte authorization (root bypasses polkit). Resolved BEFORE
+        // the capture slot is claimed so a pending interactive polkit prompt
+        // can never hold the slot and starve Authenticate.
+        let authz = if caller_is_root {
+            FrameAuthz::Granted
+        } else {
+            let sender = hdr
+                .sender()
+                .ok_or_else(|| fdo::Error::Failed("no sender in D-Bus message".into()))?
+                .to_string();
+            let authz = self.preview_authz.begin_or_lookup(&sender, Instant::now());
+            if authz == FrameAuthz::NeedsCheck {
+                // Exactly one polkit round-trip per caller connection; the
+                // verdict lands in the cache for subsequent frame requests.
+                tokio::spawn(run_frame_authz_check(
+                    connection.clone(),
+                    self.preview_authz.clone(),
+                    sender,
+                ));
+            }
+            authz
+        };
+        let allow_frames = allow_preview_jpeg(caller_is_root, authz);
+
+        let capture_guard = self.capture_slot.try_acquire("PreviewDetectFrame")?;
         let handler = self.handler.clone();
         let user = user.to_string();
         let result = tokio::task::spawn_blocking(move || {
+            let _capture_guard = capture_guard;
             let mut handler = lock_handler_with_timeout(&handler)?;
             let request = DaemonRequest::PreviewDetectFrame { user };
             let response = handler.handle(request);
             match response {
                 DaemonResponse::DetectFrame { jpeg_data, faces } => {
+                    let jpeg_data = sanitize_preview_jpeg(jpeg_data, allow_frames);
                     let face_infos: Vec<PreviewFaceInfo> = faces
                         .into_iter()
                         .map(|f| PreviewFaceInfo {
@@ -716,12 +1082,15 @@ impl FacelockService {
     }
 
     /// Signal emitted after each authentication attempt.
+    ///
+    /// Carries only the user and the match outcome — never the raw
+    /// similarity score (an information leak / spoof-tuning oracle).
+    /// The bus policy additionally restricts who may receive this signal.
     #[zbus(signal)]
     async fn auth_attempted(
         emitter: &SignalEmitter<'_>,
         user: &str,
         matched: bool,
-        similarity: f64,
     ) -> zbus::Result<()>;
 }
 
@@ -921,11 +1290,14 @@ async fn run_dbus_server(
     startup_config_mtime: Option<std::time::SystemTime>,
 ) -> anyhow::Result<()> {
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
+    let preview_authz = Arc::new(PreviewAuthzCache::default());
     let service = FacelockService {
         handler: handler.clone(),
         last_activity: last_activity.clone(),
         config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
         camera_owner_uid: Arc::new(Mutex::new(None)),
+        capture_slot: Arc::new(CaptureSlot::default()),
+        preview_authz: preview_authz.clone(),
     };
 
     let _connection = zbus::connection::Builder::system()?
@@ -935,6 +1307,15 @@ async fn run_dbus_server(
         .await?;
 
     info!("facelock daemon running on D-Bus system bus as {BUS_NAME}");
+
+    // Evict cached frame authorizations when their caller disconnects, so a
+    // polkit grant can never outlive the caller's bus connection.
+    let conn_for_watch = _connection.clone();
+    tokio::spawn(async move {
+        if let Err(e) = watch_bus_disconnects(conn_for_watch, preview_authz).await {
+            warn!("failed to watch bus disconnects for authz eviction: {e}");
+        }
+    });
 
     // Drop capabilities now that initialization is complete — camera fd is
     // open, models are loaded, D-Bus is connected, database is open.
@@ -1154,5 +1535,161 @@ mod tests {
             require_camera_owner_or_root(&caller(1001, Some("bob")), Some(1000), "ReleaseCamera")
                 .unwrap_err();
         assert!(matches!(err, fdo::Error::AccessDenied(_)));
+    }
+
+    #[test]
+    fn capture_slot_grants_when_free() {
+        let slot = Arc::new(CaptureSlot::default());
+        assert!(slot.try_acquire("Authenticate").is_ok());
+    }
+
+    #[test]
+    fn capture_slot_rejects_concurrent_capture_immediately() {
+        let slot = Arc::new(CaptureSlot::default());
+        let _guard = slot.try_acquire("Authenticate").expect("first acquire");
+        let err = slot.try_acquire("Authenticate").unwrap_err();
+        // Busy must surface as a plain daemon error so PAM degrades to
+        // password (never a lockout), and the message must say "busy".
+        match err {
+            fdo::Error::Failed(msg) => assert!(msg.contains("busy"), "message: {msg}"),
+            other => panic!("expected fdo::Error::Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_slot_frees_on_guard_drop() {
+        let slot = Arc::new(CaptureSlot::default());
+        let guard = slot.try_acquire("Authenticate").expect("first acquire");
+        drop(guard);
+        assert!(
+            slot.try_acquire("Authenticate").is_ok(),
+            "slot must be reusable after the previous capture finishes"
+        );
+    }
+
+    #[test]
+    fn preview_jpeg_stripped_when_frames_not_allowed() {
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        assert!(sanitize_preview_jpeg(jpeg, false).is_empty());
+    }
+
+    #[test]
+    fn preview_jpeg_kept_when_frames_allowed() {
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        assert_eq!(sanitize_preview_jpeg(jpeg.clone(), true), jpeg);
+    }
+
+    // --- Frame authorization decision logic (polkit-gated frames) ---
+
+    #[test]
+    fn root_gets_frames_regardless_of_polkit_state() {
+        for authz in [
+            FrameAuthz::Granted,
+            FrameAuthz::Refused,
+            FrameAuthz::Pending,
+            FrameAuthz::NeedsCheck,
+        ] {
+            assert!(allow_preview_jpeg(true, authz), "root denied at {authz:?}");
+        }
+    }
+
+    #[test]
+    fn non_root_gets_frames_only_when_polkit_granted() {
+        assert!(allow_preview_jpeg(false, FrameAuthz::Granted));
+        assert!(!allow_preview_jpeg(false, FrameAuthz::Refused));
+        // Pending / not-yet-checked states FAIL CLOSED.
+        assert!(!allow_preview_jpeg(false, FrameAuthz::Pending));
+        assert!(!allow_preview_jpeg(false, FrameAuthz::NeedsCheck));
+    }
+
+    #[test]
+    fn authz_cache_first_lookup_starts_a_check() {
+        let cache = PreviewAuthzCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+        // Second lookup while the check is in flight must not start another.
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::Pending);
+    }
+
+    #[test]
+    fn authz_cache_polkit_authorized_grants_until_ttl() {
+        let cache = PreviewAuthzCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+        cache.complete(":1.5", Ok(true), now);
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::Granted);
+        // Still granted just before the TTL...
+        let almost = now + AUTHZ_GRANTED_TTL - Duration::from_secs(1);
+        assert_eq!(cache.begin_or_lookup(":1.5", almost), FrameAuthz::Granted);
+        // ...and re-checked (never silently extended) after it.
+        let expired = now + AUTHZ_GRANTED_TTL + Duration::from_secs(1);
+        assert_eq!(
+            cache.begin_or_lookup(":1.5", expired),
+            FrameAuthz::NeedsCheck
+        );
+    }
+
+    #[test]
+    fn authz_cache_polkit_denied_refuses_then_allows_retry() {
+        let cache = PreviewAuthzCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+        cache.complete(":1.5", Ok(false), now);
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::Refused);
+        // A dismissed prompt can be retried after the short denial TTL.
+        let retry = now + AUTHZ_DENIED_TTL + Duration::from_secs(1);
+        assert_eq!(cache.begin_or_lookup(":1.5", retry), FrameAuthz::NeedsCheck);
+    }
+
+    #[test]
+    fn authz_cache_polkit_error_fails_closed() {
+        let cache = PreviewAuthzCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+        cache.complete(":1.5", Err("polkit unreachable".into()), now);
+        // A polkit/D-Bus error must never grant frames.
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::Refused);
+        assert!(!allow_preview_jpeg(false, FrameAuthz::Refused));
+    }
+
+    #[test]
+    fn authz_cache_eviction_kills_grant_with_connection() {
+        let cache = PreviewAuthzCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+        cache.complete(":1.5", Ok(true), now);
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::Granted);
+        // Caller's bus connection went away — grant dies with it.
+        cache.evict(":1.5");
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+    }
+
+    #[test]
+    fn authz_cache_drops_verdict_for_disconnected_caller() {
+        let cache = PreviewAuthzCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+        // Connection dies while the polkit check is in flight.
+        cache.evict(":1.5");
+        cache.complete(":1.5", Ok(true), now);
+        // The late verdict must not resurrect a grant for a dead connection
+        // (a reconnecting caller re-runs the polkit check).
+        assert_eq!(cache.begin_or_lookup(":1.5", now), FrameAuthz::NeedsCheck);
+    }
+
+    #[test]
+    fn authz_cache_is_bounded() {
+        let cache = PreviewAuthzCache::default();
+        let now = Instant::now();
+        for i in 0..(AUTHZ_CACHE_MAX_ENTRIES * 2) {
+            let name = format!(":1.{i}");
+            assert_eq!(cache.begin_or_lookup(&name, now), FrameAuthz::NeedsCheck);
+            cache.complete(&name, Ok(true), now);
+        }
+        let len = cache.entries.lock().unwrap().len();
+        assert!(
+            len <= AUTHZ_CACHE_MAX_ENTRIES,
+            "cache grew unbounded: {len} entries"
+        );
     }
 }

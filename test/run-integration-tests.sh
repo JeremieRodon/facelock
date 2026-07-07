@@ -85,10 +85,25 @@ mkdir -p /run/dbus
 dbus-uuidgen --ensure=/etc/machine-id >/dev/null 2>&1 || true
 dbus-daemon --system --fork --nopidfile
 
+# Start polkitd so PreviewDetectFrame's frame authorization exercises a real
+# polkit round-trip. No authentication agent is registered in the container,
+# so interactive authorization is impossible — the daemon must FAIL CLOSED
+# (stripped frames) unless an explicit test rule grants the action.
+POLKITD_PID=""
+if [ -x /usr/lib/polkit-1/polkitd ]; then
+    /usr/lib/polkit-1/polkitd --no-debug > /tmp/polkitd.log 2>&1 &
+    POLKITD_PID=$!
+    sleep 1
+fi
+
 cleanup() {
     if [ -n "${DAEMON_PID:-}" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
+    fi
+    rm -f /etc/polkit-1/rules.d/90-facelock-test.rules
+    if [ -n "${POLKITD_PID:-}" ]; then
+        kill "$POLKITD_PID" 2>/dev/null || true
     fi
     pkill dbus-daemon 2>/dev/null || true
 }
@@ -205,6 +220,203 @@ run_test "Rate limit: PAM fails without oneshot escalation" \
 
 run_test "Rate limit: clear seeded attempts" \
     "sqlite3 $FACELOCK_DB \"DELETE FROM rate_limit WHERE user = 'testuser';\""
+
+# --- D-Bus hardening assertions (security plan 06) ---
+
+# sigwatcher: unprivileged, NOT in the facelock group (signal eavesdropper).
+# testuser: added to the facelock group (bus policy allows it to send).
+useradd -m sigwatcher 2>/dev/null || true
+usermod -aG facelock testuser
+
+# (a) Signal hardening — needs the daemon up plus one auth attempt to emit
+# the signal. Unprivileged users must not receive AuthAttempted, and the
+# payload must carry no similarity score (no 'double' argument).
+runuser -u sigwatcher -- dbus-monitor --system \
+    "type='signal',interface='org.facelock.Daemon'" > /tmp/sig-unpriv.log 2>&1 &
+UNPRIV_MON_PID=$!
+dbus-monitor --system \
+    "type='signal',interface='org.facelock.Daemon'" > /tmp/sig-root.log 2>&1 &
+ROOT_MON_PID=$!
+sleep 2
+timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser > /dev/null 2>&1 || true
+sleep 2
+kill "$UNPRIV_MON_PID" "$ROOT_MON_PID" 2>/dev/null || true
+wait "$UNPRIV_MON_PID" "$ROOT_MON_PID" 2>/dev/null || true
+
+run_test "AuthAttempted signal visible to root monitor" \
+    "grep -q 'member=AuthAttempted' /tmp/sig-root.log"
+
+run_test "AuthAttempted payload carries no similarity score" \
+    "! grep -A3 'member=AuthAttempted' /tmp/sig-root.log | grep -q 'double'"
+
+run_test "Unprivileged user receives no AuthAttempted signal" \
+    "! grep -q 'member=AuthAttempted' /tmp/sig-unpriv.log"
+
+# Policy: the default context explicitly denies owning the daemon name —
+# only root may own org.facelock.Daemon.
+check_own_denied() {
+    local out rc
+    set +e
+    out=$(runuser -u sigwatcher -- dbus-send --system --print-reply \
+        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.RequestName string:org.facelock.Daemon uint32:0 2>&1)
+    rc=$?
+    set -e
+    echo "$out"
+    [ "$rc" -ne 0 ] || { echo "RequestName unexpectedly succeeded"; return 1; }
+    echo "$out" | grep -qiE "not allowed to own|AccessDenied" || return 1
+    return 0
+}
+run_test "Unprivileged user cannot own org.facelock.Daemon" \
+    "check_own_denied"
+
+# (b) PreviewDetectFrame authz parity — a facelock-group non-root caller may
+# call it for itself, but the reply must not contain raw frame bytes
+# (dbus-send renders non-empty byte arrays as hex; a JPEG starts with ff d8).
+check_preview_detect_frame_stripped() {
+    local out
+    if ! out=$(runuser -u testuser -- dbus-send --system --print-reply \
+        --reply-timeout=60000 \
+        --dest=org.facelock.Daemon /org/facelock/Daemon \
+        org.facelock.Daemon.PreviewDetectFrame string:testuser 2>&1); then
+        echo "$out"
+        return 1
+    fi
+    echo "$out"
+    echo "$out" | grep -q "method return" || return 1
+    if echo "$out" | grep -qi "ff d8"; then
+        echo "reply contains JPEG frame bytes (ff d8) — should be stripped"
+        return 1
+    fi
+    return 0
+}
+run_test "PreviewDetectFrame returns no raw frame to non-root caller" \
+    "check_preview_detect_frame_stripped"
+
+# (b2) Packaging contract — the polkit action for frame authorization is
+# installed alongside the D-Bus policy.
+run_test "polkit action policy installed" \
+    "[ -f /usr/share/polkit-1/actions/org.facelock.policy ] && grep -q 'org.facelock.preview-frames' /usr/share/polkit-1/actions/org.facelock.policy"
+
+# (b3) AUTHORIZED PATH: with an explicit polkit rule granting
+# org.facelock.preview-frames, a non-root preview session (one bus
+# connection across frames) receives real frame bytes. The first frame is
+# metadata-only while the daemon's polkit check is in flight; subsequent
+# frames must carry jpeg bytes (jpeg_size > 0).
+check_preview_frames_authorized() {
+    mkdir -p /etc/polkit-1/rules.d
+    cat > /etc/polkit-1/rules.d/90-facelock-test.rules <<'RULES'
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.facelock.preview-frames") {
+        return polkit.Result.YES;
+    }
+});
+RULES
+    sleep 2 # polkitd reloads rules.d via inotify
+    timeout --foreground 30 runuser -u testuser -- \
+        facelock preview --text-only 2>/dev/null | head -15 > /tmp/preview-authz.log || true
+    rm -f /etc/polkit-1/rules.d/90-facelock-test.rules
+    sleep 2 # let polkitd drop the rule before the fail-closed re-check
+    cat /tmp/preview-authz.log
+    grep -q '"jpeg_size":[1-9]' /tmp/preview-authz.log || return 1
+    return 0
+}
+
+if [ -n "$POLKITD_PID" ] && kill -0 "$POLKITD_PID" 2>/dev/null; then
+    run_test "PreviewDetectFrame serves frames to polkit-authorized caller" \
+        "check_preview_frames_authorized"
+
+    # (b4) The grant must not leak: with the rule gone, a fresh caller is
+    # stripped again (fail closed).
+    run_test "PreviewDetectFrame stripped again after polkit rule removal" \
+        "check_preview_detect_frame_stripped"
+else
+    echo "SKIP: polkitd unavailable — polkit-authorized frame path not exercised"
+fi
+
+# Release the preview camera session before the concurrency test
+dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon \
+    org.facelock.Daemon.ReleaseCamera > /dev/null 2>&1 || true
+
+# (c) CAMERA-REQUIRED: mutex-DoS guard — race two simultaneous Authenticate
+# calls. Exactly one wins the capture slot; the other must be rejected
+# immediately with a "busy" error (milliseconds), never queued toward the
+# 10s handler-lock timeout.
+timed_authenticate() {
+    # $1 = output file, $2 = meta file (rc + elapsed_ms), $3 = run as user ("" = root)
+    local s e rc
+    s=$(date +%s%N)
+    if [ -n "$3" ]; then
+        runuser -u "$3" -- dbus-send --system --print-reply --reply-timeout=30000 \
+            --dest=org.facelock.Daemon /org/facelock/Daemon \
+            org.facelock.Daemon.Authenticate string:testuser > "$1" 2>&1
+        rc=$?
+    else
+        dbus-send --system --print-reply --reply-timeout=30000 \
+            --dest=org.facelock.Daemon /org/facelock/Daemon \
+            org.facelock.Daemon.Authenticate string:testuser > "$1" 2>&1
+        rc=$?
+    fi
+    e=$(date +%s%N)
+    echo "$rc $(((e - s) / 1000000))" > "$2"
+}
+
+check_concurrent_auth_busy() {
+    set +e
+    timed_authenticate /tmp/auth-a.out /tmp/auth-a.meta "" &
+    local pid_a=$!
+    timed_authenticate /tmp/auth-b.out /tmp/auth-b.meta testuser &
+    local pid_b=$!
+    wait "$pid_a" "$pid_b"
+    set -e
+
+    local rc_a ms_a rc_b ms_b
+    read -r rc_a ms_a < /tmp/auth-a.meta
+    read -r rc_b ms_b < /tmp/auth-b.meta
+    echo "call A (root):     rc=$rc_a elapsed=${ms_a}ms"
+    echo "call B (testuser): rc=$rc_b elapsed=${ms_b}ms"
+    echo "--- A reply:"
+    cat /tmp/auth-a.out
+    echo "--- B reply:"
+    cat /tmp/auth-b.out
+
+    local busy=0 busy_ms=0
+    if grep -qi "busy" /tmp/auth-a.out; then
+        busy=$((busy + 1))
+        busy_ms=$ms_a
+    fi
+    if grep -qi "busy" /tmp/auth-b.out; then
+        busy=$((busy + 1))
+        busy_ms=$ms_b
+    fi
+    [ "$busy" -eq 1 ] || { echo "expected exactly one busy rejection, got $busy"; return 1; }
+    # Rejected immediately — well under the 10s handler-lock stall
+    [ "$busy_ms" -lt 5000 ] || { echo "busy rejection took ${busy_ms}ms (stall)"; return 1; }
+    return 0
+}
+run_test "Concurrent Authenticate rejected immediately with busy" \
+    "check_concurrent_auth_busy"
+
+# The busy guard must not starve legitimate sequential auth: once the
+# concurrent capture finished, a new Authenticate must run a full capture
+# (match or no-match depending on who is in front of the camera), and must
+# NOT be rejected with a busy error.
+check_sequential_auth_not_starved() {
+    local out rc
+    set +e
+    out=$(timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser 2>&1)
+    rc=$?
+    set -e
+    echo "$out"
+    if echo "$out" | grep -qi "busy"; then
+        echo "sequential auth was rejected as busy (starved by the guard)"
+        return 1
+    fi
+    echo "$out" | grep -qE "Matched model|No match" || return 1
+    return 0
+}
+run_test "Sequential auth not starved after busy rejection" \
+    "check_sequential_auth_not_starved"
 
 # Clean up
 run_test "Clear enrolled models" \

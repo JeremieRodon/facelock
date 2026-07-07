@@ -41,6 +41,11 @@ in
     # Install the package
     environment.systemPackages = [ facelockPackage ];
 
+    # Polkit action for org.facelock.preview-frames (polkitd discovers
+    # actions from packages listed here)
+    security.polkit.enable = true;
+    environment.pathsToLink = [ "/share/polkit-1" ];
+
     # PAM module
     security.pam.services = {
       sudo.rules.auth.facelock = {

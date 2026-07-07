@@ -348,6 +348,10 @@ The daemon must also verify the caller UID via `GetConnectionUnixUser` on every 
 - `ReleaseCamera`: root or the Unix user that owns the active preview camera session
 - `ListDevices`: root or a caller in the `facelock` group
 
+The policy also self-contains two explicit defaults rather than relying on system-wide bus defaults:
+- `<deny own="org.facelock.Daemon"/>` in the default context (name-squatting protection; only root may own the name).
+- `<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>` in the default context, with explicit allows for root and the `facelock` group (see below).
+
 #### A2. PAM Peer-UID Verification (Required)
 
 The trust check runs in both directions: before trusting an `Authenticate`
@@ -372,6 +376,32 @@ classifies the error itself: rate limited maps to `PAM_AUTH_ERR` (face-auth
 budget exhausted, password modules still run), everything else to
 `PAM_IGNORE`. D-Bus errors remain reserved for authorization failures and
 transport-level problems, which do fall back to the oneshot path.
+
+#### A4. Auth-Attempt Signal Hygiene (Implemented)
+
+**Attack**: Any local user adds a match rule (or runs `dbus-monitor`) and passively observes `AuthAttempted` broadcast signals to learn who authenticates when — and, if the payload carried the raw similarity score, uses it as a spoof-tuning oracle (iterate on a photo/mask until the score climbs).
+
+**Mitigations**:
+- The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to the authorized caller.
+- The bus policy denies delivery of the daemon's signals in the default context; only root and `facelock`-group members may receive them.
+
+#### A5. Raw Frame Access Parity (Implemented — polkit-authorized)
+
+**Attack**: `PreviewFrame` is root-only, but a `facelock`-group member pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead — silently, with no user consent.
+
+**Mitigation**: `PreviewFrame` stays root-only. `PreviewDetectFrame` serves the `jpeg_data` frame bytes to root unconditionally; for a non-root caller the daemon requires an **interactive polkit authorization** for `org.facelock.preview-frames` (defaults: `allow_any=no`, `allow_inactive=no`, `allow_active=auth_self_keep` — the caller must type their own password in an active local session, and polkit keeps the grant only ~5 minutes). The daemon calls `CheckAuthorization` with `AllowUserInteraction=true` on the caller's unique bus name; the check runs in the background and never blocks the reply or holds the capture slot, so a pending prompt cannot starve `Authenticate`.
+
+**Fail closed**: while the verdict is pending, denied, timed out, or polkit is unreachable (any D-Bus error), the frame bytes are stripped and the caller gets detection/recognition metadata only (bounding boxes, confidence, similarity, recognized). Verdicts are cached per caller connection — granted for at most 120 s, denied for 15 s — and evicted the moment the caller's bus connection closes (`NameOwnerChanged`), so a grant can never outlive the connection it was issued to. This preserves the enroll/preview UX (the preview window prompts once via the user's polkit agent, then shows live frames) without ever handing out camera/IR imagery silently.
+
+`auth_self_keep` rather than `auth_admin`: the resource is the caller's *own* camera preview (the bus policy already restricts daemon access to root/`facelock` group, and `PreviewDetectFrame` to the matching Unix user). Requiring the user's own password is proportionate consent for camera imagery; `auth_admin` would lock non-admin users out of enroll feedback entirely, which is the UX regression this design fixes.
+
+**Residual — similarity in detect metadata (accepted, self-scoped).** The stripped-frame response still returns per-face recognition metadata — bounding boxes, confidence, and the recognition *similarity* score — so the enroll/preview UI can give live quality feedback ("your face is recognized well, hold still to capture"). A raw similarity score is a spoof-tuning oracle in general (iterate a photo/mask until the number climbs), which is exactly why A4 removed it from the broadcast `AuthAttempted` signal. Here it is deliberately **retained but bounded**: `PreviewDetectFrame` is authorized only for **root or the caller's matching Unix user** (see the method-level authorization list above), so a non-root caller can read the similarity only for *their own* face against *their own* templates. There is no cross-user query path — obtaining another account's tuning score would require being root or being that user, in which case the score reveals nothing they could not already obtain by authenticating. The continuous score therefore serves enroll UX without functioning as an oracle against another account. This residual is accepted rather than coarsened; a future option is to bucket the score (`weak`/`good`/`strong`) if the self-scoped exposure is ever deemed too precise.
+
+#### A6. Capture Contention Guard (Implemented)
+
+**Attack**: Local DoS — an authorized caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request.
+
+**Mitigation**: A cheap in-flight capture guard is checked *before* the expensive handler lock. If a capture is already in flight, a concurrent `Authenticate`/`Enroll`/`PreviewFrame`/`PreviewDetectFrame` call is rejected **immediately** with a `daemon busy` error instead of queueing. PAM treats this like any daemon error (`PAM_IGNORE`) and falls through to password — degraded, never locked out. Per-user rate limiting is unchanged and orthogonal.
 
 #### B. D-Bus Message Size Limits (Enforced by Bus)
 
