@@ -80,7 +80,7 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | `[recognition]` | `threshold`, `timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
 | `[daemon]` | `mode` (DaemonMode enum), `model_dir`, `idle_timeout_secs` |
 | `[storage]` | `db_path` |
-| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `min_auth_frames`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
+| `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
 | `[notification]` | `mode` (off/terminal/desktop/both), `notify_prompt`, `notify_on_success`, `notify_on_failure` |
 | `[snapshots]` | `mode` (off/all/failure/success), `dir` |
 | `[encryption]` | `method` (none/keyfile/tpm), `key_path`, `sealed_key_path` |
@@ -92,8 +92,14 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 When `device.path` is omitted:
 1. Enumerate `/dev/video0` through `/dev/video63`
 2. Filter to VIDEO_CAPTURE devices
-3. Prefer IR cameras (name contains "ir"/"infrared", or supports GREY/Y16 format)
-4. Fall back to first available device
+3. Classify every node's IR provenance (quirks `force_ir` authoritative; name
+   token / format-corroboration heuristic otherwise), with node-level
+   disambiguation for multi-node USB devices: when several nodes share one
+   quirk-matched VID:PID and at least one has an IR-like format (GREY/Y16 or
+   the quirk's `format_preference`), only the format-bearing node(s) are IR
+4. Prefer a quirks-confirmed IR node with a native IR format, then any
+   quirks-confirmed IR node, then a name-token IR node
+5. Fall back to first available device
 
 ## Database Schema
 
@@ -168,11 +174,24 @@ pam_facelock(<service>): <result> for user <username>
 |---------|--------|---------|
 | IR camera enforcement | `security.require_ir` | **true** |
 | Frame variance check | `security.require_frame_variance` | **true** |
+| Frame variance cutoff | `security.frame_variance_max_similarity` | 0.985 |
+| IR texture cutoff (raw frame) | `security.ir_texture_min_stddev` | 10.0 |
 | Landmark liveness | `security.require_landmark_liveness` | **false** |
-| Minimum auth frames | `security.min_auth_frames` | 3 |
-| Variance threshold | `FRAME_VARIANCE_THRESHOLD` | 0.998 |
+| Minimum auth frames (= variance window size) | `security.min_auth_frames` | 3 |
+| Frame variance default const | `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY` | 0.985 |
 
-These defaults must not be weakened without security review.
+IR classification requires a whole `ir`/`infrared` name token or a quirks `force_ir`
+entry; a GREY/Y16 format alone is not treated as IR. A `force_ir` quirk is
+device-level ("this USB device has an IR sensor"): when the device exposes multiple
+capture nodes and at least one has an IR-like format, only the format-bearing
+node(s) classify IR (see `docs/security.md` §A). Frame variance is passive
+anti-photo only (does not stop video replay); it is evaluated over a sliding window
+of the most recent `min_auth_frames` matched frames (see `docs/security.md` §B), with
+a 0.985 cutoff rejecting truly static input (≳0.999) with margin; the
+field-measured frozen-human band is 0.98–0.995, and the default sits inside it —
+a fully frozen user recovers via the sliding window as soon as they move
+slightly. IR texture is measured on the raw frame, never CLAHE. These defaults
+must not be weakened without security review.
 
 ## Models
 

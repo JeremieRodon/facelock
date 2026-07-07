@@ -1,3 +1,19 @@
+# Container E2E test posture.
+#
+# The camera mounted into the container (v4l2loopback / a UVC RGB webcam) is an
+# ordinary RGB device: it has no IR name token and no quirks force_ir entry, so
+# under the (correct, stricter) IR classifier it is NOT an IR camera.
+#
+# require_ir is therefore set to false HERE ON PURPOSE so the live enroll/auth
+# camera suites exercise the recognition path instead of short-circuiting on the
+# IR gate. This is a deliberate test-harness choice, not the product default
+# (which is require_ir = true). The dedicated refusal assertion in
+# run-oneshot-tests.sh flips require_ir = true against this same RGB camera to
+# prove the gate still fires.
+#
+# require_frame_variance is likewise disabled for the container: the synthetic /
+# looped test camera does not produce the natural inter-frame micro-motion of a
+# live face, so the passive frame-variance drift check would false-reject it.
 [device]
 max_height = 480
 dark_threshold = 1.0

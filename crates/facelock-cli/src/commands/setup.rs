@@ -291,9 +291,25 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
         return Ok(());
     }
 
+    // Consult the quirks DB so IR classification here matches the auth path.
+    // classify_ir_sources disambiguates multi-node USB cameras (e.g. the
+    // Logitech BRIO's RGB + IR nodes share one VID:PID quirk): only the actual
+    // IR sensor node is tagged [IR], so auto-select picks the right node.
+    let quirks = facelock_camera::QuirksDb::load();
+    let sources = facelock_camera::classify_ir_sources(&devices, Some(&quirks));
+    let is_ir_at = |idx: usize| {
+        sources
+            .get(idx)
+            .copied()
+            .unwrap_or(facelock_camera::IrSource::None)
+            != facelock_camera::IrSource::None
+    };
+
     let ir_devices: Vec<_> = devices
         .iter()
-        .filter(|d| facelock_camera::is_ir_camera(d))
+        .enumerate()
+        .filter(|(i, _)| is_ir_at(*i))
+        .map(|(_, d)| d)
         .collect();
 
     // If exactly one IR camera, auto-select it
@@ -307,12 +323,9 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
     // Build display list
     let display_items: Vec<String> = devices
         .iter()
-        .map(|d| {
-            let ir_tag = if facelock_camera::is_ir_camera(d) {
-                " [IR]"
-            } else {
-                ""
-            };
+        .enumerate()
+        .map(|(i, d)| {
+            let ir_tag = if is_ir_at(i) { " [IR]" } else { "" };
             format!("{}{} - {}", d.path, ir_tag, d.name)
         })
         .collect();
@@ -323,7 +336,7 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
         .position(|d| config.device.path.as_ref().is_some_and(|p| d.path == *p))
         .or_else(|| {
             // Default to first IR camera if available
-            devices.iter().position(facelock_camera::is_ir_camera)
+            (0..devices.len()).find(|&i| is_ir_at(i))
         })
         .unwrap_or(0);
 

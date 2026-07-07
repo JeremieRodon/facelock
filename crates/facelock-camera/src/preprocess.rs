@@ -188,7 +188,12 @@ pub fn extract_bbox_region(gray: &[u8], bbox: &BoundingBox, width: u32) -> Vec<u
 
 /// Check that face region has sufficient IR texture (real skin vs flat photo/screen).
 /// Returns true if texture is consistent with a real face.
-pub fn check_ir_texture(gray: &[u8], bbox: &BoundingBox, width: u32) -> bool {
+///
+/// `min_stddev` is the rejection cutoff for the per-face standard deviation of
+/// pixel intensity. It MUST be measured on the RAW grayscale frame — running this
+/// on a CLAHE-equalized frame inflates the std_dev of flat surfaces and masks
+/// photo/screen replays. Configurable via `security.ir_texture_min_stddev`.
+pub fn check_ir_texture(gray: &[u8], bbox: &BoundingBox, width: u32, min_stddev: f32) -> bool {
     let face_pixels = extract_bbox_region(gray, bbox, width);
     if face_pixels.is_empty() {
         return false;
@@ -200,7 +205,7 @@ pub fn check_ir_texture(gray: &[u8], bbox: &BoundingBox, width: u32) -> bool {
         .sum::<f32>()
         / face_pixels.len() as f32;
     let std_dev = variance.sqrt();
-    std_dev > 10.0
+    std_dev > min_stddev
 }
 
 #[cfg(test)]
@@ -267,6 +272,8 @@ mod tests {
         );
     }
 
+    const TEST_MIN_STDDEV: f32 = 10.0;
+
     #[test]
     fn check_ir_texture_uniform_region_false() {
         let w = 64u32;
@@ -278,7 +285,7 @@ mod tests {
             width: 20.0,
             height: 20.0,
         };
-        assert!(!check_ir_texture(&gray, &bbox, w));
+        assert!(!check_ir_texture(&gray, &bbox, w, TEST_MIN_STDDEV));
     }
 
     #[test]
@@ -298,6 +305,31 @@ mod tests {
             width: 20.0,
             height: 20.0,
         };
-        assert!(check_ir_texture(&gray, &bbox, w));
+        assert!(check_ir_texture(&gray, &bbox, w, TEST_MIN_STDDEV));
+    }
+
+    #[test]
+    fn check_ir_texture_threshold_is_a_configurable_cutoff() {
+        // A region with std_dev ~8 sits below the default 10.0 cutoff (flat photo
+        // territory) but a caller can lower the cutoff to accept it.
+        let w = 64u32;
+        let h = 64u32;
+        let mut gray = vec![100u8; (w * h) as usize];
+        // Alternate two values 8 apart => std_dev ~= 8.
+        for row in 10..30 {
+            for col in 10..30 {
+                gray[row * w as usize + col] = if (row + col) % 2 == 0 { 92 } else { 108 };
+            }
+        }
+        let bbox = BoundingBox {
+            x: 10.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        // std_dev is 8, so it fails at the default cutoff (photo-like)...
+        assert!(!check_ir_texture(&gray, &bbox, w, 10.0));
+        // ...but passes if the operator lowers the cutoff below the measured value.
+        assert!(check_ir_texture(&gray, &bbox, w, 5.0));
     }
 }

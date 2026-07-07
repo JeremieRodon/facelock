@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use facelock_camera::quirks::QuirksDb;
-use facelock_camera::{Camera, auto_detect_device, is_ir_camera_with_quirks, validate_device};
+use facelock_camera::{Camera, auto_detect_device, is_ir_camera_resolved, validate_device};
 use facelock_core::config::Config;
 use facelock_core::dbus_interface::{
     AuthResult, BUS_NAME, DeviceInfo, ModelInfo, OBJECT_PATH, PreviewFaceInfo,
@@ -721,7 +721,7 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     if config.device.path.is_none() {
         let info = auto_detect_device()
             .map_err(|e| format!("no camera device specified and auto-detection failed: {e}"))?;
-        let is_ir = is_ir_camera_with_quirks(&info, Some(&quirks));
+        let is_ir = is_ir_camera_resolved(&info, Some(&quirks));
         info!(device = %info.path, name = %info.name, ir = is_ir, "auto-detected camera device");
         config.device.path = Some(info.path);
     }
@@ -730,7 +730,9 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
 
     let device_is_ir = match validate_device(&device_path) {
         Ok(info) => {
-            let is_ir = is_ir_camera_with_quirks(&info, Some(&quirks));
+            // Sibling-aware: on multi-node USB cameras only the IR sensor
+            // node counts as IR, not every node sharing the quirk's VID:PID.
+            let is_ir = is_ir_camera_resolved(&info, Some(&quirks));
             info!(device = %device_path, ir = is_ir, name = %info.name, "camera device");
             is_ir
         }

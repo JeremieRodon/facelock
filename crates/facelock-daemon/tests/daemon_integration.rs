@@ -240,6 +240,102 @@ fn warmup_frames_zero_skips_discard() {
     );
 }
 
+/// Unit embedding at a planar angle: cosine similarity between two of these
+/// is exactly cos(theta_a - theta_b).
+fn unit_at_angle(theta: f32) -> facelock_core::types::FaceEmbedding {
+    let mut e: facelock_core::types::FaceEmbedding = [0.0; 512];
+    e[0] = theta.cos();
+    e[1] = theta.sin();
+    e
+}
+
+#[test]
+fn static_matching_frames_report_variance_reason() {
+    use facelock_core::types::AuthFailureReason;
+
+    let mut config = test_config();
+    config.recognition.timeout_secs = 1;
+
+    // Static input: the exact same embedding every frame (photo-like), which
+    // matches the enrolled template perfectly but never drifts.
+    let emb = unit_at_angle(0.0);
+    let mut camera = MockCamera::bright(64, 64, 4);
+    let mut engine = MockFaceEngine::one_face(emb);
+    let stored = vec![(1u32, emb)];
+
+    let resp = facelock_daemon::auth::authenticate_with_embeddings(
+        &mut camera,
+        &mut engine,
+        &stored,
+        &[],
+        &config,
+        "testuser",
+        false,
+    );
+
+    match resp {
+        DaemonResponse::AuthResult(r) => {
+            assert!(!r.matched, "static input must not authenticate");
+            assert!(
+                r.similarity >= config.recognition.threshold,
+                "sanity: frames matched above the recognition threshold"
+            );
+            assert_eq!(
+                r.failure_reason,
+                Some(AuthFailureReason::VarianceNotSatisfied),
+                "outcome must say the variance gate was the blocker"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn still_then_moving_frames_recover_and_authenticate() {
+    let mut config = test_config();
+    config.recognition.timeout_secs = 2;
+
+    // A user who holds still for the first frames, then moves. With the old
+    // append-only history the early still pair poisoned the session forever;
+    // the sliding window must recover and authenticate.
+    let still = unit_at_angle(0.0);
+    let frames = vec![
+        still,
+        still,
+        still,
+        still,
+        still,
+        unit_at_angle(0.20), // pair drift cos(0.20) ~= 0.9801 <= 0.985
+        unit_at_angle(0.40),
+        unit_at_angle(0.60),
+    ];
+    let mut camera = MockCamera::bright(64, 64, 16);
+    let mut engine = MockFaceEngine::cycling(frames);
+    let stored = vec![(1u32, still)];
+
+    let resp = facelock_daemon::auth::authenticate_with_embeddings(
+        &mut camera,
+        &mut engine,
+        &stored,
+        &[],
+        &config,
+        "testuser",
+        false,
+    );
+
+    match resp {
+        DaemonResponse::AuthResult(r) => {
+            assert!(
+                r.matched,
+                "still-then-moving user must authenticate once the window fills \
+                 with moving frames, got similarity {} reason {:?}",
+                r.similarity, r.failure_reason
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
 #[test]
 fn failed_auth_rate_limit_persists_across_handler_restart() {
     use facelock_daemon::handler::Handler;

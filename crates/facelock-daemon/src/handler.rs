@@ -401,28 +401,36 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             },
 
             DaemonRequest::ListDevices => {
-                use facelock_camera::{is_ir_camera, list_devices};
+                use facelock_camera::{IrSource, QuirksDb, classify_ir_sources, list_devices};
+                // Consult the quirks DB so the reported is_ir matches the
+                // authoritative decision the auth path makes, with node-level
+                // disambiguation for multi-node USB devices.
+                let quirks = QuirksDb::load();
                 match list_devices() {
-                    Ok(devices) => DaemonResponse::Devices(
-                        devices
-                            .iter()
-                            .map(|d| facelock_core::ipc::IpcDeviceInfo {
-                                path: d.path.clone(),
-                                name: d.name.clone(),
-                                driver: d.driver.clone(),
-                                is_ir: is_ir_camera(d),
-                                formats: d
-                                    .formats
-                                    .iter()
-                                    .map(|f| facelock_core::ipc::IpcFormatInfo {
-                                        fourcc: f.fourcc.clone(),
-                                        description: f.description.clone(),
-                                        sizes: f.sizes.clone(),
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                    ),
+                    Ok(devices) => {
+                        let sources = classify_ir_sources(&devices, Some(&quirks));
+                        DaemonResponse::Devices(
+                            devices
+                                .iter()
+                                .zip(&sources)
+                                .map(|(d, source)| facelock_core::ipc::IpcDeviceInfo {
+                                    path: d.path.clone(),
+                                    name: d.name.clone(),
+                                    driver: d.driver.clone(),
+                                    is_ir: *source != IrSource::None,
+                                    formats: d
+                                        .formats
+                                        .iter()
+                                        .map(|f| facelock_core::ipc::IpcFormatInfo {
+                                            fourcc: f.fourcc.clone(),
+                                            description: f.description.clone(),
+                                            sizes: f.sizes.clone(),
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                        )
+                    }
                     Err(e) => DaemonResponse::Error {
                         message: format!("device enumeration failed: {e}"),
                     },

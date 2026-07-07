@@ -8,8 +8,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{
-    Camera, DeviceInfo, auto_detect_device, is_ir_camera, is_ir_camera_with_quirks, list_devices,
-    validate_device,
+    Camera, DeviceInfo, auto_detect_device, is_ir_camera_resolved, list_devices, validate_device,
 };
 use facelock_core::config::DeviceConfig;
 use facelock_core::config::{Config, EncryptionMethod};
@@ -46,7 +45,9 @@ fn build_resolved_camera_device(
     ResolvedCameraDevice {
         device,
         device_quirk: quirks.find_match(&device_info).cloned(),
-        device_is_ir: is_ir_camera_with_quirks(&device_info, Some(quirks)),
+        // Sibling-aware: on multi-node USB cameras only the IR sensor node
+        // counts as IR, not every node sharing the quirk's VID:PID.
+        device_is_ir: is_ir_camera_resolved(&device_info, Some(quirks)),
     }
 }
 
@@ -97,12 +98,19 @@ pub fn load_engine(config: &Config) -> anyhow::Result<FaceEngine> {
         .context("failed to load face engine")
 }
 
-/// Direct authentication — returns true if matched.
-pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<bool> {
+/// Direct authentication — returns the full match result (including an
+/// internal failure reason when frames matched but a liveness gate blocked).
+pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> {
     let store = open_store(config)?;
 
     if !store.has_models(user).context("storage error")? {
-        return Ok(false);
+        return Ok(MatchResult {
+            matched: false,
+            model_id: None,
+            label: None,
+            similarity: 0.0,
+            failure_reason: None,
+        });
     }
 
     let OpenedCamera {
@@ -126,7 +134,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<bool> {
     );
 
     match response {
-        DaemonResponse::AuthResult(MatchResult { matched, .. }) => Ok(matched),
+        DaemonResponse::AuthResult(result) => Ok(result),
         DaemonResponse::Error { message } => bail!("{message}"),
         _ => bail!("unexpected auth response"),
     }
@@ -261,9 +269,18 @@ pub fn list_devices_direct() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Consult the quirks DB so the displayed [IR] tag matches the authoritative
+    // decision the auth path makes (e.g. a quirks `force_ir` camera), with
+    // node-level disambiguation for multi-node USB devices.
+    let quirks = facelock_camera::QuirksDb::load();
+    let sources = facelock_camera::classify_ir_sources(&devices, Some(&quirks));
     println!("Available video devices:\n");
-    for dev in &devices {
-        let ir_tag = if is_ir_camera(dev) { " [IR]" } else { "" };
+    for (dev, source) in devices.iter().zip(&sources) {
+        let ir_tag = if *source != facelock_camera::IrSource::None {
+            " [IR]"
+        } else {
+            ""
+        };
         println!("  {}{ir_tag}", dev.path);
         println!("    Name:    {}", dev.name);
         println!("    Driver:  {}", dev.driver);
@@ -311,8 +328,8 @@ mod facelock_daemon_auth {
     use facelock_core::ipc::DaemonResponse;
     use facelock_core::traits::{CameraSource, FaceProcessor};
     use facelock_core::types::{
-        FaceEmbedding, FaceModelInfo, MatchResult, best_match, check_frame_variance,
-        zeroize_embedding, zeroize_stored_embeddings,
+        AuthFailureReason, FaceEmbedding, FaceModelInfo, FrameVarianceWindow, MatchResult,
+        best_match, zeroize_stored_embeddings,
     };
     use facelock_daemon::liveness::LandmarkTracker;
     use std::time::Instant;
@@ -340,8 +357,13 @@ mod facelock_daemon_auth {
             Instant::now() + std::time::Duration::from_secs(config.recognition.timeout_secs as u64);
         let threshold = config.recognition.threshold;
         let mut best_similarity: f32 = 0.0;
-        let mut matched_frame_embeddings: Vec<FaceEmbedding> =
-            Vec::with_capacity(config.security.min_auth_frames as usize);
+        // Sliding window over the most recent matched-frame embeddings (see
+        // facelock-daemon auth.rs — this inline copy mirrors it): an early
+        // too-still moment is forgotten once the user moves, while a static
+        // input still never passes.
+        let mut variance_window = FrameVarianceWindow::new(config.security.min_auth_frames);
+        let mut matched_frames_total: u32 = 0;
+        let mut variance_ever_passed = false;
         let mut dark_count: u32 = 0;
         let mut frame_count: u32 = 0;
         let mut best_model_id: Option<u32> = None;
@@ -387,11 +409,12 @@ mod facelock_daemon_auth {
                 landmark_tracker.push(det.landmarks);
             }
 
-            // IR texture check: skip frames where all faces have flat texture
+            // IR texture check on the RAW frame: skip frames where all faces are flat.
+            let ir_texture_min = config.security.ir_texture_min_stddev;
             if device_is_ir {
-                let all_flat = faces
-                    .iter()
-                    .all(|(det, _)| !check_ir_texture(&frame.gray, &det.bbox, frame.width));
+                let all_flat = faces.iter().all(|(det, _)| {
+                    !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
+                });
                 if all_flat {
                     debug!(
                         frame = frame_count,
@@ -404,7 +427,9 @@ mod facelock_daemon_auth {
             let mut frame_matched = false;
             for (det, embedding) in &faces {
                 // Skip individual faces that fail IR texture check
-                if device_is_ir && !check_ir_texture(&frame.gray, &det.bbox, frame.width) {
+                if device_is_ir
+                    && !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
+                {
                     debug!(
                         frame = frame_count,
                         "IR texture check failed for face, skipping"
@@ -417,16 +442,27 @@ mod facelock_daemon_auth {
                     best_model_id = frame_best_id;
                 }
                 if frame_best_sim >= threshold && !frame_matched {
-                    matched_frame_embeddings.push(*embedding);
+                    variance_window.push(*embedding);
+                    matched_frames_total += 1;
+                    // Log drift values (never embeddings) for field tuning of
+                    // frame_variance_max_similarity.
+                    if let Some((min_sim, max_sim)) = variance_window.min_max_pair_similarity() {
+                        debug!(
+                            frame = frame_count,
+                            min_pair_similarity = format!("{min_sim:.4}"),
+                            max_pair_similarity = format!("{max_sim:.4}"),
+                            window = variance_window.len(),
+                            "frame variance window"
+                        );
+                    }
                     frame_matched = true;
                 }
             }
 
             // Frame variance check + landmark liveness check
             if config.security.require_frame_variance {
-                if matched_frame_embeddings.len() >= config.security.min_auth_frames as usize
-                    && check_frame_variance(&matched_frame_embeddings)
-                {
+                if variance_window.passes(config.security.frame_variance_max_similarity) {
+                    variance_ever_passed = true;
                     // If landmark liveness is required, check it too
                     if config.security.require_landmark_liveness
                         && !landmark_tracker.check_liveness()
@@ -452,12 +488,11 @@ mod facelock_daemon_auth {
                         model_id: best_model_id,
                         label: best_model_id.and_then(&label_for),
                         similarity: best_similarity,
+                        failure_reason: None,
                     });
                     // Zeroize sensitive embedding data before returning
                     zeroize_stored_embeddings(&mut stored);
-                    for emb in &mut matched_frame_embeddings {
-                        zeroize_embedding(emb);
-                    }
+                    variance_window.zeroize_all();
                     return response;
                 }
             } else if best_similarity >= threshold {
@@ -484,21 +519,30 @@ mod facelock_daemon_auth {
                     model_id: best_model_id,
                     label: best_model_id.and_then(&label_for),
                     similarity: best_similarity,
+                    failure_reason: None,
                 });
                 // Zeroize sensitive embedding data before returning
                 zeroize_stored_embeddings(&mut stored);
-                for emb in &mut matched_frame_embeddings {
-                    zeroize_embedding(emb);
-                }
+                variance_window.zeroize_all();
                 return response;
             }
         }
 
+        // Timeout expired. If frames DID match above the recognition threshold
+        // but the variance gate never passed, report that instead of a
+        // misleading plain "no match".
+        let failure_reason = if config.security.require_frame_variance
+            && variance_window.is_full()
+            && !variance_ever_passed
+        {
+            Some(AuthFailureReason::VarianceNotSatisfied)
+        } else {
+            None
+        };
+
         // Zeroize sensitive embedding data before returning on failure/timeout path
         zeroize_stored_embeddings(&mut stored);
-        for emb in &mut matched_frame_embeddings {
-            zeroize_embedding(emb);
-        }
+        variance_window.zeroize_all();
 
         let duration = start.elapsed();
         if dark_count == frame_count && frame_count > 0 {
@@ -512,7 +556,9 @@ mod facelock_daemon_auth {
             user,
             similarity = format!("{best_similarity:.4}"),
             frames = frame_count,
+            matched = matched_frames_total,
             duration_ms = duration.as_millis() as u64,
+            variance_blocked = failure_reason.is_some(),
             "authentication failed"
         );
         DaemonResponse::AuthResult(MatchResult {
@@ -520,6 +566,7 @@ mod facelock_daemon_auth {
             model_id: None,
             label: None,
             similarity: best_similarity,
+            failure_reason,
         })
     }
 }

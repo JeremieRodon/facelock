@@ -73,6 +73,16 @@ pub struct FaceModelInfo {
     pub embedder_model: String,
 }
 
+/// Why an authentication attempt that saw matching frames still failed.
+/// Internal plumbing only — never crosses the D-Bus `AuthResult` contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthFailureReason {
+    /// Frames matched the enrolled face above the recognition threshold, but
+    /// the passive frame-variance liveness gate was never satisfied before
+    /// the timeout (input too static).
+    VarianceNotSatisfied,
+}
+
 /// Result of a face match attempt
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchResult {
@@ -80,6 +90,10 @@ pub struct MatchResult {
     pub model_id: Option<u32>,
     pub label: Option<String>,
     pub similarity: f32,
+    /// Why the attempt failed despite matching frames (internal diagnostics;
+    /// not part of the D-Bus wire contract).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<AuthFailureReason>,
 }
 
 /// Cosine similarity between two L2-normalized embeddings (= dot product)
@@ -87,26 +101,159 @@ pub fn cosine_similarity(a: &FaceEmbedding, b: &FaceEmbedding) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-/// Threshold below which consecutive embeddings are considered "varied enough"
-/// to rule out a static photo attack.
-pub const FRAME_VARIANCE_THRESHOLD: f32 = 0.998;
+/// Default maximum consecutive-frame cosine similarity for the passive
+/// frame-variance check. Configurable via `security.frame_variance_max_similarity`.
+///
+/// Field-measured ranges (Logitech BRIO IR node, real user at a login prompt):
+/// - truly static input (photo on a stand, paused replay): pair similarity ≳ 0.999
+/// - a frozen, non-blinking live human: (0.98, 0.995]
+/// - a naturally moving live human: well below 0.98
+///
+/// The default (0.985) sits inside the frozen-human band, stricter than the
+/// top of the band (0.995) for extra margin against static replays. A fully
+/// frozen user may not pass at 0.985, but the sliding-window gate recovers as
+/// soon as they move slightly — the worst case is a brief delay, never a
+/// lockout, and password fallback always remains. Loosen the knob toward
+/// 0.995 if false rejects annoy; tighten toward 0.97 for paranoia. (The
+/// earlier 0.97 default assumed 0.02–0.10 live drift, which is empirically
+/// wrong for a still user and caused hard false-reject lockups.)
+///
+/// NOTE: frame-variance is a *passive* anti-photo heuristic only. It raises the
+/// bar for a *static* image but does NOT defeat a video replay (which contains
+/// real inter-frame motion). IR enforcement remains the load-bearing defense.
+pub const DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY: f32 = 0.985;
 
 /// Check that matched embeddings show sufficient variance (anti-photo-attack).
 /// Compares all consecutive pairs — every pair must differ enough to rule out
 /// a static image. Real faces produce micro-movements between frames.
-pub fn check_frame_variance(embeddings: &[FaceEmbedding]) -> bool {
+///
+/// `max_similarity` is the rejection cutoff: any consecutive pair with cosine
+/// similarity strictly greater than `max_similarity` fails the check (too static).
+pub fn check_frame_variance(embeddings: &[FaceEmbedding], max_similarity: f32) -> bool {
     if embeddings.len() < 2 {
         return false;
     }
-    // Every consecutive pair must show movement (similarity below threshold).
-    // A static photo produces near-identical consecutive embeddings (>0.998).
+    // Every consecutive pair must show movement (similarity at or below the cutoff).
+    // A static photo produces near-identical consecutive embeddings.
     for window in embeddings.windows(2) {
         let sim = cosine_similarity(&window[0], &window[1]);
-        if sim >= FRAME_VARIANCE_THRESHOLD {
+        if sim > max_similarity {
             return false;
         }
     }
     true
+}
+
+/// Sliding window of the most recent matched-frame embeddings for the passive
+/// frame-variance gate.
+///
+/// The gate passes only when the window is *full* AND every consecutive pair
+/// inside it drifts (similarity at or below the cutoff). Because the window
+/// slides, one too-still moment early in the session is forgotten once enough
+/// moving frames arrive — a user who starts still can always recover. A truly
+/// static input (photo, paused replay) keeps every pair above the cutoff in
+/// every window, so it can never pass regardless of session length.
+///
+/// Implemented as a ring buffer: eviction overwrites the oldest slot in place
+/// (zeroized first), so evicted embeddings never linger in memory. All slots
+/// are zeroized on drop as well.
+pub struct FrameVarianceWindow {
+    slots: Vec<FaceEmbedding>,
+    capacity: usize,
+    /// Ring index where the next push goes (== oldest slot once full).
+    next: usize,
+}
+
+impl FrameVarianceWindow {
+    /// Create a window sized by `security.min_auth_frames` (the number of
+    /// matched frames that constitute enough evidence to authenticate).
+    /// Clamped to at least 2, since variance needs a pair to compare.
+    pub fn new(min_auth_frames: u32) -> Self {
+        let capacity = (min_auth_frames as usize).max(2);
+        Self {
+            slots: Vec::with_capacity(capacity),
+            capacity,
+            next: 0,
+        }
+    }
+
+    /// Add a matched-frame embedding, evicting (and zeroizing) the oldest
+    /// when the window is full.
+    pub fn push(&mut self, embedding: FaceEmbedding) {
+        if self.slots.len() < self.capacity {
+            self.slots.push(embedding);
+            self.next = self.slots.len() % self.capacity;
+        } else {
+            // Zeroize the evicted embedding before overwriting its slot so it
+            // never lingers, then take its place in the ring.
+            zeroize_embedding(&mut self.slots[self.next]);
+            self.slots[self.next] = embedding;
+            self.next = (self.next + 1) % self.capacity;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.slots.len() == self.capacity
+    }
+
+    /// Slot index of the `chrono`-th oldest embedding.
+    fn index_at(&self, chrono: usize) -> usize {
+        if self.slots.len() < self.capacity {
+            chrono
+        } else {
+            (self.next + chrono) % self.capacity
+        }
+    }
+
+    /// Cosine similarities of consecutive (chronological) pairs in the window.
+    fn pair_similarities(&self) -> impl Iterator<Item = f32> + '_ {
+        (1..self.slots.len()).map(move |i| {
+            cosine_similarity(
+                &self.slots[self.index_at(i - 1)],
+                &self.slots[self.index_at(i)],
+            )
+        })
+    }
+
+    /// Min and max consecutive-pair similarity currently in the window.
+    /// For diagnostics/tuning logs only — exposes similarity values, never
+    /// embedding contents. `None` until the window holds at least two frames.
+    pub fn min_max_pair_similarity(&self) -> Option<(f32, f32)> {
+        let mut it = self.pair_similarities();
+        let first = it.next()?;
+        Some(it.fold((first, first), |(mn, mx), s| (mn.min(s), mx.max(s))))
+    }
+
+    /// The variance gate: full window AND every consecutive pair drifting.
+    pub fn passes(&self, max_similarity: f32) -> bool {
+        self.is_full() && self.pair_similarities().all(|s| s <= max_similarity)
+    }
+
+    /// Zeroize all held embeddings and empty the window.
+    /// Call at security boundaries (auth success/failure exit paths).
+    pub fn zeroize_all(&mut self) {
+        for emb in &mut self.slots {
+            zeroize_embedding(emb);
+        }
+        self.slots.clear();
+        self.next = 0;
+    }
+}
+
+impl Drop for FrameVarianceWindow {
+    fn drop(&mut self) {
+        for emb in &mut self.slots {
+            zeroize_embedding(emb);
+        }
+    }
 }
 
 /// Convert f32 bits to ordered u32 for constant-time comparison.
@@ -390,6 +537,196 @@ mod tests {
             frame.gray.iter().all(|&b| b == 0),
             "gray data should be zeroed"
         );
+    }
+
+    /// Build a unit embedding pointing mostly along `axis` with a small tilt so
+    /// consecutive frames can be made to drift by a controlled amount.
+    fn tilted_unit(primary: f32, secondary: f32) -> FaceEmbedding {
+        let mut e: FaceEmbedding = [0.0; 512];
+        let norm = (primary * primary + secondary * secondary).sqrt();
+        e[0] = primary / norm;
+        e[1] = secondary / norm;
+        e
+    }
+
+    #[test]
+    fn frame_variance_rejects_near_static_sequence() {
+        // Near-identical consecutive embeddings (sim > 0.985, static-like) must fail.
+        let a = tilted_unit(1.0, 0.02);
+        let b = tilted_unit(1.0, 0.03);
+        let c = tilted_unit(1.0, 0.04);
+        let seq = [a, b, c];
+        // Sanity: consecutive similarities are all above the 0.985 default.
+        assert!(cosine_similarity(&seq[0], &seq[1]) > 0.985);
+        assert!(
+            !check_frame_variance(&seq, DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+            "near-static sequence must be rejected"
+        );
+    }
+
+    #[test]
+    fn frame_variance_accepts_live_like_sequence() {
+        // Live-like drift (sim well below the 0.985 default) must pass.
+        let a = tilted_unit(1.0, 0.0);
+        let b = tilted_unit(1.0, 0.30);
+        let c = tilted_unit(1.0, 0.60);
+        let seq = [a, b, c];
+        assert!(cosine_similarity(&seq[0], &seq[1]) < 0.985);
+        assert!(cosine_similarity(&seq[1], &seq[2]) < 0.985);
+        assert!(
+            check_frame_variance(&seq, DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+            "live-like sequence must pass"
+        );
+    }
+
+    #[test]
+    fn frame_variance_threshold_is_configurable() {
+        // A sequence that passes at a strict (low) max_similarity still passes,
+        // and one that only just drifts can be tuned by the caller.
+        let a = tilted_unit(1.0, 0.10);
+        let b = tilted_unit(1.0, 0.30);
+        let seq = [a, b];
+        let sim = cosine_similarity(&seq[0], &seq[1]);
+        // With a max just below the actual similarity, it is rejected...
+        assert!(!check_frame_variance(&seq, sim - 0.001));
+        // ...and with a max just above, it is accepted.
+        assert!(check_frame_variance(&seq, sim + 0.001));
+    }
+
+    /// Unit embedding at a planar angle: cosine similarity between two of these
+    /// is exactly cos(theta_a - theta_b), giving precise control over drift.
+    fn unit_at_angle(theta: f32) -> FaceEmbedding {
+        let mut e: FaceEmbedding = [0.0; 512];
+        e[0] = theta.cos();
+        e[1] = theta.sin();
+        e
+    }
+
+    #[test]
+    fn variance_window_still_then_moving_recovers() {
+        // Field bug #1: a user who starts perfectly still must be able to recover
+        // once they move. With an append-only history one still pair poisoned the
+        // whole session; a sliding window forgets it.
+        let mut w = FrameVarianceWindow::new(3);
+        let still = unit_at_angle(0.0);
+        for _ in 0..6 {
+            w.push(still);
+            assert!(
+                !w.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+                "still frames must never satisfy the variance gate"
+            );
+        }
+        // Now the user moves: consecutive drift cos(0.20) ~= 0.9801 <= 0.985.
+        for (i, theta) in [0.20f32, 0.40, 0.60].iter().enumerate() {
+            w.push(unit_at_angle(*theta));
+            if i >= 2 {
+                assert!(
+                    w.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+                    "window filled with moving frames must pass (recovery)"
+                );
+            }
+        }
+        // And it must have passed by the time the window is all moving frames.
+        assert!(w.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY));
+    }
+
+    #[test]
+    fn variance_window_static_never_passes() {
+        // A truly static input (photo on a stand) is identical frame-to-frame.
+        // No matter how long it runs, no window may ever pass.
+        let mut w = FrameVarianceWindow::new(3);
+        let photo = unit_at_angle(0.7);
+        for _ in 0..50 {
+            w.push(photo);
+            assert!(
+                !w.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+                "a fully static sequence must never pass, regardless of length"
+            );
+        }
+    }
+
+    #[test]
+    fn variance_window_near_static_replay_never_passes() {
+        // A paused replay / photo with sensor noise sits at pair similarity
+        // >= ~0.999 — still above the 0.985 default, so it must never pass.
+        let mut w = FrameVarianceWindow::new(3);
+        for i in 0..50 {
+            // steps of 0.02 rad: consecutive similarity cos(0.02) ~= 0.9998
+            w.push(unit_at_angle(i as f32 * 0.02));
+            assert!(
+                !w.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+                "near-static (sim ~0.9998) must never pass at the default cutoff"
+            );
+        }
+    }
+
+    #[test]
+    fn variance_window_boundary_at_default() {
+        assert_eq!(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY, 0.985);
+
+        // Just above the default (pair sim ~0.9888 > 0.985): rejected. This is
+        // inside the field-measured frozen-human band (0.98, 0.995] — a fully
+        // frozen user is deliberately held until they move slightly, at which
+        // point the sliding window recovers (see recovery test above).
+        let mut too_still = FrameVarianceWindow::new(2);
+        too_still.push(unit_at_angle(0.0));
+        too_still.push(unit_at_angle(0.15)); // cos ~= 0.9888
+        let (mn, _) = too_still.min_max_pair_similarity().unwrap();
+        assert!(
+            mn > 0.985,
+            "sanity: pair must sit above the cutoff, got {mn}"
+        );
+        assert!(!too_still.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY));
+
+        // Barely-moving live human just under the cutoff ((0.98, 0.985]): accepted.
+        let mut barely_moving = FrameVarianceWindow::new(2);
+        barely_moving.push(unit_at_angle(0.0));
+        barely_moving.push(unit_at_angle(0.19)); // cos ~= 0.9820
+        let (mn, mx) = barely_moving.min_max_pair_similarity().unwrap();
+        assert!(
+            mn > 0.98 && mx <= 0.985,
+            "sanity: pair just below the cutoff, got {mn}..{mx}"
+        );
+        assert!(barely_moving.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY));
+    }
+
+    #[test]
+    fn variance_window_requires_full_window() {
+        // The gate must not fire before min_auth_frames matched frames are seen.
+        let mut w = FrameVarianceWindow::new(3);
+        w.push(unit_at_angle(0.0));
+        w.push(unit_at_angle(0.2));
+        assert!(!w.is_full());
+        assert!(
+            !w.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY),
+            "partial window must not pass even with good drift"
+        );
+    }
+
+    #[test]
+    fn variance_window_evicts_oldest_embedding() {
+        // Capacity 2: pushing a third embedding must evict (and not retain) the first.
+        let mut w = FrameVarianceWindow::new(2);
+        let first = unit_at_angle(0.0);
+        w.push(first);
+        w.push(unit_at_angle(0.5));
+        w.push(unit_at_angle(1.0));
+        assert_eq!(w.len(), 2, "window must stay at capacity");
+        assert!(
+            w.slots.iter().all(|s| *s != first),
+            "evicted embedding must not be retained in the window"
+        );
+    }
+
+    #[test]
+    fn variance_window_zeroize_all_clears() {
+        let mut w = FrameVarianceWindow::new(2);
+        w.push(unit_at_angle(0.3));
+        w.push(unit_at_angle(0.6));
+        w.zeroize_all();
+        assert_eq!(w.len(), 0);
+        assert!(w.slots.is_empty());
+        assert!(!w.passes(DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY));
     }
 
     #[test]

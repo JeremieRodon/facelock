@@ -8,7 +8,7 @@ use facelock_core::fs_security::{ensure_dir, ensure_private_dir, write_file};
 use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{
-    FaceEmbedding, Frame, MatchResult, best_match, check_frame_variance, zeroize_embedding,
+    AuthFailureReason, FaceEmbedding, Frame, FrameVarianceWindow, MatchResult, best_match,
     zeroize_stored_embeddings,
 };
 use facelock_store::FaceStore;
@@ -71,6 +71,7 @@ pub fn pre_check(
             model_id: None,
             label: None,
             similarity: 0.0,
+            failure_reason: None,
         }));
     }
 
@@ -214,8 +215,13 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         Instant::now() + std::time::Duration::from_secs(config.recognition.timeout_secs as u64);
     let threshold = config.recognition.threshold;
     let mut best_similarity: f32 = 0.0;
-    let mut matched_frame_embeddings: Vec<FaceEmbedding> =
-        Vec::with_capacity(config.security.min_auth_frames as usize);
+    // Sliding window over the most recent matched-frame embeddings. The gate
+    // evaluates only this window, so an early too-still moment is forgotten
+    // once the user moves (a static input still never passes: every window
+    // of a static sequence stays above the cutoff).
+    let mut variance_window = FrameVarianceWindow::new(config.security.min_auth_frames);
+    let mut matched_frames_total: u32 = 0;
+    let mut variance_ever_passed = false;
     let mut dark_count: u32 = 0;
     let mut frame_count: u32 = 0;
     let mut best_model_id: Option<u32> = None;
@@ -269,26 +275,19 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
             landmark_tracker.push(det.landmarks);
         }
 
-        // Compute CLAHE-enhanced grayscale only for IR texture checks
-        let clahe_gray = if device_is_ir {
-            Some(facelock_camera::preprocess::clahe(
-                &frame.gray,
-                frame.width,
-                frame.height,
-            ))
-        } else {
-            None
-        };
-
         // IR texture check: when using an IR camera, verify each detected face
         // has real skin texture (not a flat photo/screen replay attack).
         // Only applied to IR frames — RGB texture varies too much and would
         // cause false positives.
+        //
+        // Runs on the RAW grayscale frame. CLAHE is deliberately NOT applied here:
+        // equalizing the frame inflates the std_dev of flat surfaces and masks the
+        // very photo/screen replays this check exists to catch (H3).
+        let ir_texture_min = config.security.ir_texture_min_stddev;
         if device_is_ir {
-            let gray = clahe_gray.as_deref().unwrap_or(&frame.gray);
-            let all_flat = faces
-                .iter()
-                .all(|(det, _)| !check_ir_texture(gray, &det.bbox, frame.width));
+            let all_flat = faces.iter().all(|(det, _)| {
+                !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
+            });
             if all_flat {
                 debug!(
                     frame = frame_count,
@@ -302,11 +301,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         for (det, embedding) in &faces {
             // Skip individual faces that fail IR texture check
             if device_is_ir
-                && !check_ir_texture(
-                    clahe_gray.as_deref().unwrap_or(&frame.gray),
-                    &det.bbox,
-                    frame.width,
-                )
+                && !check_ir_texture(&frame.gray, &det.bbox, frame.width, ir_texture_min)
             {
                 debug!(
                     frame = frame_count,
@@ -322,23 +317,34 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
             }
 
             if frame_best_sim >= threshold && !frame_matched {
-                matched_frame_embeddings.push(*embedding);
+                variance_window.push(*embedding);
+                matched_frames_total += 1;
+                // Log drift values (never embeddings) so field tuning of
+                // frame_variance_max_similarity has real data to work with.
+                if let Some((min_sim, max_sim)) = variance_window.min_max_pair_similarity() {
+                    debug!(
+                        frame = frame_count,
+                        min_pair_similarity = format!("{min_sim:.4}"),
+                        max_pair_similarity = format!("{max_sim:.4}"),
+                        window = variance_window.len(),
+                        "frame variance window"
+                    );
+                }
                 frame_matched = true;
             }
 
             debug!(
                 frame = frame_count,
                 similarity = format!("{frame_best_sim:.4}"),
-                matched_frames = matched_frame_embeddings.len(),
+                matched_frames = matched_frames_total,
                 "face comparison"
             );
         }
 
         // Frame variance check + landmark liveness check
         if config.security.require_frame_variance {
-            if matched_frame_embeddings.len() >= config.security.min_auth_frames as usize
-                && check_frame_variance(&matched_frame_embeddings)
-            {
+            if variance_window.passes(config.security.frame_variance_max_similarity) {
+                variance_ever_passed = true;
                 // If landmark liveness is required, check it too
                 if config.security.require_landmark_liveness && !landmark_tracker.check_liveness() {
                     debug!(
@@ -354,7 +360,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                     user,
                     similarity = format!("{best_similarity:.4}"),
                     frames = frame_count,
-                    matched = matched_frame_embeddings.len(),
+                    matched = matched_frames_total,
                     duration_ms = duration.as_millis() as u64,
                     "authentication succeeded"
                 );
@@ -382,12 +388,11 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                     model_id: best_model_id,
                     label: best_model_id.and_then(&label_for),
                     similarity: best_similarity,
+                    failure_reason: None,
                 });
                 // Zero sensitive data before returning
                 zeroize_stored_embeddings(stored);
-                for emb in &mut matched_frame_embeddings {
-                    zeroize_embedding(emb);
-                }
+                variance_window.zeroize_all();
                 return response;
             }
         } else if best_similarity >= threshold {
@@ -433,22 +438,30 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                 model_id: best_model_id,
                 label: best_model_id.and_then(&label_for),
                 similarity: best_similarity,
+                failure_reason: None,
             });
             zeroize_stored_embeddings(stored);
-            for emb in &mut matched_frame_embeddings {
-                zeroize_embedding(emb);
-            }
+            variance_window.zeroize_all();
             return response;
         }
     }
 
     let duration = start.elapsed();
 
+    // Timeout expired. If frames DID match above the recognition threshold but
+    // the variance gate never passed, say so — "no match" would be misleading.
+    let failure_reason = if config.security.require_frame_variance
+        && variance_window.is_full()
+        && !variance_ever_passed
+    {
+        Some(AuthFailureReason::VarianceNotSatisfied)
+    } else {
+        None
+    };
+
     // Zero sensitive data before returning
     zeroize_stored_embeddings(stored);
-    for emb in &mut matched_frame_embeddings {
-        zeroize_embedding(emb);
-    }
+    variance_window.zeroize_all();
 
     if dark_count == frame_count && frame_count > 0 {
         warn!(
@@ -481,8 +494,9 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         user,
         similarity = format!("{best_similarity:.4}"),
         frames = frame_count,
-        matched = matched_frame_embeddings.len(),
+        matched = matched_frames_total,
         duration_ms = duration.as_millis() as u64,
+        variance_blocked = failure_reason.is_some(),
         "authentication failed"
     );
 
@@ -512,6 +526,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         model_id: None,
         label: None,
         similarity: best_similarity,
+        failure_reason,
     })
 }
 
