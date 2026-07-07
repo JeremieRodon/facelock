@@ -514,12 +514,70 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 
 **Phase 2 (shipped):** `ProtectKernelTunables/Modules/ControlGroups=yes`, `RestrictNamespaces=yes`, `LockPersonality=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`
 
-**Deferred device/seccomp phase:** `DevicePolicy`/`DeviceAllow` is intentionally omitted because cgroup device ACLs interfered with camera auto-detection, and seccomp filtering is deferred to future work. Standard Unix permissions still restrict `/dev/video*` and `/dev/tpmrm0`.
+**Phase 3 (shipped — capabilities, seccomp, network):**
 
-**GPU compatibility note:** `MemoryDenyWriteExecute=yes` is still intentionally omitted because it breaks ONNX Runtime JIT paths such as CUDA and TensorRT. Verify hardening score with:
+- `CapabilityBoundingSet=CAP_SETUID CAP_SETGID` / `AmbientCapabilities=CAP_SETUID CAP_SETGID` —
+  the daemon retains **exactly** these two capabilities and no others. Device access needs no
+  caps (`/dev/video*` and `/dev/tpmrm0` are root-owned and opened via standard file
+  permissions), but the desktop-notification path execs `runuser -u <user> -- notify-send` to
+  drop into the user's session bus, and `runuser` calls `setgroups()`/`setuid()`, which require
+  `CAP_SETGID` + `CAP_SETUID`. They are declared **Ambient** (not merely in the bounding set) so
+  the caps survive the exec into the non-setuid `runuser` under `NoNewPrivileges=yes`. The daemon
+  also narrows its in-process capability set to exactly these two after initialization
+  (`drop_capabilities()` in `facelock-cli`, holding them in effective/permitted/inheritable);
+  everything else is dropped.
+  - **This was empirically required.** An earlier revision set both directives **empty** on the
+    theory that the daemon needs no capabilities. That was wrong: on real hardware it broke
+    notifications with `runuser: cannot set groups: Operation not permitted`.
+  - **Direct-D-Bus-as-root is NOT a viable alternative.** Having root connect straight to the
+    user's session bus (skipping setuid entirely) does not work under `dbus-broker`, which rejects
+    UID 0 on a user session bus — `sudo DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+    notify-send test` fails with `Error sending data: Broken pipe`. The setuid-via-`runuser`
+    path — and therefore these two capabilities — is required for notification delivery.
+  - Notifications remain best-effort/fire-and-forget: they never block or fail the auth path, so
+    even if delivery fails the biometric result and PAM fall-through are unaffected.
+  - **End-to-end delivery is validated only on the maintainer's real hardware under systemd.**
+    The unit tests assert the retained capability mask and `systemctl show` asserts the directive
+    set; neither proves a notification actually pops.
+- `RestrictAddressFamilies=AF_UNIX AF_NETLINK` + `IPAddressDeny=any` — the daemon only talks
+  local sockets (system D-Bus, per-user session bus for notifications, kernel netlink). All
+  inference is local; a compromised daemon cannot open TCP/IP sockets or exfiltrate over the
+  network.
+- `SystemCallFilter=@system-service` + `SystemCallErrorNumber=EPERM` +
+  `SystemCallArchitectures=native` — allowlist seccomp. `@system-service` includes `ioctl`
+  (V4L2), `capget`/`capset` (in-process drop), and the memory-management syscalls ONNX Runtime
+  needs. Blocked syscalls return `EPERM` instead of killing the process, so an unexpected
+  syscall degrades to a normal auth error (PAM falls through to password) rather than a crash
+  loop — never a lockout.
+- `ProtectProc=invisible` + `ProcSubset=pid` — other processes and non-PID `/proc` contents are
+  hidden from the daemon.
+- `ProtectHostname=yes`.
+
+**Intentionally omitted directives (and why):**
+
+- `ProtectClock=yes` — implies `DeviceAllow=char-rtc`, which switches the unit to a
+  device-cgroup allowlist and breaks `/dev/video*` camera access (see below). `clock_settime`
+  and related syscalls are already denied with `EPERM` by `SystemCallFilter=@system-service`.
+- `DevicePolicy`/`DeviceAllow` — cgroup device ACLs interfered with camera auto-detection.
+  Standard Unix permissions still restrict `/dev/video*` and `/dev/tpmrm0`.
+- `MemoryDenyWriteExecute=yes` — breaks ONNX Runtime JIT paths such as CUDA and TensorRT.
+- `User=` — the daemon must open the camera/TPM as root; non-root operation has not been
+  validated on real hardware.
+
+**Exposure score:** `systemd-analyze security --offline=true` reports **2.6 (OK)** for the
+Phase 1–3 unit, down from 7.1 (MEDIUM) with Phase 1–2 only. (The score rose from 2.2 to 2.6
+when the empty capability sets were corrected to `CAP_SETUID CAP_SETGID` — the two caps the
+notification privilege-drop genuinely needs; the small increase is the honest cost of a working
+notification path.) Verify with:
 ```bash
 systemd-analyze security facelock-daemon.service
 ```
+
+**Regression coverage:** `just test-deb-pkg` / `just test-rpm-pkg` boot the package container
+with systemd as PID 1 (`test/run-pkg-validate-systemd.sh`) and assert via `systemctl show`
+that the installed unit carries the Phase 3 directives, that the daemon starts and answers on
+D-Bus inside the sandbox, and that an `AF_INET` socket cannot be created under the same
+directive set (outbound TCP blocked).
 
 ### 7. Polkit / sudo Face Auth (Implemented)
 

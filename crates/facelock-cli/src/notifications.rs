@@ -115,11 +115,19 @@ pub fn send_notification(event: &NotifyEvent) {
 
 /// Send notification as a specific user.
 ///
-/// Uses `runuser` to run `notify-send` as the target user with a proper
-/// login environment. This works even from systemd services where the
-/// daemon's mount namespace may not include `/run/user/<uid>/`.
+/// Uses `setpriv` to become the target user (real+effective uid/gid plus
+/// supplementary groups) and run `notify-send` in that context. `setpriv`
+/// does NOT open a PAM session, unlike `runuser`/`su`. That matters because
+/// the daemon runs under a hardened systemd sandbox: `runuser` triggers a
+/// full PAM login stack (pam_systemd trying to register a logind session,
+/// pam_limits trying to adjust rlimits, etc.), and those modules fail under
+/// the sandbox's restrictions, silently killing the notification. `setpriv`
+/// only needs the CAP_SETUID/CAP_SETGID capabilities the daemon already
+/// retains (see commit e006edc) and performs the uid/gid switch directly via
+/// syscalls, with no session machinery to fail.
 ///
-/// Falls back to `su -c` if `runuser` is not available.
+/// Falls back to `runuser` if `setpriv` is not available (e.g. non-systemd
+/// environments without the hardened sandbox, where a PAM session is fine).
 fn send_as_user(user: &str, event: &NotifyEvent) {
     use std::process::Command;
 
@@ -131,6 +139,7 @@ fn send_as_user(user: &str, event: &NotifyEvent) {
         }
     };
     let uid = user_info.uid.as_raw();
+    let gid = user_info.gid.as_raw();
     let bus_addr = format!("unix:path=/run/user/{uid}/bus");
     let timeout = event.timeout_ms().to_string();
 
@@ -143,17 +152,36 @@ fn send_as_user(user: &str, event: &NotifyEvent) {
         event.body().replace('\'', "'\\''"),
     );
 
-    // Try runuser first (available on most systems, works from systemd services),
-    // fall back to su -c
-    let result = Command::new("runuser")
-        .args(["-u", user, "--", "sh", "-c", &notify_cmd])
+    // Try setpriv first: it switches real+effective uid/gid and supplementary
+    // groups without opening a PAM session, so it works under the hardened
+    // systemd sandbox. `--ambient-caps -all` defensively strips the daemon's
+    // ambient CAP_SETUID/CAP_SETGID from the child (the kernel also clears
+    // them on the uid change, but we drop them explicitly too).
+    let setpriv_args: Vec<String> = vec![
+        "--reuid".into(),
+        uid.to_string(),
+        "--regid".into(),
+        gid.to_string(),
+        "--init-groups".into(),
+        "--ambient-caps".into(),
+        "-all".into(),
+        "--".into(),
+        "sh".into(),
+        "-c".into(),
+        notify_cmd.clone(),
+    ];
+
+    let result = Command::new("setpriv")
+        .args(&setpriv_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
         .or_else(|_| {
-            Command::new("su")
-                .args(["-", user, "-c", &notify_cmd])
+            // setpriv missing entirely (unlikely on util-linux systems): fall
+            // back to runuser, which is fine outside the hardened sandbox.
+            Command::new("runuser")
+                .args(["-u", user, "--", "sh", "-c", &notify_cmd])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())

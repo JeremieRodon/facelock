@@ -37,10 +37,63 @@ RestrictSUIDSGID=yes
 # DevicePolicy=closed/auto both use cgroup device ACLs which hide /dev/video*
 # from stat(), breaking camera auto-detection. Omitted — the daemon only needs
 # /dev/video* and /dev/tpmrm0, both protected by standard Unix permissions.
-# ProtectSystem=strict already prevents writing to /dev/.
+# Note: ProtectSystem=strict does NOT cover /dev/ — it only remounts /usr,
+# /etc, and /boot read-only. Device access here is restricted solely by
+# standard Unix file permissions (root:facelock ownership/mode) on
+# /dev/video* and /dev/tpmrm0.
 
-# Deferred: MemoryDenyWriteExecute=yes breaks ONNX Runtime JIT.
-# Phase 3 (seccomp, capabilities, network) deferred to future work.
+# Phase 3: Capabilities, seccomp, and network lockdown
+# The daemon needs exactly two Linux capabilities: CAP_SETUID and CAP_SETGID.
+# /dev/video* and /dev/tpmrm0 are root-owned and opened via standard file
+# permissions, so device access needs no caps — but the desktop-notification
+# path execs `runuser -u <user>` to drop into the user's session bus, and
+# runuser calls setgroups()/setuid(), which require CAP_SETGID + CAP_SETUID.
+# These are declared as Ambient (not just in the bounding set) so the caps
+# survive the exec into the non-setuid `runuser` under NoNewPrivileges=yes.
+# The daemon further narrows its in-process capability set to exactly these
+# two after initialization (see daemon.rs::drop_capabilities); everything else
+# stays denied.
+#
+# NOTE (empirically required): an earlier revision set both of these empty on
+# the theory that "the daemon needs no capabilities." That was wrong — it broke
+# notifications on real hardware with `runuser: cannot set groups: Operation not
+# permitted`. Connecting to the user session bus directly as root (no setuid)
+# is NOT a viable alternative: dbus-broker rejects UID 0 on a user session bus
+# ("Broken pipe"), so the setuid-via-runuser path — and thus these two caps —
+# is required.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+# Only local sockets: D-Bus (system bus + per-user session bus for
+# notifications) is AF_UNIX. AF_NETLINK is retained conservatively: no
+# workspace code opens a netlink socket directly (device enumeration uses
+# Path::exists, not netlink), but glibc NSS / name-resolution paths
+# (getaddrinfo and friends) may use NETLINK_ROUTE under the hood. Whether
+# AF_NETLINK can be safely dropped here is unverified — treat this as a
+# deferred, test-first hardening step rather than drop it blind.
+# No AF_INET/AF_INET6 — all inference is local, nothing talks TCP/IP.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+# Allowlist seccomp filter. @system-service includes ioctl (V4L2 camera),
+# capget/capset (in-process capability drop), and the memory-management
+# syscalls ONNX Runtime needs. Blocked syscalls return EPERM instead of
+# killing the process, so an unexpected syscall degrades to a normal auth
+# error (PAM falls through to password) rather than a crash loop.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# Hide other processes' /proc entries and non-PID /proc contents.
+ProtectProc=invisible
+ProcSubset=pid
+ProtectHostname=yes
+# ProtectClock=yes is intentionally OMITTED: it implies DeviceAllow=char-rtc,
+# which switches the unit to a device-cgroup allowlist and would break
+# /dev/video* access (see Phase 2.5 note above). clock_settime and friends
+# are already denied (EPERM) by SystemCallFilter=@system-service.
+
+# Still deferred: MemoryDenyWriteExecute=yes breaks ONNX Runtime JIT
+# (CUDA/TensorRT execution providers), and User= is not set because the
+# daemon must open the camera/TPM as root and no non-root operation has
+# been validated on real hardware.
 
 [Install]
 WantedBy=multi-user.target

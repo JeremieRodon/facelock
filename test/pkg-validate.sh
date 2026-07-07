@@ -92,8 +92,8 @@ fi
 
 # D-Bus tests (only if dbus-daemon is available)
 if command -v dbus-daemon >/dev/null 2>&1; then
-    # Start a system bus for testing
-    run_test "D-Bus system bus starts" "mkdir -p /run/dbus && dbus-daemon --system --fork --nopidfile 2>/dev/null"
+    # Start a system bus for testing (already running when booted under systemd)
+    run_test "D-Bus system bus starts" "[ -S /run/dbus/system_bus_socket ] || (mkdir -p /run/dbus && dbus-daemon --system --fork --nopidfile 2>/dev/null)"
 
     # Verify the facelock service is visible on the bus
     if command -v busctl >/dev/null 2>&1; then
@@ -107,6 +107,87 @@ if command -v dbus-daemon >/dev/null 2>&1; then
     if [ -x /polkit-agent-validate.sh ]; then
         run_test "polkit agent allowlist gate (D-Bus boundary)" "/polkit-agent-validate.sh"
     fi
+fi
+
+# systemd hardening validation — only runs under a booted systemd
+# (e.g. `just test-deb-pkg` / `test-rpm-pkg`, which boot the container with
+# systemd as PID 1 via test/run-pkg-validate-systemd.sh).
+echo ""
+echo "=== systemd Hardening Validation ==="
+
+unit_prop() {
+    systemctl show facelock-daemon -p "$1" --value 2>/dev/null
+}
+export -f unit_prop
+
+# Attempt AF_INET socket creation inside a transient unit that replicates the
+# facelock-daemon.service Phase 3 sandbox directives. This proves the directive
+# set blocks outbound TCP (RestrictAddressFamilies is seccomp-based and works
+# in containers; IPAddressDeny is BPF-based and may be a no-op in rootless
+# containers, which is why the socket-level check is the one asserted here).
+af_inet_in_sandbox() {
+    systemd-run --quiet --wait --pipe --collect \
+        -p CapabilityBoundingSet= \
+        -p AmbientCapabilities= \
+        -p 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' \
+        -p IPAddressDeny=any \
+        -p SystemCallFilter=@system-service \
+        -p SystemCallErrorNumber=EPERM \
+        -p SystemCallArchitectures=native \
+        -p NoNewPrivileges=yes \
+        python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM)' 2>/dev/null
+}
+export -f af_inet_in_sandbox
+
+af_inet_unrestricted() {
+    systemd-run --quiet --wait --pipe --collect \
+        python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM)' 2>/dev/null
+}
+export -f af_inet_unrestricted
+
+if [ -d /run/systemd/system ] && systemctl show facelock-daemon >/dev/null 2>&1; then
+    run_test "unit: CapabilityBoundingSet is empty" '[ -z "$(unit_prop CapabilityBoundingSet)" ]'
+    run_test "unit: AmbientCapabilities is empty" '[ -z "$(unit_prop AmbientCapabilities)" ]'
+    run_test "unit: RestrictAddressFamilies is AF_UNIX+AF_NETLINK only" 'v=$(unit_prop RestrictAddressFamilies); echo "$v" | grep -q AF_UNIX && echo "$v" | grep -q AF_NETLINK && ! echo "$v" | grep -q AF_INET'
+    # systemctl show expands @system-service into individual syscalls: assert
+    # allowlist mode (no "~" prefix), a marker syscall the daemon needs
+    # (ioctl for V4L2, capset for the in-process drop), and the absence of a
+    # @privileged-only syscall (chroot) to prove it is not allow-all.
+    run_test "unit: SystemCallFilter allowlist active (@system-service)" 'v=$(unit_prop SystemCallFilter); [ -n "$v" ] && case "$v" in "~"*) false ;; *) true ;; esac && echo "$v" | grep -qw ioctl && echo "$v" | grep -qw capset && ! echo "$v" | grep -qw chroot'
+    run_test "unit: SystemCallErrorNumber is EPERM" 'unit_prop SystemCallErrorNumber | grep -Eq "EPERM|^1$"'
+    run_test "unit: SystemCallArchitectures is native" 'unit_prop SystemCallArchitectures | grep -q native'
+    run_test "unit: IPAddressDeny is any" 'unit_prop IPAddressDeny | grep -Eq "any|0\.0\.0\.0/0"'
+    run_test "unit: ProtectProc=invisible" '[ "$(unit_prop ProtectProc)" = "invisible" ]'
+    run_test "unit: ProcSubset=pid" '[ "$(unit_prop ProcSubset)" = "pid" ]'
+    run_test "unit: ProtectHostname=yes" '[ "$(unit_prop ProtectHostname)" = "yes" ]'
+    run_test "unit: NoNewPrivileges=yes" '[ "$(unit_prop NoNewPrivileges)" = "yes" ]'
+    run_test "unit: ProtectSystem=strict" '[ "$(unit_prop ProtectSystem)" = "strict" ]'
+    run_test "unit: device cgroup stays permissive (no DeviceAllow)" '[ "$(unit_prop DevicePolicy)" = "auto" ] && [ -z "$(unit_prop DeviceAllow)" ]'
+
+    if command -v systemd-run >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+        run_test "sandbox blocks AF_INET socket (outbound TCP impossible)" "! af_inet_in_sandbox"
+        run_test "control: AF_INET socket allowed without sandbox" "af_inet_unrestricted"
+    else
+        echo "SKIP: outbound-TCP-blocked check (systemd-run or python3 unavailable)"
+    fi
+
+    # Daemon start test. The daemon loads ONNX models at startup, so this
+    # needs models bind-mounted at /var/lib/facelock/models (the runner
+    # mounts the repo models/ dir when present). There is no camera in the
+    # container: an explicit device.path skips auto-detection, and a probe
+    # failure on that path is non-fatal (the camera is only opened on auth).
+    if ls /var/lib/facelock/models/*.onnx >/dev/null 2>&1; then
+        if ! grep -q '^path\s*=' /etc/facelock/config.toml; then
+            sed -i '/^\[device\]/a path = "/dev/video0"' /etc/facelock/config.toml
+        fi
+        run_test "facelock-daemon starts under hardened unit" "systemctl start facelock-daemon && systemctl is-active --quiet facelock-daemon"
+        run_test "facelock-daemon answers on D-Bus" "busctl --system call org.facelock.Daemon /org/facelock/Daemon org.freedesktop.DBus.Peer Ping"
+        systemctl stop facelock-daemon 2>/dev/null || true
+    else
+        echo "SKIP: daemon start test (no ONNX models at /var/lib/facelock/models — run via just test-deb-pkg/test-rpm-pkg with repo models present)"
+    fi
+else
+    echo "SKIP: not running under a booted systemd (unit directives not verifiable here)"
 fi
 
 # Package removal test — must come last since it removes the package
