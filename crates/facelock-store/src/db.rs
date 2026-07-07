@@ -909,7 +909,6 @@ mod tests {
     #[test]
     fn raw_with_device_returns_device_id_per_row() {
         let store = FaceStore::open_memory().unwrap();
-        let emb = [0.1f32; 512];
         // One template bound to a camera, one legacy (NULL device_id).
         store
             .add_model_raw_with_device(
