@@ -40,11 +40,10 @@ audit:
 check: test lint fmt-check audit
 
 # Build the PAM test container image (uses host-built release binaries).
-# --network=host: podman's default rootless build network (pasta/slirp) can
-# truncate the SourceForge redirect chain the pamtester step downloads through;
-# build-time isolation buys nothing here.
+# Keep in sync with .github/workflows/ci.yml, which builds this same image
+# directly rather than going through this recipe.
 _build-test-container: build-release
-    podman build --network=host -t facelock-pam-test -f test/Containerfile .
+    podman build -t facelock-pam-test -f test/Containerfile .
 
 # Automated PAM smoke tests (Arch container)
 test-arch-pam: _build-test-container
@@ -55,13 +54,23 @@ test-arch-pam: _build-test-container
 # models (fresh clone/worktree — they are downloaded, not tracked) produces an
 # image whose daemon cannot load the face engine and whose enroll bails before
 # opening the camera. Fail loudly here instead of debugging opaque test FAILs.
+# Check the two non-optional models by name: a checkout holding only the
+# optional ones (det_10g.onnx, glintr100.onnx) satisfies a bare *.onnx glob but
+# still leaves the default detector/embedder missing at runtime.
 _require-models:
     #!/usr/bin/env bash
     set -euo pipefail
-    if ! ls models/*.onnx >/dev/null 2>&1; then
-        echo "error: no ONNX models in models/ — the camera test tiers need them baked into the image." >&2
-        echo "       Copy them from an existing checkout or download via 'sudo facelock setup'," >&2
-        echo "       e.g.: cp /path/to/other/checkout/models/*.onnx models/" >&2
+    missing=()
+    for m in models/scrfd_2.5g_bnkps.onnx models/w600k_r50.onnx; do
+        [ -f "$m" ] || missing+=("$m")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "error: missing required ONNX models — the camera test tiers need them baked into the image:" >&2
+        for m in "${missing[@]}"; do echo "         $m" >&2; done
+        echo "       They are downloaded, not tracked. Copy them from the install tree" >&2
+        echo "       ('sudo facelock setup' downloads them to /var/lib/facelock/models):" >&2
+        echo "         cp /var/lib/facelock/models/*.onnx models/" >&2
+        echo "       (models/*.onnx is gitignored, so this cannot be committed by accident.)" >&2
         exit 1
     fi
 

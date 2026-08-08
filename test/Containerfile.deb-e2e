@@ -19,10 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Build pamtester from source (not in Ubuntu/Debian repos)
+COPY test/install-pamtester.sh /tmp/install-pamtester.sh
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential libpam0g-dev curl && \
-    curl -sL https://sourceforge.net/projects/pamtester/files/pamtester/0.1.2/pamtester-0.1.2.tar.gz/download | tar xz -C /tmp && \
-    cd /tmp/pamtester-0.1.2 && ./configure --prefix=/usr CFLAGS="-Wno-implicit-function-declaration" && make && make install && \
-    rm -rf /tmp/pamtester-0.1.2 && \
+    sh /tmp/install-pamtester.sh && \
+    rm -f /tmp/install-pamtester.sh && \
     apt-get purge -y build-essential libpam0g-dev && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # Create test user for PAM tests
