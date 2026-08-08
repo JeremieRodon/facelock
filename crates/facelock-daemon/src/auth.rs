@@ -16,7 +16,7 @@ use image::codecs::jpeg::JpegEncoder;
 use nix::unistd::Uid;
 use tracing::{debug, info, warn};
 
-use crate::audit::{self, AuditEntry};
+use crate::audit::{self, AuditEntry, AuditSource};
 use crate::liveness::LandmarkTracker;
 use crate::rate_limit::RateLimiter;
 
@@ -109,6 +109,10 @@ pub fn pre_check(
 /// (Plan 04). There is deliberately no store-reading variant here — reading
 /// `get_user_embeddings` directly would treat an encrypted blob as a raw
 /// embedding and fail.
+///
+/// `source` records which caller ran the loop; it is stamped into every audit
+/// entry written here so a `facelock test` run is distinguishable from a real
+/// authentication in the log.
 #[allow(clippy::too_many_arguments)]
 pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
@@ -119,6 +123,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     user: &str,
     device_is_ir: bool,
     live_fingerprint: &DeviceFingerprint,
+    source: AuditSource,
 ) -> DaemonResponse {
     let mut stored = stored.to_vec();
     let models = models.to_vec();
@@ -131,6 +136,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
         user,
         device_is_ir,
         live_fingerprint,
+        source,
     )
 }
 
@@ -185,6 +191,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     user: &str,
     device_is_ir: bool,
     live_fingerprint: &DeviceFingerprint,
+    source: AuditSource,
 ) -> DaemonResponse {
     let start = Instant::now();
     let save_snapshots = config.snapshots.mode != facelock_core::config::SnapshotMode::Off;
@@ -387,6 +394,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                         timestamp: audit::now_iso8601(),
                         user: user.to_string(),
                         result: "success".into(),
+                        source: Some(source),
                         similarity: Some(best_similarity),
                         frame_count: Some(frame_count),
                         duration_ms: Some(duration.as_millis() as u64),
@@ -444,6 +452,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                     timestamp: audit::now_iso8601(),
                     user: user.to_string(),
                     result: "success".into(),
+                    source: Some(source),
                     similarity: Some(best_similarity),
                     frame_count: Some(frame_count),
                     duration_ms: Some(duration.as_millis() as u64),
@@ -500,6 +509,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                 timestamp: audit::now_iso8601(),
                 user: user.to_string(),
                 result: "error".into(),
+                source: Some(source),
                 similarity: None,
                 frame_count: Some(frame_count),
                 duration_ms: Some(duration.as_millis() as u64),
@@ -530,6 +540,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
             timestamp: audit::now_iso8601(),
             user: user.to_string(),
             result: "failure".into(),
+            source: Some(source),
             similarity: Some(best_similarity),
             frame_count: Some(frame_count),
             duration_ms: Some(duration.as_millis() as u64),

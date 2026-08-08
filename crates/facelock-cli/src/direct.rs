@@ -14,6 +14,7 @@ use facelock_core::config::DeviceConfig;
 use facelock_core::config::{Config, EncryptionMethod};
 use facelock_core::ipc::DaemonResponse;
 use facelock_core::types::MatchResult;
+use facelock_daemon::audit::AuditSource;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
 use tracing::debug;
@@ -104,6 +105,11 @@ pub fn load_engine(config: &Config) -> anyhow::Result<FaceEngine> {
 
 /// Direct authentication — returns the full match result (including an
 /// internal failure reason when frames matched but a liveness gate blocked).
+///
+/// This backs `facelock test` only, and it deliberately skips `pre_check`
+/// (rate limiting, `require_ir`, SSH/lid abort), so its audit entries are
+/// stamped `AuditSource::Test`: a success here is a recognition result, not a
+/// policy-approved authentication.
 pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> {
     let store = open_store(config)?;
 
@@ -128,11 +134,8 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
     let stored = load_user_embeddings(&store, config, user)?;
     let models = store.list_models(user).unwrap_or_default();
 
-    // Shared with daemon mode (facelock-daemon/src/auth.rs): same IR texture
-    // gate, frame-variance window, landmark liveness, device coupling, audit
-    // trail, and zeroization. A local copy of this loop previously lived here
-    // and silently drifted (no audit entries, no snapshot capture, and the
-    // device-filtered-out embeddings were never zeroized) — do not re-fork it.
+    // Shared with daemon mode (crates/facelock-daemon/src/auth.rs). A local copy
+    // of this loop previously lived here and silently drifted — do not re-fork it.
     let response = facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
@@ -142,6 +145,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         user,
         device_is_ir,
         &device_fingerprint,
+        AuditSource::Test,
     );
 
     match response {

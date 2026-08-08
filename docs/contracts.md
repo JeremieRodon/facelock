@@ -71,6 +71,12 @@ The CLI silently falls back to direct mode when the daemon is not available on D
 All paths overridable via config. `FACELOCK_CONFIG` is honored for unprivileged processes, but privileged PAM/root auth flows ignore the environment and use either an explicit `--config` path or `/etc/facelock/config.toml`.
 Runtime-created DB sidecars (`-wal`, `-shm`), audit logs, and snapshots are created with explicit restrictive modes. The packaged systemd unit also sets `UMask=0027`.
 
+### Audit Log Entries
+
+`audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
+
+`source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (`facelock test`). Only `daemon` and `oneshot` run the `pre_check` gates (rate limiting, `require_ir`, SSH/lid abort), so a `success` from `test` is a recognition result, not a policy-approved authentication. The field is absent on entries written before it existed.
+
 ## Config Schema
 
 TOML format. All keys optional — camera auto-detected, sensible defaults for everything.

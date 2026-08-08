@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use facelock_core::config::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_core::types::MatchResult;
+use facelock_daemon::audit::AuditSource;
 use facelock_store::FaceStore;
 use facelock_test_support::fixtures;
 use facelock_test_support::{MockCamera, MockFaceEngine};
@@ -200,6 +201,7 @@ fn device_mismatch_never_reaches_success() {
         "u",
         false,
         &mismatch,
+        AuditSource::Daemon,
     );
     match resp {
         DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
@@ -229,6 +231,7 @@ fn device_mismatch_never_reaches_success() {
         "u",
         false,
         &matching,
+        AuditSource::Daemon,
     );
     match resp2 {
         DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
@@ -279,6 +282,7 @@ fn legacy_null_device_id_still_authenticates() {
         "u",
         false,
         &live,
+        AuditSource::Daemon,
     );
     match resp {
         DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
@@ -427,6 +431,7 @@ fn static_matching_frames_report_variance_reason() {
         "testuser",
         false,
         &facelock_core::types::DeviceFingerprint::default(),
+        AuditSource::Daemon,
     );
 
     match resp {
@@ -479,6 +484,7 @@ fn still_then_moving_frames_recover_and_authenticate() {
         "testuser",
         false,
         &facelock_core::types::DeviceFingerprint::default(),
+        AuditSource::Daemon,
     );
 
     match resp {
@@ -494,11 +500,11 @@ fn still_then_moving_frames_recover_and_authenticate() {
     }
 }
 
-/// The auth loop must write an audit entry for a failed attempt when audit
-/// logging is enabled. This is the gate that the drifted direct-mode copy of the
-/// loop silently lacked: `facelock test` in oneshot/direct mode ran its own fork
-/// of this function and produced no audit trail at all. Direct mode now calls
-/// this same function, so this assertion covers both modes.
+/// Pins the daemon auth loop's audit contract: a failed attempt writes an entry
+/// when audit logging is enabled, stamped with the caller's `AuditSource`. The
+/// drifted direct-mode copy of this loop wrote no audit trail at all, so direct
+/// mode is only covered for as long as `direct.rs` keeps calling this function —
+/// a re-fork would leave this test green. Nothing here can detect that.
 #[test]
 fn failed_auth_writes_audit_entry() {
     let unique = SystemTime::now()
@@ -507,10 +513,7 @@ fn failed_auth_writes_audit_entry() {
         .as_nanos();
     // A dedicated directory: write_audit_entry chmods the log's parent, which
     // must never be a shared directory like /tmp itself.
-    let dir = std::env::temp_dir().join(format!(
-        "facelock-audit-{}-{unique}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("facelock-audit-{}-{unique}", std::process::id()));
     let log_path = dir.join("audit.jsonl");
 
     let mut config = test_config();
@@ -532,18 +535,40 @@ fn failed_auth_writes_audit_entry() {
         "testuser",
         false,
         &facelock_core::types::DeviceFingerprint::default(),
+        AuditSource::Daemon,
     );
     assert!(
         matches!(resp, DaemonResponse::AuthResult(ref r) if !r.matched),
         "sanity: attempt with no enrolled templates must fail, got {resp:?}"
     );
 
+    // Same loop, run the way `facelock test` runs it. Its entry must be
+    // distinguishable from the daemon's: `facelock test` skips the pre_check
+    // gates, so its results are not policy-approved authentications.
+    let mut camera = MockCamera::bright(64, 64, 4);
+    let mut engine = MockFaceEngine::one_face(unit_at_angle(0.0));
+    facelock_daemon::auth::authenticate_with_embeddings(
+        &mut camera,
+        &mut engine,
+        &[],
+        &[],
+        &config,
+        "testuser",
+        false,
+        &facelock_core::types::DeviceFingerprint::default(),
+        AuditSource::Test,
+    );
+
     let written = std::fs::read_to_string(&log_path).expect("audit log must exist");
-    let entry: serde_json::Value =
-        serde_json::from_str(written.lines().next().expect("audit log must have a line"))
-            .expect("audit entry must be valid JSON");
-    assert_eq!(entry["result"], "failure");
-    assert_eq!(entry["user"], "testuser");
+    let entries: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("audit entry must be valid JSON"))
+        .collect();
+    assert_eq!(entries.len(), 2, "each attempt writes one entry");
+    assert_eq!(entries[0]["result"], "failure");
+    assert_eq!(entries[0]["user"], "testuser");
+    assert_eq!(entries[0]["source"], "daemon");
+    assert_eq!(entries[1]["source"], "test");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

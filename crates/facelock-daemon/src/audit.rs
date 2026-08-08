@@ -8,6 +8,24 @@ use nix::unistd::Uid;
 use serde::Serialize;
 use tracing::{debug, warn};
 
+/// Which code path produced an audit entry.
+///
+/// The paths do not enforce the same policy: `Daemon` and `Oneshot` both run
+/// `pre_check` first (rate limiting, `require_ir`, SSH/lid abort), while `Test`
+/// is a diagnostic run that skips those gates. A `"success"` stamped `test` is
+/// therefore evidence that a face matched, not that an authentication was
+/// approved — without this field the two are indistinguishable in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditSource {
+    /// The daemon's `Authenticate` D-Bus method.
+    Daemon,
+    /// The `facelock auth` helper PAM spawns when the daemon is unavailable.
+    Oneshot,
+    /// `facelock test` — diagnostics, not an authentication.
+    Test,
+}
+
 /// A structured audit log entry.
 #[derive(Debug, Serialize)]
 pub struct AuditEntry {
@@ -17,6 +35,9 @@ pub struct AuditEntry {
     pub user: String,
     /// Auth result: "success", "failure", "error", "rate_limited"
     pub result: String,
+    /// Code path that produced the entry (absent in pre-upgrade entries)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<AuditSource>,
     /// Best cosine similarity score
     #[serde(skip_serializing_if = "Option::is_none")]
     pub similarity: Option<f32>,
@@ -146,6 +167,7 @@ mod tests {
             timestamp: "2026-03-12T10:00:00Z".into(),
             user: "alice".into(),
             result: "success".into(),
+            source: Some(AuditSource::Daemon),
             similarity: Some(0.92),
             frame_count: Some(5),
             duration_ms: Some(1200),
@@ -156,6 +178,7 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"user\":\"alice\""));
         assert!(json.contains("\"result\":\"success\""));
+        assert!(json.contains("\"source\":\"daemon\""));
         assert!(!json.contains("error")); // None fields skipped
     }
 
@@ -175,6 +198,7 @@ mod tests {
             timestamp: now_iso8601(),
             user: "testuser".into(),
             result: "success".into(),
+            source: None,
             similarity: Some(0.85),
             frame_count: Some(3),
             duration_ms: Some(500),
@@ -217,6 +241,7 @@ mod tests {
             timestamp: now_iso8601(),
             user: "first".into(),
             result: "success".into(),
+            source: None,
             similarity: None,
             frame_count: None,
             duration_ms: None,
@@ -234,6 +259,7 @@ mod tests {
             timestamp: now_iso8601(),
             user: "second".into(),
             result: "failure".into(),
+            source: None,
             similarity: Some(0.5),
             frame_count: None,
             duration_ms: None,
@@ -283,6 +309,7 @@ mod tests {
                 timestamp: now_iso8601(),
                 user: format!("user{i}"),
                 result: "success".into(),
+                source: None,
                 similarity: Some(0.8 + i as f32 * 0.01),
                 frame_count: Some(3),
                 duration_ms: Some(500),
@@ -314,6 +341,7 @@ mod tests {
             timestamp: "2026-03-12T12:00:00Z".into(),
             user: "alice".into(),
             result: "success".into(),
+            source: None,
             similarity: Some(0.92),
             frame_count: Some(5),
             duration_ms: Some(1234),
@@ -339,6 +367,7 @@ mod tests {
             timestamp: "2026-03-12T12:00:00Z".into(),
             user: "bob".into(),
             result: "error".into(),
+            source: None,
             similarity: None,
             frame_count: None,
             duration_ms: None,
@@ -365,6 +394,7 @@ mod tests {
             timestamp: now_iso8601(),
             user: "test".into(),
             result: "success".into(),
+            source: None,
             similarity: None,
             frame_count: None,
             duration_ms: None,
