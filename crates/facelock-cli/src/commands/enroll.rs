@@ -116,21 +116,18 @@ pub fn run(
 
     // Dedicated call with a timeout derived from the daemon's enrollment
     // deadline — the shared 15s proxy would abort mid-enrollment (issue #89).
-    let response = ipc_client::send_enroll(&user, &label, config.enroll_timeout_secs())?;
+    // send_enroll yields Enrolled or an error, so there is no other arm.
+    let response = ipc_client::send_enroll(&user, &label, &config)?;
 
-    match response {
-        DaemonResponse::Enrolled {
-            model_id,
-            embedding_count,
-        } => {
-            println!(
-                "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
-            );
-            check_model_count(&user, &config);
-        }
-        other => {
-            anyhow::bail!("unexpected response from daemon: {other:?}");
-        }
+    if let DaemonResponse::Enrolled {
+        model_id,
+        embedding_count,
+    } = response
+    {
+        println!(
+            "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
+        );
+        check_model_count(&user, &config);
     }
 
     Ok(())
@@ -142,7 +139,10 @@ pub fn run(
 /// enrollment from direct to daemon mode (issue #89 validation fallout).
 fn list_user_models(user: &str, config: &Config) -> Option<Vec<FaceModelInfo>> {
     if ipc_client::should_use_direct(config) {
-        crate::direct::open_store(config).ok()?.list_models(user).ok()
+        crate::direct::open_store(config)
+            .ok()?
+            .list_models(user)
+            .ok()
     } else {
         match ipc_client::send_request(&DaemonRequest::ListModels {
             user: user.to_string(),

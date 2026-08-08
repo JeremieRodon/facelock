@@ -26,11 +26,18 @@ struct RejectionStats {
     low_quality: u32,
     capture_errors: u32,
     last_capture_error: Option<String>,
+    engine_errors: u32,
+    last_engine_error: Option<String>,
 }
 
 impl RejectionStats {
     fn total(&self) -> u32 {
-        self.dark + self.no_face + self.multiple_faces + self.low_quality + self.capture_errors
+        self.dark
+            + self.no_face
+            + self.multiple_faces
+            + self.low_quality
+            + self.capture_errors
+            + self.engine_errors
     }
 
     /// Human-readable breakdown appended to the insufficient-captures error,
@@ -55,8 +62,17 @@ impl RejectionStats {
         }
         if self.capture_errors > 0 {
             match &self.last_capture_error {
-                Some(e) => parts.push(format!("{} capture errors (last: {e})", self.capture_errors)),
+                Some(e) => parts.push(format!(
+                    "{} capture errors (last: {e})",
+                    self.capture_errors
+                )),
                 None => parts.push(format!("{} capture errors", self.capture_errors)),
+            }
+        }
+        if self.engine_errors > 0 {
+            match &self.last_engine_error {
+                Some(e) => parts.push(format!("{} engine errors (last: {e})", self.engine_errors)),
+                None => parts.push(format!("{} engine errors", self.engine_errors)),
             }
         }
         let hint = self.hint().map(|h| format!(". {h}")).unwrap_or_default();
@@ -70,12 +86,54 @@ impl RejectionStats {
         if self.dark >= majority {
             Some("Hint: the scene is too dark — improve lighting and retry")
         } else if self.capture_errors >= majority {
-            Some("Hint: the camera is not delivering usable frames — check device.path and the camera format (see docs/troubleshooting.md)")
+            Some(
+                "Hint: the camera is not delivering usable frames — check device.path and the camera format (see docs/troubleshooting.md)",
+            )
+        } else if self.engine_errors >= majority {
+            Some(
+                "Hint: the face engine is failing on captured frames — check the model files and recognition.execution_provider (see docs/troubleshooting.md)",
+            )
         } else if self.no_face >= majority {
-            Some("Hint: no face was detected — face the camera directly and check `facelock preview`")
+            Some(
+                "Hint: no face was detected — face the camera directly and check `facelock preview`",
+            )
         } else {
             None
         }
+    }
+}
+
+/// Delete the model row a failed enrollment already created.
+///
+/// The row is written on the *first* accepted frame, so every failure path
+/// after that point leaves a usable template behind unless it is removed —
+/// including the angle-diversity rejection, whose whole point is that the
+/// embeddings are too similar to be trustworthy. A retry picks a fresh label,
+/// so the orphan is never overwritten by the next attempt.
+///
+/// Cleanup failures are logged, never returned: they must not mask the
+/// enrollment error that triggered the cleanup.
+fn discard_partial_model(store: &FaceStore, user: &str, label: &str, model_id: Option<u32>) {
+    let Some(id) = model_id else { return };
+    match store.remove_model(user, id) {
+        Ok(true) => info!(
+            user,
+            label,
+            model_id = id,
+            "removed partial model after failed enrollment"
+        ),
+        Ok(false) => warn!(
+            user,
+            label,
+            model_id = id,
+            "partial model already gone during enrollment cleanup"
+        ),
+        Err(e) => warn!(
+            user,
+            label,
+            model_id = id,
+            "failed to remove partial model after failed enrollment: {e}"
+        ),
     }
 }
 
@@ -152,8 +210,8 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
             Ok(f) => f,
             Err(e) => {
                 warn!("face engine error during enroll: {e}");
-                rejections.capture_errors += 1;
-                rejections.last_capture_error = Some(e.to_string());
+                rejections.engine_errors += 1;
+                rejections.last_engine_error = Some(e.to_string());
                 continue;
             }
         };
@@ -281,6 +339,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
             captured = stored_count,
             "insufficient angle diversity during enrollment"
         );
+        discard_partial_model(store, user, label, model_id);
         return DaemonResponse::Error {
             message: "insufficient angle diversity: please move your head to different angles during enrollment".into(),
         };
@@ -297,8 +356,10 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
             multiple_faces = rejections.multiple_faces,
             low_quality = rejections.low_quality,
             capture_errors = rejections.capture_errors,
+            engine_errors = rejections.engine_errors,
             "insufficient face captures during enrollment"
         );
+        discard_partial_model(store, user, label, model_id);
         return DaemonResponse::Error {
             message: format!(
                 "only captured {stored_count} frames, need at least {MIN_CAPTURES}{}",
@@ -383,7 +444,50 @@ mod tests {
         };
         let s = stats.summary();
         assert!(s.contains("rejected frames:"), "got: {s}");
-        assert!(!s.contains("Hint:"), "got: {s}");
+        assert!(stats.hint().is_none(), "got: {:?}", stats.hint());
+    }
+
+    #[test]
+    fn hint_requires_a_strict_majority() {
+        // 2 of 4 is not a majority: no cause dominates, so no hint.
+        let tied = RejectionStats {
+            dark: 2,
+            no_face: 2,
+            ..Default::default()
+        };
+        assert!(tied.hint().is_none(), "got: {:?}", tied.hint());
+
+        // 2 of 3 is: the dominant cause gets its remediation hint.
+        let dark_majority = RejectionStats {
+            dark: 2,
+            no_face: 1,
+            ..Default::default()
+        };
+        assert!(
+            dark_majority
+                .hint()
+                .is_some_and(|h| h.contains("improve lighting")),
+            "got: {:?}",
+            dark_majority.hint()
+        );
+    }
+
+    #[test]
+    fn summary_engine_errors_are_distinct_from_capture_errors() {
+        // A failing face engine must not be reported as a camera problem:
+        // the "check device.path" hint sends the user after healthy hardware.
+        let stats = RejectionStats {
+            engine_errors: 6,
+            last_engine_error: Some("onnxruntime: invalid input shape".into()),
+            ..Default::default()
+        };
+        let s = stats.summary();
+        assert!(
+            s.contains("6 engine errors (last: onnxruntime: invalid input shape)"),
+            "got: {s}"
+        );
+        assert!(s.contains("check the model files"), "got: {s}");
+        assert!(!s.contains("check device.path"), "got: {s}");
     }
 
     #[test]
@@ -396,5 +500,56 @@ mod tests {
         let s = stats.summary();
         assert!(s.contains("2 multiple faces"), "got: {s}");
         assert!(s.contains("4 low quality"), "got: {s}");
+    }
+
+    #[test]
+    fn angle_diversity_failure_leaves_no_model_behind() {
+        use facelock_test_support::{MockCamera, MockFaceEngine, fixtures};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "facelock-enroll-cleanup-{}-{unique}.db",
+            std::process::id()
+        ));
+        let store = FaceStore::open(&db_path).unwrap();
+        let config = Config::parse("[recognition]\ntimeout_secs = 2\n").unwrap();
+
+        // One repeated embedding: every frame passes the quality gate and is
+        // stored, then check_angle_diversity rejects the template because all
+        // pairs are identical. This is the failure that used to leave an
+        // authenticatable model row behind.
+        let mut camera = MockCamera::bright(640, 480, 3);
+        let mut engine = MockFaceEngine::one_face(fixtures::known_embedding(0));
+
+        let response = enroll(
+            &mut camera,
+            &mut engine,
+            &store,
+            &config,
+            "alice",
+            "2026-08-08-1",
+            None,
+            None,
+        );
+
+        match &response {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("angle diversity"), "got: {message}")
+            }
+            other => panic!("expected an angle-diversity error, got: {other:?}"),
+        }
+        assert_eq!(
+            store.list_models("alice").unwrap().len(),
+            0,
+            "rejected template must not remain in the database"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
     }
 }

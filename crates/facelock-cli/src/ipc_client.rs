@@ -107,14 +107,16 @@ const ENROLL_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_sec
 /// `Config::enroll_timeout_secs()` seconds (server side). The shared proxy's
 /// 15-second timeout is at or below that deadline, so it aborted the call
 /// with "I/O error: timed out" while the daemon was still enrolling
-/// (issue #89). Pass `Config::enroll_timeout_secs()` as
-/// `server_deadline_secs`; the margin is added here.
+/// (issue #89). The deadline is derived from the caller's `Config` here
+/// rather than passed in, so no caller can supply one that disagrees with
+/// the daemon's.
 pub fn send_enroll(
     user: &str,
     label: &str,
-    server_deadline_secs: u64,
+    config: &facelock_core::Config,
 ) -> anyhow::Result<DaemonResponse> {
-    let timeout = std::time::Duration::from_secs(server_deadline_secs) + ENROLL_TIMEOUT_MARGIN;
+    let timeout =
+        std::time::Duration::from_secs(config.enroll_timeout_secs()) + ENROLL_TIMEOUT_MARGIN;
     let connection = zbus::blocking::connection::Builder::system()
         .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?
         .method_timeout(timeout)
@@ -171,10 +173,11 @@ pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
                 failure_reason: None,
             }))
         }
-        // Enrollment needs a longer method timeout than the shared proxy
-        // provides; callers with a Config should use send_enroll directly.
-        // 15s here matches the daemon's minimum deadline (default config).
-        DaemonRequest::Enroll { user, label } => send_enroll(user, label, 15),
+        // Enrollment needs a method timeout derived from the daemon's
+        // config-dependent deadline, which this shared proxy cannot provide.
+        DaemonRequest::Enroll { .. } => {
+            bail!("Enroll must use send_enroll (needs a config-derived timeout)")
+        }
         DaemonRequest::ListModels { user } => {
             let models: Vec<ModelInfo> = proxy
                 .call("ListModels", &(user.as_str(),))
