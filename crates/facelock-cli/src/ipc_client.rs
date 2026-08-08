@@ -95,9 +95,48 @@ fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     Ok(PROXY.get_or_init(|| proxy).clone())
 }
 
+/// True if the error chain contains a D-Bus AccessDenied — either the system
+/// bus policy rejecting the caller outright, or the daemon's own
+/// authorization check.
+fn is_access_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        match cause.downcast_ref::<zbus::Error>() {
+            Some(zbus::Error::MethodError(name, _, _)) => {
+                name.as_str() == "org.freedesktop.DBus.Error.AccessDenied"
+            }
+            Some(zbus::Error::FDO(fdo_err)) => {
+                matches!(**fdo_err, zbus::fdo::Error::AccessDenied(_))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Append an actionable hint to AccessDenied errors.
+///
+/// The system bus policy (dbus/org.facelock.Daemon.conf) denies callers that
+/// are neither root nor in the `facelock` group *before* the request reaches
+/// the daemon, so without this a normal user's first `facelock preview` after
+/// setup fails with a bare AccessDenied and no explanation (issue #89).
+fn add_group_hint(err: anyhow::Error) -> anyhow::Error {
+    if is_access_denied(&err) {
+        err.context(
+            "Access denied by D-Bus policy. Daemon commands require root or membership \
+             in the 'facelock' group:\n  sudo usermod -aG facelock $USER\nthen log out \
+             and back in (or re-run: sudo facelock setup)",
+        )
+    } else {
+        err
+    }
+}
+
 /// Send a request to the daemon via D-Bus, translating to/from the old
 /// DaemonRequest/DaemonResponse types used by the command layer.
 pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
+    send_request_inner(request).map_err(add_group_hint)
+}
+
+fn send_request_inner(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     let proxy = create_proxy()?;
 
     match request {
@@ -270,6 +309,27 @@ pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_denied_fdo_error_gets_group_hint() {
+        let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "rejected by policy".into(),
+        ))))
+        .context("D-Bus PreviewFrame call failed");
+        let hinted = add_group_hint(err);
+        let msg = format!("{hinted:#}");
+        assert!(msg.contains("usermod -aG facelock"), "got: {msg}");
+        assert!(msg.contains("log out"), "got: {msg}");
+    }
+
+    #[test]
+    fn non_access_denied_error_is_unchanged() {
+        let err = anyhow::Error::new(zbus::Error::Failure("connection refused".into()))
+            .context("D-Bus Ping call failed");
+        let msg_before = format!("{err:#}");
+        let hinted = add_group_hint(err);
+        assert_eq!(format!("{hinted:#}"), msg_before);
+    }
 
     #[test]
     fn resolve_user_with_flag() {

@@ -9,9 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Setup manages facelock group membership** (#89): `sudo facelock setup` now
+  creates the `facelock` system group if missing and adds the invoking user to
+  it (interactive wizard asks first; non-interactive mode adds unconditionally),
+  so daemon commands like `facelock preview`/`test` work after setup without a
+  manual `usermod`. A log-out/log-in reminder is printed.
+
 ### Changed
 
 ### Fixed
+
+- **Bare D-Bus AccessDenied errors** (#89): when the system bus policy rejects
+  a caller that is not root or in the `facelock` group, the CLI now appends an
+  actionable hint (add user to group, re-login, or re-run setup) instead of a
+  bare "AccessDenied".
 
 ### Security
 

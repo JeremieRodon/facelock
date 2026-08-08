@@ -200,6 +200,13 @@ fn run_wizard() -> anyhow::Result<()> {
         }
     };
 
+    // Group membership: without it, the first daemon command a normal user
+    // runs after setup fails with a bare D-Bus AccessDenied (issue #89).
+    if let Err(e) = setup_group_membership(Some(&theme)) {
+        println!("  Group setup failed: {e}");
+        println!("  Add manually: sudo usermod -aG facelock <user>");
+    }
+
     // -- Step 9: PAM configuration --
     println!("\n--- Step 9: PAM Configuration ---\n");
     let pam_services = match wizard_pam_setup(&theme) {
@@ -1195,6 +1202,10 @@ fn run_non_interactive() -> anyhow::Result<()> {
     // 4. Auto-configure encryption
     setup_encryption_auto(&config)?;
 
+    // Ensure the facelock group exists (secure_setup_paths chowns to it) and
+    // add the invoking user so daemon commands work without sudo (#89).
+    setup_group_membership(None)?;
+
     secure_setup_paths(&config, Some(&manifest))?;
     write_setup_marker()?;
 
@@ -1285,6 +1296,83 @@ fn chown_path(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> anyhow::Result<()> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// facelock group membership
+// ---------------------------------------------------------------------------
+
+/// Resolve the invoking (non-root) user behind `sudo facelock setup`.
+fn invoking_user() -> Option<String> {
+    let valid = |u: &String| !u.is_empty() && u != "root";
+    std::env::var("SUDO_USER")
+        .ok()
+        .filter(valid)
+        .or_else(|| std::env::var("DOAS_USER").ok().filter(valid))
+}
+
+/// True if `user` is a member of `group` (supplementary or primary).
+fn user_in_group(user: &str, group: &nix::unistd::Group) -> bool {
+    if group.mem.iter().any(|m| m == user) {
+        return true;
+    }
+    // Primary-group membership is recorded in passwd, not in group.mem.
+    matches!(nix::unistd::User::from_name(user), Ok(Some(u)) if u.gid == group.gid)
+}
+
+/// Ensure the `facelock` system group exists and the invoking user is in it.
+///
+/// The D-Bus system-bus policy admits only root and the `facelock` group, so
+/// without membership the first `facelock preview`/`test` after setup fails
+/// with AccessDenied (issue #89). Packaging creates the group but cannot know
+/// which human user to add — setup is the right place. Pass `theme` for an
+/// interactive Y/n prompt; `None` adds the user unconditionally (matching the
+/// dev `just install` behavior).
+fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
+    // Create the system group if packaging didn't (e.g. source installs).
+    if nix::unistd::Group::from_name("facelock")
+        .context("failed to look up facelock group")?
+        .is_none()
+    {
+        println!("  Creating 'facelock' system group...");
+        run_cmd("groupadd", &["-r", "facelock"])?;
+    }
+    let group = nix::unistd::Group::from_name("facelock")
+        .context("failed to look up facelock group")?
+        .context("facelock group missing after creation")?;
+
+    let Some(user) = invoking_user() else {
+        println!(
+            "  Note: running daemon commands (preview/test) as a normal user requires\n  \
+             membership in the 'facelock' group: sudo usermod -aG facelock <user>"
+        );
+        return Ok(());
+    };
+
+    if user_in_group(&user, &group) {
+        println!("  User '{user}' is already in the 'facelock' group.");
+        return Ok(());
+    }
+
+    if let Some(theme) = theme {
+        let proceed = Confirm::with_theme(theme)
+            .with_prompt(format!(
+                "Add user '{user}' to the 'facelock' group? (required to run \
+                 facelock preview/test without sudo)"
+            ))
+            .default(true)
+            .interact()
+            .unwrap_or(false);
+        if !proceed {
+            println!("  Skipped. Add later with: sudo usermod -aG facelock {user}");
+            return Ok(());
+        }
+    }
+
+    run_cmd("usermod", &["-aG", "facelock", &user])?;
+    println!("  Added '{user}' to the 'facelock' group.");
+    println!("  NOTE: log out and back in for the new group membership to take effect.");
     Ok(())
 }
 
