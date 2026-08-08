@@ -116,6 +116,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a property of the camera and its driver, not of facelock. Needs no
   enrolled face and loads no models.
 
+- **NV12 and Y16 pixel format support** (#89): NV12 (semi-planar 4:2:0, common on
+  Intel IPU6/IPU7 processed cameras via v4l2-relayd) and Y16 (16-bit IR grayscale,
+  bit-depth-aware conversion) are decoded natively. Negotiation priority is now
+  `GREY > Y16 > YUYV > NV12 > MJPG`.
+- **Intel IPU6/IPU7 + v4l2-relayd compatibility recipe** in `docs/compatibility.md`.
+
 ### Changed
 
 - **An authentication at an empty chair ends early and costs no rate-limit
@@ -261,6 +267,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filtered out. Both modes now call
   `facelock_daemon::auth::authenticate_with_embeddings`. The PAM path is
   unaffected — `facelock auth` already called the daemon implementation.
+
+- **Auto-detection skips undecodable devices** (#89): devices that advertise no
+  decodable pixel format (e.g. raw Bayer sensor nodes like the IPU7's `SGRBG10`)
+  are excluded from every auto-detection tier. When no decodable camera exists,
+  the error lists every detected device and its formats.
+- **Camera open fails fast on undecodable formats** (#89): instead of silently
+  negotiating an unsupported format (and then failing every capture), opening a
+  device with no decodable format errors immediately with the advertised and
+  supported format lists.
 
 ### Fixed
 

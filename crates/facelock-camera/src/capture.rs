@@ -25,6 +25,21 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 /// keeps that discard correct if the buffer depth ever changes.
 pub const MMAP_BUFFERS: u32 = 4;
 
+/// Pixel formats facelock can decode to RGB, in negotiation priority order:
+/// IR-native grayscale first, then cheap lossless raw conversions, then MJPG
+/// (JPEG decode). "Y16 " carries its FourCC trailing space; comparisons are
+/// whitespace-trimmed. Also used by device auto-detection to skip devices
+/// (e.g. raw Bayer sensor nodes) that advertise none of these.
+pub const DECODABLE_FORMATS: &[&str] = &["GREY", "Y16 ", "YUYV", "NV12", "MJPG"];
+
+/// Index into `available` of the first advertised format in `preferred`
+/// priority order. FourCC comparison is whitespace-trimmed.
+fn select_format(preferred: &[&str], available: &[String]) -> Option<usize> {
+    preferred
+        .iter()
+        .find_map(|pref| available.iter().position(|f| f.trim() == pref.trim()))
+}
+
 use crate::ir_emitter;
 use crate::ir_emitter::EmitterXuInfo;
 use crate::preprocess;
@@ -96,31 +111,44 @@ impl<'a> Camera<'a> {
             )));
         }
 
-        // Select format: prefer GREY > YUYV > MJPG > any
-        // If a quirk specifies a format_preference, prepend it to the priority list.
+        // Select format by DECODABLE_FORMATS priority. If a quirk specifies a
+        // format_preference, prepend it to the priority list. A device that
+        // advertises no decodable format (e.g. a raw Bayer sensor node) fails
+        // here with an actionable error instead of negotiating a format that
+        // every subsequent capture would fail to decode.
         let formats = dev
             .enum_formats()
             .map_err(|e| FacelockError::Camera(format!("failed to enum formats: {e}")))?;
 
-        let default_preferred: &[&str] = &["GREY", "YUYV", "MJPG"];
         let quirk_fmt = quirk.and_then(|q| q.format_preference.as_deref());
-        let mut preferred: Vec<&str> = Vec::with_capacity(4);
+        let mut preferred: Vec<&str> = Vec::with_capacity(DECODABLE_FORMATS.len() + 1);
         if let Some(fmt_pref) = quirk_fmt {
             tracing::debug!(format = fmt_pref, "quirk: prepending format preference");
             preferred.push(fmt_pref);
         }
-        preferred.extend_from_slice(default_preferred);
+        preferred.extend_from_slice(DECODABLE_FORMATS);
 
-        let selected_fourcc = preferred
-            .iter()
-            .find_map(|&pref| {
-                formats
-                    .iter()
-                    .find(|f| f.fourcc.to_string().trim() == pref.trim())
-                    .map(|f| f.fourcc)
-            })
-            .or_else(|| formats.first().map(|f| f.fourcc))
-            .ok_or_else(|| FacelockError::Camera(format!("{device_path}: no supported formats")))?;
+        let available: Vec<String> = formats.iter().map(|f| f.fourcc.to_string()).collect();
+        let selected_fourcc = select_format(&preferred, &available)
+            .map(|idx| formats[idx].fourcc)
+            .ok_or_else(|| {
+                FacelockError::Camera(format!(
+                    "{device_path}: no decodable pixel format — device advertises [{}] but \
+                     facelock supports [{}]. Raw sensor nodes (e.g. Intel IPU6/IPU7) cannot \
+                     be used directly; set device.path to a processed camera instead \
+                     (see docs/compatibility.md)",
+                    available
+                        .iter()
+                        .map(|f| f.trim())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    DECODABLE_FORMATS
+                        .iter()
+                        .map(|f| f.trim())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            })?;
 
         // Set format with resolution capped at 640x480, respecting max_height
         let max_h = config.max_height.min(480);
@@ -253,8 +281,8 @@ impl<'a> Camera<'a> {
             .next()
             .map_err(|e| FacelockError::Camera(format!("capture failed: {e}")))?;
 
-        // Convert to RGB based on format
-        let rgb: Vec<u8> = match self.format.as_str() {
+        // Convert to RGB based on format (trimmed: "Y16 " has a trailing space)
+        let rgb: Vec<u8> = match self.format.trim() {
             "GREY" => {
                 // Replicate single channel 3x
                 let mut rgb = Vec::with_capacity(buf.len() * 3);
@@ -265,7 +293,30 @@ impl<'a> Camera<'a> {
                 }
                 rgb
             }
+            "Y16" => {
+                // 16-bit grayscale -> 8-bit (bit-depth aware), replicated 3x
+                let gray = preprocess::y16_to_gray(buf);
+                let mut rgb = Vec::with_capacity(gray.len() * 3);
+                for &p in &gray {
+                    rgb.push(p);
+                    rgb.push(p);
+                    rgb.push(p);
+                }
+                rgb
+            }
             "YUYV" => preprocess::yuyv_to_rgb(buf, self.width, self.height),
+            "NV12" => {
+                let rgb = preprocess::nv12_to_rgb(buf, self.width, self.height);
+                if rgb.is_empty() {
+                    return Err(FacelockError::Camera(format!(
+                        "NV12 frame too short: {} bytes for {}x{}",
+                        buf.len(),
+                        self.width,
+                        self.height
+                    )));
+                }
+                rgb
+            }
             "MJPG" => {
                 let reader = ImageReader::with_format(Cursor::new(buf), image::ImageFormat::Jpeg)
                     .decode()
@@ -380,6 +431,49 @@ impl CameraSource for Camera<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fourccs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn select_format_prefers_priority_order() {
+        // Device advertises MJPG and YUYV: YUYV wins (earlier in priority).
+        let available = fourccs(&["MJPG", "YUYV"]);
+        assert_eq!(select_format(DECODABLE_FORMATS, &available), Some(1));
+        // GREY beats everything.
+        let available = fourccs(&["MJPG", "YUYV", "GREY"]);
+        assert_eq!(select_format(DECODABLE_FORMATS, &available), Some(2));
+    }
+
+    #[test]
+    fn select_format_picks_nv12_over_mjpg() {
+        let available = fourccs(&["MJPG", "NV12"]);
+        assert_eq!(select_format(DECODABLE_FORMATS, &available), Some(1));
+    }
+
+    #[test]
+    fn select_format_trims_fourcc_whitespace() {
+        // "Y16 " (trailing space, as v4l reports it) matches the Y16 entry.
+        let available = fourccs(&["Y16 "]);
+        assert_eq!(select_format(DECODABLE_FORMATS, &available), Some(0));
+    }
+
+    #[test]
+    fn select_format_rejects_undecodable_only_device() {
+        // Raw Bayer IPU7 node (issue #89): nothing decodable -> None, so
+        // Camera::open fails fast instead of negotiating an unusable format.
+        let available = fourccs(&["SGRBG10", "SGBRG10"]);
+        assert_eq!(select_format(DECODABLE_FORMATS, &available), None);
+    }
+
+    #[test]
+    fn select_format_quirk_preference_first() {
+        let mut preferred = vec!["MJPG"];
+        preferred.extend_from_slice(DECODABLE_FORMATS);
+        let available = fourccs(&["GREY", "MJPG"]);
+        assert_eq!(select_format(&preferred, &available), Some(1));
+    }
 
     #[test]
     fn all_black_frame_is_dark_with_config() {

@@ -37,6 +37,65 @@ pub fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Vec<u8> {
     rgb
 }
 
+/// Convert NV12 (YUV 4:2:0 semi-planar) data to RGB.
+/// Layout: full-resolution Y plane followed by one interleaved UV plane at
+/// half resolution in both dimensions (each UV pair covers a 2x2 pixel block).
+/// Uses the same fixed-point (Q10) coefficients as [`yuyv_to_rgb`].
+/// Returns an empty vec if `data` is shorter than a full NV12 frame.
+pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_len = w * h;
+    // UV plane: w * ceil(h/2) bytes (one interleaved row per two image rows).
+    if data.len() < y_len + w * h.div_ceil(2) {
+        return Vec::new();
+    }
+
+    const C_RV: i32 = 1436; // 1.402 * 1024
+    const C_GU: i32 = 352; // 0.344136 * 1024
+    const C_GV: i32 = 731; // 0.714136 * 1024
+    const C_BU: i32 = 1814; // 1.772 * 1024
+
+    let uv_plane = &data[y_len..];
+    let mut rgb = Vec::with_capacity(y_len * 3);
+    for row in 0..h {
+        let uv_row = &uv_plane[(row / 2) * w..];
+        for col in 0..w {
+            let u = uv_row[(col / 2) * 2] as i32 - 128;
+            let v = uv_row[(col / 2) * 2 + 1] as i32 - 128;
+            let y = (data[row * w + col] as i32) << 10;
+            let r = ((y + C_RV * v) >> 10).clamp(0, 255) as u8;
+            let g = ((y - (C_GU * u + C_GV * v)) >> 10).clamp(0, 255) as u8;
+            let b = ((y + C_BU * u) >> 10).clamp(0, 255) as u8;
+            rgb.push(r);
+            rgb.push(g);
+            rgb.push(b);
+        }
+    }
+    rgb
+}
+
+/// Convert Y16 (16-bit little-endian grayscale) data to 8-bit grayscale.
+///
+/// Many IR sensors deliver 10/12-bit samples right-justified in the 16-bit
+/// container, so a plain `>> 8` yields near-black frames. Instead the shift is
+/// derived from the effective bit depth of the frame (the highest set bit of
+/// the brightest pixel), which maps full-scale sensor output to full 8-bit
+/// range without stretching the contrast of genuinely dark frames.
+pub fn y16_to_gray(data: &[u8]) -> Vec<u8> {
+    let max = data
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .max()
+        .unwrap_or(0);
+    // Effective bit depth of the frame, floored at 8 so values <= 255 pass
+    // through unshifted.
+    let shift = (16 - max.leading_zeros()).saturating_sub(8);
+    data.chunks_exact(2)
+        .map(|c| (u16::from_le_bytes([c[0], c[1]]) >> shift) as u8)
+        .collect()
+}
+
 /// Convert RGB image to grayscale using luminance formula.
 /// Uses fixed-point integer math (Q8) to avoid per-pixel float conversion.
 pub fn rgb_to_gray(rgb: &[u8], _width: u32, _height: u32) -> Vec<u8> {
@@ -227,6 +286,92 @@ mod tests {
         assert_eq!(rgb[3], 128);
         assert_eq!(rgb[4], 128);
         assert_eq!(rgb[5], 128);
+    }
+
+    #[test]
+    fn nv12_to_rgb_neutral_gray() {
+        // 2x2 frame: Y plane all 128, one UV pair at (128, 128) -> neutral gray
+        let data = [128u8, 128, 128, 128, 128, 128];
+        let rgb = nv12_to_rgb(&data, 2, 2);
+        assert_eq!(rgb.len(), 12);
+        assert!(rgb.iter().all(|&c| c == 128));
+    }
+
+    #[test]
+    fn nv12_to_rgb_red_chroma() {
+        // Y=128, U=128 (neutral), V=255 -> strong red shift, like YUYV math:
+        // R = 128 + 1.402*127 ~= 306 -> clamped 255; B = 128 (U neutral)
+        let data = [128u8, 128, 128, 128, 128, 255];
+        let rgb = nv12_to_rgb(&data, 2, 2);
+        for px in rgb.chunks_exact(3) {
+            assert_eq!(px[0], 255, "red channel should clamp high");
+            assert!(px[1] < 100, "green pulled down by positive V");
+            assert_eq!(px[2], 128, "blue unaffected by neutral U");
+        }
+    }
+
+    #[test]
+    fn nv12_to_rgb_matches_yuyv_for_same_yuv() {
+        // The same (Y, U, V) triple must produce identical RGB through both
+        // converters (they share coefficients).
+        let (y, u, v) = (90u8, 100u8, 200u8);
+        let yuyv = yuyv_to_rgb(&[y, u, y, v], 2, 1);
+        let nv12 = nv12_to_rgb(&[y, y, y, y, u, v], 2, 2);
+        assert_eq!(&yuyv[0..3], &nv12[0..3]);
+    }
+
+    #[test]
+    fn nv12_to_rgb_short_buffer_returns_empty() {
+        // Y plane only, missing the UV plane entirely.
+        let data = [128u8; 4];
+        assert!(nv12_to_rgb(&data, 2, 2).is_empty());
+    }
+
+    #[test]
+    fn nv12_to_rgb_odd_height_uses_last_uv_row() {
+        // 2x3 frame: Y plane 6 bytes + UV plane w * ceil(3/2) = 4 bytes.
+        let mut data = vec![128u8; 6];
+        data.extend_from_slice(&[128, 128, 128, 128]);
+        let rgb = nv12_to_rgb(&data, 2, 3);
+        assert_eq!(rgb.len(), 18);
+        assert!(rgb.iter().all(|&c| c == 128));
+    }
+
+    #[test]
+    fn y16_full_range_uses_high_byte() {
+        // 16-bit full-scale data: 0xFFFF -> 255, 0x8000 -> 128
+        let data = [0xFF, 0xFF, 0x00, 0x80];
+        let gray = y16_to_gray(&data);
+        assert_eq!(gray, vec![255, 128]);
+    }
+
+    #[test]
+    fn y16_ten_bit_data_maps_to_full_range() {
+        // 10-bit sensor data right-justified in the 16-bit container:
+        // full-scale 1023 must map near 255, not to 3 (which >>8 would give).
+        let data = [
+            0xFF, 0x03, // 1023
+            0x00, 0x02, // 512
+        ];
+        let gray = y16_to_gray(&data);
+        assert_eq!(gray, vec![255, 128]);
+    }
+
+    #[test]
+    fn y16_dark_frame_stays_dark() {
+        // A genuinely dark frame (all values <= 255) passes through unshifted
+        // instead of being contrast-stretched to full range — the dark-frame
+        // quality gate must still see it as dark.
+        let data = [15, 0, 20, 0, 10, 0];
+        let gray = y16_to_gray(&data);
+        assert_eq!(gray, vec![15, 20, 10]);
+    }
+
+    #[test]
+    fn y16_all_zero_frame() {
+        let data = [0u8; 8];
+        let gray = y16_to_gray(&data);
+        assert_eq!(gray, vec![0, 0, 0, 0]);
     }
 
     #[test]

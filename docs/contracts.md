@@ -447,11 +447,24 @@ When `device.path` is omitted:
    devices: when several nodes share one quirk-matched VID:PID and at least one
    has an IR-like format (GREY/Y16 or the quirk's `format_preference`), only the
    format-bearing node(s) are IR
-4. Prefer a quirks-confirmed IR node with a native IR format, then any
-   quirks-confirmed IR node, then an evidence-classified IR node (breaking ties
-   toward one whose name also carries an `ir`/`infrared` token — a hint only,
-   never a promotion of a node that lacks format evidence)
-5. Fall back to first available device
+4. Exclude devices that advertise no decodable pixel format
+   (GREY/Y16/YUYV/NV12/MJPG) — e.g. raw Bayer sensor nodes (Intel IPU6/IPU7).
+   This filter runs *after* step 3 and never feeds back into it: it changes
+   which node is selected, never whether a node counts as IR. The IR-typical
+   list (step 3) and the decodable list are deliberately different sets — a
+   node whose only IR evidence is Y8/Y10/Y12 is IR **and** undecodable, and is
+   excluded here with a syslog warning naming its path and formats
+5. Among the remaining nodes, prefer a quirks-confirmed IR node with a native
+   IR format, then any quirks-confirmed IR node, then an evidence-classified IR
+   node (breaking ties toward one whose name also carries an `ir`/`infrared`
+   token — a hint only, never a promotion of a node that lacks format evidence)
+6. Fall back to first decodable device; if none, error listing every detected
+   device and its formats
+
+Opening a device (auto-detected or explicit `device.path`) negotiates a format
+in priority order `quirk format_preference > GREY > Y16 > YUYV > NV12 > MJPG`
+and **fails** if the device advertises none of them (no silent fallback to an
+undecodable format).
 
 ## Database Schema
 
