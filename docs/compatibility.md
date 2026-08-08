@@ -72,6 +72,12 @@ Bayer — these nodes are skipped by auto-detection. The usable camera is the
 **processed loopback device** provided by `v4l2-relayd` + `v4l2loopback`
 (commonly `/dev/video50`), fed by the `icamerasrc` GStreamer element.
 
+On newer platforms (Panther Lake and later) the RGB path additionally needs the
+out-of-tree `intel_cvs` module from
+[intel/vision-drivers](https://github.com/intel/vision-drivers). Without it no
+`/dev/video*` node appears for the camera at all, so there is nothing for the
+relay — or facelock — to open.
+
 Working configuration (verified on a Dell XPS 14 with IPU7, issue #89):
 
 1. Install the vendor stack (`intel-ipu6-camera`/`intel-ipu7-camera`,
@@ -105,10 +111,19 @@ Working configuration (verified on a Dell XPS 14 with IPU7, issue #89):
    SPLASHSRC="videotestsrc is-live=true pattern=black"
    ```
 
-**Security note:** the relay path is an RGB pipeline — facelock correctly
-classifies it as non-IR (`ir=false`). Do **not** disable `security.require_ir`
-as a workaround; an RGB-only path provides no spoof protection (see
-`docs/security.md`).
+#### No IR sensor is reachable on IPU6/IPU7
+
+These laptops ship an IR sensor for Windows Hello, but there is currently **no
+Linux driver for it** — neither `intel/ipu6-drivers` nor `intel/ipu7-drivers`
+exposes one, and the `v4l2-relayd` path relays the RGB sensor only. In practice
+that means `security.require_ir = true` (the default) **cannot be satisfied on
+IPU6/IPU7 hardware**.
+
+Facelock classifying the relay node as non-IR is therefore correct, not a
+detection bug: the pipeline really is RGB. Disabling `require_ir` does not
+recover the IR sensor — it trades away the spoof resistance that IR provides,
+leaving a camera that a printed photo or a phone screen can drive. See
+`docs/security.md` §1 for what each IR-dependent check stops covering.
 
 ## Init System Support
 

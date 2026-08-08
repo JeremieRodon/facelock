@@ -27,17 +27,48 @@ pub const MMAP_BUFFERS: u32 = 4;
 
 /// Pixel formats facelock can decode to RGB, in negotiation priority order:
 /// IR-native grayscale first, then cheap lossless raw conversions, then MJPG
-/// (JPEG decode). "Y16 " carries its FourCC trailing space; comparisons are
-/// whitespace-trimmed. Also used by device auto-detection to skip devices
-/// (e.g. raw Bayer sensor nodes) that advertise none of these.
-pub const DECODABLE_FORMATS: &[&str] = &["GREY", "Y16 ", "YUYV", "NV12", "MJPG"];
+/// (JPEG decode). Also used by device auto-detection to skip devices (e.g. raw
+/// Bayer sensor nodes) that advertise none of these. The order is part of the
+/// documented negotiation contract (`docs/contracts.md`).
+pub(crate) const DECODABLE_FORMATS: &[&str] = &["GREY", "Y16", "YUYV", "NV12", "MJPG"];
+
+/// V4L2 FourCCs are four characters padded with trailing spaces ("Y16 ").
+/// Normalize at every point a FourCC enters facelock so no comparison
+/// downstream has to trim.
+pub(crate) fn normalize_fourcc(fourcc: v4l::format::FourCC) -> String {
+    fourcc.to_string().trim().to_string()
+}
 
 /// Index into `available` of the first advertised format in `preferred`
-/// priority order. FourCC comparison is whitespace-trimmed.
+/// priority order. Both lists hold normalized FourCCs.
 fn select_format(preferred: &[&str], available: &[String]) -> Option<usize> {
     preferred
         .iter()
-        .find_map(|pref| available.iter().position(|f| f.trim() == pref.trim()))
+        .find_map(|pref| available.iter().position(|f| f == pref))
+}
+
+/// A quirk's `format_preference`, dropped when facelock cannot decode it —
+/// honoring it would negotiate a format every subsequent capture fails on.
+fn quirk_format_preference(quirk: Option<&Quirk>) -> Option<&str> {
+    let pref = quirk.and_then(|q| q.format_preference.as_deref())?;
+    if !DECODABLE_FORMATS.contains(&pref) {
+        tracing::warn!(
+            format = pref,
+            "quirk format_preference is not a decodable format — ignoring"
+        );
+        return None;
+    }
+    Some(pref)
+}
+
+/// Bytes per row facelock's converters assume for an uncompressed format.
+/// `None` for compressed formats, whose `bytesperline` is not a row size.
+fn expected_stride(format: &str, width: u32) -> Option<u32> {
+    match format {
+        "GREY" | "NV12" => Some(width),
+        "Y16" | "YUYV" => Some(width * 2),
+        _ => None,
+    }
 }
 
 use crate::ir_emitter;
@@ -61,6 +92,15 @@ pub struct Camera<'a> {
     emitter_xu_info: Option<EmitterXuInfo>,
     /// Capabilities computed at construction — see `crate::caps` (gap D8).
     caps: CameraCaps,
+    /// Y16 -> 8-bit shift, derived once at open. Never recomputed per frame:
+    /// a per-frame scale is contrast normalization upstream of the IR texture
+    /// check (see `docs/security.md` §1.C).
+    ///
+    /// Scoped to this `Camera` value, which is what makes it safe under the
+    /// daemon's warm camera hold (ADR 008 §4): a hold reuses this same struct,
+    /// so the scale it pinned stays pinned; a reopen constructs a new `Camera`
+    /// and recalibrates. Nothing carries a scale across a reopen.
+    y16_shift: u8,
 }
 
 impl<'a> Camera<'a> {
@@ -114,21 +154,19 @@ impl<'a> Camera<'a> {
         // Select format by DECODABLE_FORMATS priority. If a quirk specifies a
         // format_preference, prepend it to the priority list. A device that
         // advertises no decodable format (e.g. a raw Bayer sensor node) fails
-        // here with an actionable error instead of negotiating a format that
-        // every subsequent capture would fail to decode.
+        // here with an actionable error.
         let formats = dev
             .enum_formats()
             .map_err(|e| FacelockError::Camera(format!("failed to enum formats: {e}")))?;
 
-        let quirk_fmt = quirk.and_then(|q| q.format_preference.as_deref());
         let mut preferred: Vec<&str> = Vec::with_capacity(DECODABLE_FORMATS.len() + 1);
-        if let Some(fmt_pref) = quirk_fmt {
+        if let Some(fmt_pref) = quirk_format_preference(quirk) {
             tracing::debug!(format = fmt_pref, "quirk: prepending format preference");
             preferred.push(fmt_pref);
         }
         preferred.extend_from_slice(DECODABLE_FORMATS);
 
-        let available: Vec<String> = formats.iter().map(|f| f.fourcc.to_string()).collect();
+        let available: Vec<String> = formats.iter().map(|f| normalize_fourcc(f.fourcc)).collect();
         let selected_fourcc = select_format(&preferred, &available)
             .map(|idx| formats[idx].fourcc)
             .ok_or_else(|| {
@@ -137,16 +175,8 @@ impl<'a> Camera<'a> {
                      facelock supports [{}]. Raw sensor nodes (e.g. Intel IPU6/IPU7) cannot \
                      be used directly; set device.path to a processed camera instead \
                      (see docs/compatibility.md)",
-                    available
-                        .iter()
-                        .map(|f| f.trim())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    DECODABLE_FORMATS
-                        .iter()
-                        .map(|f| f.trim())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    available.join(", "),
+                    DECODABLE_FORMATS.join(", "),
                 ))
             })?;
 
@@ -166,14 +196,26 @@ impl<'a> Camera<'a> {
 
         let width = fmt.width;
         let height = fmt.height;
-        let format_str = fmt.fourcc.to_string();
+        let format_str = normalize_fourcc(fmt.fourcc);
         tracing::info!(
             device = %device_path,
-            format = %format_str.trim(),
+            format = %format_str,
             width,
             height,
             "camera format negotiated"
         );
+
+        // The converters index rows by pixel width. ISP devices can pad
+        // bytesperline, which would shear every decoded frame silently.
+        if let Some(expected) = expected_stride(&format_str, width) {
+            if fmt.stride != expected {
+                return Err(FacelockError::Camera(format!(
+                    "{device_path}: {format_str} bytesperline is {} but facelock expects {expected} \
+                     for {width} pixels — padded strides are not supported",
+                    fmt.stride
+                )));
+            }
+        }
 
         // Create MMAP stream with `MMAP_BUFFERS` buffers and a capture timeout
         let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
@@ -204,6 +246,20 @@ impl<'a> Camera<'a> {
             false
         };
 
+        // Pin the Y16 -> 8-bit scale for the whole session from one calibration
+        // frame. Must run after the IR emitter is enabled, otherwise the scale
+        // is derived from an unlit frame and every lit frame clips to white.
+        let y16_shift = if format_str == "Y16" {
+            let (buf, _meta) = stream.next().map_err(|e| {
+                FacelockError::Camera(format!("{device_path}: Y16 calibration frame failed: {e}"))
+            })?;
+            let shift = preprocess::y16_shift(buf);
+            tracing::info!(device = %device_path, shift, "Y16 session scale pinned");
+            shift
+        } else {
+            0
+        };
+
         // Apply quirk overrides for rotation (warmup_frames is handled by the caller
         // since Camera::open doesn't consume warmup frames itself).
         let rotation = quirk.and_then(|q| q.rotation).unwrap_or(config.rotation);
@@ -228,6 +284,7 @@ impl<'a> Camera<'a> {
             ir_emitter_active,
             emitter_xu_info,
             caps,
+            y16_shift,
         })
     }
 
@@ -281,8 +338,7 @@ impl<'a> Camera<'a> {
             .next()
             .map_err(|e| FacelockError::Camera(format!("capture failed: {e}")))?;
 
-        // Convert to RGB based on format (trimmed: "Y16 " has a trailing space)
-        let rgb: Vec<u8> = match self.format.trim() {
+        let rgb: Vec<u8> = match self.format.as_str() {
             "GREY" => {
                 // Replicate single channel 3x
                 let mut rgb = Vec::with_capacity(buf.len() * 3);
@@ -294,8 +350,8 @@ impl<'a> Camera<'a> {
                 rgb
             }
             "Y16" => {
-                // 16-bit grayscale -> 8-bit (bit-depth aware), replicated 3x
-                let gray = preprocess::y16_to_gray(buf);
+                // 16-bit grayscale -> 8-bit at the session-fixed scale, replicated 3x
+                let gray = preprocess::y16_to_gray(buf, self.y16_shift);
                 let mut rgb = Vec::with_capacity(gray.len() * 3);
                 for &p in &gray {
                     rgb.push(p);
@@ -305,18 +361,14 @@ impl<'a> Camera<'a> {
                 rgb
             }
             "YUYV" => preprocess::yuyv_to_rgb(buf, self.width, self.height),
-            "NV12" => {
-                let rgb = preprocess::nv12_to_rgb(buf, self.width, self.height);
-                if rgb.is_empty() {
-                    return Err(FacelockError::Camera(format!(
-                        "NV12 frame too short: {} bytes for {}x{}",
-                        buf.len(),
-                        self.width,
-                        self.height
-                    )));
-                }
-                rgb
-            }
+            "NV12" => preprocess::nv12_to_rgb(buf, self.width, self.height).ok_or_else(|| {
+                FacelockError::Camera(format!(
+                    "NV12 frame too short: {} bytes for {}x{}",
+                    buf.len(),
+                    self.width,
+                    self.height
+                ))
+            })?,
             "MJPG" => {
                 let reader = ImageReader::with_format(Cursor::new(buf), image::ImageFormat::Jpeg)
                     .decode()
@@ -453,10 +505,28 @@ mod tests {
     }
 
     #[test]
-    fn select_format_trims_fourcc_whitespace() {
-        // "Y16 " (trailing space, as v4l reports it) matches the Y16 entry.
-        let available = fourccs(&["Y16 "]);
+    fn normalize_fourcc_strips_v4l2_padding() {
+        // v4l reports "Y16 " with its FourCC trailing space; every comparison
+        // downstream expects the normalized form.
+        let available = vec![normalize_fourcc(v4l::format::FourCC::new(b"Y16 "))];
+        assert_eq!(available[0], "Y16");
         assert_eq!(select_format(DECODABLE_FORMATS, &available), Some(0));
+    }
+
+    #[test]
+    fn decodable_formats_negotiation_order_is_pinned() {
+        // Changing this order changes the documented negotiation contract —
+        // update docs/contracts.md with it.
+        assert_eq!(DECODABLE_FORMATS, &["GREY", "Y16", "YUYV", "NV12", "MJPG"]);
+    }
+
+    #[test]
+    fn expected_stride_is_the_row_size_of_uncompressed_formats() {
+        assert_eq!(expected_stride("GREY", 640), Some(640));
+        assert_eq!(expected_stride("NV12", 640), Some(640));
+        assert_eq!(expected_stride("Y16", 640), Some(1280));
+        assert_eq!(expected_stride("YUYV", 640), Some(1280));
+        assert_eq!(expected_stride("MJPG", 640), None);
     }
 
     #[test]
@@ -473,6 +543,36 @@ mod tests {
         preferred.extend_from_slice(DECODABLE_FORMATS);
         let available = fourccs(&["GREY", "MJPG"]);
         assert_eq!(select_format(&preferred, &available), Some(1));
+    }
+
+    fn quirk_with_format(format_preference: &str) -> Quirk {
+        Quirk {
+            vendor_id: None,
+            product_id: None,
+            name_pattern: None,
+            force_ir: None,
+            emitter_xu_guid: None,
+            emitter_xu_selector: None,
+            warmup_frames: None,
+            format_preference: Some(format_preference.into()),
+            rotation: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn quirk_format_preference_accepts_decodable() {
+        let quirk = quirk_with_format("GREY");
+        assert_eq!(quirk_format_preference(Some(&quirk)), Some("GREY"));
+        assert_eq!(quirk_format_preference(None), None);
+    }
+
+    #[test]
+    fn quirk_format_preference_ignores_undecodable() {
+        // A quirk naming a format facelock cannot decode would otherwise win
+        // negotiation and then fail every capture.
+        let quirk = quirk_with_format("SGRBG10");
+        assert_eq!(quirk_format_preference(Some(&quirk)), None);
     }
 
     #[test]

@@ -119,7 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **NV12 and Y16 pixel format support** (#89): NV12 (semi-planar 4:2:0, common on
   Intel IPU6/IPU7 processed cameras via v4l2-relayd) and Y16 (16-bit IR grayscale,
   bit-depth-aware conversion) are decoded natively. Negotiation priority is now
-  `GREY > Y16 > YUYV > NV12 > MJPG`.
+  `GREY > Y16 > YUYV > NV12 > MJPG`. IPU6/IPU7 relay cameras can now be opened,
+  previewed and enrolled — but they expose no Linux-reachable IR sensor, so
+  authentication still fails under the default `security.require_ir = true`.
 - **Intel IPU6/IPU7 + v4l2-relayd compatibility recipe** in `docs/compatibility.md`.
 
 ### Changed
@@ -343,6 +345,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured service kept its line. `prerm` now runs the same explicit removal
   loop as the other packagers in addition to the `pam-auth-update` call.
 
+- **Odd-width NV12 frames no longer panic**: a UV row is `2 * ceil(width/2)` bytes,
+  not `width`, so the short-buffer guard accepted frames that the row indexing then
+  ran past the end of.
+- **Padded camera strides are rejected at open**: devices whose `bytesperline`
+  exceeds the row size for the negotiated format (ISP hardware) now fail with an
+  error naming both values instead of decoding sheared frames.
+- **Quirk `format_preference` naming an undecodable format is ignored** with a
+  warning, rather than winning negotiation and failing every subsequent capture.
+- **IR cameras excluded from auto-detection for lacking a decodable format** are
+  logged with their path and advertised formats, so syslog explains a later
+  "not an IR camera" failure.
+
 ### Security
 
 - **`CAP_CHOWN` added to the daemon's capability bounding set, for startup
@@ -378,6 +392,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-back that could not see it. `test/pkg-validate.sh` now walks
   `/proc/<pid>/task/*/status` on the running daemon and asserts `CAP_CHOWN` is
   clear on every thread.
+
+- **Y16 8-bit scaling is pinned at camera open**: the bit-depth shift is derived
+  once from a calibration frame and reused for the whole session. Deriving it per
+  frame was contrast normalization upstream of the IR texture check — it moved the
+  scale `security.ir_texture_min_stddev` is calibrated against in response to
+  scene illumination, and a single saturated pixel blacked out whole frames.
 
 ## [0.1.4] - 2026-05-31
 

@@ -182,6 +182,13 @@ The auth loop previously fed a **CLAHE**-equalized frame into `check_ir_texture`
 i.e. CLAHE was masking exactly the spoof this check exists to catch. CLAHE now belongs
 only to the recognition/embedding path; texture measurement uses `frame.gray` directly.
 
+**Fixed Y16 scale**: 16-bit IR sensors are converted to 8-bit with a right-shift derived
+from the effective sensor bit depth. That shift is pinned once at camera open and reused
+for every frame of the session. Deriving it per frame is per-frame contrast normalization
+— the same class of mistake as feeding CLAHE output to this check — and it would move the
+scale `ir_texture_min_stddev` is calibrated against on every frame, including in response
+to attacker-controlled illumination.
+
 **Raw-frame calibration**: on the raw frame, flat surfaces (photos/screens in IR) score
 std_dev **< 5**, real IR skin scores **> 15**. The cutoff `security.ir_texture_min_stddev`
 defaults to **10.0** (between the two bands). Lower it if real faces are being rejected;

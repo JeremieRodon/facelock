@@ -133,7 +133,15 @@ impl QuirksDb {
 
     fn load_file(path: &Path) -> Result<Vec<Quirk>, String> {
         let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
-        let file: QuirksFile = toml::from_str(&content).map_err(|e| format!("parse error: {e}"))?;
+        let mut file: QuirksFile =
+            toml::from_str(&content).map_err(|e| format!("parse error: {e}"))?;
+        // Quirk files are often written with the padded V4L2 FourCC ("Y16 ").
+        // Normalize here so comparisons against `FormatInfo::fourcc` match.
+        for quirk in &mut file.quirk {
+            if let Some(pref) = &mut quirk.format_preference {
+                *pref = pref.trim().to_string();
+            }
+        }
         Ok(file.quirk)
     }
 
@@ -506,7 +514,7 @@ notes = "Test camera"
             emitter_xu_guid: None,
             emitter_xu_selector: None,
             warmup_frames: Some(10),
-            format_preference: Some("Y16 ".into()),
+            format_preference: Some("Y16".into()),
             rotation: None,
             notes: Some("Intel RealSense".into()),
         });

@@ -16,7 +16,8 @@ pub struct DeviceInfo {
 
 /// A supported pixel format with its available sizes. Defined in
 /// `facelock-core` so `CameraCaps` can carry it; re-exported here where the
-/// enumeration actually happens.
+/// enumeration actually happens. [`query_device`] normalizes each `fourcc`
+/// (V4L2's trailing-space padding stripped: "Y16", not "Y16 ").
 pub use facelock_core::types::FormatInfo;
 
 /// List all V4L2 video capture devices.
@@ -118,11 +119,10 @@ fn is_ir_typical_fourcc(fourcc: &str) -> bool {
 /// says so in syslog rather than leaving the operator with only the
 /// downstream "not an IR camera" error.
 fn has_decodable_format(device: &DeviceInfo) -> bool {
-    device.formats.iter().any(|f| {
-        crate::capture::DECODABLE_FORMATS
-            .iter()
-            .any(|d| f.fourcc.trim() == d.trim())
-    })
+    device
+        .formats
+        .iter()
+        .any(|f| crate::capture::DECODABLE_FORMATS.contains(&f.fourcc.as_str()))
 }
 
 /// True if the device enumerates at least one IR-typical mono format
@@ -137,6 +137,16 @@ fn has_native_ir_format(device: &DeviceInfo) -> bool {
         .formats
         .iter()
         .any(|f| is_ir_typical_fourcc(&f.fourcc))
+}
+
+/// Comma-separated format listing for operator-facing messages.
+fn format_listing(device: &DeviceInfo) -> String {
+    device
+        .formats
+        .iter()
+        .map(|f| f.fourcc.trim())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// True if this device enumerates ONLY IR-typical mono capture formats
@@ -321,12 +331,9 @@ fn classify_ir_sources_with_ids(
             .and_then(|q| q.format_preference.clone());
         let node_has_ir_format = |j: usize| {
             has_native_ir_format(&devices[j])
-                || pref.as_deref().is_some_and(|p| {
-                    devices[j]
-                        .formats
-                        .iter()
-                        .any(|f| f.fourcc.trim() == p.trim())
-                })
+                || pref
+                    .as_deref()
+                    .is_some_and(|p| devices[j].formats.iter().any(|f| f.fourcc == p))
         };
 
         // Only demote when format evidence exists within the group; otherwise
@@ -409,31 +416,21 @@ pub fn auto_detect_device_with(quirks: &crate::quirks::QuirksDb) -> Result<Devic
         return Err(FacelockError::Camera("no video devices found".into()));
     }
     let sources = classify_ir_sources(&devices, Some(quirks));
-    pick_auto_device(&devices, &sources).cloned().ok_or_else(|| {
-        let listing = devices
-            .iter()
-            .map(|d| {
-                let fmts = d
-                    .formats
-                    .iter()
-                    .map(|f| f.fourcc.trim())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{} \"{}\" [{fmts}]", d.path, d.name)
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        FacelockError::Camera(format!(
-            "no camera with a decodable pixel format ({}) found; detected: {listing}. \
+    pick_auto_device(&devices, &sources)
+        .cloned()
+        .ok_or_else(|| {
+            let listing = devices
+                .iter()
+                .map(|d| format!("{} \"{}\" [{}]", d.path, d.name, format_listing(d)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            FacelockError::Camera(format!(
+                "no camera with a decodable pixel format ({}) found; detected: {listing}. \
              Raw sensor nodes (e.g. Intel IPU6/IPU7) are excluded from auto-detection — \
              set device.path to a processed camera (see docs/compatibility.md)",
-            crate::capture::DECODABLE_FORMATS
-                .iter()
-                .map(|f| f.trim())
-                .collect::<Vec<_>>()
-                .join("/"),
-        ))
-    })
+                crate::capture::DECODABLE_FORMATS.join("/"),
+            ))
+        })
 }
 
 /// Selection order for auto-detection, over pre-classified nodes.
@@ -452,6 +449,20 @@ pub fn auto_detect_device_with(quirks: &crate::quirks::QuirksDb) -> Result<Devic
 /// (the `require_ir` gate reads the caps of whatever node is finally picked),
 /// so the exclusion can only ever fail closed.
 fn pick_auto_device<'a>(devices: &'a [DeviceInfo], sources: &[IrSource]) -> Option<&'a DeviceInfo> {
+    // An excluded IR node is why auth later reports "not an IR camera" — say so
+    // in syslog rather than leaving the operator with only the downstream error.
+    for (device, source) in devices.iter().zip(sources) {
+        if *source != IrSource::None && !has_decodable_format(device) {
+            tracing::warn!(
+                device = %device.path,
+                name = %device.name,
+                formats = %format_listing(device),
+                source = ?source,
+                "IR-classified camera has no decodable pixel format — excluded from auto-detection"
+            );
+        }
+    }
+
     let nodes = || {
         devices
             .iter()
@@ -494,7 +505,7 @@ fn query_device(path: &str) -> Result<DeviceInfo> {
     let mut formats = Vec::new();
     if let Ok(fmt_list) = dev.enum_formats() {
         for fmt in fmt_list {
-            let fourcc = fmt.fourcc.to_string();
+            let fourcc = crate::capture::normalize_fourcc(fmt.fourcc);
             let description = fmt.description.clone();
             let mut sizes = Vec::new();
             if let Ok(size_list) = dev.enum_framesizes(fmt.fourcc) {
@@ -623,7 +634,17 @@ mod tests {
     fn is_ir_camera_y16_alone_is_format_regardless_of_name() {
         // Y16 native mono format alone → Format provenance, independent of
         // the device name (#98: evidence-derived, not name-derived).
+        //
+        // Deliberately the PADDED spelling: `query_device` now normalizes
+        // FourCCs at ingest, but IR classification must not start depending on
+        // that — a `DeviceInfo` reaching here from anywhere else (a test, a
+        // future caller, `CameraCaps`) still classifies the same. The trim in
+        // `is_ir_typical_fourcc` is what holds that, and this pins it.
         let device = device_with("Integrated IR Camera", &["Y16 "]);
+        assert!(is_ir_camera(&device));
+        assert_eq!(ir_source(&device), IrSource::Format);
+        // ...and the normalized spelling the real ingest path produces.
+        let device = device_with("Integrated IR Camera", &["Y16"]);
         assert!(is_ir_camera(&device));
         assert_eq!(ir_source(&device), IrSource::Format);
     }
@@ -634,6 +655,9 @@ mod tests {
         // device's name gives no IR hint at all — proving classification
         // does not depend on the name in either direction.
         let device = device_with("Depth Camera", &["Y16 "]);
+        assert!(is_ir_camera(&device));
+        assert_eq!(ir_source(&device), IrSource::Format);
+        let device = device_with("Depth Camera", &["Y16"]);
         assert!(is_ir_camera(&device));
         assert_eq!(ir_source(&device), IrSource::Format);
     }
@@ -991,7 +1015,7 @@ mod tests {
     #[test]
     fn pick_auto_device_y16_only_device_is_decodable() {
         // Y16 decode support means a Y16-only IR camera stays usable.
-        let devices = [device_at("/dev/video0", "Integrated IR Camera", &["Y16 "])];
+        let devices = [device_at("/dev/video0", "Integrated IR Camera", &["Y16"])];
         let sources = [IrSource::Format];
         let picked = pick_auto_device(&devices, &sources).expect("a device is picked");
         assert_eq!(picked.path, "/dev/video0");
