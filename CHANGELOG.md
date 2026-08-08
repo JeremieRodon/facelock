@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Direct-mode authentication unified with the daemon loop** (#89): `facelock
+  test` in oneshot/direct mode ran a local fork of the auth loop
+  (`mod facelock_daemon_auth` in `direct.rs`) that had drifted from
+  `facelock_daemon::auth`. It wrote **no audit entries**, ignored
+  `[snapshots]` entirely, and never zeroized templates that device coupling had
+  filtered out. Both modes now call
+  `facelock_daemon::auth::authenticate_with_embeddings`. The PAM path is
+  unaffected — `facelock auth` already called the daemon implementation.
+
 ### Fixed
 
 ### Security

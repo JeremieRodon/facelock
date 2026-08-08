@@ -494,6 +494,60 @@ fn still_then_moving_frames_recover_and_authenticate() {
     }
 }
 
+/// The auth loop must write an audit entry for a failed attempt when audit
+/// logging is enabled. This is the gate that the drifted direct-mode copy of the
+/// loop silently lacked: `facelock test` in oneshot/direct mode ran its own fork
+/// of this function and produced no audit trail at all. Direct mode now calls
+/// this same function, so this assertion covers both modes.
+#[test]
+fn failed_auth_writes_audit_entry() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // A dedicated directory: write_audit_entry chmods the log's parent, which
+    // must never be a shared directory like /tmp itself.
+    let dir = std::env::temp_dir().join(format!(
+        "facelock-audit-{}-{unique}",
+        std::process::id()
+    ));
+    let log_path = dir.join("audit.jsonl");
+
+    let mut config = test_config();
+    config.recognition.timeout_secs = 1;
+    config.audit.enabled = true;
+    config.audit.path = log_path.display().to_string();
+
+    // No enrolled templates to compare against, so the attempt times out as a
+    // plain failure rather than tripping the variance gate.
+    let mut camera = MockCamera::bright(64, 64, 4);
+    let mut engine = MockFaceEngine::one_face(unit_at_angle(0.0));
+
+    let resp = facelock_daemon::auth::authenticate_with_embeddings(
+        &mut camera,
+        &mut engine,
+        &[],
+        &[],
+        &config,
+        "testuser",
+        false,
+        &facelock_core::types::DeviceFingerprint::default(),
+    );
+    assert!(
+        matches!(resp, DaemonResponse::AuthResult(ref r) if !r.matched),
+        "sanity: attempt with no enrolled templates must fail, got {resp:?}"
+    );
+
+    let written = std::fs::read_to_string(&log_path).expect("audit log must exist");
+    let entry: serde_json::Value =
+        serde_json::from_str(written.lines().next().expect("audit log must have a line"))
+            .expect("audit entry must be valid JSON");
+    assert_eq!(entry["result"], "failure");
+    assert_eq!(entry["user"], "testuser");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// FIX B regression gate (Plan 04, storage & crypto honesty): with an encryption
 /// method configured (`keyfile`), a sealer-init failure must make ENROLL fail
 /// CLOSED. It must NOT silently downgrade to plaintext biometric storage.
