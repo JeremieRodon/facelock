@@ -120,8 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Intel IPU6/IPU7 processed cameras via v4l2-relayd) and Y16 (16-bit IR grayscale,
   bit-depth-aware conversion) are decoded natively. Negotiation priority is now
   `GREY > Y16 > YUYV > NV12 > MJPG`. IPU6/IPU7 relay cameras can now be opened,
-  previewed and enrolled — but they expose no Linux-reachable IR sensor, so
-  authentication still fails under the default `security.require_ir = true`.
+  previewed and enrolled — but their IR sensors have no in-tree Linux driver
+  yet, so authentication still fails under the default
+  `security.require_ir = true` on stock kernels (experimental community driver
+  support is tracked in #101).
 - **Intel IPU6/IPU7 + v4l2-relayd compatibility recipe** in `docs/compatibility.md`.
 
 ### Changed

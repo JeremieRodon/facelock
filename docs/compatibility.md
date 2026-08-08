@@ -111,19 +111,32 @@ Working configuration (verified on a Dell XPS 14 with IPU7, issue #89):
    SPLASHSRC="videotestsrc is-live=true pattern=black"
    ```
 
-#### No IR sensor is reachable on IPU6/IPU7
+#### IR sensors on IPU6/IPU7: not supported out of the box
 
-These laptops ship an IR sensor for Windows Hello, but there is currently **no
-Linux driver for it** — neither `intel/ipu6-drivers` nor `intel/ipu7-drivers`
-exposes one, and the `v4l2-relayd` path relays the RGB sensor only. In practice
-that means `security.require_ir = true` (the default) **cannot be satisfied on
-IPU6/IPU7 hardware**.
+These laptops ship an IR sensor for Windows Hello (Himax HM1092 on recent Dell
+XPS models), but no **in-tree or Intel-shipped** Linux driver exists for it —
+neither `intel/ipu6-drivers` nor `intel/ipu7-drivers` includes one, and the
+`v4l2-relayd` path relays the RGB sensor only. On a stock distro,
+`security.require_ir = true` (the default) cannot be satisfied on this
+hardware.
 
 Facelock classifying the relay node as non-IR is therefore correct, not a
-detection bug: the pipeline really is RGB. Disabling `require_ir` does not
+detection bug: that pipeline really is RGB. Disabling `require_ir` does not
 recover the IR sensor — it trades away the spoof resistance that IR provides,
 leaving a camera that a printed photo or a phone screen can drive. See
 `docs/security.md` §1 for what each IR-dependent check stops covering.
+
+**Experimental community IR support exists.** The out-of-tree
+[svp7500-camera-fix-pack](https://github.com/jibsta210/svp7500-camera-fix-pack)
+(DKMS) has the HM1092 IR sensor streaming — including face unlock with the IR
+flood illuminator — on SVP7500-bridged IPU7 laptops (verified on a Dell XPS 16
+DA16260; see [intel/ipu7-drivers#26](https://github.com/intel/ipu7-drivers/issues/26)
+for the full history). The illuminator side is already in mainline
+(`intel_skl_int3472_discrete` registers `ir_flood_led` on kernels ≥ 7.1.4), and
+kernel 7.2-rc1 gained an in-tree `intel_cvs` bridge driver. Facelock does not
+yet consume that IR node (capture-node format and IR classification for
+`hm1092` are tracked in issue #101) — treat this path as experimental until the
+sensor driver lands upstream.
 
 ## Init System Support
 
