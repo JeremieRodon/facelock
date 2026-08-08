@@ -10,10 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Setup manages facelock group membership** (#89): `sudo facelock setup` now
-  creates the `facelock` system group if missing and adds the invoking user to
-  it (interactive wizard asks first; non-interactive mode adds unconditionally),
-  so daemon commands like `facelock preview`/`test` work after setup without a
-  manual `usermod`. A log-out/log-in reminder is printed.
+  creates the `facelock` system group if missing and adds the invoking
+  sudo/doas user to it (the interactive wizard asks first; non-interactive mode
+  adds without prompting, and prints a manual `usermod` command when no
+  invoking user can be determined), so daemon commands like `facelock
+  preview`/`test` work after setup without a manual `usermod`. A log-out/log-in
+  reminder is printed.
 
 ### Changed
 

@@ -11,8 +11,15 @@ pub fn run() -> anyhow::Result<()> {
         return crate::direct::list_devices_direct();
     }
 
-    let response = ipc_client::send_request(&DaemonRequest::ListDevices)
-        .context("failed to query daemon — is facelock-daemon running?")?;
+    // Only blame a missing daemon when the request wasn't refused: an
+    // AccessDenied already carries the group-membership hint as its headline.
+    let response = ipc_client::send_request(&DaemonRequest::ListDevices).map_err(|e| {
+        if ipc_client::is_access_denied(&e) {
+            e
+        } else {
+            e.context("failed to query daemon — is facelock-daemon running?")
+        }
+    })?;
 
     match response {
         DaemonResponse::Devices(devices) => {

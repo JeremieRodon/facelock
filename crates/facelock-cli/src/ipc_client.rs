@@ -95,15 +95,21 @@ fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     Ok(PROXY.get_or_init(|| proxy).clone())
 }
 
+/// True if a D-Bus error name denotes AccessDenied.
+fn is_access_denied_name(name: &str) -> bool {
+    name == "org.freedesktop.DBus.Error.AccessDenied"
+}
+
 /// True if the error chain contains a D-Bus AccessDenied — either the system
 /// bus policy rejecting the caller outright, or the daemon's own
 /// authorization check.
-fn is_access_denied(err: &anyhow::Error) -> bool {
+pub fn is_access_denied(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         match cause.downcast_ref::<zbus::Error>() {
-            Some(zbus::Error::MethodError(name, _, _)) => {
-                name.as_str() == "org.freedesktop.DBus.Error.AccessDenied"
-            }
+            // What a remote denial arrives as: the bus or the daemon replies
+            // with an error name.
+            Some(zbus::Error::MethodError(name, _, _)) => is_access_denied_name(name.as_str()),
+            // Locally constructed denials (never produced by `Proxy::call`).
             Some(zbus::Error::FDO(fdo_err)) => {
                 matches!(**fdo_err, zbus::fdo::Error::AccessDenied(_))
             }
@@ -117,13 +123,17 @@ fn is_access_denied(err: &anyhow::Error) -> bool {
 /// The system bus policy (dbus/org.facelock.Daemon.conf) denies callers that
 /// are neither root nor in the `facelock` group *before* the request reaches
 /// the daemon, so without this a normal user's first `facelock preview` after
-/// setup fails with a bare AccessDenied and no explanation (issue #89).
+/// setup fails with a bare AccessDenied and no explanation (issue #89). The
+/// daemon itself also returns AccessDenied for root-only methods and
+/// cross-user requests, so the hint stays neutral and leaves the specific
+/// reason to the wrapped error.
 fn add_group_hint(err: anyhow::Error) -> anyhow::Error {
     if is_access_denied(&err) {
         err.context(
-            "Access denied by D-Bus policy. Daemon commands require root or membership \
-             in the 'facelock' group:\n  sudo usermod -aG facelock $USER\nthen log out \
-             and back in (or re-run: sudo facelock setup)",
+            "Access denied. If you are not in the 'facelock' group, add yourself:\n  \
+             sudo usermod -aG facelock $USER\nthen log out and back in (or re-run: \
+             sudo facelock setup). Note: some operations require root regardless of \
+             group membership.",
         )
     } else {
         err
@@ -310,6 +320,25 @@ pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn access_denied_name_is_recognized() {
+        assert!(is_access_denied_name(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        ));
+    }
+
+    #[test]
+    fn other_error_names_are_not_access_denied() {
+        assert!(!is_access_denied_name(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ));
+        assert!(!is_access_denied_name("org.facelock.Error.AccessDenied"));
+        assert!(!is_access_denied_name(""));
+    }
+
+    // Covers the locally constructed FDO variant, not the wire path: a denial
+    // from the bus or the daemon arrives as `zbus::Error::MethodError`, whose
+    // name is checked by `is_access_denied_name` above.
     #[test]
     fn access_denied_fdo_error_gets_group_hint() {
         let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(

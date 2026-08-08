@@ -14,7 +14,7 @@ Stable contracts. Do not change without updating this document.
 
 | Command | Purpose |
 |---------|---------|
-| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, enrollment, PAM) |
+| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, enrollment, PAM); also manages `facelock` group membership (creates the group if missing, adds the invoking user) |
 | `facelock setup --systemd` | Install/enable systemd units |
 | `facelock setup --pam` | Install PAM module to `/etc/pam.d/` |
 | `facelock enroll` | Capture and store a face |

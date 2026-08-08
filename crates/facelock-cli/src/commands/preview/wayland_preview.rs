@@ -80,6 +80,7 @@ pub fn run(user: &str) -> anyhow::Result<()> {
         width: MAX_WIDTH,
         height: MAX_HEIGHT,
         exit: false,
+        ipc_error_reported: false,
         first_configure: true,
         keyboard: None,
         keyboard_focus: false,
@@ -118,6 +119,7 @@ struct PreviewState {
     width: u32,
     height: u32,
     exit: bool,
+    ipc_error_reported: bool,
     first_configure: bool,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     keyboard_focus: bool,
@@ -187,8 +189,15 @@ impl PreviewState {
                 render_error(canvas, width, height, "unexpected daemon response");
             }
             Err(e) => {
-                tracing::warn!("IPC error: {e:#}");
-                render_error(canvas, width, height, &format!("IPC error: {e:#}"));
+                // The full message (an AccessDenied hint spans several lines)
+                // does not fit the overlay, and redrawing at frame rate would
+                // repeat it endlessly: print it once and close the preview.
+                if !self.ipc_error_reported {
+                    self.ipc_error_reported = true;
+                    eprintln!("{e:#}");
+                }
+                render_error(canvas, width, height, &format!("IPC error: {e}"));
+                self.exit = true;
             }
         }
 

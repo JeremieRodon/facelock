@@ -1327,8 +1327,9 @@ fn user_in_group(user: &str, group: &nix::unistd::Group) -> bool {
 /// without membership the first `facelock preview`/`test` after setup fails
 /// with AccessDenied (issue #89). Packaging creates the group but cannot know
 /// which human user to add — setup is the right place. Pass `theme` for an
-/// interactive Y/n prompt; `None` adds the user unconditionally (matching the
-/// dev `just install` behavior).
+/// interactive Y/n prompt; `None` adds the invoking sudo/doas user without
+/// prompting, and prints a manual `usermod` command when no invoking user can
+/// be determined.
 fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
     // Create the system group if packaging didn't (e.g. source installs).
     if nix::unistd::Group::from_name("facelock")

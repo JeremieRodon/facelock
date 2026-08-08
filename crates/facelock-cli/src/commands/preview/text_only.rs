@@ -30,7 +30,10 @@ pub fn run(user: &str) -> anyhow::Result<()> {
             user: user.to_string(),
         }) {
             Ok(r) => r,
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("{e:#}");
+                break;
+            }
         };
 
         match response {

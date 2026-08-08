@@ -38,10 +38,12 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
             .and_then(|s| s.has_models(&user).ok())
             .unwrap_or(false)
     } else {
+        // Propagate a failed query instead of folding it into "no models
+        // enrolled" — an AccessDenied here carries its own actionable hint.
         let request = DaemonRequest::ListModels { user: user.clone() };
         matches!(
-            ipc_client::send_request(&request),
-            Ok(DaemonResponse::Models(ref m)) if !m.is_empty()
+            ipc_client::send_request(&request)?,
+            DaemonResponse::Models(ref m) if !m.is_empty()
         )
     };
     if !has_models {
