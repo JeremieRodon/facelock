@@ -39,9 +39,12 @@ audit:
 # Run all checks (test + lint + format + audit)
 check: test lint fmt-check audit
 
-# Build the PAM test container image (uses host-built release binaries)
+# Build the PAM test container image (uses host-built release binaries).
+# --network=host: podman's default rootless build network (pasta/slirp) can
+# truncate the SourceForge redirect chain the pamtester step downloads through;
+# build-time isolation buys nothing here.
 _build-test-container: build-release
-    podman build -t facelock-pam-test -f test/Containerfile .
+    podman build --network=host -t facelock-pam-test -f test/Containerfile .
 
 # Automated PAM smoke tests (Arch container)
 test-arch-pam: _build-test-container
