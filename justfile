@@ -50,8 +50,23 @@ _build-test-container: build-release
 test-arch-pam: _build-test-container
     podman run --rm facelock-pam-test
 
+# Guard for the camera tiers: the Containerfile bakes models/ into the image
+# with a tolerant `|| true`, so building from a checkout without the ONNX
+# models (fresh clone/worktree — they are downloaded, not tracked) produces an
+# image whose daemon cannot load the face engine and whose enroll bails before
+# opening the camera. Fail loudly here instead of debugging opaque test FAILs.
+_require-models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! ls models/*.onnx >/dev/null 2>&1; then
+        echo "error: no ONNX models in models/ — the camera test tiers need them baked into the image." >&2
+        echo "       Copy them from an existing checkout or download via 'sudo facelock setup'," >&2
+        echo "       e.g.: cp /path/to/other/checkout/models/*.onnx models/" >&2
+        exit 1
+    fi
+
 # Automated daemon integration tests (Arch, requires camera)
-test-arch-integration: _build-test-container
+test-arch-integration: _require-models _build-test-container
     #!/usr/bin/env bash
     set -euo pipefail
     devices=""
@@ -61,7 +76,7 @@ test-arch-integration: _build-test-container
     podman run --rm $devices facelock-pam-test /run-integration-tests.sh
 
 # Automated oneshot (daemonless) integration tests (Arch, requires camera)
-test-arch-oneshot: _build-test-container
+test-arch-oneshot: _require-models _build-test-container
     #!/usr/bin/env bash
     set -euo pipefail
     devices=""
