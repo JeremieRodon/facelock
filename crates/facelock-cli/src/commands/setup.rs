@@ -1357,6 +1357,9 @@ fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
     }
 
     if let Some(theme) = theme {
+        // Propagate prompt failures instead of treating them as "declined":
+        // the wizard's caller prints the error plus the manual usermod command,
+        // so a broken stdin surfaces rather than silently skipping the add.
         let proceed = Confirm::with_theme(theme)
             .with_prompt(format!(
                 "Add user '{user}' to the 'facelock' group? (required to run \
@@ -1364,7 +1367,7 @@ fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
             ))
             .default(true)
             .interact()
-            .unwrap_or(false);
+            .context("group membership prompt failed")?;
         if !proceed {
             println!("  Skipped. Add later with: sudo usermod -aG facelock {user}");
             return Ok(());
