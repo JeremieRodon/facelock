@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Direct-mode enrollment unified with the daemon loop** (#89): `facelock
+  enroll` in oneshot/direct mode previously ran a drifted copy of the
+  enrollment loop that skipped the frame quality gate and the angle-diversity
+  check, and lacked the new rejection breakdown. Both modes now share
+  `facelock_daemon::enroll` — direct enrollments get the same quality
+  enforcement and error reporting as daemon mode.
+- **Enroll no longer D-Bus-activates the daemon in direct mode** (#89): label
+  auto-generation and the model-count warning used an unconditional D-Bus
+  `ListModels` call, which could boot the system daemon via bus activation and
+  silently flip the enrollment from direct to daemon mode. They now read the
+  store directly when direct mode applies.
+
 ### Fixed
 
 - **D-Bus Enroll timeout race** (#89): the CLI's fixed 15-second D-Bus method
