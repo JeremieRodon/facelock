@@ -95,6 +95,43 @@ fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     Ok(PROXY.get_or_init(|| proxy).clone())
 }
 
+/// Extra headroom on top of the daemon's enrollment deadline: D-Bus
+/// activation / daemon startup, camera warmup, and inference on the final
+/// frame all happen inside the same method call.
+const ENROLL_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Send an Enroll request on a dedicated connection whose method timeout
+/// exceeds the daemon's enrollment deadline.
+///
+/// Enrollment runs synchronously inside the D-Bus method call for up to
+/// `Config::enroll_timeout_secs()` seconds (server side). The shared proxy's
+/// 15-second timeout is at or below that deadline, so it aborted the call
+/// with "I/O error: timed out" while the daemon was still enrolling
+/// (issue #89). Pass `Config::enroll_timeout_secs()` as
+/// `server_deadline_secs`; the margin is added here.
+pub fn send_enroll(
+    user: &str,
+    label: &str,
+    server_deadline_secs: u64,
+) -> anyhow::Result<DaemonResponse> {
+    let timeout = std::time::Duration::from_secs(server_deadline_secs) + ENROLL_TIMEOUT_MARGIN;
+    let connection = zbus::blocking::connection::Builder::system()
+        .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?
+        .method_timeout(timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?;
+    let proxy = Proxy::new_owned(connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|e| anyhow::anyhow!("D-Bus proxy failed: {e}"))?;
+
+    let result: (u32, u32) = proxy
+        .call("Enroll", &(user, label))
+        .context("D-Bus Enroll call failed")?;
+    Ok(DaemonResponse::Enrolled {
+        model_id: result.0,
+        embedding_count: result.1,
+    })
+}
+
 /// Send a request to the daemon via D-Bus, translating to/from the old
 /// DaemonRequest/DaemonResponse types used by the command layer.
 pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
@@ -134,15 +171,10 @@ pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
                 failure_reason: None,
             }))
         }
-        DaemonRequest::Enroll { user, label } => {
-            let result: (u32, u32) = proxy
-                .call("Enroll", &(user.as_str(), label.as_str()))
-                .context("D-Bus Enroll call failed")?;
-            Ok(DaemonResponse::Enrolled {
-                model_id: result.0,
-                embedding_count: result.1,
-            })
-        }
+        // Enrollment needs a longer method timeout than the shared proxy
+        // provides; callers with a Config should use send_enroll directly.
+        // 15s here matches the daemon's minimum deadline (default config).
+        DaemonRequest::Enroll { user, label } => send_enroll(user, label, 15),
         DaemonRequest::ListModels { user } => {
             let models: Vec<ModelInfo> = proxy
                 .call("ListModels", &(user.as_str(),))

@@ -112,12 +112,9 @@ pub fn run(
         return Ok(());
     }
 
-    let request = DaemonRequest::Enroll {
-        user: user.clone(),
-        label: label.clone(),
-    };
-
-    let response = ipc_client::send_request(&request)?;
+    // Dedicated call with a timeout derived from the daemon's enrollment
+    // deadline — the shared 15s proxy would abort mid-enrollment (issue #89).
+    let response = ipc_client::send_enroll(&user, &label, config.enroll_timeout_secs())?;
 
     match response {
         DaemonResponse::Enrolled {

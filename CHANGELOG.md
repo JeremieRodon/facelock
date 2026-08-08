@@ -9,9 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enrollment failure breakdown** (#89): when enrollment captures too few
+  frames, the error now reports why frames were rejected (too dark, no face,
+  multiple faces, low quality, capture errors with the last error message) and
+  hints at the fix when one cause dominates (e.g. "improve lighting").
+
 ### Changed
 
 ### Fixed
+
+- **D-Bus Enroll timeout race** (#89): the CLI's fixed 15-second D-Bus method
+  timeout was at or below the daemon's enrollment deadline
+  (3x `recognition.timeout_secs`, minimum 15s), so `facelock enroll` in daemon
+  mode could fail with "I/O error: timed out" while the daemon was still
+  enrolling. Enroll now uses a dedicated connection whose timeout is the shared
+  server deadline (`Config::enroll_timeout_secs()`) plus a 15-second margin.
 
 ### Security
 
