@@ -75,7 +75,7 @@ Runtime-created DB sidecars (`-wal`, `-shm`), audit logs, and snapshots are crea
 
 `audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
 
-`source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (`facelock test`). Only `daemon` and `oneshot` run the `pre_check` gates (rate limiting, `require_ir`, SSH/lid abort), so a `success` from `test` is a recognition result, not a policy-approved authentication. The field is absent on entries written before it existed.
+`source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (direct-mode `facelock test`, which runs the recognition loop in-process). It records the **enforcement path, not the caller's intent**: `facelock test` against a running daemon goes through `Authenticate` and is logged as `daemon`, because it runs the full `pre_check` gates (rate limiting, `require_ir`, SSH/lid abort) and its failures count against the rate limit. Only `test` skips those gates, so a `success` stamped `test` is a recognition result, not a policy-approved authentication. The field is absent on entries written before it existed.
 
 ## Config Schema
 

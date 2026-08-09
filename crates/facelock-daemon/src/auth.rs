@@ -110,9 +110,11 @@ pub fn pre_check(
 /// `get_user_embeddings` directly would treat an encrypted blob as a raw
 /// embedding and fail.
 ///
-/// `source` records which caller ran the loop; it is stamped into every audit
-/// entry written here so a `facelock test` run is distinguishable from a real
-/// authentication in the log.
+/// `source` records which code path ran the loop; it is stamped into every
+/// audit entry written here. It marks the enforcement path, not caller intent:
+/// only `Test` (direct-mode `facelock test`) skips `pre_check`, so a `success`
+/// stamped `test` is a recognition result rather than an approved
+/// authentication.
 #[allow(clippy::too_many_arguments)]
 pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
