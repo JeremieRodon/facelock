@@ -35,6 +35,12 @@ pub struct Quirk {
     /// Preferred pixel format
     #[serde(default)]
     pub format_preference: Option<String>,
+    /// Effective bit depth of this sensor's Y16 samples (8..=16). Authoritative
+    /// when present: the session Y16 -> 8-bit shift becomes `bit_depth - 8` and
+    /// no calibration frames are captured, so the scale cannot depend on what
+    /// the lens happened to see at open.
+    #[serde(default)]
+    pub y16_bit_depth: Option<u8>,
     /// Image rotation in degrees
     #[serde(default)]
     pub rotation: Option<u16>,
@@ -472,6 +478,22 @@ notes = "Test camera"
         assert_eq!(file.quirk[0].vendor_id.as_deref(), Some("8086"));
         assert_eq!(file.quirk[0].force_ir, Some(true));
         assert_eq!(file.quirk[0].warmup_frames, Some(10));
+        // Omitted keys stay None: an entry written before y16_bit_depth existed
+        // keeps calibrating the Y16 scale from frames.
+        assert_eq!(file.quirk[0].y16_bit_depth, None);
+    }
+
+    #[test]
+    fn quirk_deserialization_y16_bit_depth() {
+        let toml = r#"
+[[quirk]]
+vendor_id = "8086"
+product_id = "0b07"
+format_preference = "Y16 "
+y16_bit_depth = 10
+"#;
+        let file: QuirksFile = toml::from_str(toml).unwrap();
+        assert_eq!(file.quirk[0].y16_bit_depth, Some(10));
     }
 
     #[test]
@@ -486,6 +508,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: Some(8),
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("HP IR".into()),
         });
@@ -515,6 +538,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: Some(10),
             format_preference: Some("Y16".into()),
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("Intel RealSense".into()),
         });
@@ -528,6 +552,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         });
@@ -555,6 +580,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("Logitech".into()),
         });
@@ -576,6 +602,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("first pattern".into()),
         });
@@ -588,6 +615,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("second pattern".into()),
         });
@@ -748,6 +776,7 @@ emitter_xu_guid = "abcd-1234"
 emitter_xu_selector = 3
 warmup_frames = 15
 format_preference = "GREY"
+y16_bit_depth = 12
 rotation = 90
 notes = "Full test quirk"
 "#;
@@ -757,6 +786,7 @@ notes = "Full test quirk"
         assert_eq!(q.emitter_xu_selector, Some(3));
         assert_eq!(q.warmup_frames, Some(15));
         assert_eq!(q.format_preference.as_deref(), Some("GREY"));
+        assert_eq!(q.y16_bit_depth, Some(12));
         assert_eq!(q.rotation, Some(90));
     }
 

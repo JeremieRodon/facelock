@@ -466,6 +466,12 @@ in priority order `quirk format_preference > GREY > Y16 > YUYV > NV12 > MJPG`
 and **fails** if the device advertises none of them (no silent fallback to an
 undecodable format).
 
+On a Y16 device, open also pins the session's 16-bit-to-8-bit shift, which is
+never recomputed per frame (`docs/security.md` §1.C). A quirk's `y16_bit_depth`
+(8..=16) is authoritative and skips frame inspection; otherwise the shift comes
+from the brightest sample in a burst of frames captured at open (at least the
+device's `warmup_frames`, bounded by one second).
+
 ## Database Schema
 
 SQLite with WAL mode and foreign keys:

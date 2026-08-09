@@ -396,10 +396,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clear on every thread.
 
 - **Y16 8-bit scaling is pinned at camera open**: the bit-depth shift is derived
-  once from a calibration frame and reused for the whole session. Deriving it per
-  frame was contrast normalization upstream of the IR texture check — it moved the
-  scale `security.ir_texture_min_stddev` is calibrated against in response to
-  scene illumination, and a single saturated pixel blacked out whole frames.
+  once and reused for the whole session. Deriving it per frame was contrast
+  normalization upstream of the IR texture check — it moved the scale
+  `security.ir_texture_min_stddev` is calibrated against in response to scene
+  illumination, and a single saturated pixel blacked out whole frames. The shift
+  comes from the new quirk key `y16_bit_depth` when a device declares one
+  (hardware truth, no frame inspected); otherwise it is calibrated from the peak
+  of a short burst of frames rather than a single frame, so a dark pre-AGC frame
+  at open no longer pins an 8-bit scale that clips the rest of the session.
 
 ## [0.1.4] - 2026-05-31
 

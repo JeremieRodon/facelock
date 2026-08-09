@@ -674,6 +674,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("test force_ir via USB ID".into()),
         });
@@ -702,6 +703,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("test force_ir".into()),
         });
@@ -746,6 +748,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         });
@@ -773,6 +776,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: Some(1),
             format_preference: format_preference.map(Into::into),
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("Logitech BRIO 4K with IR sensor".into()),
         }
@@ -910,6 +914,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         });
@@ -948,6 +953,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         });

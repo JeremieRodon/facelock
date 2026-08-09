@@ -352,6 +352,7 @@ mod tests {
             emitter_xu_selector: Some(3),
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         }
@@ -367,6 +368,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         }

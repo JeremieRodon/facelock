@@ -4,7 +4,7 @@ use facelock_core::traits::CameraSource;
 use facelock_core::types::Frame;
 use image::ImageReader;
 use std::io::Cursor;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use v4l::Device;
 use v4l::buffer::Type;
 use v4l::io::mmap::Stream;
@@ -24,6 +24,25 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 /// right after the previous request. Reading the count from here is what
 /// keeps that discard correct if the buffer depth ever changes.
 pub const MMAP_BUFFERS: u32 = 4;
+
+/// Minimum frames sampled at open to calibrate the Y16 -> 8-bit scale when no
+/// quirk supplies a sensor bit depth. Calibrating from a single frame races the
+/// camera's own AGC/AE warmup: a dark first frame pins an 8-bit scale that
+/// clips every warmed-up 10/12-bit frame to flat white, which the IR texture
+/// check then rejects. A short burst gives exposure time to move.
+///
+/// This burst is paid on a COLD open only, and only on a Y16 device: the
+/// daemon's warm hold (ADR 008 §4) reuses the `Camera` and therefore its
+/// already-pinned scale. It is nonetheless emitter-LED-on time on IR
+/// hardware, which is exactly what ADR 008 set out to shorten — a device that
+/// declares `y16_bit_depth` in its quirk skips the burst entirely and is the
+/// preferred configuration on any camera where the reopen cost matters.
+const Y16_CALIBRATION_FRAMES: usize = 8;
+
+/// Wall-clock ceiling on that burst. Frames are already flowing when it runs,
+/// so it normally costs a fraction of a second; the budget keeps a stalling
+/// camera from stretching `Camera::open` by `CAPTURE_TIMEOUT` eight times over.
+const Y16_CALIBRATION_BUDGET: Duration = Duration::from_secs(1);
 
 /// Pixel formats facelock can decode to RGB, in negotiation priority order:
 /// IR-native grayscale first, then cheap lossless raw conversions, then MJPG
@@ -59,6 +78,96 @@ fn quirk_format_preference(quirk: Option<&Quirk>) -> Option<&str> {
         return None;
     }
     Some(pref)
+}
+
+/// The Y16 shift implied by a quirk's declared sensor bit depth, if any.
+/// A depth the 16-bit container cannot hold is a quirks-file typo rather than
+/// hardware truth: warn and let frame calibration decide instead.
+fn quirk_y16_shift(quirk: Option<&Quirk>) -> Option<u8> {
+    let bit_depth = quirk.and_then(|q| q.y16_bit_depth)?;
+    let shift = preprocess::y16_shift_from_bit_depth(bit_depth);
+    if shift.is_none() {
+        tracing::warn!(
+            bit_depth,
+            "quirk y16_bit_depth is outside 8..=16 — ignoring, calibrating from frames"
+        );
+    }
+    shift
+}
+
+/// How many frames the calibration burst aims for on this device. A quirk's
+/// `warmup_frames` is the device's own statement of how long its exposure takes
+/// to settle, so a camera that declares more than the default gets a burst at
+/// least that long. The wall-clock budget still bounds it.
+fn y16_calibration_frames(quirk: Option<&Quirk>) -> usize {
+    quirk
+        .and_then(|q| q.warmup_frames)
+        .unwrap_or(0)
+        .max(Y16_CALIBRATION_FRAMES as u32) as usize
+}
+
+/// Pin the session Y16 scale by sampling a burst of frames and taking the
+/// brightest sample any of them produced. The peak is a lower bound on the
+/// sensor's full scale, so more frames can only improve the estimate.
+///
+/// Individual capture errors are tolerated as long as one frame arrives; with
+/// none, opening fails rather than proceeding on a guessed scale.
+fn calibrate_y16_shift(stream: &mut Stream<'_>, device_path: &str, target: usize) -> Result<u8> {
+    let start = Instant::now();
+    let mut peak = 0u16;
+    let mut frames = 0usize;
+    let mut errors = 0usize;
+    let mut last_err = None;
+
+    while frames < target
+        && errors < Y16_CALIBRATION_FRAMES
+        && start.elapsed() < Y16_CALIBRATION_BUDGET
+    {
+        match stream.next() {
+            Ok((buf, _meta)) => {
+                peak = peak.max(preprocess::y16_peak(buf));
+                frames += 1;
+            }
+            Err(e) => {
+                errors += 1;
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if frames == 0 {
+        let detail = match last_err {
+            Some(e) => e.to_string(),
+            None => "no frame arrived within the calibration budget".to_string(),
+        };
+        return Err(FacelockError::Camera(format!(
+            "{device_path}: Y16 calibration failed: {detail}"
+        )));
+    }
+
+    let (shift, verdict) = preprocess::y16_calibration(peak);
+    match verdict {
+        preprocess::Y16Calibration::LowRange => tracing::warn!(
+            device = %device_path,
+            peak,
+            frames,
+            "Y16 scale calibrated to 8-bit: no sample above 255 during calibration. \
+             Correct for a true 8-bit sensor, but a covered or unlit camera at open \
+             looks identical and makes later frames clip to white. Set the quirk's \
+             y16_bit_depth for this device to pin the scale from hardware instead."
+        ),
+        preprocess::Y16Calibration::Saturated => tracing::warn!(
+            device = %device_path,
+            peak,
+            frames,
+            "Y16 calibration saturated the 16-bit container: an IR glint or hot pixel \
+             at open pins a scale that darkens every later frame. Set the quirk's \
+             y16_bit_depth for this device to pin the scale from hardware instead."
+        ),
+        preprocess::Y16Calibration::Normal => {}
+    }
+    tracing::info!(device = %device_path, shift, peak, frames, "Y16 session scale pinned");
+    Ok(shift)
 }
 
 /// Bytes per row facelock's converters assume for an uncompressed format.
@@ -122,6 +231,7 @@ impl<'a> Camera<'a> {
     /// - `format_preference` is prepended to the format priority list.
     /// - `warmup_frames` replaces `config.warmup_frames`.
     /// - `rotation` replaces `config.rotation`.
+    /// - `y16_bit_depth` pins the Y16 scale, skipping frame calibration.
     pub(crate) fn open_resolved(
         config: &DeviceConfig,
         quirk: Option<&Quirk>,
@@ -246,16 +356,20 @@ impl<'a> Camera<'a> {
             false
         };
 
-        // Pin the Y16 -> 8-bit scale for the whole session from one calibration
-        // frame. Must run after the IR emitter is enabled, otherwise the scale
-        // is derived from an unlit frame and every lit frame clips to white.
+        // Pin the Y16 -> 8-bit scale for the whole session. A quirk-declared
+        // sensor bit depth is authoritative; otherwise calibrate from a burst
+        // of frames. Must run after the IR emitter is enabled, otherwise the
+        // scale is derived from unlit frames and every lit frame clips to white.
         let y16_shift = if format_str == "Y16" {
-            let (buf, _meta) = stream.next().map_err(|e| {
-                FacelockError::Camera(format!("{device_path}: Y16 calibration frame failed: {e}"))
-            })?;
-            let shift = preprocess::y16_shift(buf);
-            tracing::info!(device = %device_path, shift, "Y16 session scale pinned");
-            shift
+            match quirk_y16_shift(quirk) {
+                Some(shift) => {
+                    tracing::info!(device = %device_path, shift, "Y16 session scale from quirk bit depth");
+                    shift
+                }
+                None => {
+                    calibrate_y16_shift(&mut stream, &device_path, y16_calibration_frames(quirk))?
+                }
+            }
         } else {
             0
         };
@@ -555,6 +669,7 @@ mod tests {
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: Some(format_preference.into()),
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         }
@@ -565,6 +680,46 @@ mod tests {
         let quirk = quirk_with_format("GREY");
         assert_eq!(quirk_format_preference(Some(&quirk)), Some("GREY"));
         assert_eq!(quirk_format_preference(None), None);
+    }
+
+    #[test]
+    fn quirk_y16_shift_uses_declared_bit_depth() {
+        let mut quirk = quirk_with_format("Y16");
+        quirk.y16_bit_depth = Some(10);
+        assert_eq!(quirk_y16_shift(Some(&quirk)), Some(2));
+        quirk.y16_bit_depth = Some(16);
+        assert_eq!(quirk_y16_shift(Some(&quirk)), Some(8));
+    }
+
+    #[test]
+    fn quirk_y16_shift_absent_falls_back_to_calibration() {
+        // No quirk, and a quirk without the field, both leave the burst
+        // calibration in charge.
+        assert_eq!(quirk_y16_shift(None), None);
+        assert_eq!(quirk_y16_shift(Some(&quirk_with_format("Y16"))), None);
+    }
+
+    #[test]
+    fn y16_calibration_frames_follows_declared_warmup() {
+        // Default burst when the device says nothing.
+        assert_eq!(y16_calibration_frames(None), Y16_CALIBRATION_FRAMES);
+        let mut quirk = quirk_with_format("Y16");
+        assert_eq!(y16_calibration_frames(Some(&quirk)), 8);
+        // A camera that declares a longer warmup (RealSense SR300) gets a burst
+        // that covers it; a shorter one never shortens the default.
+        quirk.warmup_frames = Some(10);
+        assert_eq!(y16_calibration_frames(Some(&quirk)), 10);
+        quirk.warmup_frames = Some(1);
+        assert_eq!(y16_calibration_frames(Some(&quirk)), 8);
+    }
+
+    #[test]
+    fn quirk_y16_shift_ignores_impossible_bit_depth() {
+        let mut quirk = quirk_with_format("Y16");
+        quirk.y16_bit_depth = Some(24);
+        assert_eq!(quirk_y16_shift(Some(&quirk)), None);
+        quirk.y16_bit_depth = Some(4);
+        assert_eq!(quirk_y16_shift(Some(&quirk)), None);
     }
 
     #[test]

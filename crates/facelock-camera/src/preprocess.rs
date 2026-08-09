@@ -77,24 +77,74 @@ pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     Some(rgb)
 }
 
-/// Right-shift that maps a Y16 sensor's effective bit depth onto 8 bits.
+/// Brightest 16-bit sample in a Y16 buffer (little-endian).
+///
+/// Callers accumulate this across a burst of calibration frames: the peak is a
+/// lower bound on the sensor's full scale, so taking the maximum over several
+/// frames can only move the estimate toward the true bit depth, never past it.
+pub fn y16_peak(data: &[u8]) -> u16 {
+    data.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Right-shift implied by an observed Y16 `peak` sample.
 ///
 /// Many IR sensors deliver 10/12-bit samples right-justified in the 16-bit
-/// container, so a plain `>> 8` yields near-black frames. The shift is derived
-/// from the highest set bit of the brightest pixel in `data`, floored at 0 so
-/// samples that already fit in 8 bits pass through unshifted.
+/// container, so a plain `>> 8` yields near-black frames. The shift comes from
+/// the highest set bit of the peak, floored at 0 so samples that already fit in
+/// 8 bits pass through unshifted.
+pub fn y16_shift_from_peak(peak: u16) -> u8 {
+    (16 - peak.leading_zeros()).saturating_sub(8) as u8
+}
+
+/// Right-shift that maps a Y16 sensor's effective bit depth onto 8 bits,
+/// derived from the brightest sample in `data`.
 ///
 /// The shift MUST be derived once per camera session and reused for every
 /// frame. Recomputing it per frame is contrast normalization upstream of
 /// [`check_ir_texture`], whose `min_stddev` cutoff is calibrated against a
 /// fixed scale (see `docs/security.md` §1.C).
 pub fn y16_shift(data: &[u8]) -> u8 {
-    let max = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .max()
-        .unwrap_or(0);
-    (16 - max.leading_zeros()).saturating_sub(8) as u8
+    y16_shift_from_peak(y16_peak(data))
+}
+
+/// Right-shift for a sensor bit depth supplied by the hardware quirks DB.
+///
+/// `None` for a depth that cannot describe a Y16 sample (below 8 bits, or above
+/// the 16-bit container); the caller warns and falls back to frame calibration
+/// rather than trusting a typo in a quirks file.
+pub fn y16_shift_from_bit_depth(bit_depth: u8) -> Option<u8> {
+    (8..=16).contains(&bit_depth).then(|| bit_depth - 8)
+}
+
+/// What a Y16 calibration burst's peak says about the scale it produced.
+///
+/// The shift itself is usable in every case — this only distinguishes the peaks
+/// that are equally consistent with a correctly-calibrated sensor and with a
+/// camera that was covered, unlit, or still pre-AGC while the burst ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Y16Calibration {
+    /// The burst never saw a sample above 8 bits. True for a genuinely 8-bit
+    /// sensor padded into Y16, and equally true for a covered lens.
+    LowRange,
+    /// The burst saturated the 16-bit container, which is what an IR glint (or
+    /// a hot pixel) looks like on a sensor whose real range is narrower.
+    Saturated,
+    /// Peak landed inside the container with room on both sides.
+    Normal,
+}
+
+/// Pin a session Y16 shift from the peak sample of a calibration burst, along
+/// with a verdict on how trustworthy that peak is.
+pub fn y16_calibration(peak: u16) -> (u8, Y16Calibration) {
+    let verdict = match peak {
+        u16::MAX => Y16Calibration::Saturated,
+        p if p < 256 => Y16Calibration::LowRange,
+        _ => Y16Calibration::Normal,
+    };
+    (y16_shift_from_peak(peak), verdict)
 }
 
 /// Convert Y16 (16-bit little-endian grayscale) data to 8-bit grayscale using
@@ -411,6 +461,49 @@ mod tests {
         let data = [0u8; 8];
         assert_eq!(y16_shift(&data), 0);
         assert_eq!(y16_to_gray(&data, 0), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn y16_peak_accumulates_toward_the_true_bit_depth() {
+        // A dark pre-AGC frame alone pins an 8-bit scale that clips every later
+        // 10-bit frame to white. Taking the peak across a burst recovers the
+        // real depth, and can never overshoot it: no sample can exceed the
+        // sensor's full scale.
+        let dark = [0x40, 0x00, 0x10, 0x00]; // 64, 16
+        let warm = [0xFF, 0x03, 0x00, 0x02]; // 1023, 512
+        assert_eq!(y16_shift_from_peak(y16_peak(&dark)), 0);
+        let burst = y16_peak(&dark).max(y16_peak(&warm));
+        assert_eq!(y16_shift_from_peak(burst), 2);
+    }
+
+    #[test]
+    fn y16_shift_from_bit_depth_is_the_quirk_channel() {
+        assert_eq!(y16_shift_from_bit_depth(8), Some(0));
+        assert_eq!(y16_shift_from_bit_depth(10), Some(2));
+        assert_eq!(y16_shift_from_bit_depth(12), Some(4));
+        assert_eq!(y16_shift_from_bit_depth(16), Some(8));
+    }
+
+    #[test]
+    fn y16_shift_from_bit_depth_rejects_out_of_range() {
+        // A depth outside the container is a quirks-file typo, not hardware
+        // truth: the caller warns and calibrates from frames instead.
+        assert_eq!(y16_shift_from_bit_depth(0), None);
+        assert_eq!(y16_shift_from_bit_depth(7), None);
+        assert_eq!(y16_shift_from_bit_depth(17), None);
+        assert_eq!(y16_shift_from_bit_depth(u8::MAX), None);
+    }
+
+    #[test]
+    fn y16_calibration_flags_suspicious_peaks() {
+        // Indistinguishable from a covered lens.
+        assert_eq!(y16_calibration(0), (0, Y16Calibration::LowRange));
+        assert_eq!(y16_calibration(255), (0, Y16Calibration::LowRange));
+        // Full-container saturation: an IR glint on a narrower sensor.
+        assert_eq!(y16_calibration(u16::MAX), (8, Y16Calibration::Saturated));
+        // Ordinary 10/12-bit peaks.
+        assert_eq!(y16_calibration(1023), (2, Y16Calibration::Normal));
+        assert_eq!(y16_calibration(4095), (4, Y16Calibration::Normal));
     }
 
     #[test]

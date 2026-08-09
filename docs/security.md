@@ -187,7 +187,13 @@ from the effective sensor bit depth. That shift is pinned once at camera open an
 for every frame of the session. Deriving it per frame is per-frame contrast normalization
 — the same class of mistake as feeding CLAHE output to this check — and it would move the
 scale `ir_texture_min_stddev` is calibrated against on every frame, including in response
-to attacker-controlled illumination.
+to attacker-controlled illumination. A quirk's `y16_bit_depth`
+(`/etc/facelock/quirks.d/`) is **authoritative** when present — the shift becomes
+`bit_depth - 8` and no frame is inspected; the fallback samples a burst of frames at open
+(at least the device's declared `warmup_frames`) and takes their peak, so the scale does
+not hinge on whatever a single pre-AGC frame happened to see. A scene-derived scale is a reliability risk rather than a bypass (a
+covered lens at open clips later frames to flat white, which this check *rejects*), but on
+hardware where it recurs, pin `y16_bit_depth`.
 
 **Raw-frame calibration**: on the raw frame, flat surfaces (photos/screens in IR) score
 std_dev **< 5**, real IR skin scores **> 15**. The cutoff `security.ir_texture_min_stddev`
