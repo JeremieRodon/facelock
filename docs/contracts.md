@@ -218,6 +218,18 @@ and every cached verdict dies when the caller's bus connection closes
 (whichever comes first). Clients that want frames across a preview session
 must therefore keep one D-Bus connection open for the whole session.
 
+Method timeouts: `Enroll` runs synchronously inside the method call for up to
+`Config::enroll_timeout_secs()` seconds server-side (`3 × max(recognition.timeout_secs, 5)`
+seconds — i.e. minimum 15s). Clients MUST use a method timeout **greater
+than** this deadline plus startup/inference margin for `Enroll` (the CLI uses
+deadline + 15s); the shared 15-second client timeout applies to every other
+method. A client timeout at or below the server deadline aborts the call while
+the daemon is still enrolling.
+
+Enrollment behavior is mode-independent: oneshot (`facelock enroll` in direct
+mode) and the daemon's `Enroll` method run the same capture loop, so the
+quality gate and the angle-diversity check apply in both.
+
 Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and
 `PreviewDetectFrame` are serialized by an in-flight capture guard. While one
 capture is in progress, a concurrent call to any of these methods fails
