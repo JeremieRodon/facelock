@@ -150,9 +150,58 @@ fn is_timeout_error(err: &zbus::Error) -> bool {
     matches!(err, zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut)
 }
 
+/// True if a D-Bus error name denotes AccessDenied.
+fn is_access_denied_name(name: &str) -> bool {
+    name == "org.freedesktop.DBus.Error.AccessDenied"
+}
+
+/// True if the error chain contains a D-Bus AccessDenied — either the system
+/// bus policy rejecting the caller outright, or the daemon's own
+/// authorization check.
+pub fn is_access_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        match cause.downcast_ref::<zbus::Error>() {
+            // What a remote denial arrives as: the bus or the daemon replies
+            // with an error name.
+            Some(zbus::Error::MethodError(name, _, _)) => is_access_denied_name(name.as_str()),
+            // Locally constructed denials (never produced by `Proxy::call`).
+            Some(zbus::Error::FDO(fdo_err)) => {
+                matches!(**fdo_err, zbus::fdo::Error::AccessDenied(_))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Append an actionable hint to AccessDenied errors.
+///
+/// The system bus policy (dbus/org.facelock.Daemon.conf) denies callers that
+/// are neither root nor in the `facelock` group *before* the request reaches
+/// the daemon, so without this a normal user's first `facelock preview` after
+/// setup fails with a bare AccessDenied and no explanation (issue #89). The
+/// daemon itself also returns AccessDenied for root-only methods and
+/// cross-user requests, so the hint stays neutral and leaves the specific
+/// reason to the wrapped error.
+fn add_group_hint(err: anyhow::Error) -> anyhow::Error {
+    if is_access_denied(&err) {
+        err.context(
+            "Access denied. If you are not in the 'facelock' group, add yourself:\n  \
+             sudo usermod -aG facelock $USER\nthen log out and back in (or re-run: \
+             sudo facelock setup). Note: some operations require root regardless of \
+             group membership.",
+        )
+    } else {
+        err
+    }
+}
+
 /// Send a request to the daemon via D-Bus, translating to/from the old
 /// DaemonRequest/DaemonResponse types used by the command layer.
 pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
+    send_request_inner(request).map_err(add_group_hint)
+}
+
+fn send_request_inner(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     let proxy = create_proxy()?;
 
     match request {
@@ -321,6 +370,46 @@ pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_denied_name_is_recognized() {
+        assert!(is_access_denied_name(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        ));
+    }
+
+    #[test]
+    fn other_error_names_are_not_access_denied() {
+        assert!(!is_access_denied_name(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ));
+        assert!(!is_access_denied_name("org.facelock.Error.AccessDenied"));
+        assert!(!is_access_denied_name(""));
+    }
+
+    // Covers the locally constructed FDO variant, not the wire path: a denial
+    // from the bus or the daemon arrives as `zbus::Error::MethodError`, whose
+    // name is checked by `is_access_denied_name` above.
+    #[test]
+    fn access_denied_fdo_error_gets_group_hint() {
+        let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "rejected by policy".into(),
+        ))))
+        .context("D-Bus PreviewFrame call failed");
+        let hinted = add_group_hint(err);
+        let msg = format!("{hinted:#}");
+        assert!(msg.contains("usermod -aG facelock"), "got: {msg}");
+        assert!(msg.contains("log out"), "got: {msg}");
+    }
+
+    #[test]
+    fn non_access_denied_error_is_unchanged() {
+        let err = anyhow::Error::new(zbus::Error::Failure("connection refused".into()))
+            .context("D-Bus Ping call failed");
+        let msg_before = format!("{err:#}");
+        let hinted = add_group_hint(err);
+        assert_eq!(format!("{hinted:#}"), msg_before);
+    }
 
     #[test]
     fn resolve_user_with_flag() {

@@ -165,9 +165,14 @@ The ONNX runtime requires access to `/dev/null`, `/dev/urandom`, and `/proc/sys`
 
 ## Permission issues
 
-### "Permission denied" when running facelock commands
+### "Permission denied" / "AccessDenied" when running facelock commands
 
-Ensure your user is in the `facelock` group:
+**Symptom**: `facelock preview` or `facelock test` fails with a D-Bus
+`AccessDenied` error as a normal user (root works fine).
+
+The D-Bus system-bus policy only allows root and the `facelock` group to talk
+to the daemon. `sudo facelock setup` offers to add you to the group; if you
+skipped it (or are on another account), add yourself:
 ```bash
 groups  # check current groups
 sudo usermod -aG facelock $USER

@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frames, the error now reports why frames were rejected (too dark, no face,
   multiple faces, low quality, capture errors with the last error message) and
   hints at the fix when one cause dominates (e.g. "improve lighting").
+- **Setup manages facelock group membership** (#89): `sudo facelock setup` now
+  creates the `facelock` system group if missing and adds the invoking
+  sudo/doas user to it (the interactive wizard asks first; non-interactive mode
+  adds without prompting, and prints a manual `usermod` command when no
+  invoking user can be determined), so daemon commands like `facelock
+  preview`/`test` work after setup without a manual `usermod`. A log-out/log-in
+  reminder is printed.
 
 ### Changed
 
@@ -36,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode could fail with "I/O error: timed out" while the daemon was still
   enrolling. Enroll now uses a dedicated connection whose timeout is the shared
   server deadline (`Config::enroll_timeout_secs()`) plus a 15-second margin.
+- **Bare D-Bus AccessDenied errors** (#89): when the system bus policy rejects
+  a caller that is not root or in the `facelock` group, the CLI now appends an
+  actionable hint (add user to group, re-login, or re-run setup) instead of a
+  bare "AccessDenied".
 
 ### Security
 
