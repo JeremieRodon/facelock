@@ -125,13 +125,29 @@ pub fn send_enroll(
     let proxy = Proxy::new_owned(connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
         .map_err(|e| anyhow::anyhow!("D-Bus proxy failed: {e}"))?;
 
-    let result: (u32, u32) = proxy
-        .call("Enroll", &(user, label))
-        .context("D-Bus Enroll call failed")?;
+    // A client-side timeout does NOT cancel the daemon's enrollment — it runs
+    // to completion and persists. Say so instead of leaving the user to retry
+    // into a duplicate label.
+    let result: (u32, u32) = proxy.call("Enroll", &(user, label)).map_err(|e| {
+        if is_timeout_error(&e) {
+            anyhow::Error::new(e).context(
+                "enrollment timed out client-side; the daemon may have completed it — \
+                 run `facelock list` before retrying",
+            )
+        } else {
+            anyhow::Error::new(e).context("D-Bus Enroll call failed")
+        }
+    })?;
     Ok(DaemonResponse::Enrolled {
         model_id: result.0,
         embedding_count: result.1,
     })
+}
+
+/// True for the client-side method-timeout shape: `method_timeout` expiring
+/// surfaces as an I/O `TimedOut` error.
+fn is_timeout_error(err: &zbus::Error) -> bool {
+    matches!(err, zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut)
 }
 
 /// Send a request to the daemon via D-Bus, translating to/from the old
