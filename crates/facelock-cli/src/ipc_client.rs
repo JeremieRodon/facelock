@@ -95,9 +95,113 @@ fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     Ok(PROXY.get_or_init(|| proxy).clone())
 }
 
+/// Extra headroom on top of the daemon's enrollment deadline: D-Bus
+/// activation / daemon startup, camera warmup, and inference on the final
+/// frame all happen inside the same method call.
+const ENROLL_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Send an Enroll request on a dedicated connection whose method timeout
+/// exceeds the daemon's enrollment deadline.
+///
+/// Enrollment runs synchronously inside the D-Bus method call for up to
+/// `Config::enroll_timeout_secs()` seconds (server side). The shared proxy's
+/// 15-second timeout is at or below that deadline, so it aborted the call
+/// with "I/O error: timed out" while the daemon was still enrolling
+/// (issue #89). The deadline is derived from the caller's `Config` here
+/// rather than passed in, so no caller can supply one that disagrees with
+/// the daemon's.
+pub fn send_enroll(
+    user: &str,
+    label: &str,
+    config: &facelock_core::Config,
+) -> anyhow::Result<DaemonResponse> {
+    let timeout =
+        std::time::Duration::from_secs(config.enroll_timeout_secs()) + ENROLL_TIMEOUT_MARGIN;
+    let connection = zbus::blocking::connection::Builder::system()
+        .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?
+        .method_timeout(timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?;
+    let proxy = Proxy::new_owned(connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|e| anyhow::anyhow!("D-Bus proxy failed: {e}"))?;
+
+    // A client-side timeout does NOT cancel the daemon's enrollment — it runs
+    // to completion and persists. Say so instead of leaving the user to retry
+    // into a duplicate label.
+    let result: (u32, u32) = proxy.call("Enroll", &(user, label)).map_err(|e| {
+        if is_timeout_error(&e) {
+            anyhow::Error::new(e).context(
+                "enrollment timed out client-side; the daemon may have completed it — \
+                 run `facelock list` before retrying",
+            )
+        } else {
+            anyhow::Error::new(e).context("D-Bus Enroll call failed")
+        }
+    })?;
+    Ok(DaemonResponse::Enrolled {
+        model_id: result.0,
+        embedding_count: result.1,
+    })
+}
+
+/// True for the client-side method-timeout shape: `method_timeout` expiring
+/// surfaces as an I/O `TimedOut` error.
+fn is_timeout_error(err: &zbus::Error) -> bool {
+    matches!(err, zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut)
+}
+
+/// True if a D-Bus error name denotes AccessDenied.
+fn is_access_denied_name(name: &str) -> bool {
+    name == "org.freedesktop.DBus.Error.AccessDenied"
+}
+
+/// True if the error chain contains a D-Bus AccessDenied — either the system
+/// bus policy rejecting the caller outright, or the daemon's own
+/// authorization check.
+pub fn is_access_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        match cause.downcast_ref::<zbus::Error>() {
+            // What a remote denial arrives as: the bus or the daemon replies
+            // with an error name.
+            Some(zbus::Error::MethodError(name, _, _)) => is_access_denied_name(name.as_str()),
+            // Locally constructed denials (never produced by `Proxy::call`).
+            Some(zbus::Error::FDO(fdo_err)) => {
+                matches!(**fdo_err, zbus::fdo::Error::AccessDenied(_))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Append an actionable hint to AccessDenied errors.
+///
+/// The system bus policy (dbus/org.facelock.Daemon.conf) denies callers that
+/// are neither root nor in the `facelock` group *before* the request reaches
+/// the daemon, so without this a normal user's first `facelock preview` after
+/// setup fails with a bare AccessDenied and no explanation (issue #89). The
+/// daemon itself also returns AccessDenied for root-only methods and
+/// cross-user requests, so the hint stays neutral and leaves the specific
+/// reason to the wrapped error.
+fn add_group_hint(err: anyhow::Error) -> anyhow::Error {
+    if is_access_denied(&err) {
+        err.context(
+            "Access denied. If you are not in the 'facelock' group, add yourself:\n  \
+             sudo usermod -aG facelock $USER\nthen log out and back in (or re-run: \
+             sudo facelock setup). Note: some operations require root regardless of \
+             group membership.",
+        )
+    } else {
+        err
+    }
+}
+
 /// Send a request to the daemon via D-Bus, translating to/from the old
 /// DaemonRequest/DaemonResponse types used by the command layer.
 pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
+    send_request_inner(request).map_err(add_group_hint)
+}
+
+fn send_request_inner(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     let proxy = create_proxy()?;
 
     match request {
@@ -134,14 +238,10 @@ pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
                 failure_reason: None,
             }))
         }
-        DaemonRequest::Enroll { user, label } => {
-            let result: (u32, u32) = proxy
-                .call("Enroll", &(user.as_str(), label.as_str()))
-                .context("D-Bus Enroll call failed")?;
-            Ok(DaemonResponse::Enrolled {
-                model_id: result.0,
-                embedding_count: result.1,
-            })
+        // Enrollment needs a method timeout derived from the daemon's
+        // config-dependent deadline, which this shared proxy cannot provide.
+        DaemonRequest::Enroll { .. } => {
+            bail!("Enroll must use send_enroll (needs a config-derived timeout)")
         }
         DaemonRequest::ListModels { user } => {
             let models: Vec<ModelInfo> = proxy
@@ -270,6 +370,46 @@ pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_denied_name_is_recognized() {
+        assert!(is_access_denied_name(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        ));
+    }
+
+    #[test]
+    fn other_error_names_are_not_access_denied() {
+        assert!(!is_access_denied_name(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ));
+        assert!(!is_access_denied_name("org.facelock.Error.AccessDenied"));
+        assert!(!is_access_denied_name(""));
+    }
+
+    // Covers the locally constructed FDO variant, not the wire path: a denial
+    // from the bus or the daemon arrives as `zbus::Error::MethodError`, whose
+    // name is checked by `is_access_denied_name` above.
+    #[test]
+    fn access_denied_fdo_error_gets_group_hint() {
+        let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "rejected by policy".into(),
+        ))))
+        .context("D-Bus PreviewFrame call failed");
+        let hinted = add_group_hint(err);
+        let msg = format!("{hinted:#}");
+        assert!(msg.contains("usermod -aG facelock"), "got: {msg}");
+        assert!(msg.contains("log out"), "got: {msg}");
+    }
+
+    #[test]
+    fn non_access_denied_error_is_unchanged() {
+        let err = anyhow::Error::new(zbus::Error::Failure("connection refused".into()))
+            .context("D-Bus Ping call failed");
+        let msg_before = format!("{err:#}");
+        let hinted = add_group_hint(err);
+        assert_eq!(format!("{hinted:#}"), msg_before);
+    }
 
     #[test]
     fn resolve_user_with_flag() {

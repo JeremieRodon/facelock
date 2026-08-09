@@ -685,6 +685,17 @@ impl Config {
         Ok(())
     }
 
+    /// Server-side enrollment deadline in seconds: 3x the auth timeout
+    /// (floored at 5s) because enrollment needs multiple good captures.
+    ///
+    /// Single source of truth for both the daemon's enrollment loop and the
+    /// CLI's D-Bus Enroll method timeout — the client timeout must exceed
+    /// this deadline (plus margin) or it aborts while the daemon is still
+    /// enrolling (see docs/contracts.md §IPC Protocol).
+    pub fn enroll_timeout_secs(&self) -> u64 {
+        (self.recognition.timeout_secs as u64).max(5) * 3
+    }
+
     /// Parse config from a TOML string.
     pub fn parse(toml_str: &str) -> Result<Self, ConfigError> {
         let config: Config =
@@ -778,6 +789,20 @@ path = "/dev/video0"
         assert_eq!(config.device.max_height, 480);
         assert_eq!(config.recognition.threshold, 0.80);
         assert!(config.security.require_ir);
+    }
+
+    #[test]
+    fn enroll_timeout_is_three_times_auth_timeout_with_floor() {
+        // Default timeout_secs = 5 -> 15s enrollment deadline.
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.enroll_timeout_secs(), 15);
+
+        let config = Config::parse("[recognition]\ntimeout_secs = 10\n").unwrap();
+        assert_eq!(config.enroll_timeout_secs(), 30);
+
+        // Values below the 5s floor still yield the 15s minimum deadline.
+        let config = Config::parse("[recognition]\ntimeout_secs = 2\n").unwrap();
+        assert_eq!(config.enroll_timeout_secs(), 15);
     }
 
     #[test]

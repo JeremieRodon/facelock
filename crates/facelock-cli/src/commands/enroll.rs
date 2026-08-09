@@ -3,6 +3,7 @@ use chrono::Local;
 
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
+use facelock_core::types::FaceModelInfo;
 
 use crate::ipc_client;
 
@@ -65,7 +66,7 @@ pub fn run(
 
     let label = label.unwrap_or_else(|| {
         let date = Local::now().format("%Y-%m-%d").to_string();
-        next_label(&date, &user)
+        next_label(&date, &user, &config)
     });
 
     // Warn if existing models use a different embedder than currently configured
@@ -109,63 +110,71 @@ pub fn run(
         println!(
             "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
         );
+        check_model_count(&user, &config);
         return Ok(());
     }
 
-    let request = DaemonRequest::Enroll {
-        user: user.clone(),
-        label: label.clone(),
-    };
+    // Dedicated call with a timeout derived from the daemon's enrollment
+    // deadline — the shared 15s proxy would abort mid-enrollment (issue #89).
+    // send_enroll yields Enrolled or an error, so there is no other arm.
+    let response = ipc_client::send_enroll(&user, &label, &config)?;
 
-    let response = ipc_client::send_request(&request)?;
-
-    match response {
-        DaemonResponse::Enrolled {
-            model_id,
-            embedding_count,
-        } => {
-            println!(
-                "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
-            );
-            check_model_count(&user)?;
-        }
-        other => {
-            anyhow::bail!("unexpected response from daemon: {other:?}");
-        }
+    if let DaemonResponse::Enrolled {
+        model_id,
+        embedding_count,
+    } = response
+    {
+        println!(
+            "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
+        );
+        check_model_count(&user, &config);
     }
 
     Ok(())
 }
 
-/// Generate the next available label like "2026-03-15-1", "2026-03-15-2", etc.
-fn next_label(date_prefix: &str, user: &str) -> String {
-    let existing = ipc_client::send_request(&DaemonRequest::ListModels {
-        user: user.to_string(),
-    });
+/// List a user's models, honoring direct mode. Unlike a bare `send_request`,
+/// this never touches D-Bus in direct mode — an unconditional D-Bus call here
+/// would *activate* the system daemon and silently flip the subsequent
+/// enrollment from direct to daemon mode (issue #89 validation fallout).
+fn list_user_models(user: &str, config: &Config) -> Option<Vec<FaceModelInfo>> {
+    if ipc_client::should_use_direct(config) {
+        crate::direct::open_store(config)
+            .ok()?
+            .list_models(user)
+            .ok()
+    } else {
+        match ipc_client::send_request(&DaemonRequest::ListModels {
+            user: user.to_string(),
+        }) {
+            Ok(DaemonResponse::Models(models)) => Some(models),
+            _ => None,
+        }
+    }
+}
 
-    let max_suffix = match existing {
-        Ok(DaemonResponse::Models(models)) => models
-            .iter()
-            .filter_map(|m| {
-                m.label
-                    .strip_prefix(date_prefix)
-                    .and_then(|rest| rest.strip_prefix('-'))
-                    .and_then(|n| n.parse::<u32>().ok())
-            })
-            .max()
-            .unwrap_or(0),
-        _ => 0,
-    };
+/// Generate the next available label like "2026-03-15-1", "2026-03-15-2", etc.
+fn next_label(date_prefix: &str, user: &str, config: &Config) -> String {
+    let max_suffix = list_user_models(user, config)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    m.label
+                        .strip_prefix(date_prefix)
+                        .and_then(|rest| rest.strip_prefix('-'))
+                        .and_then(|n| n.parse::<u32>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
 
     format!("{date_prefix}-{}", max_suffix + 1)
 }
 
-fn check_model_count(user: &str) -> anyhow::Result<()> {
-    let request = DaemonRequest::ListModels {
-        user: user.to_string(),
-    };
-
-    if let Ok(DaemonResponse::Models(models)) = ipc_client::send_request(&request) {
+fn check_model_count(user: &str, config: &Config) {
+    if let Some(models) = list_user_models(user, config) {
         if models.len() > 5 {
             println!(
                 "\nWarning: user '{user}' has {} face models. Consider removing old ones with 'facelock remove'.",
@@ -173,6 +182,4 @@ fn check_model_count(user: &str) -> anyhow::Result<()> {
             );
         }
     }
-
-    Ok(())
 }
