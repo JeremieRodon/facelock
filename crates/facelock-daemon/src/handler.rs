@@ -8,7 +8,7 @@ use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
 
-use crate::audit::{self, AuditEntry};
+use crate::audit::{self, AuditEntry, AuditSource};
 use crate::auth;
 use crate::enroll;
 use crate::rate_limit::RateLimiter;
@@ -360,6 +360,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                             timestamp: audit::now_iso8601(),
                             user: user.clone(),
                             result,
+                            source: Some(AuditSource::Daemon),
                             similarity: None,
                             frame_count: None,
                             duration_ms: None,
@@ -393,6 +394,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     &user,
                     self.device_is_ir,
                     &self.device_fingerprint,
+                    AuditSource::Daemon,
                 );
                 self.camera = Some(camera);
                 self.camera_last_used = Instant::now();

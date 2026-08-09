@@ -9,7 +9,7 @@ use facelock_camera::{Camera, auto_detect_device, is_ir_camera_resolved, validat
 use facelock_core::config::Config;
 use facelock_core::ipc::DaemonResponse;
 use facelock_core::types::MatchResult;
-use facelock_daemon::audit::{self, AuditEntry};
+use facelock_daemon::audit::{self, AuditEntry, AuditSource};
 use facelock_daemon::auth;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
@@ -186,6 +186,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         &user,
         device_is_ir,
         &live_fingerprint,
+        AuditSource::Oneshot,
     );
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -240,6 +241,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
                     timestamp: audit::now_iso8601(),
                     user: user.clone(),
                     result: "error".into(),
+                    source: Some(AuditSource::Oneshot),
                     similarity: None,
                     frame_count: None,
                     duration_ms: Some(duration_ms),
