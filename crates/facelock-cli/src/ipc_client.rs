@@ -95,6 +95,61 @@ fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     Ok(PROXY.get_or_init(|| proxy).clone())
 }
 
+/// Extra headroom on top of the daemon's enrollment deadline: D-Bus
+/// activation / daemon startup, camera warmup, and inference on the final
+/// frame all happen inside the same method call.
+const ENROLL_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Send an Enroll request on a dedicated connection whose method timeout
+/// exceeds the daemon's enrollment deadline.
+///
+/// Enrollment runs synchronously inside the D-Bus method call for up to
+/// `Config::enroll_timeout_secs()` seconds (server side). The shared proxy's
+/// 15-second timeout is at or below that deadline, so it aborted the call
+/// with "I/O error: timed out" while the daemon was still enrolling
+/// (issue #89). The deadline is derived from the caller's `Config` here
+/// rather than passed in, so no caller can supply one that disagrees with
+/// the daemon's.
+pub fn send_enroll(
+    user: &str,
+    label: &str,
+    config: &facelock_core::Config,
+) -> anyhow::Result<DaemonResponse> {
+    let timeout =
+        std::time::Duration::from_secs(config.enroll_timeout_secs()) + ENROLL_TIMEOUT_MARGIN;
+    let connection = zbus::blocking::connection::Builder::system()
+        .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?
+        .method_timeout(timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("D-Bus connection failed: {e}"))?;
+    let proxy = Proxy::new_owned(connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|e| anyhow::anyhow!("D-Bus proxy failed: {e}"))?;
+
+    // A client-side timeout does NOT cancel the daemon's enrollment — it runs
+    // to completion and persists. Say so instead of leaving the user to retry
+    // into a duplicate label.
+    let result: (u32, u32) = proxy.call("Enroll", &(user, label)).map_err(|e| {
+        if is_timeout_error(&e) {
+            anyhow::Error::new(e).context(
+                "enrollment timed out client-side; the daemon may have completed it — \
+                 run `facelock list` before retrying",
+            )
+        } else {
+            anyhow::Error::new(e).context("D-Bus Enroll call failed")
+        }
+    })?;
+    Ok(DaemonResponse::Enrolled {
+        model_id: result.0,
+        embedding_count: result.1,
+    })
+}
+
+/// True for the client-side method-timeout shape: `method_timeout` expiring
+/// surfaces as an I/O `TimedOut` error.
+fn is_timeout_error(err: &zbus::Error) -> bool {
+    matches!(err, zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut)
+}
+
 /// True if a D-Bus error name denotes AccessDenied.
 fn is_access_denied_name(name: &str) -> bool {
     name == "org.freedesktop.DBus.Error.AccessDenied"
@@ -183,14 +238,10 @@ fn send_request_inner(request: &DaemonRequest) -> anyhow::Result<DaemonResponse>
                 failure_reason: None,
             }))
         }
-        DaemonRequest::Enroll { user, label } => {
-            let result: (u32, u32) = proxy
-                .call("Enroll", &(user.as_str(), label.as_str()))
-                .context("D-Bus Enroll call failed")?;
-            Ok(DaemonResponse::Enrolled {
-                model_id: result.0,
-                embedding_count: result.1,
-            })
+        // Enrollment needs a method timeout derived from the daemon's
+        // config-dependent deadline, which this shared proxy cannot provide.
+        DaemonRequest::Enroll { .. } => {
+            bail!("Enroll must use send_enroll (needs a config-derived timeout)")
         }
         DaemonRequest::ListModels { user } => {
             let models: Vec<ModelInfo> = proxy

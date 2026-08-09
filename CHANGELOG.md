@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enrollment failure breakdown** (#89): when enrollment captures too few
+  frames, the error now reports why frames were rejected (too dark, no face,
+  multiple faces, low quality, capture errors with the last error message) and
+  hints at the fix when one cause dominates (e.g. "improve lighting").
 - **Setup manages facelock group membership** (#89): `sudo facelock setup` now
   creates the `facelock` system group if missing and adds the invoking
   sudo/doas user to it (the interactive wizard asks first; non-interactive mode
@@ -19,8 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Direct-mode enrollment unified with the daemon loop** (#89): `facelock
+  enroll` in oneshot/direct mode previously ran a drifted copy of the
+  enrollment loop that skipped the frame quality gate and the angle-diversity
+  check, and lacked the new rejection breakdown. Both modes now share
+  `facelock_daemon::enroll` — direct enrollments get the same quality
+  enforcement and error reporting as daemon mode.
+- **Enroll no longer D-Bus-activates the daemon in direct mode** (#89): label
+  auto-generation and the model-count warning used an unconditional D-Bus
+  `ListModels` call, which could boot the system daemon via bus activation and
+  silently flip the enrollment from direct to daemon mode. They now read the
+  store directly when direct mode applies.
+
 ### Fixed
 
+- **D-Bus Enroll timeout race** (#89): the CLI's fixed 15-second D-Bus method
+  timeout was at or below the daemon's enrollment deadline
+  (3x `recognition.timeout_secs`, minimum 15s), so `facelock enroll` in daemon
+  mode could fail with "I/O error: timed out" while the daemon was still
+  enrolling. Enroll now uses a dedicated connection whose timeout is the shared
+  server deadline (`Config::enroll_timeout_secs()`) plus a 15-second margin.
 - **Bare D-Bus AccessDenied errors** (#89): when the system bus policy rejects
   a caller that is not root or in the `facelock` group, the CLI now appends an
   actionable hint (add user to group, re-login, or re-run setup) instead of a

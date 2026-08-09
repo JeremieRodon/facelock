@@ -39,7 +39,9 @@ audit:
 # Run all checks (test + lint + format + audit)
 check: test lint fmt-check audit
 
-# Build the PAM test container image (uses host-built release binaries)
+# Build the PAM test container image (uses host-built release binaries).
+# Keep in sync with .github/workflows/ci.yml, which builds this same image
+# directly rather than going through this recipe.
 _build-test-container: build-release
     podman build -t facelock-pam-test -f test/Containerfile .
 
@@ -47,8 +49,33 @@ _build-test-container: build-release
 test-arch-pam: _build-test-container
     podman run --rm facelock-pam-test
 
+# Guard for the camera tiers: the Containerfile bakes models/ into the image
+# with a tolerant `|| true`, so building from a checkout without the ONNX
+# models (fresh clone/worktree — they are downloaded, not tracked) produces an
+# image whose daemon cannot load the face engine and whose enroll bails before
+# opening the camera. Fail loudly here instead of debugging opaque test FAILs.
+# Check the two non-optional models by name: a checkout holding only the
+# optional ones (det_10g.onnx, glintr100.onnx) satisfies a bare *.onnx glob but
+# still leaves the default detector/embedder missing at runtime.
+_require-models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=()
+    for m in models/scrfd_2.5g_bnkps.onnx models/w600k_r50.onnx; do
+        [ -f "$m" ] || missing+=("$m")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "error: missing required ONNX models — the camera test tiers need them baked into the image:" >&2
+        for m in "${missing[@]}"; do echo "         $m" >&2; done
+        echo "       They are downloaded, not tracked. Copy them from the install tree" >&2
+        echo "       ('sudo facelock setup' downloads them to /var/lib/facelock/models):" >&2
+        echo "         cp /var/lib/facelock/models/*.onnx models/" >&2
+        echo "       (models/*.onnx is gitignored, so this cannot be committed by accident.)" >&2
+        exit 1
+    fi
+
 # Automated daemon integration tests (Arch, requires camera)
-test-arch-integration: _build-test-container
+test-arch-integration: _require-models _build-test-container
     #!/usr/bin/env bash
     set -euo pipefail
     devices=""
@@ -58,7 +85,7 @@ test-arch-integration: _build-test-container
     podman run --rm $devices facelock-pam-test /run-integration-tests.sh
 
 # Automated oneshot (daemonless) integration tests (Arch, requires camera)
-test-arch-oneshot: _build-test-container
+test-arch-oneshot: _require-models _build-test-container
     #!/usr/bin/env bash
     set -euo pipefail
     devices=""
