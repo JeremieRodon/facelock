@@ -181,7 +181,12 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
 
     // Load embeddings with encryption support, matching the daemon handler path.
     let mut stored = load_user_embeddings(&store, config, user)?;
-    let models = store.list_models(user).unwrap_or_default();
+    // Same shape as the daemon's `handle_authenticate` (C3): a storage failure
+    // is an error, not an empty model list that guarantees "no match". No
+    // rate-limit charge exists on this path, but the falsehood is the same.
+    let models = store
+        .list_models(user)
+        .context("storage error listing face models")?;
 
     // Shared with daemon mode (crates/facelock-daemon/src/auth.rs). A local copy
     // of this loop previously lived here and silently drifted — do not re-fork it.

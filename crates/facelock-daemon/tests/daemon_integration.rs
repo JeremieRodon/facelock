@@ -816,3 +816,97 @@ fn exempted_authenticate_does_not_consume_rate_limit_budget() {
 
     cleanup_db(&db_path);
 }
+
+/// C3 (issue #105): a storage failure while listing models during
+/// `Authenticate` must surface as `DaemonResponse::Error` — and must not
+/// consume rate-limit budget. Before the fix, a `list_models` error was
+/// folded into an empty model list, which filtered every stored embedding
+/// out of the device-allowed set, guaranteed "no match", and charged the
+/// user's rate-limit budget: retries walked straight into a silent lockout.
+///
+/// Failure injection: drop the `embedder_model` column from `face_models`
+/// (`label` is pinned by the `UNIQUE(user, label)` constraint). That way
+/// `pre_check`'s `has_models` (a `COUNT(*)`) and the embedding load (id +
+/// embedding only) still succeed, so the request gets past every earlier
+/// gate and exercises exactly the `list_models` call inside
+/// `handle_authenticate`.
+#[test]
+fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    let db_path = temp_db_path("storage-failure-auth");
+    cleanup_db(&db_path);
+
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+    config.recognition.timeout_secs = 0;
+    config.security.rate_limit.max_attempts = 1;
+    config.security.require_frame_variance = false;
+    config.security.require_landmark_liveness = false;
+
+    {
+        let store = FaceStore::create(&db_path).unwrap();
+        store
+            .add_model("testuser", "front", &fixtures::known_embedding(0), "")
+            .unwrap();
+    }
+
+    // Corrupt the schema so only `list_models` fails (see doc comment). The
+    // migrations' unconditional `CREATE TABLE IF NOT EXISTS` no-ops on the
+    // still-present table, and the V5 migration that would re-add the column
+    // is gated behind a schema version this database is already past, so the
+    // handler's own connection opens cleanly.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("ALTER TABLE face_models DROP COLUMN embedder_model;")
+            .unwrap();
+    }
+
+    let factory: Box<
+        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
+    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+
+    let mut handler = Handler::new(
+        config.clone(),
+        MockFaceEngine::no_faces(),
+        FaceStore::create(&db_path).unwrap(),
+        RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        ),
+        false,
+        facelock_core::types::DeviceFingerprint::default(),
+        Some(factory),
+        None,
+    )
+    .unwrap();
+
+    // charge_failed_attempt = true: this is the real-authentication path
+    // (`handle()` always charges); the exemption exists only for root `test`.
+    let resp = handler.handle_authenticate("testuser".into(), true);
+    match resp {
+        DaemonResponse::Error { ref message } => {
+            assert!(
+                message.contains("storage error"),
+                "error must name the storage failure, got: {message}"
+            );
+        }
+        other => panic!(
+            "a storage failure must be reported as Error, never as a no-match \
+             AuthResult; got {other:?}"
+        ),
+    }
+
+    // The part that bites users: the rate-limit counter must be unchanged.
+    // With max_attempts = 1, a single recorded failure would flip this check
+    // to "rate limited" — a fresh look at the same database must still say
+    // "not rate limited".
+    let inspect_store = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect_store.check_rate_limit("testuser", 1, 60).unwrap(),
+        "rate_limit counter must be unchanged by a storage-failure response"
+    );
+
+    cleanup_db(&db_path);
+}

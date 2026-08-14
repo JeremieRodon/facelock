@@ -526,6 +526,21 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             return resp;
         }
 
+        // A storage failure here must surface as an error, never fold into an
+        // empty model list (C3, issue #105): empty `models` means an empty
+        // device-allowed set, a guaranteed "no match", and a rate-limit charge
+        // for an attempt the user never got to make — retries then walk
+        // straight into a lockout. Matches what `pre_check` already returns
+        // for the same failure class, and runs before the camera is touched.
+        let models = match self.store.list_models(&user) {
+            Ok(m) => m,
+            Err(e) => {
+                return DaemonResponse::Error {
+                    message: format!("storage error: {e}"),
+                };
+            }
+        };
+
         if let Err(resp) = self.acquire_camera() {
             return resp;
         }
@@ -538,7 +553,6 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
 
         // Split borrows: take camera out, run auth, put it back
         let mut camera = self.camera.take().unwrap();
-        let models = self.store.list_models(&user).unwrap_or_default();
         let result = auth::authenticate_with_embeddings(
             &mut camera,
             &mut self.engine,
