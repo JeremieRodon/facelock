@@ -6,7 +6,7 @@ use facelock_core::notify::{NotifyEvent, notify_desktop_if_enabled};
 
 use crate::backend::{Backend, BackendKind};
 use crate::ipc_client;
-use crate::message::{Terminal, UserMessage, fail};
+use crate::message::{FaceMessage, Terminal, fail};
 use crate::notifications::DesktopNotifier;
 
 pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
@@ -22,18 +22,18 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
 
     // Check models exist — offer to run setup if missing
     if !crate::resolved::ModelFiles::probe(config).all_present() {
-        Terminal.info(&UserMessage::ModelsNotFoundOfferSetup);
-        if Terminal.confirm(&UserMessage::ConfirmDownloadModels)? {
+        Terminal.info(&FaceMessage::ModelsNotFoundOfferSetup);
+        if Terminal.confirm(&FaceMessage::ConfirmDownloadModels)? {
             crate::commands::setup::run(false)?;
             // Deliberate re-probe: setup just changed the disk. The judgment
             // still uses the Config this process parsed, as it always has —
             // setup may have rewritten the file, and picking that up would be
             // a mid-command re-read.
             if !crate::resolved::ModelFiles::probe(config).all_present() {
-                return Err(fail(UserMessage::ModelsStillMissingAfterSetup));
+                return Err(fail(FaceMessage::ModelsStillMissingAfterSetup));
             }
         } else {
-            return Err(fail(UserMessage::ModelsRequired));
+            return Err(fail(FaceMessage::ModelsRequired));
         }
     }
 
@@ -52,8 +52,8 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     // is an error, and must never be reported as "no models enrolled".
     let has_models = enrolled_check(&backend, config, &user)?;
     if !has_models {
-        Terminal.info(&UserMessage::NoModelsEnrolled { user: user.clone() });
-        Terminal.info(&UserMessage::RunEnrollFirst);
+        Terminal.info(&FaceMessage::NoModelsEnrolled { user: user.clone() });
+        Terminal.info(&FaceMessage::RunEnrollFirst);
         return Ok(());
     }
 
@@ -64,16 +64,16 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     {
         let config_embedder = &config.recognition.embedder_model;
         if !backend.has_models_for_embedder(&user, config_embedder)? {
-            Terminal.info(&UserMessage::NoMatchingEmbedder {
+            Terminal.info(&FaceMessage::NoMatchingEmbedder {
                 embedder: config_embedder.clone(),
             });
-            Terminal.info(&UserMessage::ReenrollHint);
+            Terminal.info(&FaceMessage::ReenrollHint);
             return Ok(());
         }
     }
 
-    Terminal.info(&UserMessage::TestingUser { user: user.clone() });
-    Terminal.info(&UserMessage::TestLookAtCamera);
+    Terminal.info(&FaceMessage::TestingUser { user: user.clone() });
+    Terminal.info(&FaceMessage::TestLookAtCamera);
 
     notify_desktop_if_enabled(notif_config, &notifier, &NotifyEvent::Scanning);
 
@@ -103,7 +103,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
             BackendKind::Daemon => {
                 let model_id = result.model_id.unwrap_or(0);
                 let label = result.label.as_deref().unwrap_or("unknown");
-                Terminal.info(&UserMessage::TestMatchedModel {
+                Terminal.info(&FaceMessage::TestMatchedModel {
                     model_id,
                     label: label.to_string(),
                     similarity: result.similarity,
@@ -111,7 +111,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                 });
             }
             _ => {
-                Terminal.info(&UserMessage::TestMatched {
+                Terminal.info(&FaceMessage::TestMatched {
                     similarity: result.similarity,
                     seconds: elapsed.as_secs_f64(),
                 });
@@ -144,7 +144,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     };
 
     if variance_blocked {
-        Terminal.info(&UserMessage::TestVarianceBlocked {
+        Terminal.info(&FaceMessage::TestVarianceBlocked {
             similarity: result.similarity,
             seconds: elapsed.as_secs_f64(),
         });
@@ -156,7 +156,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
             },
         );
     } else {
-        Terminal.info(&UserMessage::TestNoMatch {
+        Terminal.info(&FaceMessage::TestNoMatch {
             similarity: result.similarity,
             seconds: elapsed.as_secs_f64(),
         });

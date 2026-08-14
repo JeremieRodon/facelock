@@ -8,14 +8,14 @@
 use facelock_core::notify::{Notifier, NotifierFactory, NotifyEvent};
 use tracing::debug;
 
-use crate::message::UserMessage;
+use crate::message::{Message, NotifyMessage};
 
 /// Body text for the notification: user-facing, so it renders through the
 /// message seam (gettext at this edge, D10). The `reason` inside
 /// `NotifyEvent::Failure` is still free text composed upstream — making it
 /// structured is an H4 vocabulary follow-up.
 fn body(event: &NotifyEvent) -> String {
-    UserMessage::from(event).localized()
+    NotifyMessage::from(event).localized()
 }
 
 /// Freedesktop icon name for the notification.

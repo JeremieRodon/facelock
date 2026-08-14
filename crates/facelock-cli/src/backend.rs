@@ -39,7 +39,7 @@ use facelock_core::types::{FaceModelInfo, MatchResult};
 use facelock_daemon::auth::AuthOutcome;
 use facelock_store::StoreError;
 
-use crate::message::{Terminal, UserMessage};
+use crate::message::{AccessMessage, Terminal};
 use crate::resolved::Fact;
 use crate::{direct, ipc_client};
 
@@ -390,13 +390,13 @@ fn classify(
 /// What selection says, per kind: the log level for the machine line, and
 /// the user-facing stderr message, if any. Three kinds, three treatments —
 /// an expected configuration is silent, a degraded fallback warns once.
-fn announcement(kind: BackendKind) -> (tracing::Level, Option<UserMessage>) {
+fn announcement(kind: BackendKind) -> (tracing::Level, Option<AccessMessage>) {
     match kind {
         BackendKind::Daemon => (tracing::Level::DEBUG, None),
         BackendKind::DirectByConfig => (tracing::Level::DEBUG, None),
         BackendKind::DirectByFallback => (
             tracing::Level::WARN,
-            Some(UserMessage::DaemonUnreachableFallback),
+            Some(AccessMessage::DaemonUnreachableFallback),
         ),
     }
 }
@@ -498,7 +498,7 @@ mod tests {
 
         let (level, msg) = announcement(BackendKind::DirectByFallback);
         assert_eq!(level, tracing::Level::WARN);
-        assert_eq!(msg, Some(UserMessage::DaemonUnreachableFallback));
+        assert_eq!(msg, Some(AccessMessage::DaemonUnreachableFallback));
     }
 
     #[test]

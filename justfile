@@ -393,11 +393,14 @@ uninstall-files:
 
 # Regenerate translation templates (po/*.pot) from source. The CLI catalog
 # extracts every `translate("...")` literal in the message seam
-# (crates/facelock-cli/src/message.rs — the one place CLI user-facing English
-# lives); the PAM catalog extracts `gettext("...")` from pam-facelock.
+# (crates/facelock-cli/src/message/ — the one place CLI user-facing English
+# lives, one module per domain); the PAM catalog extracts `gettext("...")`
+# from pam-facelock.
 # xgettext has no Rust mode, but --language=C tokenizes these files correctly
 # because the seam keeps msgids as single-line plain literals (see the
-# "Adding a message" pattern in message.rs).
+# "Adding a message" pattern in message/mod.rs). The domain modules are
+# globbed and sorted so a new one is picked up without editing this recipe
+# and the output stays byte-stable.
 pot:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -406,9 +409,10 @@ pot:
         echo "       (Translations are optional; building facelock does not need this.)" >&2
         exit 1
     fi
+    mapfile -t seam < <(ls crates/facelock-cli/src/message/*.rs | LC_ALL=C sort)
     xgettext --language=C --keyword=translate --from-code=UTF-8 --no-wrap \
         --package-name=facelock --copyright-holder="Facelock Contributors" \
-        -o po/facelock.pot crates/facelock-cli/src/message.rs
+        -o po/facelock.pot "${seam[@]}"
     xgettext --language=C --keyword=gettext --from-code=UTF-8 --no-wrap \
         --package-name=pam_facelock --copyright-holder="Facelock Contributors" \
         -o po/pam_facelock.pot crates/pam-facelock/src/lib.rs

@@ -4,7 +4,7 @@ use facelock_core::Config;
 
 use crate::backend::Backend;
 use crate::ipc_client;
-use crate::message::{Terminal, UserMessage, fail};
+use crate::message::{FaceMessage, Terminal, fail};
 
 pub fn run(
     config: &Config,
@@ -19,16 +19,16 @@ pub fn run(
         let marker = std::path::Path::new(super::setup::SETUP_COMPLETE_MARKER);
         if !marker.exists() {
             ipc_client::require_root("sudo facelock setup")?;
-            Terminal.info(&UserMessage::SetupNotCompleted);
-            if Terminal.confirm(&UserMessage::ConfirmRunSetupNow)? {
+            Terminal.info(&FaceMessage::SetupNotCompleted);
+            if Terminal.confirm(&FaceMessage::ConfirmRunSetupNow)? {
                 super::setup::run(false)?;
                 if !marker.exists() {
-                    return Err(fail(UserMessage::SetupDidNotComplete));
+                    return Err(fail(FaceMessage::SetupDidNotComplete));
                 }
                 // Setup includes face enrollment (Step 4), so we're done
                 return Ok(());
             } else {
-                Terminal.info(&UserMessage::RunSetupWhenReady);
+                Terminal.info(&FaceMessage::RunSetupWhenReady);
                 return Ok(());
             }
         }
@@ -40,7 +40,7 @@ pub fn run(
     // warn prominently when the opt-in is active.
     if config.encryption.method == facelock_core::config::EncryptionMethod::None {
         if config.security.allow_plaintext {
-            Terminal.error(&UserMessage::PlaintextEnrollWarning);
+            Terminal.error(&FaceMessage::PlaintextEnrollWarning);
         } else if let Err(message) = config.ensure_enroll_encryption_allowed() {
             anyhow::bail!(message);
         }
@@ -49,7 +49,7 @@ pub fn run(
     // Models must exist before anything opens a camera. One probe through the
     // shared fact (D7) instead of a per-command re-derivation.
     if !crate::resolved::ModelFiles::probe(config).all_present() {
-        return Err(fail(UserMessage::ModelsMissing {
+        return Err(fail(FaceMessage::ModelsMissing {
             dir: config.daemon.model_dir.clone(),
         }));
     }
@@ -84,21 +84,21 @@ pub fn run(
         let has_stale = backend.has_models(&user)?
             && !backend.has_models_for_embedder(&user, config_embedder)?;
         if has_stale {
-            Terminal.info(&UserMessage::StaleEmbedderNote {
+            Terminal.info(&FaceMessage::StaleEmbedderNote {
                 embedder: config_embedder.clone(),
             });
         }
     }
 
-    Terminal.info(&UserMessage::Enrolling {
+    Terminal.info(&FaceMessage::Enrolling {
         user: user.clone(),
         label: label.clone(),
     });
-    Terminal.info(&UserMessage::EnrollLookAtCamera);
+    Terminal.info(&FaceMessage::EnrollLookAtCamera);
 
     let (model_id, embedding_count) = backend.enroll(&user, &label)?;
 
-    Terminal.info(&UserMessage::EnrollComplete {
+    Terminal.info(&FaceMessage::EnrollComplete {
         model_id,
         count: embedding_count,
         label: label.clone(),
@@ -136,7 +136,7 @@ fn check_model_count(user: &str, backend: &Backend) {
     // reported failure.
     if let Ok(models) = backend.list_models(user) {
         if models.len() > 5 {
-            Terminal.info(&UserMessage::TooManyModels {
+            Terminal.info(&FaceMessage::TooManyModels {
                 user: user.to_string(),
                 count: models.len(),
             });

@@ -61,13 +61,13 @@ impl ConfigLoad {
     /// wording cannot drift per command. The error's Display terminates on
     /// stderr, so it renders through the message seam (D10).
     pub fn require(self) -> anyhow::Result<Config> {
-        use crate::message::{UserMessage, fail};
+        use crate::message::{AccessMessage, fail};
         match self.result {
             Ok(config) => Ok(config),
-            Err(ConfigError::NotFound(_)) => Err(fail(UserMessage::NoConfigFile {
+            Err(ConfigError::NotFound(_)) => Err(fail(AccessMessage::NoConfigFile {
                 path: self.path.display().to_string(),
             })),
-            Err(e) => Err(fail(UserMessage::InvalidConfig {
+            Err(e) => Err(fail(AccessMessage::InvalidConfig {
                 path: self.path.display().to_string(),
                 error: e.to_string(),
             })),

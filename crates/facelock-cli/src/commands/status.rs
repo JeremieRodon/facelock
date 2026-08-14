@@ -21,7 +21,7 @@ use crate::health::{
     KeyMaterial, MarkerDiagnostic, NotificationHealth, OneshotFallback, PamWiring, SecurityHealth,
 };
 use crate::ipc_client;
-use crate::message::UserMessage;
+use crate::message::{Message, StatusMessage};
 use crate::resolved::{EpStatus, ExecutionProviderFact, Fact, ModelFiles};
 
 pub fn run(loaded: crate::resolved::ConfigLoad) -> anyhow::Result<()> {
@@ -40,7 +40,7 @@ pub fn run(loaded: crate::resolved::ConfigLoad) -> anyhow::Result<()> {
 /// root, camera, or bus.
 pub fn render(health: &Health) -> String {
     let mut out = String::new();
-    out.push_str(&UserMessage::StatusHeader.localized());
+    out.push_str(&StatusMessage::StatusHeader.localized());
     out.push_str("\n\n");
 
     render_config(&mut out, health);
@@ -62,7 +62,7 @@ pub fn render(health: &Health) -> String {
 // grepped by the container tests and stay untranslated by construction.
 // ---------------------------------------------------------------------------
 
-fn item(out: &mut String, label: &UserMessage, value: &str) {
+fn item(out: &mut String, label: &StatusMessage, value: &str) {
     let label = label.localized();
     if value.is_empty() {
         out.push_str(&format!("  {label}:\n"));
@@ -71,7 +71,7 @@ fn item(out: &mut String, label: &UserMessage, value: &str) {
     }
 }
 
-fn result(out: &mut String, ok: bool, msg: &UserMessage) {
+fn result(out: &mut String, ok: bool, msg: &StatusMessage) {
     let indicator = if ok { "[ok]" } else { "[!!]" };
     out.push_str(&format!("    {indicator} {}\n", msg.localized()));
 }
@@ -83,14 +83,18 @@ fn detail(out: &mut String, key: &str, value: &str) {
 /// The N4 rule in one place: a fact that could not be determined renders as
 /// exactly that.
 fn unknown(out: &mut String, why: &str) {
-    result(out, false, &UserMessage::StatusUnknown { why: why.into() });
+    result(
+        out,
+        false,
+        &StatusMessage::StatusUnknown { why: why.into() },
+    );
 }
 
 fn yes_no(value: bool) -> String {
     if value {
-        UserMessage::StatusYes.localized()
+        StatusMessage::StatusYes.localized()
     } else {
-        UserMessage::StatusNo.localized()
+        StatusMessage::StatusNo.localized()
     }
 }
 
@@ -101,23 +105,23 @@ fn yes_no(value: bool) -> String {
 fn render_config(out: &mut String, health: &Health) {
     item(
         out,
-        &UserMessage::StatusLabelConfigFile,
+        &StatusMessage::StatusLabelConfigFile,
         &health.config.path,
     );
     match &health.config.outcome {
         ConfigOutcome::Valid { device_path } => {
-            result(out, true, &UserMessage::StatusConfigValid);
+            result(out, true, &StatusMessage::StatusConfigValid);
             detail(
                 out,
                 "device.path",
                 device_path.as_deref().unwrap_or("(auto-detect)"),
             );
         }
-        ConfigOutcome::NotFound => result(out, false, &UserMessage::StatusConfigNotFound),
+        ConfigOutcome::NotFound => result(out, false, &StatusMessage::StatusConfigNotFound),
         ConfigOutcome::Invalid { error } => result(
             out,
             false,
-            &UserMessage::StatusConfigInvalid {
+            &StatusMessage::StatusConfigInvalid {
                 error: error.clone(),
             },
         ),
@@ -129,18 +133,18 @@ fn render_daemon(out: &mut String, daemon: &Fact<DaemonPing>) {
     // config (and so the mode) is unknown.
     item(
         out,
-        &UserMessage::StatusLabelDaemon,
+        &StatusMessage::StatusLabelDaemon,
         "org.facelock.Daemon (D-Bus system bus)",
     );
     match daemon {
         Fact::Unknown { why } => unknown(out, why),
         Fact::Probed(ping) | Fact::Claimed(ping) => match ping {
-            DaemonPing::NotConfigured => result(out, true, &UserMessage::StatusDaemonOneshot),
-            DaemonPing::Responding => result(out, true, &UserMessage::StatusDaemonResponding),
+            DaemonPing::NotConfigured => result(out, true, &StatusMessage::StatusDaemonOneshot),
+            DaemonPing::Responding => result(out, true, &StatusMessage::StatusDaemonResponding),
             DaemonPing::NotResponding { error } => result(
                 out,
                 false,
-                &UserMessage::StatusDaemonNotResponding {
+                &StatusMessage::StatusDaemonNotResponding {
                     error: error.clone(),
                 },
             ),
@@ -151,19 +155,19 @@ fn render_daemon(out: &mut String, daemon: &Fact<DaemonPing>) {
 fn render_fallback(out: &mut String, fallback: &Fact<OneshotFallback>) {
     match fallback {
         Fact::Unknown { why } => {
-            item(out, &UserMessage::StatusLabelOneshotFallback, "");
+            item(out, &StatusMessage::StatusLabelOneshotFallback, "");
             unknown(out, why);
         }
         Fact::Probed(fallback) | Fact::Claimed(fallback) => {
             item(
                 out,
-                &UserMessage::StatusLabelOneshotFallback,
+                &StatusMessage::StatusLabelOneshotFallback,
                 &fallback.auth_bin,
             );
             if fallback.usable() {
-                result(out, true, &UserMessage::StatusFallbackUsable);
+                result(out, true, &StatusMessage::StatusFallbackUsable);
             } else {
-                let missing = UserMessage::StatusMissing.localized();
+                let missing = StatusMessage::StatusMissing.localized();
                 for (key, present) in [
                     ("binary", fallback.auth_bin_present),
                     ("models", fallback.models_present),
@@ -173,7 +177,7 @@ fn render_fallback(out: &mut String, fallback: &Fact<OneshotFallback>) {
                         detail(out, key, &missing);
                     }
                 }
-                result(out, false, &UserMessage::StatusFallbackNotUsable);
+                result(out, false, &StatusMessage::StatusFallbackNotUsable);
             }
         }
     }
@@ -182,7 +186,7 @@ fn render_fallback(out: &mut String, fallback: &Fact<OneshotFallback>) {
 fn render_camera(out: &mut String, camera: &Fact<CameraHealth>) {
     match camera {
         Fact::Unknown { why } => {
-            item(out, &UserMessage::StatusLabelCameraDevice, "");
+            item(out, &StatusMessage::StatusLabelCameraDevice, "");
             unknown(out, why);
         }
         Fact::Probed(camera) | Fact::Claimed(camera) => match camera {
@@ -191,19 +195,23 @@ fn render_camera(out: &mut String, camera: &Fact<CameraHealth>) {
                 present,
                 interrogated,
             } => {
-                item(out, &UserMessage::StatusLabelCameraDevice, path);
+                item(out, &StatusMessage::StatusLabelCameraDevice, path);
                 if *present {
-                    result(out, true, &UserMessage::StatusCameraDeviceExists);
+                    result(out, true, &StatusMessage::StatusCameraDeviceExists);
                 } else {
-                    result(out, false, &UserMessage::StatusCameraDeviceNotFound);
+                    result(out, false, &StatusMessage::StatusCameraDeviceNotFound);
                 }
                 if let Some(camera) = interrogated {
                     camera_details(out, camera);
                 }
             }
             CameraHealth::AutoDetect { resolved } => {
-                item(out, &UserMessage::StatusLabelCameraDevice, "(auto-detect)");
-                result(out, true, &UserMessage::StatusCameraAutoDetect);
+                item(
+                    out,
+                    &StatusMessage::StatusLabelCameraDevice,
+                    "(auto-detect)",
+                );
+                result(out, true, &StatusMessage::StatusCameraAutoDetect);
                 if let Some(camera) = resolved {
                     detail(out, "device", &format!("{} ({})", camera.path, camera.name));
                     camera_details(out, camera);
@@ -226,17 +234,17 @@ fn camera_details(out: &mut String, camera: &InterrogatedCamera) {
 fn render_models(out: &mut String, models: &Fact<ModelFiles>) {
     match models {
         Fact::Unknown { why } => {
-            item(out, &UserMessage::StatusLabelModelDirectory, "");
+            item(out, &StatusMessage::StatusLabelModelDirectory, "");
             unknown(out, why);
         }
         Fact::Probed(models) | Fact::Claimed(models) => {
             item(
                 out,
-                &UserMessage::StatusLabelModelDirectory,
+                &StatusMessage::StatusLabelModelDirectory,
                 &models.dir.display().to_string(),
             );
             if !models.dir_present {
-                result(out, false, &UserMessage::StatusModelsDirNotFound);
+                result(out, false, &StatusMessage::StatusModelsDirNotFound);
                 return;
             }
             for (purpose, file) in [
@@ -245,9 +253,9 @@ fn render_models(out: &mut String, models: &Fact<ModelFiles>) {
             ] {
                 let filename = file.path.file_name().unwrap_or_default().to_string_lossy();
                 let presence = if file.present {
-                    UserMessage::StatusPresent
+                    StatusMessage::StatusPresent
                 } else {
-                    UserMessage::StatusMissing
+                    StatusMessage::StatusMissing
                 };
                 detail(
                     out,
@@ -256,9 +264,9 @@ fn render_models(out: &mut String, models: &Fact<ModelFiles>) {
                 );
             }
             if models.all_present() {
-                result(out, true, &UserMessage::StatusModelsAllPresent);
+                result(out, true, &StatusMessage::StatusModelsAllPresent);
             } else {
-                result(out, false, &UserMessage::StatusModelsSomeMissing);
+                result(out, false, &StatusMessage::StatusModelsSomeMissing);
             }
         }
     }
@@ -267,7 +275,7 @@ fn render_models(out: &mut String, models: &Fact<ModelFiles>) {
 fn render_execution_provider(out: &mut String, ep: &Fact<ExecutionProviderFact>) {
     match ep {
         Fact::Unknown { why } => {
-            item(out, &UserMessage::StatusLabelExecutionProvider, "");
+            item(out, &StatusMessage::StatusLabelExecutionProvider, "");
             unknown(out, why);
         }
         Fact::Probed(ep) | Fact::Claimed(ep) => {
@@ -278,15 +286,15 @@ fn render_execution_provider(out: &mut String, ep: &Fact<ExecutionProviderFact>)
                 "openvino" => "OpenVINO (Intel)",
                 other => other,
             };
-            item(out, &UserMessage::StatusLabelExecutionProvider, label);
+            item(out, &StatusMessage::StatusLabelExecutionProvider, label);
             match &ep.status {
-                EpStatus::Available => result(out, true, &UserMessage::StatusEpSupported),
-                EpStatus::NotBuiltIn => result(out, false, &UserMessage::StatusEpNotBuiltIn),
-                EpStatus::UnknownName => result(out, false, &UserMessage::StatusEpUnknownName),
+                EpStatus::Available => result(out, true, &StatusMessage::StatusEpSupported),
+                EpStatus::NotBuiltIn => result(out, false, &StatusMessage::StatusEpNotBuiltIn),
+                EpStatus::UnknownName => result(out, false, &StatusMessage::StatusEpUnknownName),
                 EpStatus::Unqueryable(error) => result(
                     out,
                     false,
-                    &UserMessage::StatusEpUnqueryable {
+                    &StatusMessage::StatusEpUnqueryable {
                         error: error.clone(),
                     },
                 ),
@@ -298,7 +306,7 @@ fn render_execution_provider(out: &mut String, ep: &Fact<ExecutionProviderFact>)
 fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
     match encryption {
         Fact::Unknown { why } => {
-            item(out, &UserMessage::StatusLabelEncryption, "");
+            item(out, &StatusMessage::StatusLabelEncryption, "");
             unknown(out, why);
         }
         Fact::Probed(encryption) | Fact::Claimed(encryption) => {
@@ -308,7 +316,7 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
                 EncryptionMethod::Keyfile => "AES-256-GCM (keyfile)",
                 EncryptionMethod::None => "none",
             };
-            item(out, &UserMessage::StatusLabelEncryption, method);
+            item(out, &StatusMessage::StatusLabelEncryption, method);
             match &encryption.material {
                 KeyMaterial::Tpm {
                     sealed_key_path,
@@ -320,7 +328,7 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
                         result(
                             out,
                             true,
-                            &UserMessage::StatusSealedKey {
+                            &StatusMessage::StatusSealedKey {
                                 path: sealed_key_path.clone(),
                             },
                         );
@@ -328,7 +336,7 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
                         result(
                             out,
                             false,
-                            &UserMessage::StatusSealedKeyMissing {
+                            &StatusMessage::StatusSealedKeyMissing {
                                 path: sealed_key_path.clone(),
                             },
                         );
@@ -336,7 +344,7 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
                         result(
                             out,
                             false,
-                            &UserMessage::StatusTpmDeviceMissing {
+                            &StatusMessage::StatusTpmDeviceMissing {
                                 path: device_path.clone(),
                             },
                         );
@@ -347,7 +355,7 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
                         result(
                             out,
                             true,
-                            &UserMessage::StatusKeyFile {
+                            &StatusMessage::StatusKeyFile {
                                 path: key_path.clone(),
                             },
                         );
@@ -355,14 +363,14 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
                         result(
                             out,
                             false,
-                            &UserMessage::StatusKeyFileMissing {
+                            &StatusMessage::StatusKeyFileMissing {
                                 path: key_path.clone(),
                             },
                         );
                     }
                 }
                 KeyMaterial::None => {
-                    result(out, false, &UserMessage::StatusPlaintextEmbeddings);
+                    result(out, false, &StatusMessage::StatusPlaintextEmbeddings);
                 }
             }
             if let Some((sealed, plaintext)) = encryption.sealed_counts {
@@ -376,19 +384,19 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
 }
 
 fn render_enrolled(out: &mut String, user: &str, enrolled: &Fact<EnrollmentHealth>) {
-    item(out, &UserMessage::StatusLabelEnrolledFaces, user);
+    item(out, &StatusMessage::StatusLabelEnrolledFaces, user);
     match enrolled {
         // The money case. An unreadable store renders as *cannot determine*
         // — never as "no faces enrolled" (N4).
         Fact::Unknown { why } => unknown(out, why),
         Fact::Probed(enrolled) | Fact::Claimed(enrolled) => {
             if enrolled.models.is_empty() {
-                result(out, false, &UserMessage::StatusNoFacesEnrolled);
+                result(out, false, &StatusMessage::StatusNoFacesEnrolled);
             } else {
                 result(
                     out,
                     true,
-                    &UserMessage::StatusModelCount {
+                    &StatusMessage::StatusModelCount {
                         count: enrolled.models.len(),
                     },
                 );
@@ -401,7 +409,7 @@ fn render_enrolled(out: &mut String, user: &str, enrolled: &Fact<EnrollmentHealt
                 MarkerDiagnostic::Mismatch { marker, store } => detail(
                     out,
                     "marker",
-                    &UserMessage::StatusMarkerMismatch {
+                    &StatusMessage::StatusMarkerMismatch {
                         marker: *marker,
                         store: *store,
                     }
@@ -410,7 +418,7 @@ fn render_enrolled(out: &mut String, user: &str, enrolled: &Fact<EnrollmentHealt
                 MarkerDiagnostic::Unreadable { why } => detail(
                     out,
                     "marker",
-                    &UserMessage::StatusMarkerUnreadable { why: why.clone() }.localized(),
+                    &StatusMessage::StatusMarkerUnreadable { why: why.clone() }.localized(),
                 ),
             }
         }
@@ -418,12 +426,12 @@ fn render_enrolled(out: &mut String, user: &str, enrolled: &Fact<EnrollmentHealt
 }
 
 fn render_security(out: &mut String, security: &Fact<SecurityHealth>) {
-    item(out, &UserMessage::StatusLabelSecurity, "");
+    item(out, &StatusMessage::StatusLabelSecurity, "");
     match security {
         Fact::Unknown { why } => unknown(out, why),
         Fact::Probed(security) | Fact::Claimed(security) => {
             if security.disabled {
-                result(out, false, &UserMessage::StatusSecurityDisabled);
+                result(out, false, &StatusMessage::StatusSecurityDisabled);
                 return;
             }
             detail(out, "require_ir", &yes_no(security.require_ir));
@@ -449,20 +457,20 @@ fn render_security(out: &mut String, security: &Fact<SecurityHealth>) {
 fn render_notifications(out: &mut String, notifications: &Fact<NotificationHealth>) {
     match notifications {
         Fact::Unknown { why } => {
-            item(out, &UserMessage::StatusLabelNotifications, "");
+            item(out, &StatusMessage::StatusLabelNotifications, "");
             unknown(out, why);
         }
         Fact::Probed(notifications) | Fact::Claimed(notifications) => {
             use facelock_core::config::NotificationMode;
             let mode = match notifications.mode {
-                NotificationMode::Off => UserMessage::StatusNotifyOff,
-                NotificationMode::Terminal => UserMessage::StatusNotifyTerminal,
-                NotificationMode::Desktop => UserMessage::StatusNotifyDesktop,
-                NotificationMode::Both => UserMessage::StatusNotifyBoth,
+                NotificationMode::Off => StatusMessage::StatusNotifyOff,
+                NotificationMode::Terminal => StatusMessage::StatusNotifyTerminal,
+                NotificationMode::Desktop => StatusMessage::StatusNotifyDesktop,
+                NotificationMode::Both => StatusMessage::StatusNotifyBoth,
             };
             item(
                 out,
-                &UserMessage::StatusLabelNotifications,
+                &StatusMessage::StatusLabelNotifications,
                 &mode.localized(),
             );
             if notifications.mode != NotificationMode::Off {
@@ -475,23 +483,23 @@ fn render_notifications(out: &mut String, notifications: &Fact<NotificationHealt
 }
 
 fn render_pam(out: &mut String, pam: &PamWiring) {
-    item(out, &UserMessage::StatusLabelPamModule, &pam.module_path);
+    item(out, &StatusMessage::StatusLabelPamModule, &pam.module_path);
     match &pam.installed_at {
         Some(path) if *path == pam.module_path => {
-            result(out, true, &UserMessage::StatusPamInstalled)
+            result(out, true, &StatusMessage::StatusPamInstalled)
         }
         Some(path) => result(
             out,
             true,
-            &UserMessage::StatusPamInstalledAt { path: path.clone() },
+            &StatusMessage::StatusPamInstalledAt { path: path.clone() },
         ),
-        None => result(out, false, &UserMessage::StatusPamNotInstalled),
+        None => result(out, false, &StatusMessage::StatusPamNotInstalled),
     }
     if let Some(configured) = pam.sudo_configured {
         let value = if configured {
-            UserMessage::StatusPamSudoConfigured
+            StatusMessage::StatusPamSudoConfigured
         } else {
-            UserMessage::StatusPamSudoNotConfigured
+            StatusMessage::StatusPamSudoNotConfigured
         };
         detail(out, "sudo PAM", &value.localized());
     }

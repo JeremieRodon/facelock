@@ -2,7 +2,7 @@ use facelock_core::Config;
 
 use crate::backend::Backend;
 use crate::ipc_client;
-use crate::message::{Terminal, UserMessage};
+use crate::message::{FaceMessage, Terminal};
 
 pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()> {
     // C6: root check must run before the confirmation prompt below — a group
@@ -17,25 +17,25 @@ pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> a
     let backend = Backend::select(config);
 
     if !yes {
-        let confirmed = Terminal.confirm(&UserMessage::ConfirmRemoveModel {
+        let confirmed = Terminal.confirm(&FaceMessage::ConfirmRemoveModel {
             model_id,
             user: user.clone(),
         })?;
         if !confirmed {
-            Terminal.info(&UserMessage::Cancelled);
+            Terminal.info(&FaceMessage::Cancelled);
             return Ok(());
         }
     }
 
     match backend.remove_model(&user, model_id)? {
-        Some(false) => Terminal.info(&UserMessage::ModelNotFound {
+        Some(false) => Terminal.info(&FaceMessage::ModelNotFound {
             model_id,
             user: user.clone(),
         }),
         // `None`: the daemon reply cannot say whether the model existed
         // (wire-stable), so a completed request reports as removed — as the
         // daemon path always has.
-        Some(true) | None => Terminal.info(&UserMessage::RemovedModel {
+        Some(true) | None => Terminal.info(&FaceMessage::RemovedModel {
             model_id,
             user: user.clone(),
         }),

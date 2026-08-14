@@ -2,7 +2,7 @@ use facelock_core::Config;
 
 use crate::backend::Backend;
 use crate::ipc_client;
-use crate::message::{Terminal, UserMessage};
+use crate::message::{FaceMessage, Terminal};
 
 pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<()> {
     // ClearModels is root-only on the daemon side too, so demand root up front.
@@ -21,14 +21,14 @@ pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<(
     // never "no models enrolled", never "assume yes and prompt anyway" — and
     // a provably absent database reads as "no models" without being created.
     if !backend.has_models(&user)? {
-        Terminal.info(&UserMessage::NoModelsEnrolled { user: user.clone() });
+        Terminal.info(&FaceMessage::NoModelsEnrolled { user: user.clone() });
         return Ok(());
     }
 
     if !yes {
-        let confirmed = Terminal.confirm(&UserMessage::ConfirmClearAll { user: user.clone() })?;
+        let confirmed = Terminal.confirm(&FaceMessage::ConfirmClearAll { user: user.clone() })?;
         if !confirmed {
-            Terminal.info(&UserMessage::Cancelled);
+            Terminal.info(&FaceMessage::Cancelled);
             return Ok(());
         }
     }
@@ -36,11 +36,11 @@ pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<(
     match backend.clear_models(&user)? {
         // The direct backend counted what it deleted; the daemon reply
         // cannot carry a count (wire-stable), so the message differs.
-        Some(count) => Terminal.info(&UserMessage::ClearedModels {
+        Some(count) => Terminal.info(&FaceMessage::ClearedModels {
             count,
             user: user.clone(),
         }),
-        None => Terminal.info(&UserMessage::AllModelsRemoved { user: user.clone() }),
+        None => Terminal.info(&FaceMessage::AllModelsRemoved { user: user.clone() }),
     }
 
     // The user has no models by construction, so drop the marker outright.

@@ -8,7 +8,7 @@ use facelock_core::Config;
 
 use crate::backend::{Backend, BackendKind};
 use crate::ipc_client;
-use crate::message::{Terminal, UserMessage};
+use crate::message::{AccessMessage, Terminal};
 
 pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Result<()> {
     // DEC-6/N13: `PreviewDetectFrame` is root-only now — it was the last
@@ -44,10 +44,10 @@ pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Re
 
 /// Why graphical preview is unavailable on a direct backend, accurately per
 /// kind.
-fn graphical_unavailable_message(kind: BackendKind) -> UserMessage {
+fn graphical_unavailable_message(kind: BackendKind) -> AccessMessage {
     match kind {
-        BackendKind::DirectByFallback => UserMessage::PreviewGraphicalDaemonUnreachable,
-        _ => UserMessage::PreviewGraphicalNeedsDaemonOneshot,
+        BackendKind::DirectByFallback => AccessMessage::PreviewGraphicalDaemonUnreachable,
+        _ => AccessMessage::PreviewGraphicalNeedsDaemonOneshot,
     }
 }
 
@@ -87,11 +87,11 @@ mod tests {
     fn stopped_daemon_is_not_blamed_on_configuration() {
         assert_eq!(
             graphical_unavailable_message(BackendKind::DirectByFallback),
-            UserMessage::PreviewGraphicalDaemonUnreachable
+            AccessMessage::PreviewGraphicalDaemonUnreachable
         );
         assert_eq!(
             graphical_unavailable_message(BackendKind::DirectByConfig),
-            UserMessage::PreviewGraphicalNeedsDaemonOneshot
+            AccessMessage::PreviewGraphicalNeedsDaemonOneshot
         );
     }
 
