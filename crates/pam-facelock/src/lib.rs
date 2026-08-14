@@ -118,10 +118,24 @@ enum PamNotificationMode {
     Off,
     /// The default mode, named once in [`PamNotificationConfig::default`] and
     /// nowhere else. It must equal facelock-core's `NotificationMode`
-    /// default. This enum deliberately has no `Default` impl: it carried a
-    /// second answer to the same question, and the two drifted (`Both` here,
-    /// `Terminal` there) — undetected because `terminal()` treats Both and
-    /// Terminal identically.
+    /// default.
+    ///
+    /// This enum deliberately has no `Default` impl. It carried a second
+    /// answer to the same question and the two drifted (`Both` here,
+    /// `Terminal` there), undetected because `terminal()` treats Both and
+    /// Terminal identically. Deleting it is not just tidying: with no
+    /// `Default`, re-adding `#[serde(default)]` to the `mode` field does not
+    /// compile, so the drift cannot come back the way it arrived. The one
+    /// remaining route — `#[serde(default = "some_fn")]`, which needs no
+    /// `Default` — is caught by
+    /// `notification_section_present_with_keys_omitted_equals_absent`.
+    ///
+    /// facelock-core's mirror of this enum KEEPS its `Default`, deliberately:
+    /// two sibling enums there (`SnapshotMode`, `EncryptionMethod`) still
+    /// have live field-level defaults, so removing only this one would be a
+    /// locally-invisible asymmetry. The two crates must agree on the default
+    /// *value*, not on how each spells it. Do not "restore" this impl for
+    /// symmetry with core.
     Terminal,
     Desktop,
     Both,
