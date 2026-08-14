@@ -36,6 +36,12 @@ const LOG_WARNING: libc::c_int = 4;
 const DEFAULT_CONFIG_PATH: &str = "/etc/facelock/config.toml";
 const DEFAULT_TIMEOUT_SECS: u32 = 5;
 
+/// The binary spawned for oneshot authentication. Hardcoded: a configurable
+/// path would let anyone who can influence the config select which binary a
+/// root PAM context executes (E7/N9). The path is still validated as
+/// root-owned and non-writable before spawning.
+const AUTH_BIN: &str = "/usr/bin/facelock";
+
 // D-Bus constants
 const DBUS_BUS_NAME: &str = "org.facelock.Daemon";
 const DBUS_OBJECT_PATH: &str = "/org/facelock/Daemon";
@@ -62,16 +68,14 @@ struct PamDaemonConfig {
     /// "daemon" (default) or "oneshot"
     #[serde(default = "default_mode")]
     mode: String,
-    /// Path to the facelock binary for oneshot mode
-    #[serde(default = "default_auth_bin")]
-    auth_bin: String,
+    // The oneshot binary path is NOT configurable — see `AUTH_BIN`. A leftover
+    // `auth_bin` key in an existing config is silently ignored (serde default).
 }
 
 impl Default for PamDaemonConfig {
     fn default() -> Self {
         Self {
             mode: default_mode(),
-            auth_bin: default_auth_bin(),
         }
     }
 }
@@ -173,10 +177,6 @@ fn default_timeout() -> u32 {
 
 fn default_mode() -> String {
     "daemon".to_string()
-}
-
-fn default_auth_bin() -> String {
-    "/usr/bin/facelock".to_string()
 }
 
 fn default_true() -> bool {
@@ -750,7 +750,7 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
 
     let timeout_secs = config.recognition.timeout_secs as u64 + 3; // buffer for model load
 
-    let auth_bin = match validate_auth_bin(&config.daemon.auth_bin) {
+    let auth_bin = match validate_auth_bin(AUTH_BIN) {
         Ok(path) => path,
         Err(e) => {
             log_auth(
@@ -1115,6 +1115,19 @@ db_path = "/tmp/test.db"
 "#;
         let config: PamConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.daemon.mode, "daemon");
+    }
+
+    #[test]
+    fn config_with_removed_auth_bin_key_still_parses() {
+        // N9 removed the `auth_bin` key. Existing installs may still have it
+        // in /etc/facelock/config.toml; it must be ignored, never an error.
+        let toml_str = r#"
+[daemon]
+mode = "oneshot"
+auth_bin = "/usr/local/bin/evil"
+"#;
+        let config: PamConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.daemon.mode, "oneshot");
     }
 
     #[test]
