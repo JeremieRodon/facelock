@@ -482,15 +482,29 @@ Sentinel `model_id` values (only meaningful with `matched == false`):
 | model_id | Meaning |
 |----------|---------|
 | >= 0 | Matched model id (with `matched == true`) |
-| -1 | No match / no enrolled faces |
+| -1 | No match, and no face was detected (also: no enrolled faces, and the pre-camera gates) |
 | -2 | Recoverable daemon error; `label` carries the error message (rate limited, IR required, camera/storage failure) |
 | -3 | Suppressed: no enrolled models and `security.suppress_unknown = true` |
+| -4 | No match, and the detector **did** see a face |
 
 Recoverable errors travel **in-band** (model_id `-2`), not as D-Bus errors, so
 clients can distinguish "the daemon decided auth cannot proceed" from "the
 daemon is unavailable". D-Bus errors remain for authorization failures,
 daemon-busy, and transport problems. In particular, a rate-limited state is a
 daemon decision and must never make the PAM client retry via a root oneshot.
+
+`-4` exists because `similarity` cannot carry "was a face seen?": the score is
+redacted to `0.0` for every non-root caller, so a user-run locker (hyprlock)
+could not tell a genuine face-seen non-match from an empty frame and abstained
+(`PAM_IGNORE`) for both. It is a *detector* signal — a face was present, never
+how close it came to an enrolled template — so unlike `similarity` it is not a
+hill-climbing oracle and is not redacted.
+
+A PAM module older than `-4` decodes it as an ordinary non-match (its sentinel
+match falls through to the same arm as `-1`), so a daemon newer than the
+installed module degrades to the previous behavior rather than breaking. In the
+other direction, a `-1` reply carries no face-seen signal at all, and the module
+falls back to the score test it used before.
 
 ### Rejection classes (`AuthOutcome::Error`)
 
@@ -529,7 +543,8 @@ the module falls through (oneshot fallback / password), never `PAM_SUCCESS`.
 | Outcome | PAM Code |
 |---------|----------|
 | Face matched | `PAM_SUCCESS` (0) |
-| No match | `PAM_AUTH_ERR` (7) |
+| No match, face seen (model_id -4) | `PAM_AUTH_ERR` (7) |
+| No match, no face seen (model_id -1) | `PAM_IGNORE` (25) |
 | Rate limited (daemon, model_id -2) | `PAM_AUTH_ERR` (7) — no oneshot fallback |
 | IR required / internal daemon error (model_id -2) | `PAM_IGNORE` (25) — no oneshot fallback |
 | Suppressed (model_id -3) | `PAM_AUTHINFO_UNAVAIL` (9) |

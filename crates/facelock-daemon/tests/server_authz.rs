@@ -5,9 +5,11 @@
 //!
 //! Covered here: the method-level entry points end to end minus zbus —
 //! per-method authorization (denials, the Authenticate self-scope, the
-//! root-only catch-all), the in-band `-2`/`-3` sentinel encoding with its
-//! byte-exact protocol strings, similarity redaction for non-root callers,
-//! and which entry point charges the rate limit (N11).
+//! root-only catch-all), the in-band `-2`/`-3`/`-4` sentinel encoding with its
+//! byte-exact protocol strings, similarity redaction for non-root callers
+//! (and the `-4` sentinel that keeps a redacted caller able to tell a
+//! face-seen non-match from an empty frame), and which entry point charges
+//! the rate limit (N11).
 //!
 //! NOT covered here, deliberately: the zbus wiring — caller-identity
 //! resolution from message headers (`GetConnectionUnixUser`), signal
@@ -368,6 +370,114 @@ async fn suppress_unknown_maps_to_the_minus_three_sentinel() {
     assert!(!result.matched);
     assert_eq!(result.model_id, -3, "suppressed sentinel");
     assert!(result.label.is_empty());
+}
+
+/// An embedding no fixture is near. The `known_embedding` family are all
+/// near-uniform unit vectors (cosine ≈ 1.0 to each other), so a genuine
+/// non-match needs a vector pointing elsewhere: cosine from this one to any
+/// of them is ≈ 1/√512 ≈ 0.044, far under the 0.45 test threshold.
+fn unrelated_embedding() -> facelock_core::types::FaceEmbedding {
+    let mut emb = [0.0f32; 512];
+    emb[0] = 1.0;
+    emb
+}
+
+/// A non-root caller must be able to tell "we saw you and it was not a match"
+/// from "the camera saw nobody" — the distinction PAM needs to choose
+/// `PAM_AUTH_ERR` over `PAM_IGNORE`.
+///
+/// It could not: PAM inferred "no face was seen" from `similarity == 0.0`,
+/// but the N12 redaction (PR #108) zeroes the score for *every* non-root
+/// caller, so for a user-run locker (hyprlock) both cases arrived identical
+/// and both abstained. #108 spotted this and deferred it to #109, which never
+/// carried it.
+///
+/// What this covers: the daemon's reply, through the real service and the
+/// real redaction, for the two cases as an unprivileged caller sees them.
+/// What it does not: PAM itself, which is a separate binary that cannot be
+/// linked here — `pam_code_for_no_match` in `pam-facelock` covers the
+/// decision this reply feeds.
+#[tokio::test]
+async fn a_redacted_caller_can_tell_a_seen_face_from_an_empty_frame() {
+    let store = FaceStore::open_memory().unwrap();
+    store
+        .add_model(
+            "alice",
+            "front",
+            &fixtures::known_embedding(1),
+            "test-embedder",
+        )
+        .unwrap();
+    let saw_someone = service(handler_with(
+        test_config(5, 1),
+        MockFaceEngine::one_face(unrelated_embedding()),
+        store,
+    ));
+
+    let seen = saw_someone.authenticate_as(alice(), "alice").await.unwrap();
+    assert!(!seen.matched, "an unrelated face must not authenticate");
+    assert_eq!(
+        seen.similarity, 0.0,
+        "the score is redacted for a non-root caller, which is why the \
+         sentinel has to carry the signal instead"
+    );
+    assert_eq!(
+        seen.model_id, -4,
+        "a face was detected and did not match: {seen:?}"
+    );
+
+    let empty_store = FaceStore::open_memory().unwrap();
+    empty_store
+        .add_model(
+            "alice",
+            "front",
+            &fixtures::known_embedding(1),
+            "test-embedder",
+        )
+        .unwrap();
+    let saw_nobody = service(handler_with(
+        test_config(5, 1),
+        MockFaceEngine::no_faces(),
+        empty_store,
+    ));
+
+    let unseen = saw_nobody.authenticate_as(alice(), "alice").await.unwrap();
+    assert!(!unseen.matched);
+    assert_eq!(unseen.similarity, 0.0);
+    assert_eq!(unseen.model_id, -1, "no face was detected: {unseen:?}");
+
+    // The point of the whole exercise: the two replies are no longer the same
+    // bytes to a caller who cannot see the score.
+    assert_ne!(
+        (seen.model_id, seen.similarity),
+        (unseen.model_id, unseen.similarity),
+        "a redacted caller must still be able to distinguish these"
+    );
+}
+
+/// The `-4` sentinel must not reach a caller who did match, and must not
+/// disturb the score a root caller is allowed to see.
+#[tokio::test]
+async fn a_match_still_reports_its_model_id_and_score_to_root() {
+    let emb = fixtures::known_embedding(1);
+    let store = FaceStore::open_memory().unwrap();
+    let model_id = store
+        .add_model("alice", "front", &emb, "test-embedder")
+        .unwrap();
+
+    let svc = service(handler_with(
+        test_config(5, 1),
+        MockFaceEngine::one_face(emb),
+        store,
+    ));
+
+    let result = svc.authenticate_as(root(), "alice").await.unwrap();
+    assert!(result.matched);
+    assert_eq!(result.model_id, model_id as i32);
+    assert!(
+        result.similarity > 0.45,
+        "root sees the real score: {result:?}"
+    );
 }
 
 /// REGRESSION PIN: a ROOT caller's failed `Authenticate` charges the

@@ -321,6 +321,19 @@ pub struct MatchResult {
     pub model_id: Option<u32>,
     pub label: Option<String>,
     pub similarity: f32,
+    /// Whether the detector found a face at any point during the attempt.
+    ///
+    /// Carried explicitly because it cannot be inferred from `similarity`: the
+    /// score is redacted to `0.0` for every non-root D-Bus caller, which made
+    /// "a face was seen and did not match" indistinguishable from "the camera
+    /// saw nobody" for user-run lockers. Reaches the wire as the `model_id`
+    /// `-4` sentinel (docs/contracts.md).
+    ///
+    /// This is a *detector* signal, not a matcher signal — it says a face was
+    /// present, never how close it came to an enrolled template — so unlike
+    /// `similarity` it is not a hill-climbing oracle and is not redacted.
+    #[serde(default)]
+    pub face_detected: bool,
     /// Why the attempt failed despite matching frames (internal diagnostics;
     /// not part of the D-Bus wire contract).
     #[serde(default, skip_serializing_if = "Option::is_none")]

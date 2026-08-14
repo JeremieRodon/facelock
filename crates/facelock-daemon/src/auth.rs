@@ -293,6 +293,9 @@ pub fn pre_check_with_context(
             model_id: None,
             label: None,
             similarity: 0.0,
+            // No camera was opened on this path, so no face can have been
+            // seen — the gate rejected before any capture.
+            face_detected: false,
             failure_reason: None,
         }));
     }
@@ -520,6 +523,11 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     let mut variance_ever_passed = false;
     let mut dark_count: u32 = 0;
     let mut frame_count: u32 = 0;
+    // Whether the detector ever found a face during this attempt. Reported to
+    // clients so "we looked and nobody was there" is distinguishable from "we
+    // saw you and it wasn't a match" without reading the similarity score,
+    // which is redacted to 0.0 for non-root callers (review C4 / #108's N12).
+    let mut face_detected = false;
     let mut best_model_id: Option<u32> = None;
     let mut landmark_tracker = LandmarkTracker::new(
         10,
@@ -565,6 +573,9 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
             debug!(frame = frame_count, "no faces detected");
             continue;
         }
+        // Detection, not recognition: a face rejected below by the IR texture
+        // gate or by the compare set still means the camera saw somebody.
+        face_detected = true;
 
         // Push landmarks from the first detected face for liveness tracking
         if let Some((det, _)) = faces.first() {
@@ -692,6 +703,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                     model_id: best_model_id,
                     label: best_model_id.and_then(&label_for),
                     similarity: best_similarity,
+                    face_detected,
                     failure_reason: None,
                 });
                 // Zero sensitive data before returning
@@ -743,6 +755,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                 model_id: best_model_id,
                 label: best_model_id.and_then(&label_for),
                 similarity: best_similarity,
+                face_detected,
                 failure_reason: None,
             });
             zeroize_stored_embeddings(stored);
@@ -831,6 +844,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         model_id: None,
         label: None,
         similarity: best_similarity,
+        face_detected,
         failure_reason,
     })
 }

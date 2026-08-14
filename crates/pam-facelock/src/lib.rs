@@ -434,8 +434,12 @@ enum AuthResponse {
         #[allow(dead_code)]
         similarity: f32,
     },
-    /// Face not matched
+    /// Face not matched, and the daemon gave no face-seen signal — either it
+    /// saw nobody, or it predates the `-4` sentinel.
     NoMatch { similarity: f32 },
+    /// Face not matched, and the daemon explicitly reports that its detector
+    /// did see a face (`model_id == -4`).
+    NoMatchFaceSeen,
     /// No enrolled models and suppress_unknown is enabled.
     /// PAM should return PAM_AUTHINFO_UNAVAIL to let the stack try the next module.
     Suppressed,
@@ -494,6 +498,7 @@ fn classify_fdo_error(prefix: &str, err: &zbus::fdo::Error) -> String {
 /// - `-2`: recoverable daemon error, `label` carries the error message
 ///   (rate limited, IR required, camera/storage failure).
 /// - `-3`: suppressed (no enrolled models + `suppress_unknown`).
+/// - `-4`: no match, and the daemon's detector did see a face.
 fn parse_auth_reply(matched: bool, model_id: i32, label: String, similarity: f64) -> AuthResponse {
     if matched {
         return AuthResponse::Matched {
@@ -503,6 +508,7 @@ fn parse_auth_reply(matched: bool, model_id: i32, label: String, similarity: f64
     match model_id {
         -2 => AuthResponse::Error { message: label },
         -3 => AuthResponse::Suppressed,
+        -4 => AuthResponse::NoMatchFaceSeen,
         _ => AuthResponse::NoMatch {
             similarity: similarity as f32,
         },
@@ -873,6 +879,34 @@ fn pam_code_for_daemon_error(message: &str) -> (libc::c_int, &'static str) {
     }
 }
 
+/// Map an unmatched authentication onto a PAM return code.
+///
+/// `face_seen` is the daemon's explicit answer to "did the detector see
+/// anybody?", carried by the `model_id == -4` sentinel. Reading it off
+/// `similarity` instead is what this exists to stop: the score is redacted to
+/// `0.0` for every non-root caller, so for a user-run locker (hyprlock) a
+/// genuine face-seen non-match was indistinguishable from an empty frame and
+/// wrongly abstained (#108's N12, deferred to #109 and never carried).
+///
+/// `similarity` is only consulted when the reply carries no face-seen signal,
+/// which for a current daemon means no face was seen — the same answer. It is
+/// the fallback for a daemon older than the `-4` sentinel, where it reproduces
+/// the previous behavior exactly.
+///
+/// Never PAM_SUCCESS: an unmatched attempt either fails or abstains.
+fn pam_code_for_no_match(face_seen: bool, similarity: f32) -> libc::c_int {
+    if face_seen {
+        // The daemon looked at a face and said no. That is a decision, so
+        // fail rather than abstain.
+        return PAM_AUTH_ERR;
+    }
+    if similarity == 0.0 {
+        PAM_IGNORE
+    } else {
+        PAM_AUTH_ERR
+    }
+}
+
 fn identify(pamh: *mut libc::c_void) -> libc::c_int {
     // 0. Get PAM service name for logging
     let service = unsafe { pam_get_service(pamh) }.unwrap_or_else(|| "unknown".to_string());
@@ -961,13 +995,13 @@ fn identify(pamh: *mut libc::c_void) -> libc::c_int {
             }
             PAM_SUCCESS
         }
+        Ok(AuthResponse::NoMatchFaceSeen) => {
+            log_auth(&service, "no_match", &user, LOG_INFO);
+            pam_code_for_no_match(true, 0.0)
+        }
         Ok(AuthResponse::NoMatch { similarity }) => {
             log_auth(&service, "no_match", &user, LOG_INFO);
-            if similarity == 0.0 {
-                PAM_IGNORE
-            } else {
-                PAM_AUTH_ERR
-            }
+            pam_code_for_no_match(false, similarity)
         }
         Ok(AuthResponse::Suppressed) => {
             log_auth(&service, "suppressed (no enrolled models)", &user, LOG_INFO);
@@ -1322,6 +1356,66 @@ auth_bin = "/usr/local/bin/evil"
         match parse_auth_reply(false, -1, String::new(), 0.4) {
             AuthResponse::NoMatch { similarity } => assert!((similarity - 0.4).abs() < 1e-6),
             _ => panic!("expected NoMatch"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_reply_decodes_face_seen_no_match() {
+        assert!(matches!(
+            parse_auth_reply(false, -4, String::new(), 0.0),
+            AuthResponse::NoMatchFaceSeen
+        ));
+    }
+
+    /// The defect: a non-root caller's score is redacted to 0.0 by the daemon
+    /// (PR #108's N12), so "we saw a face and it did not match" and "the
+    /// camera saw nobody" arrived as the same reply and both abstained. A
+    /// user-run locker (hyprlock) is exactly that caller.
+    ///
+    /// Both replies below carry `similarity == 0.0`, as a redacted caller's
+    /// always do; only the sentinel separates them, and only the sentinel is
+    /// consulted.
+    #[test]
+    fn a_redacted_face_seen_no_match_is_not_read_as_an_empty_frame() {
+        let face_seen = parse_auth_reply(false, -4, String::new(), 0.0);
+        let no_face = parse_auth_reply(false, -1, String::new(), 0.0);
+
+        let code_for = |response: &AuthResponse| match response {
+            AuthResponse::NoMatchFaceSeen => pam_code_for_no_match(true, 0.0),
+            AuthResponse::NoMatch { similarity } => pam_code_for_no_match(false, *similarity),
+            _ => panic!("expected a non-match reply"),
+        };
+
+        assert_eq!(
+            code_for(&face_seen),
+            PAM_AUTH_ERR,
+            "the daemon looked at a face and said no — that is a decision"
+        );
+        assert_eq!(
+            code_for(&no_face),
+            PAM_IGNORE,
+            "the camera saw nobody — abstain"
+        );
+    }
+
+    /// The pre-`-4` fallback, which a daemon older than the sentinel still
+    /// exercises: `-1` plus an unredacted (root-caller) score reproduces the
+    /// previous behavior exactly, so an upgrade window cannot change any
+    /// existing decision.
+    #[test]
+    fn no_match_without_a_face_seen_signal_falls_back_to_the_score() {
+        assert_eq!(pam_code_for_no_match(false, 0.0), PAM_IGNORE);
+        assert_eq!(pam_code_for_no_match(false, 0.31), PAM_AUTH_ERR);
+    }
+
+    #[test]
+    fn no_match_never_maps_to_success() {
+        for (face_seen, similarity) in [(true, 0.0), (true, 0.9), (false, 0.0), (false, 0.42)] {
+            assert_ne!(
+                pam_code_for_no_match(face_seen, similarity),
+                PAM_SUCCESS,
+                "fail-open for face_seen={face_seen} similarity={similarity}"
+            );
         }
     }
 

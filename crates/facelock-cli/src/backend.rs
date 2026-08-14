@@ -265,6 +265,7 @@ impl<'a> Backend<'a> {
                     model_id: None,
                     label: None,
                     similarity: 0.0,
+                    face_detected: false,
                     failure_reason: None,
                 }),
                 AuthOutcome::Error { message, .. } => bail!("daemon error: {message}"),

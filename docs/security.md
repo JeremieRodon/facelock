@@ -495,6 +495,14 @@ PAM still matches the message because it cannot link the daemon crate, so the
 two strings it matches (`rate limited`, `IR camera required`) are frozen
 protocol — see docs/contracts.md, "Rejection classes".
 
+A non-match reply also states explicitly whether a face was detected
+(`model_id == -4`). PAM used to infer that from `similarity == 0.0`, which is
+wrong for any non-root caller because the score is redacted to `0.0` for all of
+them; a user-run locker therefore abstained on genuine non-matches. The
+face-detected bit is a detector signal, not a matcher signal — it says a face
+was present, never how close it came — so it is not a hill-climbing oracle and
+is not redacted.
+
 #### A4. Auth-Attempt Signal Hygiene (Implemented)
 
 **Attack**: Any local user adds a match rule (or runs `dbus-monitor`) and passively observes `AuthAttempted` broadcast signals to learn who authenticates when — and, if the payload carried the raw similarity score, uses it as a spoof-tuning oracle (iterate on a photo/mask until the score climbs).

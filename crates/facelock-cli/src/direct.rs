@@ -148,6 +148,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
                 model_id: None,
                 label: None,
                 similarity: 0.0,
+                face_detected: false,
                 failure_reason: None,
             }),
             AuthOutcome::Error { message, .. } => bail!("{message}"),

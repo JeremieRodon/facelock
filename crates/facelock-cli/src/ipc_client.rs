@@ -233,9 +233,10 @@ pub fn test_authenticate(user: &str) -> anyhow::Result<AuthOutcome> {
 /// "Authenticate error encoding"): `model_id == -2` is a recoverable daemon
 /// error travelling as data (label carries the message, byte-identical —
 /// PAM string-matches "rate limited"), `-3` is the `suppress_unknown`
-/// short-circuit. Split from the transport so the sentinel decoding is
-/// testable without a bus, and so any future method replying with an
-/// `AuthResult` decodes it identically.
+/// short-circuit, `-4` is a no-match in which the detector did see a face.
+/// Split from the transport so the sentinel decoding is testable without a
+/// bus, and so any future method replying with an `AuthResult` decodes it
+/// identically.
 ///
 /// The wire has no field for the rejection's class, so `-2` is re-classified
 /// from its message here. [`ErrorKind::classify`] is the inverse of the
@@ -263,6 +264,7 @@ fn decode_auth_result(result: AuthResult) -> AuthOutcome {
             Some(result.label)
         },
         similarity: result.similarity as f32,
+        face_detected: result.matched || result.model_id == -4,
         // Not part of the D-Bus AuthResult contract; derived client-side
         // where needed (see test_cmd).
         failure_reason: None,

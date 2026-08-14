@@ -375,6 +375,35 @@ fn recoverable_auth_error(message: String) -> AuthResult {
     }
 }
 
+/// `model_id` for an unmatched attempt in which the detector saw nobody (and
+/// for the pre-camera gates, which reject before a face could be seen).
+const NO_MATCH_NO_FACE: i32 = -1;
+
+/// `model_id` for an unmatched attempt in which the detector *did* see a face.
+///
+/// PAM needs this distinction to choose `PAM_AUTH_ERR` (we looked at you and
+/// said no) over `PAM_IGNORE` (we have no opinion), and it cannot read it off
+/// `similarity`, which is redacted to `0.0` for every non-root caller — so a
+/// hyprlock user's genuine no-match used to be indistinguishable from an empty
+/// frame (#108's N12, deferred to #109 and never carried).
+///
+/// A pre-`-4` PAM module decodes this as a plain no-match (its `match` falls
+/// through to the same arm as `-1`), so the sentinel is safe to emit at a
+/// daemon that is newer than the installed module.
+const NO_MATCH_FACE_SEEN: i32 = -4;
+
+/// The `model_id` field for a [`MatchResult`] on the wire.
+///
+/// A matched attempt carries the winning model's id; an unmatched one carries
+/// the sentinel that says whether a face was there at all.
+fn wire_model_id(result: &facelock_core::types::MatchResult) -> i32 {
+    match result.model_id {
+        Some(id) => id as i32,
+        None if result.face_detected && !result.matched => NO_MATCH_FACE_SEEN,
+        None => NO_MATCH_NO_FACE,
+    }
+}
+
 /// The `org.facelock.Daemon` service.
 ///
 /// Generic over the handler's camera and engine so integration tests can
@@ -564,7 +593,7 @@ where
 
                     Ok(AuthResult {
                         matched: result.matched,
-                        model_id: result.model_id.map(|id| id as i32).unwrap_or(-1),
+                        model_id: wire_model_id(&result),
                         label: result.label.unwrap_or_default(),
                         similarity: result.similarity as f64,
                     })
@@ -1357,6 +1386,7 @@ mod tests {
             model_id: matched.then_some(1),
             label: matched.then(|| "front".to_string()),
             similarity: 0.42,
+            face_detected: true,
             failure_reason: None,
         }
     }
