@@ -51,6 +51,16 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Verify pam-facelock dependency surface
+        run: |
+          cargo tree -p pam-facelock --edges normal --prefix none | awk '{print $1}' | sort -u > /tmp/pam-deps
+          echo "pam-facelock crate count: $(wc -l < /tmp/pam-deps)"
+          if grep -Eq '^(async-io|async-signal|signal-hook-registry|polling)$' /tmp/pam-deps; then
+            echo "forbidden async crates in pam-facelock"
+            exit 1
+          fi
+          echo "pam-facelock dependency guard passed"
+
       - name: Build release binaries
         run: |
           cargo build --release --workspace
