@@ -3,6 +3,7 @@ pub mod dbus_interface;
 pub mod error;
 pub mod fs_security;
 pub mod ipc;
+pub mod notify;
 pub mod paths;
 pub mod traits;
 pub mod types;
