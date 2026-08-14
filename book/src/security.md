@@ -112,7 +112,7 @@ For high-security deployments, embeddings can be encrypted with AES-256-GCM usin
 
 The D-Bus system bus policy (`/usr/share/dbus-1/system.d/org.facelock.Daemon.conf`) restricts which users and groups can own the bus name and invoke methods. Only root and members of the `facelock` group are granted access. (`/etc/dbus-1/system.d/` is the admin-override location for local customization.)
 
-Beyond bus-level access, the daemon enforces per-method UID authorization. Before executing any method, the daemon calls `GetConnectionUnixUser` to verify the caller's UID. `Authenticate` allows the caller's own UID. `Enroll` and `Shutdown` are restricted to root (UID 0) only. This prevents a `facelock` group member from enrolling faces or shutting down the daemon without root privileges.
+Beyond bus-level access, the daemon enforces per-method UID authorization. Before executing any method, the daemon calls `GetConnectionUnixUser` to verify the caller's UID. `Authenticate` allows the caller's own UID — a user must be able to request authentication for themselves, since screen lockers run their PAM stack as that user. Every other method, including `Enroll`, `Shutdown`, and the preview methods, is restricted to root (UID 0). This prevents a `facelock` group member from enrolling faces, pulling camera frames, or shutting down the daemon without root privileges.
 
 #### B. D-Bus Message Size Limits (Required)
 

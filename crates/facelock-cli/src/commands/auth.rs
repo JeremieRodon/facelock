@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use facelock_camera::quirks::QuirksDb;
-use facelock_camera::{Camera, ResolvedCamera, auto_detect_device, validate_device};
+use facelock_camera::{Camera, ResolvedCamera, auto_detect_device_with, validate_device};
 use facelock_core::config::Config;
 use facelock_core::types::CameraCaps;
 use facelock_core::types::MatchResult;
@@ -40,8 +40,13 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         .with_writer(std::io::stderr)
         .init();
 
+    // Loaded once, up front: auto-detection and the interrogation below must
+    // be decided by the SAME quirk set, or the device picked and the device
+    // classified could disagree.
+    let quirks = QuirksDb::load();
+
     if config.device.path.is_none() {
-        match auto_detect_device() {
+        match auto_detect_device_with(&quirks) {
             Ok(dev) => {
                 info!(device = %dev.path, name = %dev.name, "auto-detected camera");
                 config.device.path = Some(dev.path);
@@ -59,7 +64,6 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     // cannot be queried: non-IR caps with whatever identity sysfs still
     // offers, so `require_ir` rejects rather than a hard error here.
     let device_path = config.device.path.clone().unwrap();
-    let quirks = QuirksDb::load();
     let resolved = match validate_device(&device_path) {
         Ok(info) => Some(ResolvedCamera::interrogate(info, &quirks)),
         Err(_) => None,
@@ -67,9 +71,8 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     let caps = resolved
         .as_ref()
         .map(|r| r.caps.clone())
-        .unwrap_or_else(|| CameraCaps {
-            fingerprint: facelock_camera::device_fingerprint(&device_path),
-            ..Default::default()
+        .unwrap_or_else(|| {
+            CameraCaps::unqueryable(facelock_camera::device_fingerprint(&device_path))
         });
 
     // Best-effort mode fixing before the store is opened: this is the PAM

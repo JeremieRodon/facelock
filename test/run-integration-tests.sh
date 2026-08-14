@@ -258,28 +258,36 @@ check_own_denied() {
 run_test "Unprivileged user cannot own org.facelock.Daemon" \
     "check_own_denied"
 
-# (b) PreviewDetectFrame authz parity — a facelock-group non-root caller may
-# call it for itself, but the reply must not contain raw frame bytes
-# (dbus-send renders non-empty byte arrays as hex; a JPEG starts with ff d8).
-check_preview_detect_frame_stripped() {
-    local out
-    if ! out=$(runuser -u testuser -- dbus-send --system --print-reply \
+# (b) PreviewDetectFrame authz parity — the intent here has always been that a
+# non-root caller obtains no imagery. Under N13 the method became root-only, so
+# the way that holds changed: a facelock-group non-root caller is now denied
+# outright, before the method reaches the camera, rather than receiving a reply
+# with jpeg_data stripped. This asserts the denial AND that the error reply
+# carries no frame bytes (dbus-send renders non-empty byte arrays as hex; a
+# JPEG starts with ff d8).
+check_preview_detect_frame_denied() {
+    local out rc
+    set +e
+    out=$(runuser -u testuser -- dbus-send --system --print-reply \
         --reply-timeout=60000 \
         --dest=org.facelock.Daemon /org/facelock/Daemon \
-        org.facelock.Daemon.PreviewDetectFrame string:testuser 2>&1); then
-        echo "$out"
-        return 1
-    fi
+        org.facelock.Daemon.PreviewDetectFrame string:testuser 2>&1)
+    rc=$?
+    set -e
     echo "$out"
-    echo "$out" | grep -q "method return" || return 1
+    [ "$rc" -ne 0 ] || {
+        echo "PreviewDetectFrame unexpectedly succeeded for a non-root caller"
+        return 1
+    }
+    echo "$out" | grep -qi "AccessDenied" || return 1
     if echo "$out" | grep -qi "ff d8"; then
-        echo "reply contains JPEG frame bytes (ff d8) — should be stripped"
+        echo "denial reply contains JPEG frame bytes (ff d8)"
         return 1
     fi
     return 0
 }
-run_test "PreviewDetectFrame returns no raw frame to non-root caller" \
-    "check_preview_detect_frame_stripped"
+run_test "PreviewDetectFrame denies non-root caller (no raw frame)" \
+    "check_preview_detect_frame_denied"
 
 # Release the preview camera session before the concurrency test
 dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon \

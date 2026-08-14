@@ -305,23 +305,19 @@ impl<'a> Camera<'a> {
 
         Ok((rgb, width, height))
     }
-
-    /// Check if a frame is too dark using default thresholds.
-    pub fn is_dark(frame: &Frame) -> bool {
-        is_dark(frame)
-    }
 }
 
-/// Check if a frame is too dark using default thresholds.
+/// Check if a frame is too dark to process.
 ///
 /// A free function, not a `CameraSource` method: darkness is a property of a
 /// frame, and hanging it off the trait was what made the trait non-object-safe
 /// (`where Self: Sized`).
-pub fn is_dark(frame: &Frame) -> bool {
-    is_dark_with_config(frame, 0.6, 10)
-}
-
-/// Check if a frame is too dark to process.
+///
+/// The thresholds are always passed in, from `device.dark_threshold` and
+/// `device.dark_pixel_value`. There is deliberately no default-threshold
+/// variant: one existed, hardcoding the same 0.6/10 the config defaults to,
+/// which is a second source of truth that drifts silently the day those
+/// defaults change.
 ///
 /// Uses both a per-pixel threshold check and mean brightness:
 /// - If the fraction of pixels below `dark_value` exceeds `threshold`, the frame is dark.
@@ -374,28 +370,6 @@ impl CameraSource for Camera<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_dark_all_black() {
-        let frame = Frame {
-            rgb: vec![0u8; 64 * 64 * 3],
-            gray: vec![0u8; 64 * 64],
-            width: 64,
-            height: 64,
-        };
-        assert!(Camera::is_dark(&frame));
-    }
-
-    #[test]
-    fn is_dark_all_white() {
-        let frame = Frame {
-            rgb: vec![255u8; 64 * 64 * 3],
-            gray: vec![255u8; 64 * 64],
-            width: 64,
-            height: 64,
-        };
-        assert!(!Camera::is_dark(&frame));
-    }
 
     #[test]
     fn all_black_frame_is_dark_with_config() {

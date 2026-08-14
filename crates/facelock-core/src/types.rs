@@ -166,12 +166,6 @@ pub struct CameraCaps {
     /// from the free-text device name, which is attacker-controlled on
     /// virtual devices (#98). `security.require_ir` gates on this field.
     pub is_ir: bool,
-    /// The quirks DB declares a controllable IR emitter (XU GUID + selector)
-    /// for this device. Declared, not probed: whether the ioctl actually
-    /// works is only known when the emitter is enabled at capture time.
-    pub has_emitter: bool,
-    /// The capture formats the device enumerates.
-    pub formats: Vec<FormatInfo>,
     /// Hardware identity used for device coupling. All fields are `None`
     /// when the device exposes no readable USB identity — "unknown" is a
     /// value inside [`DeviceFingerprint`], not an `Option` around it.
@@ -179,6 +173,24 @@ pub struct CameraCaps {
     /// Human-readable identifiers of the quirks applied to this device, for
     /// diagnostics ("why did this camera behave oddly").
     pub applied_quirks: Vec<String>,
+}
+
+impl CameraCaps {
+    /// Caps for a device that could not be interrogated at all — it exists at
+    /// the configured path, but querying it failed.
+    ///
+    /// Fails closed on everything the device did not demonstrate: `is_ir` is
+    /// false, so `security.require_ir` rejects rather than admits, and no
+    /// quirks are recorded as applied. The fingerprint is passed in because
+    /// sysfs identity is readable straight from the path even when the V4L2
+    /// query fails, and dropping it would turn every unqueryable camera into
+    /// a device-coupling mismatch.
+    pub fn unqueryable(fingerprint: DeviceFingerprint) -> Self {
+        Self {
+            fingerprint,
+            ..Default::default()
+        }
+    }
 }
 
 /// Granularity at which a live camera must match a template's enrolling camera.

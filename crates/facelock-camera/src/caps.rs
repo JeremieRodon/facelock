@@ -13,7 +13,6 @@ use facelock_core::types::CameraCaps;
 
 use crate::capture::Camera;
 use crate::device::{self, DeviceInfo};
-use crate::ir_emitter::EmitterXuInfo;
 use crate::quirks::{Quirk, QuirksDb, device_fingerprint};
 
 /// A resolved-but-not-yet-opened camera device: its identity, its matched
@@ -37,7 +36,9 @@ impl ResolvedCamera {
     pub fn resolve(config: &DeviceConfig, quirks: &QuirksDb) -> Result<Self> {
         let info = match config.path.as_deref() {
             Some(path) => device::validate_device(path)?,
-            None => device::auto_detect_device()?,
+            // The caller's DB, not a second `QuirksDb::load()`: the quirk set
+            // that picks the device must be the one that then classifies it.
+            None => device::auto_detect_device_with(quirks)?,
         };
         Ok(Self::interrogate(info, quirks))
     }
@@ -48,15 +49,15 @@ impl ResolvedCamera {
     ///   (`ir_source_resolved`, #98): queried mono-only formats or a
     ///   corroborated quirk — never the free-text device name.
     /// - `fingerprint` reads sysfs identity; all-`None` when unreadable.
-    /// - `has_emitter` and `applied_quirks` reflect the quirks match.
+    /// - `applied_quirks` reflects the quirks match.
+    ///
+    /// The device's enumerated formats are deliberately NOT copied onto the
+    /// caps: they already live on `info`, which every holder of a
+    /// `ResolvedCamera` has.
     pub fn interrogate(info: DeviceInfo, quirks: &QuirksDb) -> Self {
         let quirk = quirks.find_match(&info).cloned();
         let caps = CameraCaps {
             is_ir: device::is_ir_camera_resolved(&info, Some(quirks)),
-            has_emitter: quirk
-                .as_ref()
-                .is_some_and(|q| EmitterXuInfo::from_quirk(q).is_some()),
-            formats: info.formats.clone(),
             fingerprint: device_fingerprint(&info.path),
             applied_quirks: quirk.as_ref().map(quirk_id).into_iter().collect(),
         };
@@ -90,6 +91,7 @@ pub fn quirk_id(quirk: &Quirk) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir_emitter::EmitterXuInfo;
     use facelock_core::types::{DeviceFingerprint, FormatInfo};
 
     fn device_with(name: &str, fourccs: &[&str]) -> DeviceInfo {
@@ -133,9 +135,9 @@ mod tests {
             ResolvedCamera::interrogate(device_with("USB Camera", &["GREY"]), &QuirksDb::default());
         assert!(resolved.caps.is_ir);
         assert!(resolved.caps.applied_quirks.is_empty());
-        assert!(!resolved.caps.has_emitter);
-        assert_eq!(resolved.caps.formats.len(), 1);
-        assert_eq!(resolved.caps.formats[0].fourcc, "GREY");
+        // The enumerated formats stay on `info`; the caps do not copy them.
+        assert_eq!(resolved.info.formats.len(), 1);
+        assert_eq!(resolved.info.formats[0].fourcc, "GREY");
         // Fake path → no sysfs identity → all-None fingerprint, not an error.
         assert_eq!(resolved.caps.fingerprint, DeviceFingerprint::default());
     }
@@ -153,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_quirk_populates_applied_quirks_and_emitter() {
+    fn matched_quirk_populates_applied_quirks() {
         let mut db = QuirksDb::default();
         let mut q = quirk("(?i)test.*module");
         q.emitter_xu_guid = Some("04".into());
@@ -162,15 +164,15 @@ mod tests {
         db.push_quirk_for_test(q);
 
         // GREY-only: the quirk match is corroborated by the device's own
-        // format evidence, and the emitter declaration carries over.
+        // format evidence. The matched quirk itself rides on `resolved.quirk`,
+        // which is what the emitter path reads at open time.
         let resolved = ResolvedCamera::interrogate(device_with("Test IR Module", &["GREY"]), &db);
         assert!(resolved.caps.is_ir);
-        assert!(resolved.caps.has_emitter);
         assert_eq!(
             resolved.caps.applied_quirks,
             vec!["name:(?i)test.*module (test emitter module)".to_string()]
         );
-        assert!(resolved.quirk.is_some());
+        assert!(EmitterXuInfo::from_quirk(resolved.quirk.as_ref().unwrap()).is_some());
     }
 
     #[test]
@@ -179,8 +181,27 @@ mod tests {
         db.push_quirk_for_test(quirk("(?i)plain.*cam"));
 
         let resolved = ResolvedCamera::interrogate(device_with("Plain Cam", &["YUYV"]), &db);
-        assert!(!resolved.caps.has_emitter);
         assert_eq!(resolved.caps.applied_quirks.len(), 1);
+        assert!(EmitterXuInfo::from_quirk(resolved.quirk.as_ref().unwrap()).is_none());
+    }
+
+    #[test]
+    fn unqueryable_caps_fail_closed_but_keep_identity() {
+        // The state both the daemon and the oneshot path fall back to when
+        // the configured device exists but cannot be interrogated: nothing
+        // the device did not demonstrate is asserted, but the sysfs identity
+        // (readable from the path alone) survives so device coupling still
+        // has something to compare.
+        let fp = DeviceFingerprint {
+            vid: Some("046d".into()),
+            pid: Some("085e".into()),
+            serial: None,
+            by_path: None,
+        };
+        let caps = CameraCaps::unqueryable(fp.clone());
+        assert!(!caps.is_ir, "an uninterrogated device must not claim IR");
+        assert!(caps.applied_quirks.is_empty());
+        assert_eq!(caps.fingerprint, fp);
     }
 
     #[test]

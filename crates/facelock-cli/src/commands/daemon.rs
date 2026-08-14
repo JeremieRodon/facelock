@@ -12,7 +12,7 @@ use std::path::Path;
 
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{
-    Camera, ResolvedCamera, auto_detect_device, is_ir_camera_resolved, validate_device,
+    Camera, ResolvedCamera, auto_detect_device_with, is_ir_camera_resolved, validate_device,
 };
 use facelock_core::config::Config;
 use facelock_core::notify::NotifierFactory;
@@ -45,7 +45,9 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     let quirks = QuirksDb::load();
 
     if config.device.path.is_none() {
-        let info = auto_detect_device()
+        // The DB loaded above, not a second load: the quirk set that picks the
+        // device must be the one that then classifies it.
+        let info = auto_detect_device_with(&quirks)
             .map_err(|e| format!("no camera device specified and auto-detection failed: {e}"))?;
         let is_ir = is_ir_camera_resolved(&info, Some(&quirks));
         info!(device = %info.path, name = %info.name, ir = is_ir, "auto-detected camera device");
@@ -79,9 +81,10 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     let device_caps = resolved
         .as_ref()
         .map(|r| r.caps.clone())
-        .unwrap_or_else(|| facelock_core::types::CameraCaps {
-            fingerprint: facelock_camera::device_fingerprint(&device_path),
-            ..Default::default()
+        .unwrap_or_else(|| {
+            facelock_core::types::CameraCaps::unqueryable(facelock_camera::device_fingerprint(
+                &device_path,
+            ))
         });
 
     // Explicit resolution before construction (D7): name what is missing or
@@ -147,21 +150,18 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
         .as_ref()
         .and_then(|r| r.quirk.as_ref())
         .and_then(|q| q.warmup_frames);
-    let camera_factory: CameraFactory = match resolved {
-        // Reuse the startup interrogation for every (re)open, exactly as the
-        // startup-captured quirk used to be reused.
-        Some(resolved) => Box::new(move |config: &Config| {
-            resolved
-                .clone()
-                .open(&config.device)
-                .map_err(|e| e.to_string())
-        }),
-        // Unqueryable at startup: retry a fresh resolve-and-open per request
-        // so a later-appearing device surfaces its own open error (or works).
-        None => Box::new(move |config: &Config| {
-            Camera::open(&config.device, &QuirksDb::load()).map_err(|e| e.to_string())
-        }),
-    };
+    // Resolve and interrogate afresh on every (re)open rather than replaying
+    // the startup interrogation. Replaying it would let a device swapped in at
+    // the same /dev/videoN after startup inherit the startup device's `is_ir`
+    // and fingerprint — caps it never demonstrated — which is exactly the
+    // invariant `ResolvedCamera` exists to hold: the caps a camera carries are
+    // the caps that camera showed. Reopens happen at idle-timeout frequency,
+    // not per frame, so the extra interrogation is not on the hot path. A
+    // device that is unqueryable at startup gets the same treatment, and so
+    // still surfaces its own open error (or works) if it appears later.
+    let camera_factory: CameraFactory = Box::new(move |config: &Config| {
+        Camera::open(&config.device, &QuirksDb::load()).map_err(|e| e.to_string())
+    });
     let handler = facelock_daemon::handler::Handler::new(
         config,
         engine,
