@@ -58,7 +58,7 @@ pub fn open_store_existing(config: &Config) -> Result<FaceStore, StoreError> {
 /// (`is_ir`, fingerprint, formats, applied quirks) that used to be threaded
 /// around as loose values — pre-flight gates read `resolved.caps`, and the
 /// camera opened from it carries the very same caps.
-fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCamera> {
+pub(crate) fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCamera> {
     let quirks = QuirksDb::load();
     let device_info = match config.device.path.as_deref() {
         Some(path) => validate_device(path)

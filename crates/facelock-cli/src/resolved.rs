@@ -86,10 +86,7 @@ impl ConfigLoad {
 
 /// How a resolved fact was determined.
 ///
-/// Deliberately minimal: H8 (Health) will grow this into a richer `Fact`
-/// type carrying *unknown-is-not-false* across privilege and reachability;
-/// until then, a provenance tag per fact is all resolution promises. The
-/// daemon-reachability fact sits beside the existing ones the same way
+/// The daemon-reachability fact sits beside the existing ones the same way
 /// (`crate::backend::DaemonReachability` — Backend owns that probe, not
 /// this module).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +104,66 @@ pub enum Provenance {
 pub struct Resolved<T> {
     pub value: T,
     pub provenance: Provenance,
+}
+
+/// A fact as `status` reports it: known — with the [`Provenance`] every
+/// resolved fact already carries — or honestly unknown (H8).
+///
+/// This is the grown form of [`Resolved`]: the same value-plus-provenance
+/// when the answer exists, plus the arm [`Resolved`] cannot express — *the
+/// probe could not determine the answer*. The domain map (§5) sketched
+/// `Unavailable { needs: Privilege }`; DEC-6 collapsed the privilege tiers
+/// (`status` is root, `is-enrolled` never comes here), so what is left of N4
+/// is probe failure — an unreadable database, a config that did not parse —
+/// and the honest payload is the reason, not a privilege level.
+///
+/// The discipline it enforces sits in the renderer: an [`Fact::Unknown`]
+/// value must never render as a guessed answer. "The database could not be
+/// read" is a distinct value from "this user has no models".
+#[derive(Debug, Clone)]
+pub enum Fact<T> {
+    Known(Resolved<T>),
+    /// Not an error and NOT a false answer: the probe could not determine
+    /// the value. `why` says what stood in the way.
+    Unknown {
+        why: String,
+    },
+}
+
+impl<T> Fact<T> {
+    /// A fact verified against the live system.
+    pub fn probed(value: T) -> Self {
+        Fact::Known(Resolved {
+            value,
+            provenance: Provenance::Probed,
+        })
+    }
+
+    /// A fact taken from configuration without verification.
+    pub fn claimed(value: T) -> Self {
+        Fact::Known(Resolved {
+            value,
+            provenance: Provenance::Claimed,
+        })
+    }
+
+    pub fn unknown(why: impl Into<String>) -> Self {
+        Fact::Unknown { why: why.into() }
+    }
+
+    /// The value, when it is known.
+    pub fn known(&self) -> Option<&T> {
+        match self {
+            Fact::Known(resolved) => Some(&resolved.value),
+            Fact::Unknown { .. } => None,
+        }
+    }
+}
+
+impl<T> From<Resolved<T>> for Fact<T> {
+    fn from(resolved: Resolved<T>) -> Self {
+        Fact::Known(resolved)
+    }
 }
 
 /// One file the config names, and whether it is on disk.

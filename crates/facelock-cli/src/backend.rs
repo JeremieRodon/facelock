@@ -22,8 +22,9 @@
 //!   fallback). It shares test vectors, not code.
 //! - **`is-enrolled`** is dispatched in `main` before any config parse and
 //!   must never probe the bus; `hyprlock` and `config` touch no backend.
-//! - **`status`** renders its own probes for now — H8 (Health) will consume
-//!   the [`DaemonReachability`] fact this module records.
+//! - **`status`** consumes facts, not transport: its daemon probe is
+//!   [`probe_daemon`] here in the seam (H8), so `ipc_client` stays
+//!   single-sited.
 //! - Maintenance commands (`bench`, `encrypt`, `tpm`, `audit`, `auth`,
 //!   `daemon`) are direct-by-nature and never select.
 
@@ -65,8 +66,9 @@ impl BackendKind {
 
 /// What the one probe observed, recorded beside the resolved-config facts
 /// (D7) with the same provenance discipline: `NotProbed` is a distinct value,
-/// never a guessed `Unreachable`. H8 (Health) lifts this into its `Fact`
-/// model; until then it is logged at selection.
+/// never a guessed `Unreachable`. `status` reports the same discipline
+/// through [`DaemonPing`], which additionally carries the failure detail a
+/// report wants and a human does not need at selection time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonReachability {
     /// `mode = "oneshot"`: the bus is deliberately never asked.
@@ -315,6 +317,54 @@ impl<'a> Backend<'a> {
     }
 }
 
+/// What `status`'s deliberate daemon probe found (H8).
+///
+/// Distinct from [`DaemonReachability`] on purpose. Selection's probe
+/// (`name_has_owner`) must never activate the daemon, because selection runs
+/// on every backend-using command. `status` exists to diagnose, so its probe
+/// is the full `Ping` round-trip — allowed to trigger D-Bus activation,
+/// because "responding" in a health report means *the daemon the next auth
+/// would get answered a method call*, not merely that the name has an owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonPing {
+    /// `daemon.mode = "oneshot"`: the bus is deliberately never asked; there
+    /// is no daemon to report on.
+    NotConfigured,
+    /// A `Ping` method call completed.
+    Responding,
+    /// The round-trip failed; `error` is the transport's own account.
+    NotResponding { error: String },
+}
+
+/// `status`'s daemon probe. Lives in the seam so `ipc_client::ping` stays
+/// single-sited (D1) — the health model consumes the fact, not the transport.
+pub fn probe_daemon(mode: &DaemonMode) -> Resolved<DaemonPing> {
+    probe_daemon_with(mode, ipc_client::ping)
+}
+
+/// The probe rule, split from the transport so it is testable without a bus
+/// (same shape as [`classify`]).
+fn probe_daemon_with(
+    mode: &DaemonMode,
+    ping: impl FnOnce() -> anyhow::Result<()>,
+) -> Resolved<DaemonPing> {
+    match mode {
+        DaemonMode::Oneshot => Resolved {
+            value: DaemonPing::NotConfigured,
+            provenance: Provenance::Claimed,
+        },
+        DaemonMode::Daemon => Resolved {
+            value: match ping() {
+                Ok(()) => DaemonPing::Responding,
+                Err(e) => DaemonPing::NotResponding {
+                    error: e.to_string(),
+                },
+            },
+            provenance: Provenance::Probed,
+        },
+    }
+}
+
 /// The selection rule, split from the probe so it is testable without a bus.
 fn classify(
     mode: &DaemonMode,
@@ -415,6 +465,40 @@ mod tests {
         let (kind, fact) = classify(&DaemonMode::Daemon, || false);
         assert_eq!(kind, BackendKind::DirectByFallback);
         assert_eq!(fact.value, DaemonReachability::Unreachable);
+        assert_eq!(fact.provenance, Provenance::Probed);
+    }
+
+    // -----------------------------------------------------------------------
+    // status's daemon probe (H8): mode x ping outcome -> DaemonPing fact.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oneshot_daemon_probe_never_pings() {
+        let fact = probe_daemon_with(&DaemonMode::Oneshot, || {
+            panic!("oneshot must never ping the daemon")
+        });
+        assert_eq!(fact.value, DaemonPing::NotConfigured);
+        assert_eq!(fact.provenance, Provenance::Claimed);
+    }
+
+    #[test]
+    fn daemon_probe_reports_a_completed_round_trip() {
+        let fact = probe_daemon_with(&DaemonMode::Daemon, || Ok(()));
+        assert_eq!(fact.value, DaemonPing::Responding);
+        assert_eq!(fact.provenance, Provenance::Probed);
+    }
+
+    #[test]
+    fn daemon_probe_carries_the_failure_detail() {
+        let fact = probe_daemon_with(&DaemonMode::Daemon, || {
+            Err(anyhow::anyhow!("D-Bus Ping call failed"))
+        });
+        assert_eq!(
+            fact.value,
+            DaemonPing::NotResponding {
+                error: "D-Bus Ping call failed".into()
+            }
+        );
         assert_eq!(fact.provenance, Provenance::Probed);
     }
 
@@ -620,7 +704,7 @@ mod tests {
             ("clear_models", backend_only),
             ("send_enroll", backend_only),
             ("list_devices", backend_only),
-            ("ping", &["commands/status.rs"]), // its own probe until H8
+            ("ping", backend_only), // status's probe routes through probe_daemon (H8)
             ("preview_detect_frame", preview),
             ("release_camera", preview),
         ];

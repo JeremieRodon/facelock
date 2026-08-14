@@ -1,6 +1,7 @@
 pub mod backend;
 mod commands;
 pub mod direct;
+pub mod health;
 mod ipc_client;
 pub mod message;
 pub mod notifications;

@@ -254,6 +254,95 @@ pub enum UserMessage {
         user: String,
     },
 
+    // -- status report (H8): the report's prose. The skeleton (item lines,
+    //    [ok]/[!!] markers, `- key:` details) stays structural in the
+    //    renderer; config-key-shaped detail keys (require_ir, device.path,
+    //    quirks, ...) are vocabulary, not prose, and stay literal. --
+    StatusHeader,
+    StatusLabelConfigFile,
+    StatusLabelDaemon,
+    StatusLabelOneshotFallback,
+    StatusLabelCameraDevice,
+    StatusLabelModelDirectory,
+    StatusLabelExecutionProvider,
+    StatusLabelEncryption,
+    StatusLabelEnrolledFaces,
+    StatusLabelSecurity,
+    StatusLabelNotifications,
+    StatusLabelPamModule,
+    /// The unknown-is-not-false rendering (N4): the answer could not be
+    /// determined, and no value is guessed in its place.
+    StatusUnknown {
+        why: String,
+    },
+    StatusConfigValid,
+    StatusConfigNotFound,
+    StatusConfigInvalid {
+        error: String,
+    },
+    StatusDaemonOneshot,
+    StatusDaemonResponding,
+    StatusDaemonNotResponding {
+        error: String,
+    },
+    StatusFallbackUsable,
+    StatusFallbackNotUsable,
+    StatusCameraDeviceExists,
+    StatusCameraDeviceNotFound,
+    StatusCameraAutoDetect,
+    StatusModelsDirNotFound,
+    StatusModelsAllPresent,
+    StatusModelsSomeMissing,
+    StatusPresent,
+    StatusMissing,
+    StatusEpSupported,
+    StatusEpNotBuiltIn,
+    StatusEpUnknownName,
+    StatusEpUnqueryable {
+        error: String,
+    },
+    StatusSealedKey {
+        path: String,
+    },
+    StatusSealedKeyMissing {
+        path: String,
+    },
+    StatusTpmDeviceMissing {
+        path: String,
+    },
+    StatusKeyFile {
+        path: String,
+    },
+    StatusKeyFileMissing {
+        path: String,
+    },
+    StatusPlaintextEmbeddings,
+    StatusNoFacesEnrolled,
+    StatusModelCount {
+        count: usize,
+    },
+    StatusMarkerMismatch {
+        marker: u32,
+        store: u32,
+    },
+    StatusMarkerUnreadable {
+        why: String,
+    },
+    StatusSecurityDisabled,
+    StatusYes,
+    StatusNo,
+    StatusNotifyOff,
+    StatusNotifyTerminal,
+    StatusNotifyDesktop,
+    StatusNotifyBoth,
+    StatusPamInstalled,
+    StatusPamInstalledAt {
+        path: String,
+    },
+    StatusPamNotInstalled,
+    StatusPamSudoConfigured,
+    StatusPamSudoNotConfigured,
+
     // -- desktop/terminal notification bodies (H4's NotifyEvent, rendered) --
     NotifyScanning,
     NotifyWelcome {
@@ -685,6 +774,108 @@ impl UserMessage {
                 translate("All face models removed for user '{user}'."),
                 &[("user", user.clone())],
             ),
+
+            StatusHeader => translate("facelock system status"),
+            StatusLabelConfigFile => translate("Config file"),
+            StatusLabelDaemon => translate("Daemon"),
+            StatusLabelOneshotFallback => translate("Oneshot fallback"),
+            StatusLabelCameraDevice => translate("Camera device"),
+            StatusLabelModelDirectory => translate("Model directory"),
+            StatusLabelExecutionProvider => translate("Execution provider"),
+            StatusLabelEncryption => translate("Encryption"),
+            StatusLabelEnrolledFaces => translate("Enrolled faces"),
+            StatusLabelSecurity => translate("Security"),
+            StatusLabelNotifications => translate("Notifications"),
+            StatusLabelPamModule => translate("PAM module"),
+            StatusUnknown { why } => fill(
+                translate("cannot determine: {why}"),
+                &[("why", why.clone())],
+            ),
+            StatusConfigValid => translate("valid"),
+            StatusConfigNotFound => translate("not found"),
+            StatusConfigInvalid { error } => {
+                fill(translate("invalid: {error}"), &[("error", error.clone())])
+            }
+            StatusDaemonOneshot => translate("oneshot mode (no daemon)"),
+            StatusDaemonResponding => translate("responding"),
+            StatusDaemonNotResponding { error } => fill(
+                translate("not responding: {error}"),
+                &[("error", error.clone())],
+            ),
+            StatusFallbackUsable => translate(
+                "usable (root-invoked PAM can authenticate via 'facelock auth' without the daemon)",
+            ),
+            StatusFallbackNotUsable => translate(
+                "not usable (PAM would fall through to the next auth method if the daemon is unreachable)",
+            ),
+            StatusCameraDeviceExists => translate("device exists"),
+            StatusCameraDeviceNotFound => translate("device not found"),
+            StatusCameraAutoDetect => translate("auto-detect enabled"),
+            StatusModelsDirNotFound => translate("directory not found"),
+            StatusModelsAllPresent => translate("all configured models present"),
+            StatusModelsSomeMissing => translate("some models missing (run 'facelock setup')"),
+            StatusPresent => translate("present"),
+            StatusMissing => translate("MISSING"),
+            StatusEpSupported => translate("supported by the installed ONNX Runtime"),
+            StatusEpNotBuiltIn => translate(
+                "not built into the installed ONNX Runtime — inference will fall back to CPU",
+            ),
+            StatusEpUnknownName => {
+                translate("unknown execution provider (valid: cpu, cuda, rocm, openvino)")
+            }
+            StatusEpUnqueryable { error } => fill(
+                translate("ONNX Runtime not loadable: {error}"),
+                &[("error", error.clone())],
+            ),
+            StatusSealedKey { path } => {
+                fill(translate("sealed key: {path}"), &[("path", path.clone())])
+            }
+            StatusSealedKeyMissing { path } => fill(
+                translate("sealed key missing: {path}"),
+                &[("path", path.clone())],
+            ),
+            StatusTpmDeviceMissing { path } => fill(
+                translate("TPM device missing: {path}"),
+                &[("path", path.clone())],
+            ),
+            StatusKeyFile { path } => {
+                fill(translate("key file: {path}"), &[("path", path.clone())])
+            }
+            StatusKeyFileMissing { path } => fill(
+                translate("key file missing: {path}"),
+                &[("path", path.clone())],
+            ),
+            StatusPlaintextEmbeddings => translate(
+                "embeddings stored as plaintext (run 'facelock setup' to enable encryption)",
+            ),
+            StatusNoFacesEnrolled => translate("no faces enrolled (run 'facelock enroll')"),
+            StatusModelCount { count } => fill(
+                translate("{count} model(s)"),
+                &[("count", count.to_string())],
+            ),
+            StatusMarkerMismatch { marker, store } => fill(
+                translate(
+                    "out of date (marker says {marker}, database has {store}) — run 'sudo facelock setup' to reconcile",
+                ),
+                &[("marker", marker.to_string()), ("store", store.to_string())],
+            ),
+            StatusMarkerUnreadable { why } => {
+                fill(translate("unreadable: {why}"), &[("why", why.clone())])
+            }
+            StatusSecurityDisabled => translate("ALL SECURITY CHECKS DISABLED"),
+            StatusYes => translate("yes"),
+            StatusNo => translate("no"),
+            StatusNotifyOff => translate("off"),
+            StatusNotifyTerminal => translate("terminal"),
+            StatusNotifyDesktop => translate("desktop"),
+            StatusNotifyBoth => translate("terminal + desktop"),
+            StatusPamInstalled => translate("installed"),
+            StatusPamInstalledAt { path } => {
+                fill(translate("installed at {path}"), &[("path", path.clone())])
+            }
+            StatusPamNotInstalled => translate("not installed"),
+            StatusPamSudoConfigured => translate("configured"),
+            StatusPamSudoNotConfigured => translate("not configured for facelock"),
 
             NotifyScanning => translate("Scanning face..."),
             NotifyWelcome { label } => {
@@ -1479,6 +1670,64 @@ mod tests {
                 user: s("u"),
             },
             AllModelsRemoved { user: s("u") },
+            StatusHeader,
+            StatusLabelConfigFile,
+            StatusLabelDaemon,
+            StatusLabelOneshotFallback,
+            StatusLabelCameraDevice,
+            StatusLabelModelDirectory,
+            StatusLabelExecutionProvider,
+            StatusLabelEncryption,
+            StatusLabelEnrolledFaces,
+            StatusLabelSecurity,
+            StatusLabelNotifications,
+            StatusLabelPamModule,
+            StatusUnknown { why: s("w") },
+            StatusConfigValid,
+            StatusConfigNotFound,
+            StatusConfigInvalid { error: s("e") },
+            StatusDaemonOneshot,
+            StatusDaemonResponding,
+            StatusDaemonNotResponding { error: s("e") },
+            StatusFallbackUsable,
+            StatusFallbackNotUsable,
+            StatusCameraDeviceExists,
+            StatusCameraDeviceNotFound,
+            StatusCameraAutoDetect,
+            StatusModelsDirNotFound,
+            StatusModelsAllPresent,
+            StatusModelsSomeMissing,
+            StatusPresent,
+            StatusMissing,
+            StatusEpSupported,
+            StatusEpNotBuiltIn,
+            StatusEpUnknownName,
+            StatusEpUnqueryable { error: s("e") },
+            StatusSealedKey { path: s("/p") },
+            StatusSealedKeyMissing { path: s("/p") },
+            StatusTpmDeviceMissing { path: s("/p") },
+            StatusKeyFile { path: s("/p") },
+            StatusKeyFileMissing { path: s("/p") },
+            StatusPlaintextEmbeddings,
+            StatusNoFacesEnrolled,
+            StatusModelCount { count: 2 },
+            StatusMarkerMismatch {
+                marker: 3,
+                store: 2,
+            },
+            StatusMarkerUnreadable { why: s("w") },
+            StatusSecurityDisabled,
+            StatusYes,
+            StatusNo,
+            StatusNotifyOff,
+            StatusNotifyTerminal,
+            StatusNotifyDesktop,
+            StatusNotifyBoth,
+            StatusPamInstalled,
+            StatusPamInstalledAt { path: s("/p") },
+            StatusPamNotInstalled,
+            StatusPamSudoConfigured,
+            StatusPamSudoNotConfigured,
             NotifyScanning,
             NotifyWelcome { label: s("l") },
             NotifyRecognized { similarity: 0.5 },
