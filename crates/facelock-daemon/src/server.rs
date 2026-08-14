@@ -393,8 +393,6 @@ where
     /// Config file mtime when the handler was last built.
     /// Used to detect config changes and reload on next request.
     config_mtime: Arc<Mutex<Option<std::time::SystemTime>>>,
-    /// UID of the caller that currently owns preview camera cleanup rights.
-    camera_owner_uid: Arc<Mutex<Option<u32>>>,
     /// In-flight guard for camera-capture operations (DoS control).
     capture_slot: Arc<CaptureSlot>,
     /// Builds per-user notifiers for auth outcomes. Injected from `main` so
@@ -423,22 +421,9 @@ where
             handler: Arc::new(Mutex::new(handler)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
-            camera_owner_uid: Arc::new(Mutex::new(None)),
             capture_slot: Arc::new(CaptureSlot::default()),
             notifier_factory,
             rebuild,
-        }
-    }
-
-    fn clear_camera_owner(&self) {
-        if let Ok(mut owner) = self.camera_owner_uid.lock() {
-            *owner = None;
-        }
-    }
-
-    fn set_camera_owner(&self, uid: u32) {
-        if let Ok(mut owner) = self.camera_owner_uid.lock() {
-            *owner = Some(uid);
         }
     }
 
@@ -482,7 +467,6 @@ where
         if let Ok(mut guard) = self.handler.lock() {
             *guard = new_handler;
         }
-        self.clear_camera_owner();
 
         // Update stored mtime
         if let Ok(mut stored) = self.config_mtime.lock() {
@@ -558,7 +542,6 @@ where
         self.maybe_reload_handler();
         authorize_method(&caller, method, Some(user))?;
         let caller_is_root = caller.uid == 0;
-        self.clear_camera_owner();
         let capture_guard = self.capture_slot.try_acquire(method.name())?;
         let handler = self.handler.clone();
         let notifier_factory = self.notifier_factory.clone();
@@ -621,7 +604,6 @@ where
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
         authorize_method(&caller, Method::Enroll, None)?;
-        self.clear_camera_owner();
         let capture_guard = self.capture_slot.try_acquire("Enroll")?;
         let handler = self.handler.clone();
         let user = user.to_string();
@@ -736,7 +718,7 @@ where
         authorize_method(&caller, Method::PreviewFrame, None)?;
         let capture_guard = self.capture_slot.try_acquire("PreviewFrame")?;
         let handler = self.handler.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _capture_guard = capture_guard;
             let mut handler = lock_handler_with_timeout(&handler)?;
             let request = DaemonRequest::PreviewFrame;
@@ -750,11 +732,7 @@ where
             }
         })
         .await
-        .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?;
-        if result.is_ok() {
-            self.set_camera_owner(caller.uid);
-        }
-        result
+        .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
     pub async fn preview_detect_frame_as(
@@ -772,7 +750,7 @@ where
         let capture_guard = self.capture_slot.try_acquire("PreviewDetectFrame")?;
         let handler = self.handler.clone();
         let user = user.to_string();
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _capture_guard = capture_guard;
             let mut handler = lock_handler_with_timeout(&handler)?;
             let request = DaemonRequest::PreviewDetectFrame { user };
@@ -807,11 +785,7 @@ where
             }
         })
         .await
-        .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?;
-        if result.is_ok() {
-            self.set_camera_owner(caller.uid);
-        }
-        result
+        .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
     pub async fn list_devices_as(&self, caller: CallerIdentity) -> fdo::Result<Vec<DeviceInfo>> {
@@ -848,7 +822,7 @@ where
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::ReleaseCamera, None)?;
         let handler = self.handler.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
             let request = DaemonRequest::ReleaseCamera;
             let response = handler.handle(request);
@@ -861,11 +835,7 @@ where
             }
         })
         .await
-        .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?;
-        if result.is_ok() {
-            self.clear_camera_owner();
-        }
-        result
+        .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
     pub async fn ping_as(&self, caller: CallerIdentity) -> fdo::Result<String> {
@@ -877,7 +847,6 @@ where
     pub async fn shutdown_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::Shutdown, None)?;
-        self.clear_camera_owner();
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -1208,7 +1177,6 @@ async fn run_dbus_server(
         handler: handler.clone(),
         last_activity: last_activity.clone(),
         config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
-        camera_owner_uid: Arc::new(Mutex::new(None)),
         capture_slot: Arc::new(CaptureSlot::default()),
         notifier_factory,
         rebuild,
