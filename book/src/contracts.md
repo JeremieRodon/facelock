@@ -131,7 +131,7 @@ D-Bus system bus (`org.facelock.Daemon`). Only used in daemon mode. The daemon e
 ### Methods
 `Authenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
 
-Raw camera frames require privilege. `PreviewFrame` remains root-only. `PreviewDetectFrame` returns the `jpeg_data` frame bytes to root unconditionally; a non-root caller receives them only after an interactive polkit authorization for the action `org.facelock.preview-frames` (checked via `org.freedesktop.PolicyKit1.Authority.CheckAuthorization`, `AllowUserInteraction=true`). While unauthorized — denied, prompt pending, polkit unreachable, or any D-Bus error — the daemon fails closed: `jpeg_data` is empty and the caller receives detection and recognition metadata only.
+Raw camera frames require privilege. Both `PreviewFrame` and `PreviewDetectFrame` are root-only: a non-root caller is denied with `AccessDenied` before either method touches the camera, and the daemon additionally strips `jpeg_data` from any non-root reply so raw camera/IR imagery cannot leak even if the authorization table were ever to regress.
 
 Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and `PreviewDetectFrame` fail immediately with a `daemon busy` error while another capture is in flight. Clients treat this like any other daemon error and degrade to password auth.
 

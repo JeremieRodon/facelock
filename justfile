@@ -220,9 +220,6 @@ install-files:
         install -Dm644 dbus/org.facelock.Daemon.service /etc/dbus-1/system-services/org.facelock.Daemon.service
     fi
 
-    # Polkit action (interactive authorization for preview frame bytes)
-    install -Dm644 dbus/org.facelock.policy /usr/share/polkit-1/actions/org.facelock.policy
-
     # Polkit agent binary (optional, do NOT install autostart — agent is not production-ready
     # and will steal polkit auth from the DE's agent, causing all privilege prompts to hang)
     [ -f target/release/facelock-polkit-agent ] && install -Dm755 target/release/facelock-polkit-agent /usr/bin/facelock-polkit-agent || true
@@ -360,7 +357,6 @@ uninstall-files:
     fi
     rm -f /usr/share/dbus-1/system.d/org.facelock.Daemon.conf
     rm -f /usr/share/dbus-1/system-services/org.facelock.Daemon.service
-    rm -f /usr/share/polkit-1/actions/org.facelock.policy
     rm -f /usr/bin/facelock-polkit-agent
     rm -f /etc/xdg/autostart/org.facelock.AuthAgent.desktop
 
@@ -540,7 +536,6 @@ show-paths:
     @echo "Models:   /var/lib/facelock/models/"
     @echo "Database: /var/lib/facelock/facelock.db"
     @echo "D-Bus:    /usr/share/dbus-1/system.d/org.facelock.Daemon.conf"
-    @echo "Polkit:   /usr/share/polkit-1/actions/org.facelock.policy"
     @echo "Service:  /usr/lib/systemd/system/facelock-daemon.service"
     @echo "Logs:     /var/log/facelock/"
 

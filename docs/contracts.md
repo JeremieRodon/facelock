@@ -431,27 +431,12 @@ hill-climbing oracle by construction rather than by redacting fields):
   by a table-driven scope (`authorize_method` in `facelock_daemon::server`)
   so a new method is root-only by default until deliberately opened up.
 
-Raw camera frames require privilege. `PreviewFrame` remains root-only.
-`PreviewDetectFrame` returns the `jpeg_data` frame bytes to root
-unconditionally; a non-root caller receives them **only** after an
-interactive polkit authorization for the action
-**`org.facelock.preview-frames`** (shipped in `dbus/org.facelock.policy`,
-installed to `/usr/share/polkit-1/actions/org.facelock.policy`; defaults
-`allow_any=no`, `allow_inactive=no`, `allow_active=auth_self_keep`). The
-daemon checks the caller via
-`org.freedesktop.PolicyKit1.Authority.CheckAuthorization` (subject = the
-caller's unique bus name, `AllowUserInteraction=true`); the first frame
-request triggers the caller's polkit agent prompt. While unauthorized —
-denied, prompt pending, polkit unreachable, or any D-Bus error — the daemon
-**fails closed**: `jpeg_data` is empty and the caller receives detection and
-recognition metadata (bounding boxes, confidence, similarity, recognized)
-only.
-
-The polkit verdict is cached per caller **connection** (keyed by unique bus
-name): granted verdicts for at most 120 s, denied/errored verdicts for 15 s,
-and every cached verdict dies when the caller's bus connection closes
-(whichever comes first). Clients that want frames across a preview session
-must therefore keep one D-Bus connection open for the whole session.
+Raw camera frames require privilege. Both `PreviewFrame` and
+`PreviewDetectFrame` are root-only, so a non-root caller is denied with
+`AccessDenied` before either method touches the camera. On top of that
+denial the daemon strips `jpeg_data` from any non-root reply, so raw
+camera/IR imagery cannot reach an unprivileged caller even if the
+authorization table were ever to regress.
 
 Method timeouts: `Enroll` runs synchronously inside the method call for up to
 `Config::enroll_timeout_secs()` seconds server-side (`3 × max(recognition.timeout_secs, 5)`
