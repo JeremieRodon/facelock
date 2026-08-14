@@ -48,10 +48,7 @@ pub fn run(
 
     // Models must exist before anything opens a camera. One probe through the
     // shared fact (D7) instead of a per-command re-derivation.
-    if !crate::resolved::ModelFiles::probe(config)
-        .value
-        .all_present()
-    {
+    if !crate::resolved::ModelFiles::probe(config).all_present() {
         return Err(fail(UserMessage::ModelsMissing {
             dir: config.daemon.model_dir.clone(),
         }));

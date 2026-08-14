@@ -10,14 +10,15 @@
 //!   `config` displays/edits the file itself, and `is-enrolled` tolerates a
 //!   missing config on its unprivileged path).
 //!
-//! - [`ResolvedConfig`] — **what is actually true.** A config value like
+//! - [`Fact`] — **what is actually true.** A config value like
 //!   `execution_provider = "cuda"` or `device.path = "/dev/video2"` is a
 //!   *claim*; whether CUDA exists in the installed ONNX Runtime or the device
-//!   node is present is discovered by an explicit probe, once, instead of
-//!   being re-derived ad hoc at each use site. Each fact carries a
-//!   [`Provenance`] tag. Resolution is for the heavyweight paths only
-//!   (daemon startup, status, enroll, test); lighter commands probe just the
-//!   fact they consume.
+//!   node is present is discovered by an explicit probe ([`ModelFiles`],
+//!   [`CameraPresence`], [`ExecutionProviderFact`]) instead of being
+//!   re-derived ad hoc at each use site. Each probe here is infallible and
+//!   returns its value plainly; commands call the one whose answer they
+//!   consume, and `status` gathers all of them into `health::Health`, where
+//!   each is lifted into a [`Fact`] — the type that can also say *unknown*.
 //!
 //! # `is-enrolled` never comes here
 //!
@@ -81,70 +82,55 @@ impl ConfigLoad {
 }
 
 // ---------------------------------------------------------------------------
-// ResolvedConfig — what is actually true
+// Facts — what is actually true
 // ---------------------------------------------------------------------------
 
-/// How a resolved fact was determined.
+/// A fact as `status` reports it: known — with a note on whether it was
+/// verified — or honestly unknown (H8).
 ///
-/// The daemon-reachability fact sits beside the existing ones the same way
-/// (`crate::backend::DaemonReachability` — Backend owns that probe, not
-/// this module).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provenance {
+/// One type, one level of nesting. The arm a plain value cannot express is
+/// [`Fact::Unknown`]: *the probe could not determine the answer*. The domain
+/// map (§5) sketched `Unavailable { needs: Privilege }`; DEC-6 collapsed the
+/// privilege tiers (`status` is root, `is-enrolled` never comes here), so what
+/// is left of N4 is probe failure — an unreadable database, a config that did
+/// not parse — and the honest payload is the reason, not a privilege level.
+///
+/// The discipline it enforces sits in the renderer: a [`Fact::Unknown`] value
+/// must never render as a guessed answer. "The database could not be read" is
+/// a distinct value from "this user has no models".
+///
+/// [`Probed`](Fact::Probed) vs [`Claimed`](Fact::Claimed) is a note, not a
+/// branch. No renderer distinguishes them and no control flow turns on them;
+/// the one machine-facing reader is `backend`'s `backend selected` trace,
+/// which prints the fact's `Debug`. It is a variant name rather than a
+/// separate `Provenance` field precisely so it stays free to carry and cannot
+/// grow back into a second level of nesting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fact<T> {
     /// Verified against the live system by this process (file stat, ORT
-    /// query).
-    Probed,
+    /// query, D-Bus round trip).
+    Probed(T),
     /// Taken from the config without verification — a claim, not a checked
     /// fact.
-    Claimed,
-}
-
-/// A fact plus how it was established.
-#[derive(Debug, Clone)]
-pub struct Resolved<T> {
-    pub value: T,
-    pub provenance: Provenance,
-}
-
-/// A fact as `status` reports it: known — with the [`Provenance`] every
-/// resolved fact already carries — or honestly unknown (H8).
-///
-/// This is the grown form of [`Resolved`]: the same value-plus-provenance
-/// when the answer exists, plus the arm [`Resolved`] cannot express — *the
-/// probe could not determine the answer*. The domain map (§5) sketched
-/// `Unavailable { needs: Privilege }`; DEC-6 collapsed the privilege tiers
-/// (`status` is root, `is-enrolled` never comes here), so what is left of N4
-/// is probe failure — an unreadable database, a config that did not parse —
-/// and the honest payload is the reason, not a privilege level.
-///
-/// The discipline it enforces sits in the renderer: an [`Fact::Unknown`]
-/// value must never render as a guessed answer. "The database could not be
-/// read" is a distinct value from "this user has no models".
-#[derive(Debug, Clone)]
-pub enum Fact<T> {
-    Known(Resolved<T>),
+    Claimed(T),
     /// Not an error and NOT a false answer: the probe could not determine
     /// the value. `why` says what stood in the way.
-    Unknown {
-        why: String,
-    },
+    Unknown { why: String },
 }
 
 impl<T> Fact<T> {
     /// A fact verified against the live system.
+    ///
+    /// Spelled lower-case beside [`Fact::unknown`], which has to be a
+    /// function because its variant holds an owned `String`; construction
+    /// sites then read alike whichever arm they build.
     pub fn probed(value: T) -> Self {
-        Fact::Known(Resolved {
-            value,
-            provenance: Provenance::Probed,
-        })
+        Fact::Probed(value)
     }
 
     /// A fact taken from configuration without verification.
     pub fn claimed(value: T) -> Self {
-        Fact::Known(Resolved {
-            value,
-            provenance: Provenance::Claimed,
-        })
+        Fact::Claimed(value)
     }
 
     pub fn unknown(why: impl Into<String>) -> Self {
@@ -152,17 +138,17 @@ impl<T> Fact<T> {
     }
 
     /// The value, when it is known.
+    ///
+    /// Deliberately `Option`: callers that need an answer either handle the
+    /// `None` or say "unknown". Folding it into a `bool` with a default —
+    /// `fact.known().is_some_and(..)` — is how an unestablished fact turns
+    /// into a confident false, which is the one thing this type exists to
+    /// prevent.
     pub fn known(&self) -> Option<&T> {
         match self {
-            Fact::Known(resolved) => Some(&resolved.value),
+            Fact::Probed(value) | Fact::Claimed(value) => Some(value),
             Fact::Unknown { .. } => None,
         }
-    }
-}
-
-impl<T> From<Resolved<T>> for Fact<T> {
-    fn from(resolved: Resolved<T>) -> Self {
-        Fact::Known(resolved)
     }
 }
 
@@ -194,17 +180,13 @@ pub struct ModelFiles {
 }
 
 impl ModelFiles {
-    pub fn probe(config: &Config) -> Resolved<ModelFiles> {
+    pub fn probe(config: &Config) -> ModelFiles {
         let dir = PathBuf::from(&config.daemon.model_dir);
-        let value = ModelFiles {
+        ModelFiles {
             dir_present: dir.is_dir(),
             detector: ProbedFile::probe(dir.join(&config.recognition.detector_model)),
             embedder: ProbedFile::probe(dir.join(&config.recognition.embedder_model)),
             dir,
-        };
-        Resolved {
-            value,
-            provenance: Provenance::Probed,
         }
     }
 
@@ -231,8 +213,8 @@ impl ModelFiles {
 /// `direct::resolve_camera_device` and friends) and is *not* duplicated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CameraPresence {
-    /// No path configured: detection happens at open time; nothing to probe
-    /// yet, so this fact stays a claim.
+    /// No path configured: there is no node to stat, so detection is deferred
+    /// to open time.
     AutoDetect,
     Configured {
         path: String,
@@ -241,18 +223,12 @@ pub enum CameraPresence {
 }
 
 impl CameraPresence {
-    pub fn probe(config: &Config) -> Resolved<CameraPresence> {
+    pub fn probe(config: &Config) -> CameraPresence {
         match config.device.path.as_deref() {
-            None => Resolved {
-                value: CameraPresence::AutoDetect,
-                provenance: Provenance::Claimed,
-            },
-            Some(path) => Resolved {
-                value: CameraPresence::Configured {
-                    path: path.to_string(),
-                    present: Path::new(path).exists(),
-                },
-                provenance: Provenance::Probed,
+            None => CameraPresence::AutoDetect,
+            Some(path) => CameraPresence::Configured {
+                path: path.to_string(),
+                present: Path::new(path).exists(),
             },
         }
     }
@@ -287,14 +263,10 @@ impl ExecutionProviderFact {
     /// Probe the installed ONNX Runtime. Loads the ORT shared library unless
     /// the configured provider is `cpu` (or unknown), so call this only on
     /// paths that will load the engine anyway or exist to diagnose (status).
-    pub fn probe(config: &Config) -> Resolved<ExecutionProviderFact> {
-        let value = Self::status_of(&config.recognition.execution_provider, || {
+    pub fn probe(config: &Config) -> ExecutionProviderFact {
+        Self::status_of(&config.recognition.execution_provider, || {
             facelock_face::detect_execution_provider().map(|d| d.available)
-        });
-        Resolved {
-            value,
-            provenance: Provenance::Probed,
-        }
+        })
     }
 
     /// The decision rule, split from the ORT query so it is testable without
@@ -315,25 +287,6 @@ impl ExecutionProviderFact {
         ExecutionProviderFact {
             configured: configured.to_string(),
             status,
-        }
-    }
-}
-
-/// The full resolution pass, for the paths that consume every fact (daemon
-/// startup logging, `status`). Commands that need one fact probe it directly.
-#[derive(Debug, Clone)]
-pub struct ResolvedConfig {
-    pub models: Resolved<ModelFiles>,
-    pub camera: Resolved<CameraPresence>,
-    pub execution_provider: Resolved<ExecutionProviderFact>,
-}
-
-impl ResolvedConfig {
-    pub fn resolve(config: &Config) -> Self {
-        ResolvedConfig {
-            models: ModelFiles::probe(config),
-            camera: CameraPresence::probe(config),
-            execution_provider: ExecutionProviderFact::probe(config),
         }
     }
 }
@@ -409,18 +362,17 @@ mod tests {
         ));
         let models = ModelFiles::probe(&config);
 
-        assert_eq!(models.provenance, Provenance::Probed);
-        assert!(models.value.dir_present);
-        assert!(models.value.detector.present);
-        assert!(!models.value.embedder.present);
-        assert!(!models.value.all_present());
+        assert!(models.dir_present);
+        assert!(models.detector.present);
+        assert!(!models.embedder.present);
+        assert!(!models.all_present());
         assert_eq!(
-            models.value.missing(),
+            models.missing(),
             vec![dir.path().join("emb.onnx").as_path()]
         );
 
         fs::write(dir.path().join("emb.onnx"), b"x").unwrap();
-        let models = ModelFiles::probe(&config).value;
+        let models = ModelFiles::probe(&config);
         assert!(models.all_present());
         assert!(models.missing().is_empty());
     }
@@ -428,30 +380,29 @@ mod tests {
     #[test]
     fn model_probe_on_missing_directory_is_all_absent() {
         let config = config_with("[daemon]\nmodel_dir = \"/nonexistent/facelock-test-models\"\n");
-        let models = ModelFiles::probe(&config).value;
+        let models = ModelFiles::probe(&config);
         assert!(!models.dir_present);
         assert!(!models.all_present());
         assert_eq!(models.missing().len(), 2);
     }
 
     #[test]
-    fn camera_probe_distinguishes_claim_from_probed_presence() {
-        // No path: a claim — detection is deferred to open time.
-        let auto = CameraPresence::probe(&config_with(""));
-        assert_eq!(auto.value, CameraPresence::AutoDetect);
-        assert_eq!(auto.provenance, Provenance::Claimed);
+    fn camera_probe_reports_auto_detect_and_node_presence() {
+        // No path: nothing to stat — detection is deferred to open time.
+        assert_eq!(
+            CameraPresence::probe(&config_with("")),
+            CameraPresence::AutoDetect
+        );
 
         // Configured and present.
         let dir = tempfile::tempdir().unwrap();
         let node = dir.path().join("video9");
         fs::write(&node, b"").unwrap();
-        let present = CameraPresence::probe(&config_with(&format!(
-            "[device]\npath = \"{}\"\n",
-            node.display()
-        )));
-        assert_eq!(present.provenance, Provenance::Probed);
         assert_eq!(
-            present.value,
+            CameraPresence::probe(&config_with(&format!(
+                "[device]\npath = \"{}\"\n",
+                node.display()
+            ))),
             CameraPresence::Configured {
                 path: node.display().to_string(),
                 present: true
@@ -459,11 +410,10 @@ mod tests {
         );
 
         // Configured and absent.
-        let absent = CameraPresence::probe(&config_with(
-            "[device]\npath = \"/dev/facelock-no-such-video\"\n",
-        ));
         assert_eq!(
-            absent.value,
+            CameraPresence::probe(&config_with(
+                "[device]\npath = \"/dev/facelock-no-such-video\"\n",
+            )),
             CameraPresence::Configured {
                 path: "/dev/facelock-no-such-video".into(),
                 present: false
@@ -592,7 +542,6 @@ mod tests {
     fn is_enrolled_module_stays_probe_free() {
         let forbidden = [
             "ConfigLoad",
-            "ResolvedConfig",
             "resolved::",
             "send_request(",
             "Backend::select(",
