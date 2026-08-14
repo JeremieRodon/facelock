@@ -45,6 +45,20 @@ pub fn require_root(hint: &str) -> anyhow::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Like [`require_root`], but never offers an interactive re-exec prompt.
+///
+/// For commands that are typically invoked non-interactively or scripted
+/// (`facelock audit`; `facelock daemon` has its own equivalent check) — a
+/// "Re-run with sudo? [Y/n]" prompt would just hang a script instead of
+/// failing loudly.
+pub fn require_root_scripted(hint: &str) -> anyhow::Result<()> {
+    if Uid::current().is_root() {
+        return Ok(());
+    }
+
+    bail!("Root required.\n  Run: {hint}");
+}
+
 /// Check whether we should use direct (daemonless) mode.
 /// Returns true if config says "oneshot" OR if the D-Bus service isn't available.
 /// When falling back from daemon mode, logs a warning.
@@ -173,32 +187,48 @@ pub fn is_access_denied(err: &anyhow::Error) -> bool {
     })
 }
 
+/// True if the D-Bus error chain carries the daemon's own "requires root"
+/// denial (`require_root` in `commands/daemon.rs`'s `authorize_method`), as
+/// opposed to a bus-policy rejection for a caller outside the `facelock`
+/// group. Matched on the rendered message rather than the `zbus::Error`
+/// shape, since the daemon's denial text is the only thing the wire
+/// preserves distinctly from a bus-policy AccessDenied.
+fn is_root_required_denial(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("requires root"))
+}
+
 /// Append an actionable hint to AccessDenied errors.
 ///
-/// The system bus policy (dbus/org.facelock.Daemon.conf) denies callers that
-/// are neither root nor in the `facelock` group *before* the request reaches
-/// the daemon, so without this a normal user's first `facelock preview` after
-/// setup fails with a bare AccessDenied and no explanation (issue #89). The
-/// daemon itself also returns AccessDenied for root-only methods and
-/// cross-user requests, so the hint stays neutral and leaves the specific
-/// reason to the wrapped error.
-fn add_group_hint(err: anyhow::Error) -> anyhow::Error {
-    if is_access_denied(&err) {
+/// Under DEC-6 (root-by-default CLI), most D-Bus methods are root-only, so
+/// most AccessDenied errors are the daemon's own `require_root` rejection —
+/// those get a root-specific hint (Wave-1 cross-PR note, issue #108: telling
+/// a root-only rejection to "join the facelock group" is actively wrong).
+/// The remaining case is the system bus policy (dbus/org.facelock.Daemon.conf)
+/// denying a caller that is neither root nor in the `facelock` group *before*
+/// the request reaches the daemon — without a hint there, a first `facelock
+/// preview`-style call after setup fails with a bare AccessDenied and no
+/// explanation (issue #89).
+fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
+    if !is_access_denied(&err) {
+        return err;
+    }
+    if is_root_required_denial(&err) {
+        err.context("Access denied: this operation requires root.\n  Re-run with sudo, or as root.")
+    } else {
         err.context(
             "Access denied. If you are not in the 'facelock' group, add yourself:\n  \
              sudo usermod -aG facelock $USER\nthen log out and back in (or re-run: \
              sudo facelock setup). Note: some operations require root regardless of \
              group membership.",
         )
-    } else {
-        err
     }
 }
 
 /// Send a request to the daemon via D-Bus, translating to/from the old
 /// DaemonRequest/DaemonResponse types used by the command layer.
 pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    send_request_inner(request).map_err(add_group_hint)
+    send_request_inner(request).map_err(add_access_denied_hint)
 }
 
 fn send_request_inner(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
@@ -390,16 +420,38 @@ mod tests {
     // Covers the locally constructed FDO variant, not the wire path: a denial
     // from the bus or the daemon arrives as `zbus::Error::MethodError`, whose
     // name is checked by `is_access_denied_name` above.
+    //
+    // "rejected by policy" deliberately does not contain "requires root", so
+    // this pins the bus-policy (non-root-specific) denial case.
     #[test]
     fn access_denied_fdo_error_gets_group_hint() {
         let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
             "rejected by policy".into(),
         ))))
         .context("D-Bus PreviewFrame call failed");
-        let hinted = add_group_hint(err);
+        let hinted = add_access_denied_hint(err);
         let msg = format!("{hinted:#}");
         assert!(msg.contains("usermod -aG facelock"), "got: {msg}");
         assert!(msg.contains("log out"), "got: {msg}");
+    }
+
+    // The daemon's `authorize_method` -> `require_root` denial (issue #108,
+    // Wave-1 cross-PR note): under DEC-6 this is now the common case, and it
+    // must say root is required rather than suggesting group membership,
+    // which would not fix anything.
+    #[test]
+    fn access_denied_root_required_gets_root_hint() {
+        let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "ListModels requires root (caller: 'alice', UID 1000)".into(),
+        ))))
+        .context("D-Bus ListModels call failed");
+        let hinted = add_access_denied_hint(err);
+        let msg = format!("{hinted:#}");
+        assert!(msg.contains("requires root"), "got: {msg}");
+        assert!(
+            !msg.contains("usermod -aG facelock"),
+            "a root-only denial must not suggest joining the group, got: {msg}"
+        );
     }
 
     #[test]
@@ -407,8 +459,26 @@ mod tests {
         let err = anyhow::Error::new(zbus::Error::Failure("connection refused".into()))
             .context("D-Bus Ping call failed");
         let msg_before = format!("{err:#}");
-        let hinted = add_group_hint(err);
+        let hinted = add_access_denied_hint(err);
         assert_eq!(format!("{hinted:#}"), msg_before);
+    }
+
+    #[test]
+    fn require_root_scripted_passes_when_root() {
+        if Uid::current().is_root() {
+            assert!(require_root_scripted("sudo facelock audit").is_ok());
+        }
+    }
+
+    #[test]
+    fn require_root_scripted_never_prompts_non_root() {
+        // Can't simulate an attached TTY here, but the important property is
+        // structural: unlike `require_root`, this function has no branch that
+        // reads stdin or writes a prompt — it only checks the UID and bails.
+        if !Uid::current().is_root() {
+            let err = require_root_scripted("sudo facelock audit").unwrap_err();
+            assert!(format!("{err:#}").contains("Root required"));
+        }
     }
 
     #[test]
