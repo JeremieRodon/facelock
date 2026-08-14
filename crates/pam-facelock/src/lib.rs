@@ -111,18 +111,17 @@ impl Default for PamSecurityConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)] // Variants used via deserialization
 enum PamNotificationMode {
     Off,
-    /// Default must agree with `PamNotificationConfig::default()` below and
-    /// with facelock-core's `NotificationMode` (Terminal). This enum-level
-    /// default is what a present `[notification]` section with `mode` omitted
-    /// produces; the struct `Default` is what an absent section produces.
-    /// The two had drifted (`Both` here, `Terminal` there) — benign only
-    /// because `terminal()` treats Both and Terminal identically.
-    #[default]
+    /// The default mode, named once in [`PamNotificationConfig::default`] and
+    /// nowhere else. It must equal facelock-core's `NotificationMode`
+    /// default. This enum deliberately has no `Default` impl: it carried a
+    /// second answer to the same question, and the two drifted (`Both` here,
+    /// `Terminal` there) — undetected because `terminal()` treats Both and
+    /// Terminal identically.
     Terminal,
     Desktop,
     Both,
@@ -135,13 +134,18 @@ enum PamNotificationMode {
 /// vocabulary as `facelock_core::notify::NotifyEvent`: `notify_prompt` ↔
 /// Scanning, `notify_on_success` ↔ Success. (This module renders them as
 /// PAM conversation text; desktop delivery is the daemon's job.)
+///
+/// `#[serde(default)]` sits on the container, not on the fields: every
+/// omitted key falls back to the [`Default`] impl below, so "section present,
+/// key omitted" and "section absent" produce the same values by construction
+/// instead of by two lists happening to agree. They did not agree once (D9),
+/// and the same shape in facelock-core's `NotificationConfig` shipped the
+/// same class of bug.
 #[derive(Deserialize)]
+#[serde(default)]
 struct PamNotificationConfig {
-    #[serde(default)]
     mode: PamNotificationMode,
-    #[serde(default = "default_true")]
     notify_prompt: bool,
-    #[serde(default = "default_true")]
     notify_on_success: bool,
 }
 

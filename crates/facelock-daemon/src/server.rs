@@ -590,7 +590,15 @@ where
             drop(capture_guard);
             match response {
                 DaemonResponse::AuthResult(result) => {
-                    // Send desktop notification (fire-and-forget, runs as root → setpriv)
+                    // Desktop notification, delivered as root via setpriv. NOT
+                    // fire-and-forget: the delivery path runs the helper with
+                    // `Command::output()`, which waits for the child, and this
+                    // runs before the reply below is built — so an auth reply
+                    // waits on it. The `Notifier` contract is that delivery
+                    // must not FAIL an authentication (errors are logged and
+                    // swallowed); staying cheap enough not to delay one is an
+                    // obligation of the implementation, not a guarantee of
+                    // this call site.
                     notify_auth_outcome(&notify_config, notifier_factory(&user).as_ref(), &result);
 
                     Ok(AuthResult {
