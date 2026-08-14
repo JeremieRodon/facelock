@@ -13,7 +13,8 @@ use facelock_camera::{
 use facelock_core::config::DeviceConfig;
 use facelock_core::config::{Config, EncryptionMethod};
 use facelock_core::ipc::DaemonResponse;
-use facelock_core::types::MatchResult;
+use facelock_core::traits::{CameraSource, FaceProcessor};
+use facelock_core::types::{MatchResult, zeroize_stored_embeddings};
 use facelock_daemon::audit::AuditSource;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
@@ -147,15 +148,15 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
     let mut engine = load_engine(config)?;
 
     // Load embeddings with encryption support, matching the daemon handler path.
-    let stored = load_user_embeddings(&store, config, user)?;
+    let mut stored = load_user_embeddings(&store, config, user)?;
     let models = store.list_models(user).unwrap_or_default();
 
     // Shared with daemon mode (crates/facelock-daemon/src/auth.rs). A local copy
     // of this loop previously lived here and silently drifted — do not re-fork it.
-    let response = facelock_daemon::auth::authenticate_with_embeddings(
+    let response = authenticate_and_wipe(
         &mut camera,
         &mut engine,
-        &stored,
+        &mut stored,
         &models,
         config,
         user,
@@ -169,6 +170,37 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         DaemonResponse::Error { message } => bail!("{message}"),
         _ => bail!("unexpected auth response"),
     }
+}
+
+/// Run the shared camera auth loop, then wipe the caller-side decrypted
+/// embeddings (#100). `authenticate_with_embeddings` copies the compare set
+/// and zeroizes only its own copies, so without this the plaintext templates
+/// passed in would outlive authentication in the caller's memory.
+#[allow(clippy::too_many_arguments)]
+pub fn authenticate_and_wipe<C: CameraSource, E: FaceProcessor>(
+    camera: &mut C,
+    engine: &mut E,
+    stored: &mut [(u32, facelock_core::types::FaceEmbedding)],
+    models: &[facelock_core::types::FaceModelInfo],
+    config: &Config,
+    user: &str,
+    device_is_ir: bool,
+    live_fingerprint: &facelock_core::types::DeviceFingerprint,
+    source: AuditSource,
+) -> DaemonResponse {
+    let response = facelock_daemon::auth::authenticate_with_embeddings(
+        camera,
+        engine,
+        stored,
+        models,
+        config,
+        user,
+        device_is_ir,
+        live_fingerprint,
+        source,
+    );
+    zeroize_stored_embeddings(stored);
+    response
 }
 
 /// Initialize a software sealer based on encryption config.
@@ -212,8 +244,11 @@ fn init_software_sealer(config: &Config) -> anyhow::Result<Option<facelock_tpm::
     }
 }
 
-/// Load user embeddings, decrypting software-encrypted or TPM-sealed blobs as needed.
-/// Mirrors `Handler::load_user_embeddings` from the daemon path.
+/// Load user embeddings, decrypting software-encrypted or TPM-sealed blobs as
+/// needed. Mirrors `Handler::load_user_embeddings` from the daemon path,
+/// including directly TPM-sealed rows (version byte 0x01/0x03) written when
+/// `tpm.seal_database` is enabled — previously those failed here, which broke
+/// `bench`, `preview --text-only`, `test` and oneshot on sealed stores (B3).
 pub fn load_user_embeddings(
     store: &FaceStore,
     config: &Config,
@@ -221,37 +256,49 @@ pub fn load_user_embeddings(
 ) -> anyhow::Result<Vec<(u32, facelock_core::types::FaceEmbedding)>> {
     let software_sealer = init_software_sealer(config)?;
 
-    // Fast path: no encryption configured
-    if software_sealer.is_none() {
+    // Fast path: nothing is configured that could have written encrypted rows.
+    // `seal_database` forces the raw path even without a software sealer, so a
+    // TPM-sealed blob is never misread as a raw embedding.
+    if software_sealer.is_none() && !config.tpm.seal_database {
         return store
             .get_user_embeddings(user)
             .context("storage error loading embeddings");
     }
 
     // Slow path: load raw blobs (with device ids for opt-in AAD) and decrypt
-    let sealer = software_sealer.unwrap();
     let raw_rows = store
         .get_user_embeddings_raw_with_device(user)
         .context("storage error loading raw embeddings")?;
 
+    // Connect to the TPM lazily, only when a TPM-sealed row is present.
+    let mut tpm_sealer: Option<facelock_tpm::TpmSealer> = None;
+
     let mut results = Vec::with_capacity(raw_rows.len());
     for (id, blob, sealed, device_id) in &raw_rows {
         let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
+            let sealer = software_sealer.as_ref().with_context(|| {
+                format!("embedding {id} is software-encrypted but no key is configured")
+            })?;
             let aad = config.security.device_aad(device_id.as_deref());
             sealer
                 .unseal_embedding_with_aad(blob, aad.as_deref())
                 .with_context(|| format!("software decryption failed for embedding {id}"))?
         } else if *sealed {
-            #[cfg(feature = "tpm")]
-            {
-                bail!(
-                    "embedding {id} is TPM-sealed but direct path only supports software encryption — use the daemon"
-                );
-            }
-            #[cfg(not(feature = "tpm"))]
-            {
-                bail!("embedding {id} is TPM-sealed but TPM support is not compiled in");
-            }
+            // TPM-sealed (version byte 0x01/0x03), matching the daemon at
+            // `Handler::load_user_embeddings`. Without the `tpm` feature the
+            // passthrough sealer reports a clear "compile with tpm" error
+            // instead of misreading the blob.
+            let sealer = match tpm_sealer.as_mut() {
+                Some(s) => s,
+                None => {
+                    let s = facelock_tpm::TpmSealer::new(&config.tpm.tcti)
+                        .context("TPM initialization failed")?;
+                    tpm_sealer.insert(s)
+                }
+            };
+            sealer
+                .unseal_embedding(blob)
+                .with_context(|| format!("TPM unseal failed for embedding {id}"))?
         } else {
             // Plaintext raw embedding
             anyhow::ensure!(
@@ -405,7 +452,7 @@ warmup_frames = 2
     #[test]
     fn auto_detected_device_inherits_quirk_state() {
         let config = test_config();
-        let device = make_device("/dev/video2", "Logitech BRIO IR", "MJPG");
+        let device = make_device("/dev/video2", "BRIO IR", "GREY");
         let dir = write_quirks_dir(
             r#"
 [[quirk]]
@@ -441,5 +488,147 @@ warmup_frames = 9
         assert_eq!(resolved.device.warmup_frames, 2);
         assert!(!resolved.device_is_ir);
         assert!(resolved.device_quirk.is_none());
+    }
+
+    // --- N8: encrypted-store loading in the direct path ---
+
+    #[test]
+    fn load_user_embeddings_decrypts_software_sealed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("facelock.key");
+        let config = Config::parse(&format!(
+            "[encryption]\nmethod = \"keyfile\"\nkey_path = \"{}\"\n",
+            key_path.display()
+        ))
+        .unwrap();
+
+        facelock_tpm::SoftwareSealer::generate_key_file(&key_path).unwrap();
+        let sealer = facelock_tpm::SoftwareSealer::from_key_file(&key_path).unwrap();
+        let emb: facelock_core::types::FaceEmbedding = [0.25; 512];
+        let blob = sealer.seal_embedding(&emb).unwrap();
+
+        let store = FaceStore::open_memory().unwrap();
+        store
+            .add_model_raw("alice", "front", &blob, true, "embedder")
+            .unwrap();
+
+        let loaded = load_user_embeddings(&store, &config, "alice").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, emb);
+    }
+
+    /// B3: a TPM-sealed row (version byte 0x01, written under
+    /// `tpm.seal_database`) must reach the TPM unseal path — never be misread
+    /// as a raw embedding via the fast path. Without the `tpm` feature the
+    /// passthrough sealer reports a clear "without TPM support" error; actual
+    /// hardware unsealing cannot be asserted in CI and is exercised only on a
+    /// machine with a TPM.
+    #[cfg(not(feature = "tpm"))]
+    #[test]
+    fn tpm_sealed_rows_error_clearly_without_tpm_support() {
+        let config =
+            Config::parse("[encryption]\nmethod = \"none\"\n\n[tpm]\nseal_database = true\n")
+                .unwrap();
+        let store = FaceStore::open_memory().unwrap();
+        let mut blob = vec![0x01u8];
+        blob.extend_from_slice(&[0u8; 64]);
+        store
+            .add_model_raw("alice", "front", &blob, true, "embedder")
+            .unwrap();
+
+        let err = load_user_embeddings(&store, &config, "alice").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("TPM unseal failed for embedding"), "{chain}");
+        assert!(chain.contains("without TPM support"), "{chain}");
+    }
+
+    /// `seal_database` forces the raw-row path even with no software sealer;
+    /// plaintext rows stored before sealing was enabled must still load.
+    #[test]
+    fn seal_database_slow_path_still_loads_plaintext_rows() {
+        let config =
+            Config::parse("[encryption]\nmethod = \"none\"\n\n[tpm]\nseal_database = true\n")
+                .unwrap();
+        let store = FaceStore::open_memory().unwrap();
+        let emb: facelock_core::types::FaceEmbedding = [0.75; 512];
+        store.add_model("alice", "front", &emb, "embedder").unwrap();
+
+        let loaded = load_user_embeddings(&store, &config, "alice").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, emb);
+    }
+
+    // --- D11 (#100): caller-side wipe of decrypted embeddings ---
+
+    /// The compare set handed to `authenticate_with_embeddings` is copied
+    /// internally and only the copies are zeroized; `authenticate_and_wipe`
+    /// must wipe the caller's buffer too. Covers the `facelock auth` and
+    /// direct-mode callers, which both go through this helper; the daemon
+    /// handler's inline wipe at its call site cannot be black-box asserted
+    /// from here.
+    #[test]
+    fn authenticate_and_wipe_zeroizes_caller_embeddings() {
+        use facelock_test_support::{MockCamera, MockFaceEngine, fixtures};
+
+        let emb = fixtures::known_embedding(1);
+        let mut camera = MockCamera::bright(64, 64, 4);
+        let mut engine = MockFaceEngine::one_face(emb);
+        let config = Config::parse(
+            r#"
+[recognition]
+threshold = 0.45
+timeout_secs = 2
+
+[security]
+require_ir = false
+require_frame_variance = false
+require_landmark_liveness = false
+abort_if_ssh = false
+abort_if_lid_closed = false
+"#,
+        )
+        .unwrap();
+
+        let mut stored = vec![(1u32, emb)];
+        let models = vec![facelock_core::types::FaceModelInfo {
+            id: 1,
+            user: "alice".into(),
+            label: "front".into(),
+            created_at: 0,
+            embedder_model: String::new(),
+            device_id: None,
+        }];
+        let fingerprint = facelock_core::types::DeviceFingerprint {
+            vid: None,
+            pid: None,
+            serial: None,
+            by_path: None,
+        };
+
+        let response = authenticate_and_wipe(
+            &mut camera,
+            &mut engine,
+            &mut stored,
+            &models,
+            &config,
+            "alice",
+            false,
+            &fingerprint,
+            AuditSource::Test,
+        );
+
+        assert!(
+            matches!(
+                response,
+                DaemonResponse::AuthResult(MatchResult { matched: true, .. })
+            ),
+            "auth loop must run to completion: {response:?}"
+        );
+        for (id, e) in &stored {
+            assert!(
+                e.iter().all(|&v| v == 0.0),
+                "caller-side embedding {id} was not wiped"
+            );
+        }
     }
 }

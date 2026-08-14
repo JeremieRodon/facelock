@@ -44,6 +44,7 @@ bytemuck = "1"
 
 [dev-dependencies]
 tempfile = "3"
+facelock-test-support = { path = "../facelock-test-support" }
 
 [features]
 default = ["wayland"]

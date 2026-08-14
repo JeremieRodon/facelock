@@ -3,12 +3,12 @@ use std::time::{Duration, Instant};
 use facelock_core::config::{Config, EncryptionMethod};
 use facelock_core::ipc::{DaemonRequest, DaemonResponse, PreviewFace};
 use facelock_core::traits::{CameraSource, FaceProcessor};
-use facelock_core::types::best_match;
+use facelock_core::types::{best_match, zeroize_stored_embeddings};
 use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
 
-use crate::audit::{self, AuditEntry, AuditSource};
+use crate::audit::AuditSource;
 use crate::auth;
 use crate::enroll;
 use crate::rate_limit::RateLimiter;
@@ -334,41 +334,14 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             }
 
             DaemonRequest::Authenticate { user } => {
-                if let Some(resp) = auth::pre_check(
+                if let Some(resp) = auth::pre_check_audited(
                     &self.config,
                     &self.store,
                     &user,
                     &self.rate_limiter,
                     self.device_is_ir,
+                    AuditSource::Daemon,
                 ) {
-                    let (result, error) = match &resp {
-                        DaemonResponse::Error { message } if message.contains("rate limited") => {
-                            ("rate_limited".to_string(), Some(message.clone()))
-                        }
-                        DaemonResponse::Error { message } => {
-                            ("error".to_string(), Some(message.clone()))
-                        }
-                        DaemonResponse::AuthResult(mr) if !mr.matched => {
-                            ("failure".to_string(), None)
-                        }
-                        DaemonResponse::Suppressed => ("suppressed".to_string(), None),
-                        _ => ("error".to_string(), None),
-                    };
-                    audit::write_audit_entry(
-                        &self.config.audit,
-                        &AuditEntry {
-                            timestamp: audit::now_iso8601(),
-                            user: user.clone(),
-                            result,
-                            source: Some(AuditSource::Daemon),
-                            similarity: None,
-                            frame_count: None,
-                            duration_ms: None,
-                            device: self.config.device.path.clone(),
-                            model_label: None,
-                            error,
-                        },
-                    );
                     return resp;
                 }
 
@@ -377,7 +350,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
 
                 // Pre-load and decrypt embeddings (handles TPM + software encryption)
-                let stored = match self.load_user_embeddings(&user) {
+                let mut stored = match self.load_user_embeddings(&user) {
                     Ok(s) => s,
                     Err(resp) => return resp,
                 };
@@ -396,6 +369,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     &self.device_fingerprint,
                     AuditSource::Daemon,
                 );
+                // `authenticate_with_embeddings` works on an internal copy;
+                // wipe the caller-side plaintext set too (#100).
+                zeroize_stored_embeddings(&mut stored);
                 self.camera = Some(camera);
                 self.camera_last_used = Instant::now();
                 // Only failed auths count against the rate limit
