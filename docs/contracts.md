@@ -64,6 +64,109 @@ Supplying a choice flag suppresses the corresponding wizard step. `auto` means
 gives the default. Under `--non-interactive`, an unresolvable choice is an error,
 never a prompt.
 
+### CLI Privilege Model (DEC-6)
+
+The CLI is root by default: every subcommand requires root except the four
+listed below, which are unprivileged by design, not by omission.
+
+| Command | Why unprivileged |
+|---------|-------------------|
+| `facelock is-enrolled` | Answers from the caller's own `0600` marker file; the unprivileged integration point (see Exit Codes above). Never probes D-Bus |
+| `facelock hyprlock …` | Edits the user's own dotfile — root would write root-owned files into `$HOME`, which is wrong, not just unnecessary |
+| `facelock config` (display, no `--edit`) | Reads a `0644` file |
+| `--help`, `--version` | — |
+
+Every other command requires root. Two escalation behaviors apply, and each
+command uses exactly one:
+
+- **Interactive prompt.** `setup`, `enroll`, `test`, `preview`, `bench`,
+  `encrypt`, `decrypt`, `tpm`, `reseal`, `restart`, `config --edit`, `remove`,
+  `clear`, `list`, `status`, `devices`. Run as non-root with a TTY attached,
+  these ask `Root required. Re-run with sudo? [Y/n]` and re-exec via `sudo`
+  on yes. Run as non-root with no TTY (scripted, piped, or closed stdin),
+  they hard-error instead — `Root required.\n  Run: sudo facelock <cmd>` —
+  rather than hang waiting for input that will never arrive
+  (`ipc_client::require_root`).
+- **Hard error only.** `facelock audit` (and `facelock daemon`, whose own
+  root check predates this table) never offer the interactive prompt at all,
+  even with a TTY attached — both are typically invoked non-interactively or
+  as a long-running service, where a stray confirmation prompt is a hang, not
+  a convenience (`ipc_client::require_root_scripted`).
+
+`facelock auth` is not user-facing — PAM spawns it directly, and it is not
+part of this table.
+
+**Ordering guarantee (C6).** Every command that prompts for confirmation or
+runs an interactive question runs its root check **first**, before that
+prompt or any other output or side effect. `remove` and `clear` both ask a
+Y/N confirmation before deleting a face model; historically `remove`'s root
+check ran *after* that confirmation, so a facelock-group member (who lacks
+root) would confirm a destructive action and only then discover it was
+refused — this is fixed. The same ordering applies to `status`, `devices`,
+`preview`, `test`, `audit`, `bench`, and `config --edit`: the root check is
+the first statement in each command's entry point, before `Config::load()`
+or any `println!`.
+
+**AccessDenied hint.** A D-Bus `AccessDenied` reply carries an actionable
+hint (`ipc_client::add_access_denied_hint`) that distinguishes two causes: the
+daemon's own `require_root` rejection (most methods now, since almost every
+D-Bus method is root-only — see IPC Protocol below) gets a root-specific
+hint; a bus-policy rejection (caller is neither root nor in the `facelock`
+group) gets the group-membership hint. Telling a root-only rejection to
+"join the facelock group" is wrong — joining the group does not grant root.
+
+### facelock test Semantics (N11)
+
+`facelock test` is root-only (issue #96) and, being root, keeps full detail
+on both transports: on the daemon transport, `AuthResult.similarity` is
+redacted to non-root D-Bus callers only (`redact_similarity_unless_root` in
+`commands/daemon.rs`) — since `test` requires root, its `Authenticate` calls
+always get the real score. The direct transport never redacts.
+
+It runs through the same pre-flight gates as real authentication —
+`security.disabled`, enrollment / `suppress_unknown`, the rate-limit check,
+and `require_ir` — via `facelock_daemon::auth::pre_check_audited*`, with one
+explicit, narrow exception: the `abort_if_ssh` / `abort_if_lid_closed` gates
+are skippable via `PreCheckContext::test()`. Those two gates exist to stop an
+*attacker*'s physical-access shortcuts, not to block an admin who is already
+root (by construction, since `test` requires root) and is deliberately
+diagnosing recognition over SSH or with the lid closed on a docked laptop.
+Every other gate stays enforced — this is a context flag threaded through
+`pre_check`, not a parallel copy of the gate logic (issue #95 was exactly
+that kind of drift).
+
+The override applies uniformly on the **direct** (daemonless) transport,
+where the pre-flight check runs in the same process that has the invoking
+session's actual `SSH_CONNECTION`/lid state. It does **not** apply
+separately on the **daemon** transport: `test` there is just another
+`Authenticate` D-Bus call, indistinguishable from real auth at that layer,
+so `abort_if_ssh` is evaluated against the long-running daemon process's own
+environment (never an SSH session) and is already inert there regardless;
+`abort_if_lid_closed` reads a system-wide hardware file and so still applies
+uniformly to every daemon-mediated `Authenticate` call, `test` included. In
+practice this means: diagnosing over SSH works on both transports (direct
+because it's overridden, daemon because the gate was already a no-op there);
+diagnosing with the lid closed only bypasses the gate in direct/oneshot mode.
+
+**Rate-limit consumption is exempted; the check is not.** A failed `test`
+attempt never consumes the shared (SQLite-backed) rate-limit budget:
+- Direct transport: `direct::authenticate` never calls
+  `RateLimiter::record_failure` — structurally, not conditionally.
+- Daemon transport: `test` reaches the daemon through the same
+  `Authenticate` D-Bus method as real auth. The D-Bus layer
+  (`commands/daemon.rs`) calls `Handler::handle_authenticate(user, charge)`
+  with `charge = !caller_is_root`; since `test` requires root, its D-Bus
+  calls are always exempted. Real end-user authentication (hyprlock, screen
+  lockers) runs as the *unprivileged user themselves*, so it is always
+  charged as before — this exemption only ever fires for a root caller.
+
+The rate-limit *check* (whether `user` is already over budget) is
+unaffected by any of the above and still runs on both transports: an
+already-limited user's `test` run reports "rate limited", exactly like real
+auth would. Root can already clear the limiter directly (it owns the
+database), so exempting *consumption* costs nothing security-wise, while
+still surfacing an existing lockout instead of masking it.
+
 ## Operating Modes
 
 | Mode | Config | PAM Behavior | CLI Behavior |
@@ -299,11 +402,22 @@ The daemon registers on the system bus via D-Bus activation.
 ### Methods
 `Authenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
 
-Method authorization contract:
-- `Authenticate`, `ListModels`, `PreviewDetectFrame`: root or the matching Unix user.
-- `Enroll`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `Shutdown`: root only.
-- `ReleaseCamera`: root or the Unix user that owns the active preview camera session.
-- `ListDevices`, `Ping`: resolve caller UID before replying and rely on the system bus policy for admission control.
+Method authorization contract (updated under DEC-6/N13 — the CLI's
+root-by-default privilege map left no unprivileged consumer for most of
+these, so tightening them to root-only closes the per-frame similarity
+hill-climbing oracle by construction rather than by redacting fields):
+- `Authenticate`: root or the matching Unix user. The one user-scoped method
+  — screen lockers run their PAM stack as the user, so this is architecture,
+  not policy.
+- Every other method — `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`,
+  `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`,
+  `Ping`, `Shutdown` — is root only. The bus policy
+  (`dbus/org.facelock.Daemon.conf`) stays interface-scoped (grants send
+  access to root and the `facelock` group for the whole interface); the
+  per-method root/user-scoped decision is the in-daemon check on the caller
+  UID from `GetConnectionUnixUser`, keyed by a table-driven scope
+  (`authorize_method` in `commands/daemon.rs`) so a new method is root-only
+  by default until deliberately opened up.
 
 Raw camera frames require privilege. `PreviewFrame` remains root-only.
 `PreviewDetectFrame` returns the `jpeg_data` frame bytes to root
