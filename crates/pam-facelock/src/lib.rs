@@ -949,8 +949,10 @@ fn identify(pamh: *mut libc::c_void) -> libc::c_int {
     }
 
     // 6. Daemon mode: connect via D-Bus, fall back to oneshot if unavailable
-    // Desktop notifications are handled by the daemon's auth_attempted D-Bus signal;
-    // PAM only provides terminal feedback via pam_info().
+    // Desktop notifications are sent by the daemon itself (setpriv +
+    // notify-send into the user's session bus); the auth_attempted signal
+    // carries no notification duty. PAM only provides terminal feedback via
+    // pam_info().
     match daemon_authenticate(&config, &user) {
         Ok(AuthResponse::Matched { .. }) => {
             log_auth(&service, "success", &user, LOG_INFO);
