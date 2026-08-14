@@ -515,7 +515,7 @@ mod tests {
             "facelock-enroll-cleanup-{}-{unique}.db",
             std::process::id()
         ));
-        let store = FaceStore::open(&db_path).unwrap();
+        let store = FaceStore::create(&db_path).unwrap();
         let config = Config::parse("[recognition]\ntimeout_secs = 2\n").unwrap();
 
         // One repeated embedding: every frame passes the quality gate and is

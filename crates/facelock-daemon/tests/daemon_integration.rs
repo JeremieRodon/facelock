@@ -682,7 +682,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
     config.security.require_landmark_liveness = false;
 
     {
-        let store = FaceStore::open(&db_path).unwrap();
+        let store = FaceStore::create(&db_path).unwrap();
         store
             .add_model("testuser", "front", &fixtures::known_embedding(0), "")
             .unwrap();
@@ -695,7 +695,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
     let mut first_handler = Handler::new(
         config.clone(),
         MockFaceEngine::no_faces(),
-        FaceStore::open(&db_path).unwrap(),
+        FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,
@@ -722,7 +722,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
     let mut restarted_handler = Handler::new(
         config.clone(),
         MockFaceEngine::no_faces(),
-        FaceStore::open(&db_path).unwrap(),
+        FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,

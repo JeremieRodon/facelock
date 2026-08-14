@@ -28,6 +28,222 @@ const MANIFEST_TOML: &str = include_str!("../../../../models/manifest.toml");
 /// Marker file written on successful setup completion.
 pub const SETUP_COMPLETE_MARKER: &str = "/etc/facelock/.setup-complete";
 
+/// PAM service targeted by `--pam` when `--service` is not given.
+pub const DEFAULT_PAM_SERVICE: &str = "sudo";
+
+// ---------------------------------------------------------------------------
+// CLI argument resolution
+//
+// `facelock setup` has enough flags that "which flag wins" needs to be a pure,
+// testable function rather than a chain of `if`s in the dispatch. Everything in
+// this section is a total function of the parsed CLI args: no root, no camera,
+// no network, so the compatibility matrix in the plan is unit-testable.
+// ---------------------------------------------------------------------------
+
+/// Model quality preset for `--models`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ModelPreset {
+    Standard,
+    Balanced,
+    High,
+}
+
+/// ONNX Runtime execution provider for `--execution-provider`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExecutionProviderChoice {
+    Cpu,
+    Cuda,
+    Rocm,
+    Openvino,
+    Auto,
+}
+
+/// Embedding encryption method for `--encryption`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EncryptionChoice {
+    Tpm,
+    Keyfile,
+    None,
+    Auto,
+}
+
+/// Camera selection for `--camera`. `auto` re-derives from hardware rather than
+/// meaning "the default" — omitting the flag already gives you the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CameraChoice {
+    Path(String),
+    Auto,
+}
+
+/// Which base setup flow runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseMode {
+    Wizard,
+    NonInteractive,
+}
+
+/// Systemd preference. `Ask` = wizard prompts (today's default); under a
+/// non-interactive base `Ask` means "do nothing", exactly as today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemdPref {
+    Ask,
+    Install,
+    Disable,
+    Skip,
+}
+
+/// PAM preference. `Ask` behaves like [`SystemdPref::Ask`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PamPref {
+    Ask,
+    Install { service: Option<String> },
+    Remove { service: String },
+    Skip,
+}
+
+/// Raw `facelock setup` arguments, exactly as clap parsed them.
+///
+/// This mirrors the `Commands::Setup` variant field for field so that
+/// [`resolve_setup_plan`] is the only place the precedence rules live.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupArgs {
+    pub non_interactive: bool,
+    pub yes: bool,
+    pub pam: bool,
+    pub no_pam: bool,
+    pub systemd: bool,
+    pub no_systemd: bool,
+    pub enroll: bool,
+    pub no_enroll: bool,
+    pub disable: bool,
+    pub service: Option<String>,
+    pub remove: bool,
+    pub camera: Option<String>,
+    pub models: Option<ModelPreset>,
+    pub execution_provider: Option<ExecutionProviderChoice>,
+    pub encryption: Option<EncryptionChoice>,
+}
+
+/// Fully resolved `facelock setup` invocation. Pure function of the CLI args.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupPlan {
+    /// `None` = standalone action mode: no base setup runs, only the systemd
+    /// and/or PAM actions below — exactly today's `--systemd` / `--pam` behavior.
+    pub base: Option<BaseMode>,
+    pub systemd: SystemdPref,
+    pub pam: PamPref,
+    /// `None` = ask (wizard) / skip (non-interactive)
+    pub enroll: Option<bool>,
+    pub camera: Option<CameraChoice>,
+    pub models: Option<ModelPreset>,
+    pub execution_provider: Option<ExecutionProviderChoice>,
+    pub encryption: Option<EncryptionChoice>,
+    pub yes: bool,
+}
+
+impl Default for SetupPlan {
+    /// The full interactive wizard — what a bare `facelock setup` resolves to.
+    fn default() -> Self {
+        Self {
+            base: Some(BaseMode::Wizard),
+            systemd: SystemdPref::Ask,
+            pam: PamPref::Ask,
+            enroll: None,
+            camera: None,
+            models: None,
+            execution_provider: None,
+            encryption: None,
+            yes: false,
+        }
+    }
+}
+
+/// Resolve raw CLI args into a [`SetupPlan`].
+///
+/// The load-bearing rule is `base_requested`: any flag that only makes sense
+/// while the base setup runs forces the base to run. Without it, `setup
+/// --camera=/dev/video2 --pam` would silently drop `--camera` the way the old
+/// mutually-exclusive dispatch did.
+pub fn resolve_setup_plan(args: SetupArgs) -> SetupPlan {
+    let base_requested = args.non_interactive
+        || args.no_pam
+        || args.no_systemd
+        || args.enroll
+        || args.no_enroll
+        || args.camera.is_some()
+        || args.models.is_some()
+        || args.execution_provider.is_some()
+        || args.encryption.is_some();
+
+    // `--pam` / `--systemd` on their own keep their historical meaning: perform
+    // just that action, touch nothing else.
+    let standalone = !base_requested && (args.pam || args.systemd);
+
+    let base = if standalone {
+        None
+    } else if args.non_interactive {
+        Some(BaseMode::NonInteractive)
+    } else {
+        Some(BaseMode::Wizard)
+    };
+
+    let systemd = if args.systemd && args.disable {
+        SystemdPref::Disable
+    } else if args.systemd {
+        SystemdPref::Install
+    } else if args.no_systemd {
+        SystemdPref::Skip
+    } else {
+        SystemdPref::Ask
+    };
+
+    let pam = if args.pam && args.remove {
+        // Removal always needs a concrete service, so apply the default now.
+        PamPref::Remove {
+            service: args
+                .service
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PAM_SERVICE.to_string()),
+        }
+    } else if args.pam {
+        PamPref::Install {
+            service: args.service.clone(),
+        }
+    } else if args.no_pam {
+        PamPref::Skip
+    } else {
+        PamPref::Ask
+    };
+
+    let enroll = if args.enroll {
+        Some(true)
+    } else if args.no_enroll {
+        Some(false)
+    } else {
+        None
+    };
+
+    let camera = args.camera.map(|s| {
+        if s == "auto" {
+            CameraChoice::Auto
+        } else {
+            CameraChoice::Path(s)
+        }
+    });
+
+    SetupPlan {
+        base,
+        systemd,
+        pam,
+        enroll,
+        camera,
+        models: args.models,
+        execution_provider: args.execution_provider,
+        encryption: args.encryption,
+        yes: args.yes,
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ModelManifest {
     models: Vec<ModelEntry>,
@@ -58,21 +274,87 @@ fn is_interactive() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Entry point for a plain `facelock setup` / `facelock setup --non-interactive`.
+///
+/// Kept as a thin wrapper over [`run_with_plan`] because `enroll` calls it.
 pub fn run(non_interactive: bool) -> anyhow::Result<()> {
-    crate::ipc_client::require_root("sudo facelock setup")?;
+    let base = if non_interactive {
+        BaseMode::NonInteractive
+    } else {
+        BaseMode::Wizard
+    };
+    run_with_plan(SetupPlan {
+        base: Some(base),
+        ..SetupPlan::default()
+    })
+}
 
-    if non_interactive || !is_interactive() {
-        return run_non_interactive();
+/// Whether to run the interactive root pre-check before executing a plan.
+///
+/// Only when a base setup runs. `ipc_client::require_root` prompts and re-execs
+/// under `sudo` on a TTY, and standalone `--pam` / `--systemd` never did that:
+/// they bail immediately from their own root checks (`run_pam`, `check_root`).
+/// Escalating there would be a new, surprising behavior for exactly the
+/// scripted invocations that must stay byte-compatible.
+pub fn needs_root_precheck(plan: &SetupPlan) -> bool {
+    plan.base.is_some()
+}
+
+/// Execute a resolved plan: base setup first (if any), then the standalone
+/// systemd and PAM actions, in that order — the wizard runs systemd (step 8)
+/// before PAM (step 9), and `--systemd --pam` must match.
+pub fn run_with_plan(plan: SetupPlan) -> anyhow::Result<()> {
+    if needs_root_precheck(&plan) {
+        crate::ipc_client::require_root("sudo facelock setup")?;
     }
 
-    run_wizard()
+    // Whether the interactive wizard ran, and therefore already asked about PAM.
+    let mut wizard_ran = false;
+
+    match plan.base {
+        Some(BaseMode::NonInteractive) => run_non_interactive(&plan)?,
+        // A non-tty demotes the wizard to the non-interactive flow, as before.
+        Some(BaseMode::Wizard) if is_interactive() => {
+            wizard_ran = true;
+            run_wizard(&plan)?;
+        }
+        Some(BaseMode::Wizard) => run_non_interactive(&plan)?,
+        None => {}
+    }
+
+    match plan.systemd {
+        SystemdPref::Install => run_systemd(false)?,
+        SystemdPref::Disable => run_systemd(true)?,
+        // Under a wizard base `Ask` is step 8; everywhere else it means nothing.
+        SystemdPref::Ask | SystemdPref::Skip => {}
+    }
+
+    match &plan.pam {
+        PamPref::Remove { service } => run_pam(service, true, plan.yes)?,
+        PamPref::Install { service } => {
+            // The wizard's step 9 already applied `--pam`; installing again here
+            // would be a second, unasked-for edit of the same file.
+            if !wizard_ran {
+                let service = service.as_deref().unwrap_or(DEFAULT_PAM_SERVICE);
+                // `--non-interactive` promises no prompts, so the per-file
+                // "Proceed?" confirmation is suppressed. It deliberately does
+                // *not* bypass the SENSITIVE_SERVICES gate, which checks `--yes`.
+                let no_prompt = plan.base == Some(BaseMode::NonInteractive);
+                pam_install(service, plan.yes, no_prompt)?;
+                print_pam_extension_hint();
+            }
+        }
+        PamPref::Ask | PamPref::Skip => {}
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Interactive wizard
 // ---------------------------------------------------------------------------
 
-fn run_wizard() -> anyhow::Result<()> {
+fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     let theme = ColorfulTheme::default();
 
     // -- Welcome --
@@ -101,45 +383,58 @@ fn run_wizard() -> anyhow::Result<()> {
 
     // -- Create directories (always needed) --
     create_directories(&config)?;
+    ensure_state_layout_or_bail(&config)?;
 
     // -- Step 1: Camera selection --
+    // `--camera` answers the question and therefore replaces the prompt (plan
+    // §1 rule 1). An explicit value that cannot be honoured is fatal: the user
+    // asked for a specific device, so falling back would be silently wrong.
     println!("\n--- Step 1: Camera Selection ---\n");
-    match wizard_camera_selection(&theme, &mut config) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("  Camera detection failed: {e}");
-            println!("  You can configure the camera later in the config file.");
-            println!(
-                "  Continuing with current setting: {}",
-                config.device.path.as_deref().unwrap_or("/dev/video0")
-            );
-        }
+    match plan.camera.as_ref() {
+        Some(choice) => apply_camera_choice(&mut config, choice)?,
+        None => match wizard_camera_selection(&theme, &mut config) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  Camera detection failed: {e}");
+                println!("  You can configure the camera later in the config file.");
+                println!(
+                    "  Continuing with current setting: {}",
+                    config.device.path.as_deref().unwrap_or("/dev/video0")
+                );
+            }
+        },
     }
 
     // -- Step 2: Model quality --
     println!("\n--- Step 2: Model Quality ---\n");
-    match wizard_model_quality(&theme, &mut config) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("  Model quality selection failed: {e}");
-            println!(
-                "  Continuing with current setting: {}",
-                config.recognition.detector_model
-            );
-        }
+    match plan.models {
+        Some(preset) => apply_model_preset(&mut config, preset)?,
+        None => match wizard_model_quality(&theme, &mut config) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  Model quality selection failed: {e}");
+                println!(
+                    "  Continuing with current setting: {}",
+                    config.recognition.detector_model
+                );
+            }
+        },
     }
 
     // -- Step 3: Execution provider --
     println!("\n--- Step 3: Inference Device ---\n");
-    match wizard_execution_provider(&theme, &mut config) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("  Inference device selection failed: {e}");
-            println!(
-                "  Continuing with current setting: {}",
-                config.recognition.execution_provider
-            );
-        }
+    match plan.execution_provider {
+        Some(choice) => apply_execution_provider(&mut config, choice)?,
+        None => match wizard_execution_provider(&theme, &mut config) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  Inference device selection failed: {e}");
+                println!(
+                    "  Continuing with current setting: {}",
+                    config.recognition.execution_provider
+                );
+            }
+        },
     }
 
     // -- Step 4: Model download --
@@ -154,31 +449,40 @@ fn run_wizard() -> anyhow::Result<()> {
 
     // -- Step 5: Encryption setup --
     println!("\n--- Step 5: Embedding Encryption ---\n");
-    match wizard_encryption_setup(&theme, &mut config) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("  Encryption setup failed: {e}");
-            println!(
-                "  You can configure encryption later with: sudo facelock encrypt --generate-key"
-            );
-        }
+    match plan.encryption {
+        Some(choice) => apply_encryption_choice(&mut config, choice, Some(&theme))?,
+        None => match wizard_encryption_setup(&theme, &mut config) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  Encryption setup failed: {e}");
+                println!(
+                    "  You can configure encryption later with: sudo facelock encrypt --generate-key"
+                );
+            }
+        },
     }
 
     // -- Step 6: Face enrollment --
-    println!("\n--- Step 6: Face Enrollment ---\n");
-    let enrolled = match wizard_face_enroll(&theme) {
-        Ok(did_enroll) => did_enroll,
-        Err(e) => {
-            println!("  Enrollment failed: {e}");
-            println!("  You can enroll later with: facelock enroll");
-            false
+    let enroll_steps = enroll_steps_for(plan);
+    let enrolled = if enroll_steps.enroll {
+        println!("\n--- Step 6: Face Enrollment ---\n");
+        match wizard_face_enroll(&theme, enroll_steps.assume_yes) {
+            Ok(did_enroll) => did_enroll,
+            Err(e) => {
+                println!("  Enrollment failed: {e}");
+                println!("  You can enroll later with: facelock enroll");
+                false
+            }
         }
+    } else {
+        println!("\n--- Step 6: Face Enrollment (skipped, --no-enroll) ---\n");
+        false
     };
 
     // -- Step 7: Test recognition --
-    if enrolled {
+    if test_recognition_runs(enroll_steps, enrolled) {
         println!("\n--- Step 7: Test Recognition ---\n");
-        match wizard_test_recognition(&theme) {
+        match wizard_test_recognition(&theme, plan.yes) {
             Ok(()) => {}
             Err(e) => {
                 println!("  Test failed: {e}");
@@ -191,13 +495,24 @@ fn run_wizard() -> anyhow::Result<()> {
 
     // -- Step 8: Systemd setup --
     println!("\n--- Step 8: Daemon Configuration ---\n");
-    let systemd_enabled = match wizard_systemd_setup(&theme) {
-        Ok(enabled) => enabled,
-        Err(e) => {
-            println!("  Systemd setup failed: {e}");
-            println!("  You can enable it later with: sudo facelock setup --systemd");
-            false
+    let systemd_step = systemd_step_for(plan);
+    let systemd_enabled = if systemd_step.wizard_may_install() {
+        match wizard_systemd_setup(&theme, plan.yes) {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                println!("  Systemd setup failed: {e}");
+                println!("  You can enable it later with: sudo facelock setup --systemd");
+                false
+            }
         }
+    } else {
+        if systemd_step == SystemdStep::Skip {
+            println!("  Skipping daemon configuration (--no-systemd).");
+            println!("  No unit files are written and systemctl is not invoked.");
+        } else {
+            println!("  Answered on the command line; applied once setup finishes.");
+        }
+        false
     };
 
     // Group membership: without it, the first daemon command a normal user
@@ -209,7 +524,12 @@ fn run_wizard() -> anyhow::Result<()> {
 
     // -- Step 9: PAM configuration --
     println!("\n--- Step 9: PAM Configuration ---\n");
-    let pam_services = match wizard_pam_setup(&theme) {
+    let pam_services = match pam_step_in(
+        Path::new(PAM_DIR),
+        plan,
+        &theme,
+        Path::new(PAM_MODULE_PATH).exists(),
+    ) {
         Ok(services) => services,
         Err(e) => {
             println!("  PAM setup failed: {e}");
@@ -255,19 +575,24 @@ fn run_wizard() -> anyhow::Result<()> {
     println!("  Encryption: {}", encryption_label);
     println!(
         "  Daemon:   {}",
-        if systemd_enabled {
-            "enabled (D-Bus activation)"
-        } else {
-            "not configured"
+        match systemd_step {
+            SystemdStep::Skip => "not configured (--no-systemd)",
+            SystemdStep::Deferred => "configured from the command line",
+            SystemdStep::Ask if systemd_enabled => "enabled (D-Bus activation)",
+            SystemdStep::Ask => "not configured",
         }
     );
-    if pam_services.is_empty() {
-        println!("  PAM:      not configured");
-    } else {
+    if !pam_services.is_empty() {
         println!("  PAM:      {}", pam_services.join(", "));
+    } else if pam_step_for(plan) == PamStep::Skip {
+        println!("  PAM:      not configured (--no-pam)");
+    } else {
+        println!("  PAM:      not configured");
     }
     if enrolled {
         println!("  Face:     enrolled");
+    } else if !enroll_steps.enroll {
+        println!("  Face:     not enrolled (--no-enroll; run `facelock enroll`)");
     } else {
         println!("  Face:     not enrolled (run `facelock enroll`)");
     }
@@ -277,6 +602,11 @@ fn run_wizard() -> anyhow::Result<()> {
         toml::from_str(MANIFEST_TOML).context("failed to parse model manifest")?;
     secure_setup_paths(&config, Some(&manifest))?;
     write_setup_marker()?;
+    // Backfill/refresh enrollment markers from the DB. Needs DB access, so it
+    // only ever runs here in privileged setup, never in `facelock is-enrolled`.
+    if let Err(e) = super::enrollment_marker::reconcile_all(&config) {
+        tracing::warn!("could not reconcile enrollment markers: {e}");
+    }
     Ok(())
 }
 
@@ -360,64 +690,206 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
     Ok(())
 }
 
-fn wizard_model_quality(theme: &ColorfulTheme, config: &mut Config) -> anyhow::Result<()> {
-    let manifest: ModelManifest =
-        toml::from_str(MANIFEST_TOML).context("failed to parse model manifest")?;
-    let current_detector = &config.recognition.detector_model;
-    let current_embedder = &config.recognition.embedder_model;
+/// One enumerated video device plus its IR verdict.
+///
+/// `--camera auto` selection is expressed over this rather than over V4L2 so it
+/// stays a pure function: testable on a machine with no camera at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CameraCandidate {
+    path: String,
+    name: String,
+    is_ir: bool,
+}
 
-    let default_idx = match (current_detector.as_str(), current_embedder.as_str()) {
-        ("det_10g.onnx", "glintr100.onnx") => 2,
-        ("scrfd_2.5g_bnkps.onnx", "glintr100.onnx") => 1,
-        _ => 0,
+/// Pick the single IR device for `--camera auto`.
+///
+/// Zero and many are both errors: silently taking the first IR node would pin
+/// setup to whichever device happened to enumerate first, and getting that
+/// wrong means auth never works.
+fn select_ir_camera(candidates: &[CameraCandidate]) -> anyhow::Result<String> {
+    let ir: Vec<&CameraCandidate> = candidates.iter().filter(|c| c.is_ir).collect();
+
+    match ir.len() {
+        1 => Ok(ir[0].path.clone()),
+        0 if candidates.is_empty() => bail!(
+            "--camera=auto found no video devices; check that the camera is connected \
+             and the v4l2 module is loaded"
+        ),
+        0 => {
+            let listed = candidates
+                .iter()
+                .map(|c| format!("    {} - {}", c.path, c.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "--camera=auto found no IR-capable camera among the detected devices:\n{listed}\n  \
+                 Pass an explicit device path, e.g. --camera={}",
+                candidates[0].path
+            )
+        }
+        _ => {
+            let listed = ir
+                .iter()
+                .map(|c| format!("    {} - {}", c.path, c.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "--camera=auto found {} IR-capable cameras:\n{listed}\n  \
+                 Pass an explicit device path to choose one.",
+                ir.len()
+            )
+        }
+    }
+}
+
+/// Enumerate and classify video devices the same way step 1 does, so `auto`
+/// and the prompt agree on what counts as IR.
+fn enumerate_camera_candidates() -> anyhow::Result<Vec<CameraCandidate>> {
+    let devices = facelock_camera::list_devices().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let quirks = facelock_camera::QuirksDb::load();
+    let sources = facelock_camera::classify_ir_sources(&devices, Some(&quirks));
+
+    Ok(devices
+        .iter()
+        .enumerate()
+        .map(|(i, d)| CameraCandidate {
+            path: d.path.clone(),
+            name: d.name.clone(),
+            is_ir: sources
+                .get(i)
+                .copied()
+                .unwrap_or(facelock_camera::IrSource::None)
+                != facelock_camera::IrSource::None,
+        })
+        .collect())
+}
+
+/// Apply `--camera`, persisting the result. `Auto` re-derives from hardware and
+/// ignores whatever the config already says (plan §1 rule 3).
+fn apply_camera_choice(config: &mut Config, choice: &CameraChoice) -> anyhow::Result<()> {
+    let path = match choice {
+        CameraChoice::Auto => {
+            let path = select_ir_camera(&enumerate_camera_candidates()?)?;
+            println!("  Auto-selected IR camera: {path}");
+            path
+        }
+        CameraChoice::Path(path) => {
+            if !Path::new(path).exists() {
+                bail!(
+                    "camera device {path} does not exist; \
+                     pass a valid /dev/video* path or --camera=auto"
+                );
+            }
+            println!("  Selected: {path}");
+            path.clone()
+        }
     };
 
-    let options = [
-        "Standard (recommended) — SCRFD 2.5G + ArcFace R50 (~170MB, fast)",
-        "Balanced — SCRFD 2.5G + ArcFace R100 (~252MB, ~15-30ms slower)",
-        "High accuracy — SCRFD 10G + ArcFace R100 (~266MB, ~40-50ms slower)",
-    ];
+    config.device.path = Some(path);
+    update_config_device(config)?;
+    Ok(())
+}
+
+/// Persist `[device] path`. Counterpart to [`update_config_provider`]; the
+/// prompt path has never written the device back, so this is only reached when
+/// `--camera` supplied the value.
+fn update_config_device(config: &Config) -> anyhow::Result<()> {
+    let config_path = facelock_core::paths::config_path();
+    if !config_path.exists() {
+        return Ok(());
+    }
+    update_config_device_at(&config_path, config)
+}
+
+fn update_config_device_at(config_path: &Path, config: &Config) -> anyhow::Result<()> {
+    let Some(path) = config.device.path.as_deref() else {
+        return Ok(());
+    };
+    set_config_scalar(config_path, "device", "path", path)
+}
+
+/// The wizard's model-quality options, in prompt order. The `--models` values
+/// and the `Select` arms index the same table so the two cannot drift.
+const MODEL_PRESETS: [ModelPreset; 3] = [
+    ModelPreset::Standard,
+    ModelPreset::Balanced,
+    ModelPreset::High,
+];
+
+/// Prompt labels, in the same order as [`MODEL_PRESETS`].
+const MODEL_PRESET_OPTIONS: [&str; 3] = [
+    "Standard (recommended) — SCRFD 2.5G + ArcFace R50 (~170MB, fast)",
+    "Balanced — SCRFD 2.5G + ArcFace R100 (~252MB, ~15-30ms slower)",
+    "High accuracy — SCRFD 10G + ArcFace R100 (~266MB, ~40-50ms slower)",
+];
+
+/// `(detector, embedder)` filenames for a preset. Single source of truth.
+fn preset_models(preset: ModelPreset) -> (&'static str, &'static str) {
+    match preset {
+        ModelPreset::Standard => ("scrfd_2.5g_bnkps.onnx", "w600k_r50.onnx"),
+        ModelPreset::Balanced => ("scrfd_2.5g_bnkps.onnx", "glintr100.onnx"),
+        ModelPreset::High => ("det_10g.onnx", "glintr100.onnx"),
+    }
+}
+
+/// The preset a config currently corresponds to, if any.
+fn preset_of_models(detector: &str, embedder: &str) -> Option<ModelPreset> {
+    MODEL_PRESETS
+        .into_iter()
+        .find(|p| preset_models(*p) == (detector, embedder))
+}
+
+fn preset_summary(preset: ModelPreset) -> &'static str {
+    match preset {
+        ModelPreset::Standard => "Selected standard models (fast, good accuracy).",
+        ModelPreset::Balanced => {
+            "Selected balanced models (fast detection, high-accuracy embedding)."
+        }
+        ModelPreset::High => "Selected high-accuracy models (larger, ~40-50ms slower).",
+    }
+}
+
+/// Write a preset into `config`, taking the checksums from the bundled
+/// manifest. In-memory half of [`apply_model_preset`].
+fn set_model_preset(config: &mut Config, preset: ModelPreset) -> anyhow::Result<()> {
+    let manifest: ModelManifest =
+        toml::from_str(MANIFEST_TOML).context("failed to parse model manifest")?;
+    let (detector, embedder) = preset_models(preset);
+
+    config.recognition.detector_model = detector.to_string();
+    config.recognition.detector_sha256 = manifest.find(detector).map(|m| m.sha256.clone());
+    config.recognition.embedder_model = embedder.to_string();
+    config.recognition.embedder_sha256 = manifest.find(embedder).map(|m| m.sha256.clone());
+    Ok(())
+}
+
+/// Select a model preset and persist it. Used by both the prompt and
+/// `--models`, so the two cannot disagree about what a preset means.
+fn apply_model_preset(config: &mut Config, preset: ModelPreset) -> anyhow::Result<()> {
+    set_model_preset(config, preset)?;
+    println!("  {}", preset_summary(preset));
+    update_config_models(config)?;
+    Ok(())
+}
+
+fn wizard_model_quality(theme: &ColorfulTheme, config: &mut Config) -> anyhow::Result<()> {
+    let default_idx = preset_of_models(
+        &config.recognition.detector_model,
+        &config.recognition.embedder_model,
+    )
+    .and_then(|p| MODEL_PRESETS.iter().position(|c| *c == p))
+    .unwrap_or(0);
 
     let selection = Select::with_theme(theme)
         .with_prompt("Select model quality")
-        .items(&options[..])
+        .items(&MODEL_PRESET_OPTIONS[..])
         .default(default_idx)
         .interact()?;
 
-    match selection {
-        0 => {
-            config.recognition.detector_model = "scrfd_2.5g_bnkps.onnx".to_string();
-            config.recognition.detector_sha256 = manifest
-                .find("scrfd_2.5g_bnkps.onnx")
-                .map(|m| m.sha256.clone());
-            config.recognition.embedder_model = "w600k_r50.onnx".to_string();
-            config.recognition.embedder_sha256 =
-                manifest.find("w600k_r50.onnx").map(|m| m.sha256.clone());
-            println!("  Selected standard models (fast, good accuracy).");
-        }
-        1 => {
-            config.recognition.detector_model = "scrfd_2.5g_bnkps.onnx".to_string();
-            config.recognition.detector_sha256 = manifest
-                .find("scrfd_2.5g_bnkps.onnx")
-                .map(|m| m.sha256.clone());
-            config.recognition.embedder_model = "glintr100.onnx".to_string();
-            config.recognition.embedder_sha256 =
-                manifest.find("glintr100.onnx").map(|m| m.sha256.clone());
-            println!("  Selected balanced models (fast detection, high-accuracy embedding).");
-        }
-        _ => {
-            config.recognition.detector_model = "det_10g.onnx".to_string();
-            config.recognition.detector_sha256 =
-                manifest.find("det_10g.onnx").map(|m| m.sha256.clone());
-            config.recognition.embedder_model = "glintr100.onnx".to_string();
-            config.recognition.embedder_sha256 =
-                manifest.find("glintr100.onnx").map(|m| m.sha256.clone());
-            println!("  Selected high-accuracy models (larger, ~40-50ms slower).");
-        }
-    }
-
-    update_config_models(config)?;
-    Ok(())
+    apply_model_preset(
+        config,
+        MODEL_PRESETS[selection.min(MODEL_PRESETS.len() - 1)],
+    )
 }
 
 fn wizard_execution_provider(theme: &ColorfulTheme, config: &mut Config) -> anyhow::Result<()> {
@@ -446,24 +918,81 @@ fn wizard_execution_provider(theme: &ColorfulTheme, config: &mut Config) -> anyh
 
     config.recognition.execution_provider = provider.to_string();
     println!("  Selected: {}", provider);
+    warn_provider_preflight(provider);
 
-    if provider == "cuda" {
-        let has_nvidia_driver = Path::new("/dev/nvidiactl").exists();
-        let has_cuda_ort = ["/usr/lib/libonnxruntime.so", "/usr/lib64/libonnxruntime.so"]
-            .iter()
-            .any(|p| Path::new(p).exists());
+    update_config_provider(config)?;
+    Ok(())
+}
 
-        if !has_nvidia_driver {
-            println!("  \u{26a0} NVIDIA driver not detected. Install the NVIDIA driver package");
-            println!("    before starting the daemon.");
+/// Resolve `--execution-provider=auto` by asking the installed ONNX Runtime
+/// which providers it was built with, preferring cuda > rocm > openvino > cpu.
+///
+/// Always prints what it found and why: the failure this exists to fix is a
+/// machine with `onnxruntime-opt-cuda` silently running CPU inference, so a
+/// silent `cpu` answer would be no better than the old error.
+///
+/// A runtime that cannot be loaded at all is reported loudly and resolves to
+/// `cpu` rather than aborting setup — no provider is usable in that state, and
+/// `cpu` is the only one that can become usable once the package is installed.
+fn resolve_execution_provider_auto() -> anyhow::Result<String> {
+    match facelock_face::detect_execution_provider() {
+        Ok(detection) => {
+            println!("  Detected: {}", detection.explain());
+            Ok(detection.provider.as_str().to_string())
         }
-        if !has_cuda_ort {
-            println!(
-                "  \u{26a0} CUDA-enabled ONNX Runtime not found. Install onnxruntime-opt-cuda"
-            );
-            println!("    before starting the daemon, or inference will fall back to CPU.");
+        Err(e) => {
+            println!("  \u{26a0} Could not query the ONNX Runtime for available providers: {e}");
+            println!("    Selecting cpu. Re-run with an explicit --execution-provider once the");
+            println!("    runtime is installed if you need GPU inference.");
+            Ok("cpu".to_string())
         }
     }
+}
+
+/// The config value for an `--execution-provider` choice.
+fn provider_name(choice: ExecutionProviderChoice) -> anyhow::Result<String> {
+    Ok(match choice {
+        ExecutionProviderChoice::Cpu => "cpu".to_string(),
+        ExecutionProviderChoice::Cuda => "cuda".to_string(),
+        ExecutionProviderChoice::Rocm => "rocm".to_string(),
+        ExecutionProviderChoice::Openvino => "openvino".to_string(),
+        ExecutionProviderChoice::Auto => resolve_execution_provider_auto()?,
+    })
+}
+
+/// Warn about a GPU provider selected without the pieces it needs. Runs for the
+/// flag as well as the prompt — the failure mode (silent CPU fallback at auth
+/// time) is identical either way.
+fn warn_provider_preflight(provider: &str) {
+    if provider != "cuda" {
+        return;
+    }
+    let has_nvidia_driver = Path::new("/dev/nvidiactl").exists();
+    let has_cuda_ort = ["/usr/lib/libonnxruntime.so", "/usr/lib64/libonnxruntime.so"]
+        .iter()
+        .any(|p| Path::new(p).exists());
+
+    if !has_nvidia_driver {
+        println!("  \u{26a0} NVIDIA driver not detected. Install the NVIDIA driver package");
+        println!("    before starting the daemon.");
+    }
+    if !has_cuda_ort {
+        println!("  \u{26a0} CUDA-enabled ONNX Runtime not found. Install onnxruntime-opt-cuda");
+        println!("    before starting the daemon, or inference will fall back to CPU.");
+    }
+}
+
+/// Apply `--execution-provider`. The prompt only offers CPU and CUDA; `rocm`
+/// and `openvino` are valid config values (see `facelock-face`'s provider
+/// registry) and are accepted from the flag.
+fn apply_execution_provider(
+    config: &mut Config,
+    choice: ExecutionProviderChoice,
+) -> anyhow::Result<()> {
+    let provider = provider_name(choice)?;
+    config.recognition.execution_provider = provider.clone();
+    println!("  Selected: {provider}");
+    warn_provider_preflight(&provider);
 
     update_config_provider(config)?;
     Ok(())
@@ -474,51 +1003,78 @@ fn update_config_provider(config: &Config) -> anyhow::Result<()> {
     if !config_path.exists() {
         return Ok(());
     }
+    update_config_provider_at(&config_path, config)
+}
 
-    let content = fs::read_to_string(&config_path)
+fn update_config_provider_at(config_path: &Path, config: &Config) -> anyhow::Result<()> {
+    set_config_scalar(
+        config_path,
+        "recognition",
+        "execution_provider",
+        &config.recognition.execution_provider,
+    )
+}
+
+/// True if `line` assigns `key` (`key = ...`), ignoring leading whitespace.
+fn is_key_assignment(line: &str, key: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+/// Set `key = "value"` inside `[section]`, appending the section if absent.
+///
+/// Line-based rather than a serde round-trip on purpose: the config file is
+/// heavily commented and a re-serialize would discard every comment.
+fn set_config_scalar(
+    config_path: &Path,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
 
-    let provider = &config.recognition.execution_provider;
+    let header = format!("[{section}]");
+    let entry = format!("{key} = \"{value}\"\n");
 
-    if content.contains("[recognition]") {
+    if content.contains(&header) {
         let mut new_content = String::new();
-        let mut in_recognition = false;
-        let mut provider_written = false;
+        let mut in_section = false;
+        let mut written = false;
 
         for line in content.lines() {
-            if line.trim() == "[recognition]" {
-                in_recognition = true;
+            if line.trim() == header {
+                in_section = true;
                 new_content.push_str(line);
                 new_content.push('\n');
                 continue;
             }
-            if in_recognition && line.trim_start().starts_with("execution_provider") {
-                new_content.push_str(&format!("execution_provider = \"{provider}\"\n"));
-                provider_written = true;
+            if in_section && is_key_assignment(line, key) {
+                new_content.push_str(&entry);
+                written = true;
                 continue;
             }
-            if in_recognition && line.starts_with('[') {
-                if !provider_written {
-                    new_content.push_str(&format!("execution_provider = \"{provider}\"\n"));
+            if in_section && line.starts_with('[') {
+                if !written {
+                    new_content.push_str(&entry);
                 }
-                in_recognition = false;
+                in_section = false;
             }
             new_content.push_str(line);
             new_content.push('\n');
         }
-        if in_recognition && !provider_written {
-            new_content.push_str(&format!("execution_provider = \"{provider}\"\n"));
+        if in_section && !written {
+            new_content.push_str(&entry);
         }
-        write_file(&config_path, new_content.as_bytes(), 0o644)?;
+        write_file(config_path, new_content.as_bytes(), 0o644)?;
     } else {
         let mut content = content;
         if !content.ends_with('\n') {
             content.push('\n');
         }
-        content.push_str(&format!(
-            "\n[recognition]\nexecution_provider = \"{provider}\"\n",
-        ));
-        write_file(&config_path, content.as_bytes(), 0o644)?;
+        content.push_str(&format!("\n{header}\n{entry}"));
+        write_file(config_path, content.as_bytes(), 0o644)?;
     }
 
     Ok(())
@@ -597,9 +1153,12 @@ fn wizard_model_download(theme: &ColorfulTheme, config: &Config) -> anyhow::Resu
 /// but the relevant key file is missing and we're about to mint a new one.
 /// Generating a fresh key would silently invalidate every existing model.
 /// Offer to clear them; abort if the user declines.
+///
+/// `theme` is `None` when the caller must not prompt (non-interactive base), in
+/// which case the situation is an error rather than a question.
 fn handle_orphan_models_before_keygen(
     config: &Config,
-    theme: &ColorfulTheme,
+    theme: Option<&ColorfulTheme>,
 ) -> anyhow::Result<()> {
     let store = match crate::direct::open_store(config) {
         Ok(s) => s,
@@ -617,12 +1176,12 @@ fn handle_orphan_models_before_keygen(
     println!("  encryption key is missing. Generating a new key would make them unreadable.");
     println!();
 
-    if !is_interactive() {
+    let Some(theme) = theme.filter(|_| is_interactive()) else {
         bail!(
             "orphaned encrypted models found and no encryption key present; \
              re-run setup interactively, or clear models first with: sudo facelock clear --yes"
         );
-    }
+    };
 
     let clear = Confirm::with_theme(theme)
         .with_prompt("Delete orphaned models and continue?")
@@ -641,8 +1200,6 @@ fn handle_orphan_models_before_keygen(
 }
 
 fn wizard_encryption_setup(theme: &ColorfulTheme, config: &mut Config) -> anyhow::Result<()> {
-    use facelock_core::config::EncryptionMethod;
-
     println!("  Setting up AES-256-GCM encryption for face embeddings.");
 
     // Detect TPM availability
@@ -660,46 +1217,65 @@ fn wizard_encryption_setup(theme: &ColorfulTheme, config: &mut Config) -> anyhow
             .interact()?;
 
         if selection == 0 {
-            // TPM-sealed key
-            let sealed_path = Path::new(&config.encryption.sealed_key_path);
-            if sealed_path.exists() {
-                println!(
-                    "  TPM-sealed key already exists at {}.",
-                    sealed_path.display()
-                );
-            } else {
-                handle_orphan_models_before_keygen(config, theme)?;
-                println!("  Generating and sealing AES key with TPM...");
-                let pcr = if config.tpm.pcr_binding {
-                    Some(config.tpm.pcr_indices.as_slice())
-                } else {
-                    None
-                };
-                #[cfg(feature = "tpm")]
-                {
-                    let mut tpm = facelock_tpm::TpmSealer::new(&config.tpm.tcti)
-                        .context("failed to initialize TPM")?;
-                    facelock_tpm::generate_and_seal_key(&mut tpm, sealed_path, pcr)
-                        .context("failed to generate and seal key")?;
-                    println!(
-                        "  TPM-sealed key written to {} (permissions: 0600).",
-                        sealed_path.display()
-                    );
-                }
-                #[cfg(not(feature = "tpm"))]
-                {
-                    let _ = pcr;
-                    anyhow::bail!("TPM support not compiled in (missing 'tpm' feature)");
-                }
-            }
-            config.encryption.method = EncryptionMethod::Tpm;
-            update_config_encryption(config, "tpm")?;
-            println!("  Encryption enabled (TPM-sealed key).");
-            return Ok(());
+            return setup_encryption_tpm_key(config, Some(theme));
         }
     }
 
-    // Software keyfile path
+    setup_encryption_keyfile(config, Some(theme))
+}
+
+/// Seal an AES key with the TPM and switch the config to it. Callers must have
+/// established that a TPM is usable.
+fn setup_encryption_tpm_key(
+    config: &mut Config,
+    theme: Option<&ColorfulTheme>,
+) -> anyhow::Result<()> {
+    use facelock_core::config::EncryptionMethod;
+
+    let sealed_path = Path::new(&config.encryption.sealed_key_path);
+    if sealed_path.exists() {
+        println!(
+            "  TPM-sealed key already exists at {}.",
+            sealed_path.display()
+        );
+    } else {
+        handle_orphan_models_before_keygen(config, theme)?;
+        println!("  Generating and sealing AES key with TPM...");
+        let pcr = if config.tpm.pcr_binding {
+            Some(config.tpm.pcr_indices.as_slice())
+        } else {
+            None
+        };
+        #[cfg(feature = "tpm")]
+        {
+            let mut tpm = facelock_tpm::TpmSealer::new(&config.tpm.tcti)
+                .context("failed to initialize TPM")?;
+            facelock_tpm::generate_and_seal_key(&mut tpm, sealed_path, pcr)
+                .context("failed to generate and seal key")?;
+            println!(
+                "  TPM-sealed key written to {} (permissions: 0600).",
+                sealed_path.display()
+            );
+        }
+        #[cfg(not(feature = "tpm"))]
+        {
+            let _ = pcr;
+            anyhow::bail!("TPM support not compiled in (missing 'tpm' feature)");
+        }
+    }
+    config.encryption.method = EncryptionMethod::Tpm;
+    update_config_encryption(config, "tpm")?;
+    println!("  Encryption enabled (TPM-sealed key).");
+    Ok(())
+}
+
+/// Generate (or reuse) a software keyfile and switch the config to it.
+fn setup_encryption_keyfile(
+    config: &mut Config,
+    theme: Option<&ColorfulTheme>,
+) -> anyhow::Result<()> {
+    use facelock_core::config::EncryptionMethod;
+
     let key_path = Path::new(&config.encryption.key_path);
     if key_path.exists() {
         println!("  Encryption key already exists at {}.", key_path.display());
@@ -719,6 +1295,70 @@ fn wizard_encryption_setup(theme: &ColorfulTheme, config: &mut Config) -> anyhow
     println!("  Encryption enabled.");
 
     Ok(())
+}
+
+/// Turn embedding encryption off, loudly.
+fn setup_encryption_none(config: &mut Config) -> anyhow::Result<()> {
+    use facelock_core::config::EncryptionMethod;
+
+    config.encryption.method = EncryptionMethod::None;
+    update_config_encryption(config, "none")?;
+
+    println!("  \u{26a0} WARNING: encryption disabled (--encryption=none).");
+    println!("    Biometric templates will be stored UNENCRYPTED in the database.");
+    println!("    `facelock enroll` refuses to write plaintext embeddings unless");
+    println!("    security.allow_plaintext is also set in the config.");
+    Ok(())
+}
+
+/// True if the auto policy would mint a new key, and therefore needs the
+/// orphaned-models guard first.
+fn auto_encryption_needs_keygen(config: &Config, tpm_available: bool) -> bool {
+    use facelock_core::config::EncryptionMethod;
+
+    if config.encryption.method != EncryptionMethod::None {
+        return false;
+    }
+    let key_path = if tpm_available {
+        &config.encryption.sealed_key_path
+    } else {
+        &config.encryption.key_path
+    };
+    !Path::new(key_path).exists()
+}
+
+/// Apply `--encryption`. `theme` is `None` where prompting is not allowed.
+///
+/// Every branch that can mint a key goes through
+/// [`handle_orphan_models_before_keygen`]: a fresh key silently invalidates
+/// every already-enrolled model.
+fn apply_encryption_choice(
+    config: &mut Config,
+    choice: EncryptionChoice,
+    theme: Option<&ColorfulTheme>,
+) -> anyhow::Result<()> {
+    match choice {
+        EncryptionChoice::Tpm => {
+            if !detect_tpm(config) {
+                bail!(
+                    "--encryption=tpm requested but no usable TPM 2.0 was found (tcti: {}); \
+                     refusing to fall back to a software keyfile. \
+                     Pass --encryption=keyfile to accept a software key, \
+                     or --encryption=auto to use the TPM only when present.",
+                    config.tpm.tcti
+                );
+            }
+            setup_encryption_tpm_key(config, theme)
+        }
+        EncryptionChoice::Keyfile => setup_encryption_keyfile(config, theme),
+        EncryptionChoice::None => setup_encryption_none(config),
+        EncryptionChoice::Auto => {
+            if auto_encryption_needs_keygen(config, detect_tpm(config)) {
+                handle_orphan_models_before_keygen(config, theme)?;
+            }
+            setup_encryption_auto(config)
+        }
+    }
 }
 
 /// Detect if TPM is available and functional.
@@ -948,11 +1588,131 @@ fn resolve_configured_model_sha256(
     anyhow::bail!("custom model {filename} requires an explicit SHA256 in config")
 }
 
-fn wizard_face_enroll(theme: &ColorfulTheme) -> anyhow::Result<bool> {
-    let proceed = Confirm::with_theme(theme)
-        .with_prompt("Would you like to enroll a face now?")
+// ---------------------------------------------------------------------------
+// Action step control flow (steps 6, 7, 8, 9)
+//
+// Each action step decides *whether it acts* before it does any I/O, so
+// `--no-enroll` / `--no-systemd` / `--no-pam` are testable without a camera,
+// systemd or root. Rule 2 of the plan: declining an action is not the same as
+// letting it fall back to the default — declining PAM must configure nothing,
+// not configure the candidate set's five `default_enabled` services.
+// ---------------------------------------------------------------------------
+
+/// Steps 6 and 7, decided up front. Step 7 exists only to exercise the
+/// enrollment step 6 produced, so `--no-enroll` suppresses both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnrollSteps {
+    /// Step 6 runs at all.
+    enroll: bool,
+    /// Step 6 proceeds without its confirmation prompt.
+    assume_yes: bool,
+}
+
+fn enroll_steps_for(plan: &SetupPlan) -> EnrollSteps {
+    match plan.enroll {
+        // `--no-enroll` declines the action outright.
+        Some(false) => EnrollSteps {
+            enroll: false,
+            assume_yes: false,
+        },
+        // `--enroll` answers the question, so the confirm is not asked.
+        Some(true) => EnrollSteps {
+            enroll: true,
+            assume_yes: true,
+        },
+        // No flag: today's prompt, taking its default under `-y`.
+        None => EnrollSteps {
+            enroll: true,
+            assume_yes: plan.yes,
+        },
+    }
+}
+
+/// Step 7 runs only when step 6 actually enrolled a face.
+fn test_recognition_runs(steps: EnrollSteps, enrolled: bool) -> bool {
+    steps.enroll && enrolled
+}
+
+/// What step 8 does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdStep {
+    /// No flag: prompt, then install if accepted.
+    Ask,
+    /// `--no-systemd`: declined. No unit files, no `systemctl`.
+    Skip,
+    /// `--systemd` / `--systemd --disable`: already answered, and
+    /// [`run_with_plan`] performs the action after the base flow — the wizard
+    /// must not do it a second time.
+    Deferred,
+}
+
+impl SystemdStep {
+    /// Whether the wizard itself may write unit files or invoke `systemctl`.
+    fn wizard_may_install(self) -> bool {
+        matches!(self, SystemdStep::Ask)
+    }
+}
+
+fn systemd_step_for(plan: &SetupPlan) -> SystemdStep {
+    match plan.systemd {
+        SystemdPref::Ask => SystemdStep::Ask,
+        SystemdPref::Skip => SystemdStep::Skip,
+        SystemdPref::Install | SystemdPref::Disable => SystemdStep::Deferred,
+    }
+}
+
+/// What step 9 does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PamStep {
+    /// No flag: today's multi-select over the detected candidates.
+    Ask,
+    /// `--pam [--service X]`: exactly this one service. Deliberately *not* the
+    /// candidates' five `default_enabled` entries — `--pam` already means "sudo"
+    /// in standalone mode, so a scripter gets one consistent meaning everywhere.
+    Install(String),
+    /// `--no-pam`: declined. Nothing under the PAM directory is written or
+    /// backed up.
+    Skip,
+    /// `--pam --remove`: [`run_with_plan`] performs the removal.
+    Deferred,
+}
+
+impl PamStep {
+    /// Whether step 9 modifies anything under the PAM directory.
+    fn touches_pam_d(&self) -> bool {
+        matches!(self, PamStep::Ask | PamStep::Install(_))
+    }
+}
+
+fn pam_step_for(plan: &SetupPlan) -> PamStep {
+    match &plan.pam {
+        PamPref::Ask => PamStep::Ask,
+        PamPref::Skip => PamStep::Skip,
+        PamPref::Install { service } => PamStep::Install(
+            service
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PAM_SERVICE.to_string()),
+        ),
+        PamPref::Remove { .. } => PamStep::Deferred,
+    }
+}
+
+/// A step's yes/no confirmation, whose default is always "yes".
+///
+/// `assume_yes` — from `--enroll` (which answers the question) or `-y` (which
+/// suppresses confirmations, §2.1) — takes that default without prompting.
+fn confirm_step(theme: &ColorfulTheme, prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
+    if assume_yes {
+        return Ok(true);
+    }
+    Ok(Confirm::with_theme(theme)
+        .with_prompt(prompt)
         .default(true)
-        .interact()?;
+        .interact()?)
+}
+
+fn wizard_face_enroll(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Result<bool> {
+    let proceed = confirm_step(theme, "Would you like to enroll a face now?", assume_yes)?;
 
     if !proceed {
         println!("  Skipping face enrollment.");
@@ -963,11 +1723,8 @@ fn wizard_face_enroll(theme: &ColorfulTheme) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn wizard_test_recognition(theme: &ColorfulTheme) -> anyhow::Result<()> {
-    let proceed = Confirm::with_theme(theme)
-        .with_prompt("Would you like to test recognition?")
-        .default(true)
-        .interact()?;
+fn wizard_test_recognition(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Result<()> {
+    let proceed = confirm_step(theme, "Would you like to test recognition?", assume_yes)?;
 
     if !proceed {
         println!("  Skipping recognition test.");
@@ -978,17 +1735,18 @@ fn wizard_test_recognition(theme: &ColorfulTheme) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn wizard_systemd_setup(theme: &ColorfulTheme) -> anyhow::Result<bool> {
+fn wizard_systemd_setup(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Result<bool> {
     if !Path::new("/run/systemd/system").exists() {
         println!("  systemd not detected. Skipping daemon configuration.");
         println!("  Facelock will use oneshot mode for authentication.");
         return Ok(false);
     }
 
-    let proceed = Confirm::with_theme(theme)
-        .with_prompt("Enable daemon mode with D-Bus activation?")
-        .default(true)
-        .interact()?;
+    let proceed = confirm_step(
+        theme,
+        "Enable daemon mode with D-Bus activation?",
+        assume_yes,
+    )?;
 
     if !proceed {
         println!("  Skipping systemd setup. Facelock will use oneshot mode.");
@@ -999,17 +1757,55 @@ fn wizard_systemd_setup(theme: &ColorfulTheme) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn wizard_pam_setup(theme: &ColorfulTheme) -> anyhow::Result<Vec<String>> {
-    if !Path::new(PAM_MODULE_PATH).exists() {
+/// Step 9, parameterized on the PAM directory so that "declining PAM leaves
+/// every file byte-identical" is testable against a tempdir.
+///
+/// `module_present` is the caller's answer to "is `pam_facelock.so` installed?".
+/// It is hoisted out of [`pam_install_in`] so the check happens once, before any
+/// prompt or write, and so tests can drive the write path on a machine that has
+/// no PAM module installed.
+fn pam_step_in(
+    base: &Path,
+    plan: &SetupPlan,
+    theme: &ColorfulTheme,
+    module_present: bool,
+) -> anyhow::Result<Vec<String>> {
+    let step = pam_step_for(plan);
+
+    if !step.touches_pam_d() {
+        if step == PamStep::Skip {
+            println!("  Skipping PAM configuration (--no-pam).");
+            println!("  No file under {} is read or modified.", base.display());
+        }
+        return Ok(Vec::new());
+    }
+
+    if !module_present {
         println!("  PAM module not found at {PAM_MODULE_PATH}.");
         println!("  Install it first, then run: sudo facelock setup --pam");
         return Ok(Vec::new());
     }
 
-    let candidates = detect_available_pam_candidates();
+    match step {
+        PamStep::Install(service) => {
+            println!("  Configuring PAM for {service}...");
+            pam_install_in(base, &service, plan.yes, false)?;
+            Ok(vec![service])
+        }
+        PamStep::Ask => wizard_pam_setup_in(base, theme),
+        // Both returned above; repeated here to keep the match exhaustive.
+        PamStep::Skip | PamStep::Deferred => Ok(Vec::new()),
+    }
+}
+
+fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec<String>> {
+    let candidates = candidates_in(base);
 
     if candidates.is_empty() {
-        println!("  No supported PAM service files found in /etc/pam.d/.");
+        println!(
+            "  No supported PAM service files found in {}/.",
+            base.display()
+        );
         return Ok(Vec::new());
     }
 
@@ -1050,7 +1846,9 @@ fn wizard_pam_setup(theme: &ColorfulTheme) -> anyhow::Result<Vec<String>> {
     let mut configured = Vec::new();
     for service in selected_services {
         println!("  Configuring PAM for {service}...");
-        match pam_install(&service, true) {
+        // `yes = true`: the multi-select above *is* the per-service consent, and
+        // no candidate is in SENSITIVE_SERVICES.
+        match pam_install_in(base, &service, true, false) {
             Ok(()) => configured.push(service),
             Err(e) => {
                 println!("  Failed to configure {service}: {e}");
@@ -1132,11 +1930,11 @@ fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
 // Non-interactive setup (original behavior)
 // ---------------------------------------------------------------------------
 
-fn run_non_interactive() -> anyhow::Result<()> {
+fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
     println!("facelock setup: preparing system...\n");
 
     // Load config (or use defaults for paths)
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("could not load config ({e}), using default paths");
@@ -1147,6 +1945,20 @@ fn run_non_interactive() -> anyhow::Result<()> {
 
     // 1. Create directories
     create_directories(&config)?;
+    ensure_state_layout_or_bail(&config)?;
+
+    // 1b. Choice flags override the config. This has to happen before step 3:
+    //     `--models` decides which models are downloaded. None of these paths
+    //     prompt — an unresolvable value is an error, never a hang.
+    if let Some(choice) = plan.camera.as_ref() {
+        apply_camera_choice(&mut config, choice)?;
+    }
+    if let Some(preset) = plan.models {
+        apply_model_preset(&mut config, preset)?;
+    }
+    if let Some(provider) = plan.execution_provider {
+        apply_execution_provider(&mut config, provider)?;
+    }
 
     // 2. Parse model manifest
     let manifest: ModelManifest =
@@ -1199,8 +2011,13 @@ fn run_non_interactive() -> anyhow::Result<()> {
         }
     }
 
-    // 4. Auto-configure encryption
-    setup_encryption_auto(&config)?;
+    // 4. Configure encryption. `--encryption` answers the question; without it
+    //    the auto policy runs, exactly as before.
+    match plan.encryption {
+        // No theme: nothing here may prompt under a non-interactive base.
+        Some(choice) => apply_encryption_choice(&mut config, choice, None)?,
+        None => setup_encryption_auto(&config)?,
+    }
 
     // Ensure the facelock group exists (secure_setup_paths chowns to it) and
     // add the invoking user so daemon commands work without sudo (#89).
@@ -1209,13 +2026,32 @@ fn run_non_interactive() -> anyhow::Result<()> {
     secure_setup_paths(&config, Some(&manifest))?;
     write_setup_marker()?;
 
+    // Enrollment only happens here when it was explicitly asked for: `None` and
+    // `--no-enroll` both mean "do nothing", which is what this flow has always
+    // done. `--enroll` runs unattended — `enroll::run` prompts for nothing once
+    // the setup marker exists.
+    let enrolled = plan.enroll == Some(true);
+    if enrolled {
+        println!("\nEnrolling face...");
+        super::enroll::run(None, None, true)?;
+    }
+
+    // See the matching call in `run_wizard`.
+    if let Err(e) = super::enrollment_marker::reconcile_all(&config) {
+        tracing::warn!("could not reconcile enrollment markers: {e}");
+    }
+
     if let Ok(pam_content) = fs::read_to_string(Path::new("/etc/pam.d/hyprlock"))
         && pam_content.lines().any(is_facelock_pam_line)
     {
         print_hyprlock_hint();
     }
 
-    println!("\nSetup complete. Run `facelock enroll` to register your face.");
+    if enrolled {
+        println!("\nSetup complete.");
+    } else {
+        println!("\nSetup complete. Run `facelock enroll` to register your face.");
+    }
     Ok(())
 }
 
@@ -1437,14 +2273,22 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     let sealed_key_path = Path::new(&config.encryption.sealed_key_path);
 
     secure_dir_if_exists(config_dir, 0o755, 0)?;
-    secure_dir_if_exists(Path::new(&config.daemon.model_dir), 0o755, 0)?;
-    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o750, facelock_gid)?;
+    // Snapshots hold raw face images: root-only, no group access.
+    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700, 0)?;
 
-    if let Some(parent) = db_path.parent() {
-        secure_dir_if_exists(parent, 0o750, facelock_gid)?;
+    // The state directory subtree — state dir, models/, enrolled/, and the
+    // database file modes — is owned by `state_layout`. Re-applied here
+    // because setup only creates the `facelock` group partway through, so the
+    // earlier call could not chown.
+    if let Some(layout) = crate::state_layout::StateLayout::from_config(config) {
+        let owners = nix::unistd::Uid::current()
+            .is_root()
+            .then_some(crate::state_layout::Owners { facelock_gid });
+        crate::state_layout::apply_layout(&layout, owners)?;
     }
     if let Some(parent) = audit_path.parent() {
-        secure_dir_if_exists(parent, 0o750, facelock_gid)?;
+        // Per-user auth history: root-only, like the snapshots.
+        secure_dir_if_exists(parent, 0o700, 0)?;
     }
     if let Some(parent) = key_path.parent() {
         secure_dir_if_exists(parent, 0o755, 0)?;
@@ -1454,8 +2298,8 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     }
 
     secure_existing_path(&config_path, 0o644, 0)?;
-    secure_existing_path(db_path, 0o640, facelock_gid)?;
-    secure_existing_path(audit_path, 0o640, facelock_gid)?;
+    secure_existing_path(db_path, 0o600, 0)?;
+    secure_existing_path(audit_path, 0o600, 0)?;
     secure_existing_path(key_path, 0o600, 0)?;
     secure_existing_path(sealed_key_path, 0o600, 0)?;
     secure_existing_path(Path::new(SETUP_COMPLETE_MARKER), 0o644, 0)?;
@@ -1470,16 +2314,32 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     Ok(())
 }
 
+/// Apply the state-directory layout, turning a failure into a fatal setup
+/// error.
+///
+/// Setup is the one place a user is watching, so a failure to create or
+/// secure the state directory must stop here with its message intact rather
+/// than being logged and stepped over.
+fn ensure_state_layout_or_bail(config: &Config) -> anyhow::Result<()> {
+    crate::state_layout::ensure_state_layout(config)
+        .context("failed to prepare the facelock state directory")
+}
+
 fn create_directories(config: &Config) -> anyhow::Result<()> {
     let config_path = facelock_core::paths::config_path();
     let mut dirs: Vec<(&Path, u32)> = vec![
-        (Path::new(&config.daemon.model_dir), 0o755),
-        (Path::new(&config.snapshots.dir), 0o750),
+        (
+            Path::new(&config.daemon.model_dir),
+            crate::state_layout::MODELS_DIR_MODE,
+        ),
+        // Snapshots hold raw face images: root-only.
+        (Path::new(&config.snapshots.dir), 0o700),
     ];
 
     for (path, mode) in [
-        (&config.storage.db_path, 0o750),
-        (&config.audit.path, 0o750),
+        (&config.storage.db_path, crate::state_layout::STATE_DIR_MODE),
+        // Per-user auth history: root-only.
+        (&config.audit.path, 0o700),
         (&config.encryption.key_path, 0o755),
         (&config.encryption.sealed_key_path, 0o755),
     ] {
@@ -1706,11 +2566,9 @@ const PAM_CANDIDATES: &[PamCandidate] = &[
     },
 ];
 
-/// Returns the subset of PAM_CANDIDATES whose `/etc/pam.d/<service>` file exists,
-/// delegating path construction to `candidates_in` for testability.
-fn detect_available_pam_candidates() -> Vec<&'static PamCandidate> {
-    candidates_in(Path::new("/etc/pam.d"))
-}
+/// The real PAM configuration directory. `candidates_in` and `pam_install_in`
+/// take it as a parameter so tests can point them at a tempdir instead.
+const PAM_DIR: &str = "/etc/pam.d";
 
 /// Returns candidates from `PAM_CANDIDATES` whose service file exists under `base`.
 fn candidates_in(base: &Path) -> Vec<&'static PamCandidate> {
@@ -1752,13 +2610,25 @@ pub fn run_pam(service: &str, remove: bool, yes: bool) -> anyhow::Result<()> {
     if remove {
         pam_remove(service)
     } else {
-        pam_install(service, yes)?;
+        pam_install(service, yes, false)?;
         print_pam_extension_hint();
         Ok(())
     }
 }
 
-fn pam_install(service: &str, yes: bool) -> anyhow::Result<()> {
+/// [`pam_install_in`] against the real [`PAM_DIR`], plus the module-presence
+/// precondition that the parameterized form leaves to its caller.
+///
+/// Root is re-checked here rather than only in [`run_pam`]: this function edits
+/// `/etc/pam.d`, and it is reachable both from `run_pam` and directly from
+/// `run_with_plan`. The parameterized [`pam_install_in`] deliberately does not
+/// check, so tests can drive the write path against a tempdir unprivileged.
+fn pam_install(service: &str, yes: bool, no_prompt: bool) -> anyhow::Result<()> {
+    // 1. Check root
+    if !nix::unistd::Uid::current().is_root() {
+        bail!("PAM configuration requires root. Run with sudo.");
+    }
+
     // 2. Check PAM module exists
     if !Path::new(PAM_MODULE_PATH).exists() {
         bail!(
@@ -1768,6 +2638,17 @@ fn pam_install(service: &str, yes: bool) -> anyhow::Result<()> {
         );
     }
 
+    pam_install_in(Path::new(PAM_DIR), service, yes, no_prompt)
+}
+
+/// Insert the facelock PAM line into `<base>/<service>`.
+///
+/// `yes` gates [`SENSITIVE_SERVICES`]; `no_prompt` only suppresses the per-file
+/// "Proceed?" confirmation, because `--non-interactive` promises no prompts but
+/// must not weaken the sensitive-service gate.
+///
+/// The caller is responsible for checking that the PAM module is installed.
+fn pam_install_in(base: &Path, service: &str, yes: bool, no_prompt: bool) -> anyhow::Result<()> {
     // 3. Refuse sensitive services without --yes
     if SENSITIVE_SERVICES.contains(&service) && !yes {
         bail!(
@@ -1776,8 +2657,9 @@ fn pam_install(service: &str, yes: bool) -> anyhow::Result<()> {
         );
     }
 
-    let pam_path = format!("/etc/pam.d/{service}");
-    let pam_file = Path::new(&pam_path);
+    let pam_file = base.join(service);
+    let pam_path = pam_file.display().to_string();
+    let pam_file = pam_file.as_path();
 
     if !pam_file.exists() {
         bail!("PAM service file not found: {pam_path}");
@@ -1810,7 +2692,7 @@ fn pam_install(service: &str, yes: bool) -> anyhow::Result<()> {
     println!();
     println!("(To configure manually instead, add the line above to each service yourself.)");
 
-    let proceed = if yes || !std::io::stdin().is_terminal() {
+    let proceed = if yes || no_prompt || !std::io::stdin().is_terminal() {
         true
     } else {
         Confirm::new()
@@ -2052,6 +2934,365 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Choice-flag tests
+//
+// These run as an unprivileged user with no camera, no TPM and no network. The
+// flag paths are factored so every decision is a pure function and only the
+// writers touch the filesystem, which is what makes that possible.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod choice_tests {
+    use super::*;
+    use facelock_core::config::EncryptionMethod;
+
+    fn base_config() -> Config {
+        Config::parse("").expect("an empty config must resolve to defaults")
+    }
+
+    fn cam(path: &str, name: &str, is_ir: bool) -> CameraCandidate {
+        CameraCandidate {
+            path: path.to_string(),
+            name: name.to_string(),
+            is_ir,
+        }
+    }
+
+    fn temp_config(name: &str, contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    // -- --models ------------------------------------------------------------
+
+    /// The preset table is the contract documented in the plan; pin it.
+    #[test]
+    fn preset_models_match_documented_table() {
+        assert_eq!(
+            preset_models(ModelPreset::Standard),
+            ("scrfd_2.5g_bnkps.onnx", "w600k_r50.onnx")
+        );
+        assert_eq!(
+            preset_models(ModelPreset::Balanced),
+            ("scrfd_2.5g_bnkps.onnx", "glintr100.onnx")
+        );
+        assert_eq!(
+            preset_models(ModelPreset::High),
+            ("det_10g.onnx", "glintr100.onnx")
+        );
+    }
+
+    /// Every preset resolves to checksums taken from the bundled manifest, not
+    /// from anything typed twice.
+    #[test]
+    fn preset_checksums_come_from_the_bundled_manifest() {
+        let manifest: ModelManifest = toml::from_str(MANIFEST_TOML).unwrap();
+
+        for preset in MODEL_PRESETS {
+            let mut config = base_config();
+            set_model_preset(&mut config, preset).unwrap();
+
+            let (detector, embedder) = preset_models(preset);
+            assert_eq!(config.recognition.detector_model, detector);
+            assert_eq!(config.recognition.embedder_model, embedder);
+            assert_eq!(
+                config.recognition.detector_sha256.as_deref(),
+                Some(manifest.find(detector).unwrap().sha256.as_str()),
+                "{preset:?} detector checksum"
+            );
+            assert_eq!(
+                config.recognition.embedder_sha256.as_deref(),
+                Some(manifest.find(embedder).unwrap().sha256.as_str()),
+                "{preset:?} embedder checksum"
+            );
+        }
+    }
+
+    /// The wizard picks `MODEL_PRESETS[selection]`, so the prompt labels must
+    /// stay in preset order. This is what stops the two from drifting.
+    #[test]
+    fn wizard_options_are_in_preset_order() {
+        assert_eq!(MODEL_PRESET_OPTIONS.len(), MODEL_PRESETS.len());
+        for (idx, preset) in MODEL_PRESETS.iter().enumerate() {
+            let expected_prefix = match preset {
+                ModelPreset::Standard => "Standard",
+                ModelPreset::Balanced => "Balanced",
+                ModelPreset::High => "High accuracy",
+            };
+            assert!(
+                MODEL_PRESET_OPTIONS[idx].starts_with(expected_prefix),
+                "option {idx} ({}) does not describe {preset:?}",
+                MODEL_PRESET_OPTIONS[idx]
+            );
+        }
+    }
+
+    /// The prompt's default index is a reverse lookup of the same table, so a
+    /// config written by `--models` must pre-select the matching prompt entry.
+    #[test]
+    fn preset_reverse_lookup_round_trips() {
+        for (idx, preset) in MODEL_PRESETS.iter().enumerate() {
+            let mut config = base_config();
+            set_model_preset(&mut config, *preset).unwrap();
+
+            let found = preset_of_models(
+                &config.recognition.detector_model,
+                &config.recognition.embedder_model,
+            );
+            assert_eq!(found, Some(*preset));
+            assert_eq!(
+                MODEL_PRESETS.iter().position(|p| Some(*p) == found),
+                Some(idx)
+            );
+        }
+        assert_eq!(preset_of_models("custom.onnx", "custom.onnx"), None);
+    }
+
+    // -- --camera ------------------------------------------------------------
+
+    #[test]
+    fn camera_auto_selects_the_single_ir_device() {
+        let candidates = [
+            cam("/dev/video0", "Integrated Camera", false),
+            cam("/dev/video2", "Integrated IR Camera", true),
+        ];
+        assert_eq!(select_ir_camera(&candidates).unwrap(), "/dev/video2");
+    }
+
+    #[test]
+    fn camera_auto_errors_when_no_ir_device() {
+        let candidates = [cam("/dev/video0", "Integrated Camera", false)];
+        let err = select_ir_camera(&candidates).unwrap_err().to_string();
+        assert!(err.contains("no IR-capable camera"), "{err}");
+        // The message has to be actionable: name what was found and the way out.
+        assert!(err.contains("/dev/video0"), "{err}");
+        assert!(err.contains("--camera="), "{err}");
+    }
+
+    #[test]
+    fn camera_auto_errors_when_no_devices_at_all() {
+        let err = select_ir_camera(&[]).unwrap_err().to_string();
+        assert!(err.contains("no video devices"), "{err}");
+    }
+
+    /// Never silently take the first of several IR nodes — pinning setup to the
+    /// wrong node means auth never works.
+    #[test]
+    fn camera_auto_errors_when_several_ir_devices() {
+        let candidates = [
+            cam("/dev/video2", "Integrated IR Camera", true),
+            cam("/dev/video4", "BRIO IR", true),
+        ];
+        let err = select_ir_camera(&candidates).unwrap_err().to_string();
+        assert!(err.contains("2 IR-capable cameras"), "{err}");
+        assert!(
+            err.contains("/dev/video2") && err.contains("/dev/video4"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn camera_explicit_path_must_exist() {
+        let mut config = base_config();
+        let err = apply_camera_choice(
+            &mut config,
+            &CameraChoice::Path("/dev/video-does-not-exist".to_string()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        // Nothing was written into the config on the way out.
+        assert_eq!(config.device.path, None);
+    }
+
+    // -- config writers ------------------------------------------------------
+
+    #[test]
+    fn update_config_device_appends_section_when_absent() {
+        let (_dir, path) = temp_config("config.toml", "[recognition]\nthreshold = 0.75\n");
+        let mut config = base_config();
+        config.device.path = Some("/dev/video2".to_string());
+        update_config_device_at(&path, &config).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("[device]"), "{result}");
+        assert!(result.contains("path = \"/dev/video2\""), "{result}");
+        assert!(result.contains("threshold = 0.75"), "{result}");
+    }
+
+    #[test]
+    fn update_config_device_updates_path_in_place() {
+        let (_dir, path) = temp_config(
+            "config.toml",
+            "[device]\npath = \"/dev/video0\"\nmax_height = 480\n\n[recognition]\nthreshold = 0.75\n",
+        );
+        let mut config = base_config();
+        config.device.path = Some("/dev/video2".to_string());
+        update_config_device_at(&path, &config).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("path = \"/dev/video2\""), "{result}");
+        assert!(!result.contains("/dev/video0"), "{result}");
+        // Unrelated keys, in this and in other sections, survive.
+        assert!(result.contains("max_height = 480"), "{result}");
+        assert!(result.contains("threshold = 0.75"), "{result}");
+        assert_eq!(result.matches("[device]").count(), 1, "{result}");
+        assert_eq!(result.matches("path = ").count(), 1, "{result}");
+    }
+
+    /// `[device]` has no other key that starts with `path`, but the writer must
+    /// match on the assignment rather than the prefix regardless.
+    #[test]
+    fn key_assignment_matches_whole_key_only() {
+        assert!(is_key_assignment("path = \"/dev/video0\"", "path"));
+        assert!(is_key_assignment("  path=\"/dev/video0\"", "path"));
+        assert!(!is_key_assignment("path_suffix = 1", "path"));
+        assert!(!is_key_assignment("# path = \"/dev/video0\"", "path"));
+    }
+
+    // -- --execution-provider ------------------------------------------------
+
+    /// Detection depends on which ONNX Runtime build the host has installed, so
+    /// this asserts only that `auto` resolves to something the provider
+    /// registry accepts — never that a particular GPU was found. The priority
+    /// rule itself is unit-tested in `facelock-face`.
+    #[test]
+    fn execution_provider_auto_resolves_to_a_valid_provider() {
+        let resolved = resolve_execution_provider_auto().expect("auto must always resolve");
+        assert!(
+            facelock_face::ProviderKind::parse(&resolved).is_some(),
+            "auto produced an unregisterable provider: {resolved}"
+        );
+
+        assert_eq!(
+            provider_name(ExecutionProviderChoice::Auto).unwrap(),
+            resolved,
+            "provider_name must not diverge from resolve_execution_provider_auto"
+        );
+    }
+
+    #[test]
+    fn explicit_providers_resolve_to_their_config_value() {
+        for (choice, expected) in [
+            (ExecutionProviderChoice::Cpu, "cpu"),
+            (ExecutionProviderChoice::Cuda, "cuda"),
+            (ExecutionProviderChoice::Rocm, "rocm"),
+            (ExecutionProviderChoice::Openvino, "openvino"),
+        ] {
+            assert_eq!(provider_name(choice).unwrap(), expected);
+        }
+    }
+
+    /// Including `rocm` and `openvino`, which the prompt never offers but the
+    /// ORT provider registry accepts.
+    #[test]
+    fn every_explicit_provider_persists() {
+        for provider in ["cpu", "cuda", "rocm", "openvino"] {
+            let (_dir, path) = temp_config(
+                "config.toml",
+                "[recognition]\nexecution_provider = \"cpu\"\nthreshold = 0.75\n",
+            );
+            let mut config = base_config();
+            config.recognition.execution_provider = provider.to_string();
+            update_config_provider_at(&path, &config).unwrap();
+
+            let result = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                result.contains(&format!("execution_provider = \"{provider}\"")),
+                "{result}"
+            );
+            assert!(result.contains("threshold = 0.75"), "{result}");
+            assert_eq!(result.matches("execution_provider").count(), 1, "{result}");
+        }
+    }
+
+    #[test]
+    fn provider_persists_into_a_config_without_a_recognition_section() {
+        let (_dir, path) = temp_config("config.toml", "[device]\npath = \"/dev/video0\"\n");
+        let mut config = base_config();
+        config.recognition.execution_provider = "rocm".to_string();
+        update_config_provider_at(&path, &config).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("[recognition]"), "{result}");
+        assert!(result.contains("execution_provider = \"rocm\""), "{result}");
+        assert!(result.contains("path = \"/dev/video0\""), "{result}");
+    }
+
+    // -- --encryption --------------------------------------------------------
+
+    /// A TPM that is not there is an error, never a quiet downgrade to a
+    /// software keyfile: the user asked for hardware protection.
+    #[test]
+    fn encryption_tpm_without_a_tpm_errors_instead_of_downgrading() {
+        let mut config = Config::parse(
+            "[tpm]\ntcti = \"device:/nonexistent/tpm\"\n\n[encryption]\nmethod = \"none\"\n",
+        )
+        .unwrap();
+
+        let err = apply_encryption_choice(&mut config, EncryptionChoice::Tpm, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("no usable TPM"), "{err}");
+        assert!(err.contains("--encryption=keyfile"), "{err}");
+        // Specifically not Keyfile: that is the downgrade this must never do.
+        assert_eq!(config.encryption.method, EncryptionMethod::None);
+    }
+
+    /// Writes through `paths::config_path()`, so it needs the process override.
+    #[test]
+    fn encryption_none_sets_method_none() {
+        struct OverrideGuard;
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                facelock_core::paths::clear_process_config_override();
+            }
+        }
+
+        let (_dir, path) = temp_config(
+            "config.toml",
+            "[encryption]\nmethod = \"keyfile\"\nkey_path = \"/tmp/k\"\n",
+        );
+
+        facelock_core::paths::set_process_config_override(path.clone());
+        let _guard = OverrideGuard;
+
+        let mut config = base_config();
+        apply_encryption_choice(&mut config, EncryptionChoice::None, None).unwrap();
+
+        assert_eq!(config.encryption.method, EncryptionMethod::None);
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("method = \"none\""), "{result}");
+    }
+
+    /// The orphaned-models guard must not become a prompt when no theme is
+    /// available — that is the non-interactive path, and it must not hang.
+    #[test]
+    fn auto_encryption_keygen_detection() {
+        let mut config = base_config();
+        config.encryption.method = EncryptionMethod::None;
+        config.encryption.key_path = "/nonexistent/facelock/encryption.key".to_string();
+        config.encryption.sealed_key_path =
+            "/nonexistent/facelock/encryption.key.sealed".to_string();
+
+        assert!(auto_encryption_needs_keygen(&config, false));
+        assert!(auto_encryption_needs_keygen(&config, true));
+
+        // Already-configured encryption never mints a key.
+        config.encryption.method = EncryptionMethod::Keyfile;
+        assert!(!auto_encryption_needs_keygen(&config, false));
+
+        // An existing key file is reused, not replaced.
+        let (_dir, key) = temp_config("encryption.key", "not-a-real-key");
+        config.encryption.method = EncryptionMethod::None;
+        config.encryption.key_path = key.display().to_string();
+        assert!(!auto_encryption_needs_keygen(&config, false));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2289,5 +3530,348 @@ account include   system-login
         assert!(result.contains("threshold = 0.75"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Tests for the action opt-outs `--no-pam` / `--no-systemd` / `--no-enroll`.
+///
+/// All of these run as an unprivileged user with no camera, no systemd and no
+/// writes outside a tempdir.
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A realistic-enough `/etc/pam.d` to hash.
+    fn fake_pam_d() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("sudo"),
+            "#%PAM-1.0\nauth\t\tinclude\t\tsystem-auth\naccount\t\tinclude\t\tsystem-auth\nsession\t\tinclude\t\tsystem-auth\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("polkit-1"),
+            "#%PAM-1.0\nauth\t\tinclude\t\tsystem-auth\naccount\t\tinclude\t\tsystem-auth\npassword\tinclude\t\tsystem-auth\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("hyprlock"),
+            "#%PAM-1.0\nauth\t\tinclude\t\tsystem-auth\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// SHA-256 of every entry in `dir`, keyed by file name.
+    ///
+    /// Enumerating the directory rather than the files we wrote is what catches
+    /// a stray `.facelock-backup` appearing.
+    fn hash_dir(dir: &Path) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let bytes = fs::read(entry.path()).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let hex: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            out.insert(entry.file_name().to_string_lossy().into_owned(), hex);
+        }
+        out
+    }
+
+    fn pam_plan(pam: PamPref) -> SetupPlan {
+        SetupPlan {
+            pam,
+            ..SetupPlan::default()
+        }
+    }
+
+    // -- `--no-pam` ---------------------------------------------------------
+
+    /// The plan's acceptance criterion: declining PAM leaves every file under
+    /// the PAM directory byte-identical, and adds none.
+    #[test]
+    fn no_pam_leaves_every_pam_file_byte_identical() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = pam_plan(PamPref::Skip);
+        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+
+        assert!(configured.is_empty());
+        assert_eq!(
+            before,
+            hash_dir(dir.path()),
+            "--no-pam must not modify or add any file under pam.d"
+        );
+    }
+
+    /// Positive control for the harness above: without this, that test could
+    /// pass because `hash_dir` cannot see a write at all.
+    #[test]
+    fn hash_harness_detects_a_real_pam_write() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = SetupPlan {
+            yes: true,
+            ..pam_plan(PamPref::Install {
+                service: Some("sudo".to_string()),
+            })
+        };
+        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+
+        assert_eq!(configured, vec!["sudo".to_string()]);
+        let after = hash_dir(dir.path());
+        assert_ne!(before["sudo"], after["sudo"], "sudo must have changed");
+        assert!(
+            after.contains_key("sudo.facelock-backup"),
+            "a backup file must have appeared: {after:?}"
+        );
+        assert!(
+            fs::read_to_string(dir.path().join("sudo"))
+                .unwrap()
+                .lines()
+                .any(is_facelock_pam_line)
+        );
+    }
+
+    /// `--pam --remove` is `run_with_plan`'s job; step 9 must not pre-empt it.
+    #[test]
+    fn pam_remove_is_deferred_and_step_9_writes_nothing() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = pam_plan(PamPref::Remove {
+            service: "sudo".to_string(),
+        });
+        assert_eq!(pam_step_for(&plan), PamStep::Deferred);
+        assert!(
+            pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(before, hash_dir(dir.path()));
+    }
+
+    // -- `--pam` in a wizard base -------------------------------------------
+
+    /// `--pam --service hyprlock` configures exactly `hyprlock`.
+    #[test]
+    fn pam_with_service_configures_only_that_service() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = SetupPlan {
+            yes: true,
+            ..pam_plan(PamPref::Install {
+                service: Some("hyprlock".to_string()),
+            })
+        };
+        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+
+        assert_eq!(configured, vec!["hyprlock".to_string()]);
+        let after = hash_dir(dir.path());
+        assert_ne!(before["hyprlock"], after["hyprlock"]);
+        assert_eq!(before["sudo"], after["sudo"]);
+        assert_eq!(before["polkit-1"], after["polkit-1"]);
+    }
+
+    /// Bare `--pam` means `sudo`, not the candidates' `default_enabled` set.
+    #[test]
+    fn pam_without_service_means_sudo_not_the_default_enabled_set() {
+        let plan = pam_plan(PamPref::Install { service: None });
+        assert_eq!(
+            pam_step_for(&plan),
+            PamStep::Install(DEFAULT_PAM_SERVICE.to_string())
+        );
+
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+        assert_eq!(configured, vec![DEFAULT_PAM_SERVICE.to_string()]);
+
+        // hyprlock is `default_enabled` but was not named, so it is untouched.
+        let after = hash_dir(dir.path());
+        assert_eq!(before["hyprlock"], after["hyprlock"]);
+        assert_eq!(before["polkit-1"], after["polkit-1"]);
+    }
+
+    /// The sensitive-service gate still requires `--yes`, and refusing it
+    /// writes nothing.
+    #[test]
+    fn sensitive_service_refused_without_yes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("sshd"),
+            "#%PAM-1.0\nauth\t\tinclude\t\tsystem-auth\n",
+        )
+        .unwrap();
+        let before = hash_dir(dir.path());
+
+        // `no_prompt` (what `--non-interactive` sets) must not weaken the gate.
+        let err = pam_install_in(dir.path(), "sshd", false, true).unwrap_err();
+        assert!(err.to_string().contains("Refusing to modify 'sshd'"));
+        assert_eq!(before, hash_dir(dir.path()));
+    }
+
+    // -- `--no-systemd` -----------------------------------------------------
+
+    /// `--no-systemd` writes no unit files and invokes no `systemctl`. The
+    /// decision is made before any I/O, so this is assertable without root.
+    #[test]
+    fn no_systemd_writes_nothing_and_invokes_no_systemctl() {
+        let plan = SetupPlan {
+            systemd: SystemdPref::Skip,
+            ..SetupPlan::default()
+        };
+        let step = systemd_step_for(&plan);
+        assert_eq!(step, SystemdStep::Skip);
+
+        // `wizard_systemd_setup` is the wizard's only path to unit files and
+        // `systemctl`, and it runs only when `wizard_may_install()` holds.
+        assert!(!step.wizard_may_install());
+        // `run_with_plan` acts only on Install/Disable.
+        assert!(!matches!(
+            plan.systemd,
+            SystemdPref::Install | SystemdPref::Disable
+        ));
+    }
+
+    /// `--systemd` is applied by `run_with_plan`, so step 8 must defer rather
+    /// than install a second time.
+    #[test]
+    fn systemd_flag_is_deferred_to_run_with_plan() {
+        for pref in [SystemdPref::Install, SystemdPref::Disable] {
+            let plan = SetupPlan {
+                systemd: pref,
+                ..SetupPlan::default()
+            };
+            let step = systemd_step_for(&plan);
+            assert_eq!(step, SystemdStep::Deferred);
+            assert!(!step.wizard_may_install());
+        }
+    }
+
+    // -- `--no-enroll` ------------------------------------------------------
+
+    /// `--no-enroll` suppresses step 6 *and* step 7, which depends on it.
+    #[test]
+    fn no_enroll_suppresses_steps_6_and_7() {
+        let plan = SetupPlan {
+            enroll: Some(false),
+            ..SetupPlan::default()
+        };
+        let steps = enroll_steps_for(&plan);
+
+        assert!(!steps.enroll, "step 6 must not run");
+        // Step 7 is gated on step 6, so it cannot run whatever `enrolled` says.
+        assert!(!test_recognition_runs(steps, true));
+        assert!(!test_recognition_runs(steps, false));
+    }
+
+    /// `--enroll` runs enrollment without the confirm prompt.
+    #[test]
+    fn enroll_flag_runs_without_the_confirm_prompt() {
+        let plan = SetupPlan {
+            enroll: Some(true),
+            ..SetupPlan::default()
+        };
+        let steps = enroll_steps_for(&plan);
+        assert!(steps.enroll);
+        assert!(steps.assume_yes);
+        assert!(test_recognition_runs(steps, true));
+    }
+
+    // -- defaults and `-y` --------------------------------------------------
+
+    /// Nothing is suppressed by default: a bare `facelock setup` still reaches
+    /// steps 6, 7, 8 and 9.
+    #[test]
+    fn default_plan_still_reaches_all_four_action_steps() {
+        let plan = SetupPlan::default();
+
+        let steps = enroll_steps_for(&plan);
+        assert!(steps.enroll, "step 6");
+        assert!(!steps.assume_yes, "step 6 still prompts");
+        assert!(test_recognition_runs(steps, true), "step 7");
+        assert_eq!(systemd_step_for(&plan), SystemdStep::Ask, "step 8");
+        assert!(systemd_step_for(&plan).wizard_may_install());
+        assert_eq!(pam_step_for(&plan), PamStep::Ask, "step 9");
+        assert!(pam_step_for(&plan).touches_pam_d());
+    }
+
+    /// ...and step 9 under a default plan really does write. Under `cargo test`
+    /// stdin is not a terminal, so it falls back to the candidates'
+    /// `default_enabled` set — which is exactly what `--no-pam` must prevent.
+    #[test]
+    fn default_plan_still_configures_pam() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = SetupPlan::default();
+        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+
+        assert!(configured.contains(&"sudo".to_string()));
+        assert!(configured.contains(&"hyprlock".to_string()));
+        assert_ne!(before, hash_dir(dir.path()));
+    }
+
+    /// `-y` makes the step 6/7/8 confirmations take their default instead of
+    /// prompting. `cargo test` gives us a non-tty stdin, so a real prompt here
+    /// would fail — `Ok(true)` is proof it was suppressed.
+    #[test]
+    fn yes_makes_step_confirms_take_their_default() {
+        let theme = ColorfulTheme::default();
+        for prompt in [
+            "Would you like to enroll a face now?",
+            "Would you like to test recognition?",
+            "Enable daemon mode with D-Bus activation?",
+        ] {
+            assert!(confirm_step(&theme, prompt, true).unwrap());
+        }
+
+        // `-y` is what feeds `assume_yes` at the step 6 call site; steps 7 and 8
+        // are passed `plan.yes` directly.
+        let plan = SetupPlan {
+            yes: true,
+            ..SetupPlan::default()
+        };
+        assert!(enroll_steps_for(&plan).assume_yes);
+    }
+
+    /// A PAM module that is not installed short-circuits step 9 before any
+    /// write — the check the tests above hoist out of `pam_install_in`.
+    #[test]
+    fn missing_pam_module_writes_nothing() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = SetupPlan::default();
+        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), false).unwrap();
+
+        assert!(configured.is_empty());
+        assert_eq!(before, hash_dir(dir.path()));
+    }
+
+    /// `pam_install` edits `/etc/pam.d` and is reachable from `run_with_plan`
+    /// without going through `run_pam`, so it must refuse non-root itself.
+    /// Regression: routing standalone `--pam` through `pam_install` once let an
+    /// unprivileged `facelock setup --pam` read and report on `/etc/pam.d/sudo`.
+    #[test]
+    fn pam_install_refuses_without_root() {
+        if nix::unistd::Uid::current().is_root() {
+            return; // the check cannot fire; nothing to assert
+        }
+        let err = pam_install("sudo", true, true).unwrap_err().to_string();
+        assert!(
+            err.contains("requires root"),
+            "expected the root refusal before any other check, got: {err}"
+        );
     }
 }

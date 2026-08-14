@@ -147,9 +147,9 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
 fn save_snapshot(snapshot_config: &SnapshotConfig, user: &str, similarity: f32, frame: &Frame) {
     let dir = Path::new(&snapshot_config.dir);
     let ensure_snapshot_dir = if Uid::current().is_root() {
-        ensure_private_dir(dir, 0o750)
+        ensure_private_dir(dir, 0o700)
     } else {
-        ensure_dir(dir, 0o750)
+        ensure_dir(dir, 0o700)
     };
     if let Err(e) = ensure_snapshot_dir {
         warn!(dir = %dir.display(), error = %e, "failed to secure snapshot directory");
@@ -175,7 +175,7 @@ fn save_snapshot(snapshot_config: &SnapshotConfig, user: &str, similarity: f32, 
         return;
     }
 
-    if let Err(e) = write_file(&path, &buf, 0o640) {
+    if let Err(e) = write_file(&path, &buf, 0o600) {
         warn!(path = %path.display(), error = %e, "failed to write snapshot");
         return;
     }

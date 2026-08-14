@@ -1232,6 +1232,7 @@ dependencies = [
  "bytemuck",
  "facelock-core",
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

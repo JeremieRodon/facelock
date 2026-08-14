@@ -29,6 +29,13 @@ pub fn run(model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()>
         } else {
             println!("Model #{model_id} not found for user '{user}'.");
         }
+        // Recompute from the list we already have open rather than decrementing:
+        // same cost, and it cannot drift from the database.
+        let remaining = store.list_models(&user).ok().map(|m| m.len() as u32);
+        drop(store);
+        if let Some(remaining) = remaining {
+            super::enrollment_marker::set(&config, &user, remaining);
+        }
         return Ok(());
     }
 
@@ -42,6 +49,7 @@ pub fn run(model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()>
     match response {
         DaemonResponse::Removed => {
             println!("Removed face model #{model_id} for user '{user}'.");
+            super::enrollment_marker::refresh(&config, &user);
         }
         other => {
             anyhow::bail!("unexpected response from daemon: {other:?}");

@@ -110,6 +110,7 @@ pub fn run(
         println!(
             "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
         );
+        super::enrollment_marker::refresh(&config, &user);
         check_model_count(&user, &config);
         return Ok(());
     }
@@ -127,6 +128,7 @@ pub fn run(
         println!(
             "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
         );
+        super::enrollment_marker::refresh(&config, &user);
         check_model_count(&user, &config);
     }
 

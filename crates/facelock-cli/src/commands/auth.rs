@@ -31,8 +31,13 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
 
     tracing_subscriber::fmt()
         .with_env_filter(
+            // `facelock`, not `facelock_cli`: the crate builds as a bin target
+            // named `facelock`, so that is the target its own events carry.
+            // Filtering on `facelock_cli` matched nothing and silently dropped
+            // every diagnostic this command emits — including the reason an
+            // auth attempt failed. `daemon.rs` already gets this right.
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "facelock_cli=info".into()),
+                .unwrap_or_else(|_| "facelock=info,facelock_daemon=info".into()),
         )
         .with_target(false)
         .with_writer(std::io::stderr)
@@ -75,9 +80,18 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         }
     }
 
+    // Best-effort mode fixing before the store is opened: this is the PAM
+    // path, the one entry point guaranteed to run on an oneshot-mode install
+    // that never starts the daemon and never re-runs setup. A failure only
+    // means modes could not be set and must never block an authentication.
+    crate::state_layout::ensure_state_layout_best_effort(&config);
+
     // Open a writable store for rate limiting (the oneshot path runs as root
-    // or the facelock group, so write access is available).
-    let store = match FaceStore::open(Path::new(&config.storage.db_path)) {
+    // or the facelock group, so write access is available). `create`: on a
+    // genuinely fresh install this is what brings the rate-limiter's storage
+    // into being, so switching to `open_existing` would change auth-path
+    // behaviour, not harden it.
+    let store = match FaceStore::create(Path::new(&config.storage.db_path)) {
         Ok(s) => s,
         Err(e) => {
             error!("database: {e}");

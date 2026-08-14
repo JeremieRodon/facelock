@@ -45,6 +45,8 @@ pub fn run(user: Option<String>, yes: bool) -> anyhow::Result<()> {
             .clear_user(&user)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("Removed {count} face model(s) for user '{user}'.");
+        // The user has no models by construction, so drop the marker outright.
+        super::enrollment_marker::forget(&config, &user);
         return Ok(());
     }
 
@@ -55,6 +57,7 @@ pub fn run(user: Option<String>, yes: bool) -> anyhow::Result<()> {
     match response {
         DaemonResponse::Removed => {
             println!("All face models removed for user '{user}'.");
+            super::enrollment_marker::forget(&config, &user);
         }
         other => {
             anyhow::bail!("unexpected response from daemon: {other:?}");

@@ -1106,6 +1106,11 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     };
     let mut config = config.map_err(|e| format!("failed to load config: {e}"))?;
 
+    // Before anything opens the store: the daemon runs as root, so this is
+    // where an upgraded install converges on the documented modes. A handful
+    // of stat calls in the steady state.
+    crate::state_layout::ensure_state_layout(&config).map_err(|e| format!("{e:#}"))?;
+
     let quirks = QuirksDb::load();
 
     if config.device.path.is_none() {
@@ -1135,7 +1140,9 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     let engine = FaceEngine::load(&config.recognition, Path::new(&config.daemon.model_dir))
         .map_err(|e| format!("failed to load face engine: {e}"))?;
 
-    let store = FaceStore::open(Path::new(&config.storage.db_path))
+    // `create`: a fresh install with nobody enrolled still needs a store for
+    // rate limiting.
+    let store = FaceStore::create(Path::new(&config.storage.db_path))
         .map_err(|e| format!("failed to open database: {e}"))?;
 
     let rate_limiter = RateLimiter::new(
