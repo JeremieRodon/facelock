@@ -533,6 +533,70 @@ mod tests {
         }
     }
 
+    /// The same pin, for the spelling that walks around it. `Config::load()`
+    /// is not the only way to re-read the global config file: `Config::
+    /// load_from(paths::config_path())` does exactly the same thing, and it
+    /// is the *natural* thing to write, since `ConfigLoad::read_from` models
+    /// that shape. Two pins, because the bypass has two shapes:
+    ///
+    /// 1. Composed on one line — allowed nowhere. `ConfigLoad::read` is the
+    ///    one canonical global read, and it spells the two halves separately.
+    /// 2. Named at all — allowed only in the files below. This is per-file
+    ///    rather than per-count so that setup's config *writes* can come and
+    ///    go freely, while a brand-new file that starts reaching for the
+    ///    global path still has to be a decision someone makes here.
+    #[test]
+    fn global_config_path_reads_are_pinned() {
+        // Files that may legitimately name the global config path.
+        let allowed_to_name_global_path: &[&str] = &[
+            // The canonical read itself.
+            "resolved.rs",
+            // `facelock config` edits the file, so it must address it.
+            "commands/config.rs",
+            // Reload trigger: stats the file's mtime (does not parse it).
+            "commands/daemon.rs",
+            // Bootstrap writes the file into existence, plus its tests.
+            "commands/setup.rs",
+        ];
+
+        // Assembled at runtime so this test's own prose does not count.
+        let global_path = format!("config_path{}", "()");
+        let load_from = format!("load_from{}", "(");
+
+        for (path, content) in source_files() {
+            let rel = path
+                .to_string_lossy()
+                .split("/src/")
+                .last()
+                .unwrap()
+                .to_string();
+
+            for line in content
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+            {
+                assert!(
+                    !(line.contains(&global_path) && line.contains(&load_from)),
+                    "{rel}: `load_from` applied directly to the global config \
+                     path re-reads what main already parsed — the D7 \
+                     regression under a different spelling. Take the &Config \
+                     the command is given.\n  {}",
+                    line.trim()
+                );
+            }
+
+            if count_code_occurrences(&content, &global_path) > 0 {
+                assert!(
+                    allowed_to_name_global_path.contains(&rel.as_str()),
+                    "{rel}: names the global config path ({global_path}), which \
+                     only the files that read or write the file itself may do. \
+                     Commands receive &Config from main (see \
+                     resolved::ConfigLoad)."
+                );
+            }
+        }
+    }
+
     /// `is-enrolled` isolation pin: its module must not name the resolution
     /// machinery or any transport/store entry point. This guarantees only that
     /// the module itself stays clean — indirect calls would need a reviewer —

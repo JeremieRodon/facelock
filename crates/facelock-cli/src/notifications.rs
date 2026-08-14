@@ -75,8 +75,9 @@ fn send_notification_dbus(event: &NotifyEvent) -> anyhow::Result<()> {
 
 /// Send a desktop notification for the given event.
 ///
-/// This is fire-and-forget: errors are logged at debug level but never propagated.
-/// Notifications should never block or fail the auth flow.
+/// Errors are logged at debug level and never propagated, so a notification
+/// cannot fail the auth flow. It can, however, delay it: the delivery below
+/// runs a child process and waits for it.
 ///
 /// When running as root (via sudo), D-Bus rejects connections from UID 0 to the
 /// user's session bus. We handle this by resolving the original user's session bus

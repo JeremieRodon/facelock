@@ -39,8 +39,14 @@ pub enum NotifyEvent {
 
 /// Delivery seam: something that can tell a human about a [`NotifyEvent`].
 ///
-/// Delivery is fire-and-forget by contract — implementations must never
-/// block or fail the auth flow (log and move on).
+/// The contract is that delivery must never *fail* the auth flow: an
+/// implementation logs its errors and returns normally, and `notify` has no
+/// return value precisely so a caller cannot branch on one.
+///
+/// It is not "fire-and-forget". Implementations may block, and the desktop
+/// one does — it runs `setpriv` + `notify-send` and waits for the child —
+/// which is why the daemon sends notifications after releasing the capture
+/// slot but still before returning its reply. Keep delivery cheap.
 pub trait Notifier {
     fn notify(&self, event: &NotifyEvent);
 }
