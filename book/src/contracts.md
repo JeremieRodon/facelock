@@ -93,7 +93,7 @@ TOML format. All keys optional -- camera auto-detected, sensible defaults for ev
 When `device.path` is omitted:
 1. Enumerate `/dev/video0` through `/dev/video63`
 2. Filter to VIDEO_CAPTURE devices
-3. Prefer IR cameras (name contains "ir"/"infrared", or supports GREY/Y16 format)
+3. Classify IR from queried evidence: a node whose formats are mono-only/IR-typical (GREY/Y8/Y10/Y12/Y16, no color format mixed in), or a quirks `force_ir` match (authoritative by USB vendor:product ID; a name-only match only when corroborated by a real USB identity or the node's own mono-format evidence). The device name is never used to classify a node — only as an auto-detection tiebreak among nodes that already qualify
 4. Fall back to first available device
 
 ## Database Schema
