@@ -19,13 +19,147 @@ use crate::audit::{self, AuditEntry, AuditSource};
 use crate::liveness::LandmarkTracker;
 use crate::rate_limit::RateLimiter;
 
+/// The class of a recoverable authentication rejection — the discriminant
+/// every consumer switches on.
+///
+/// It exists because the same English sentence used to be four things at
+/// once: the user-facing message, the audit `result` label, the PAM wire
+/// discriminant, and the oneshot exit-code selector. Four independent
+/// substring matchers read it, so rewording a message silently changed PAM
+/// policy and mislabelled the audit trail. The class now travels as a type
+/// and the prose is *rendered* from it at the boundary, never parsed back
+/// out of it.
+///
+/// [`ErrorKind::render`] is the single producer of that prose, and two of the
+/// strings it renders are **frozen protocol**: PAM substring-matches
+/// "rate limited" and "IR camera required" to pick `PAM_AUTH_ERR` vs
+/// `PAM_IGNORE` (`crates/pam-facelock/src/lib.rs`), and
+/// `tests/server_authz.rs` pins them byte-exactly. They are documented in
+/// docs/contracts.md. Change the rendering of any other class freely; changing
+/// those two is a protocol break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// `security.disabled` is set.
+    Disabled,
+    /// `security.abort_if_ssh` and the caller is on an SSH session.
+    SshSession,
+    /// `security.abort_if_lid_closed` and the lid is closed.
+    LidClosed,
+    /// The face store could not be read. Carries the underlying error.
+    Storage,
+    /// The user has exhausted their face-auth budget. **Frozen wire string.**
+    RateLimited,
+    /// The rate-limit *check itself* failed (a storage fault, not a
+    /// rejection). Deliberately distinct from [`ErrorKind::RateLimited`]:
+    /// PAM must not read a broken limiter as a deliberate lockout. Carries
+    /// the underlying error.
+    RateLimitCheckFailed,
+    /// `security.require_ir` and the resolved device is not IR.
+    /// **Frozen wire string.**
+    IrRequired,
+    /// Every captured frame was below the darkness threshold — the camera
+    /// produced no usable image, which is not a non-match.
+    AllFramesDark,
+    /// A class this build does not name. Only [`ErrorKind::classify`]
+    /// produces it, for a message from a daemon of a different version.
+    /// Carries that message verbatim.
+    Internal,
+}
+
+impl ErrorKind {
+    /// Every variant, so a table-driven test cannot silently skip one.
+    pub const ALL: &'static [ErrorKind] = &[
+        ErrorKind::Disabled,
+        ErrorKind::SshSession,
+        ErrorKind::LidClosed,
+        ErrorKind::Storage,
+        ErrorKind::RateLimited,
+        ErrorKind::RateLimitCheckFailed,
+        ErrorKind::IrRequired,
+        ErrorKind::AllFramesDark,
+        ErrorKind::Internal,
+    ];
+
+    /// The exact user- and wire-facing text for this class.
+    ///
+    /// `detail` is the interpolated underlying error for the classes that
+    /// carry one ([`Storage`](ErrorKind::Storage),
+    /// [`RateLimitCheckFailed`](ErrorKind::RateLimitCheckFailed),
+    /// [`Internal`](ErrorKind::Internal)); the fixed-text classes ignore it.
+    /// This is the *only* place any of these sentences is written.
+    pub fn render(self, detail: &str) -> String {
+        match self {
+            ErrorKind::Disabled => "facelock is disabled".to_string(),
+            ErrorKind::SshSession => "SSH session detected".to_string(),
+            ErrorKind::LidClosed => "lid closed".to_string(),
+            ErrorKind::Storage => format!("storage error: {detail}"),
+            ErrorKind::RateLimited => "rate limited".to_string(),
+            ErrorKind::RateLimitCheckFailed => format!("rate limit check failed: {detail}"),
+            ErrorKind::IrRequired => "IR camera required for authentication. Set security.require_ir = false to override (NOT RECOMMENDED).".to_string(),
+            ErrorKind::AllFramesDark => "all frames dark".to_string(),
+            ErrorKind::Internal => detail.to_string(),
+        }
+    }
+
+    /// The audit log's `result` field for this class. Was
+    /// `message.contains("rate limited")`.
+    ///
+    /// Exhaustive on purpose: a new class must be given a label here, not
+    /// silently fall into `"error"`.
+    pub fn audit_result(self) -> &'static str {
+        match self {
+            ErrorKind::RateLimited => "rate_limited",
+            ErrorKind::Disabled
+            | ErrorKind::SshSession
+            | ErrorKind::LidClosed
+            | ErrorKind::Storage
+            | ErrorKind::RateLimitCheckFailed
+            | ErrorKind::IrRequired
+            | ErrorKind::AllFramesDark
+            | ErrorKind::Internal => "error",
+        }
+    }
+
+    /// Recover the class from a message that crossed the D-Bus wire.
+    ///
+    /// The wire has no room for the discriminant (`AuthResult` carries only
+    /// `matched`/`model_id`/`label`/`similarity`, and its signature is
+    /// frozen), so the CLI's client rebuilds the class from the rendered
+    /// text. This is the inverse of [`ErrorKind::render`] and the *only*
+    /// remaining place a rejection message is matched as text on this side of
+    /// the wire — `daemon_error_classify_inverts_render` pins the round trip.
+    ///
+    /// Unrecognized text is [`ErrorKind::Internal`], which is what a message
+    /// from an older or newer daemon lands on.
+    pub fn classify(message: &str) -> ErrorKind {
+        for kind in ErrorKind::ALL {
+            match kind {
+                // Detail-carrying classes match on their rendered prefix.
+                ErrorKind::Storage | ErrorKind::RateLimitCheckFailed => {
+                    let prefix = kind.render("");
+                    if message.starts_with(&prefix) {
+                        return *kind;
+                    }
+                }
+                // `Internal` renders the detail verbatim, so it has no
+                // recognizable form; it is the fallback below.
+                ErrorKind::Internal => {}
+                _ => {
+                    if message == kind.render("") {
+                        return *kind;
+                    }
+                }
+            }
+        }
+        ErrorKind::Internal
+    }
+}
+
 /// The outcome of an authentication attempt or its pre-flight gates — the
 /// vocabulary every transport shares. The daemon handler maps it onto its
 /// wire response; the direct path (`facelock test`, oneshot `facelock auth`)
 /// and the D-Bus client consume it as-is, so the CLI never needs the
-/// handler's own request/response enums (D5). The `Error` messages are
-/// protocol-bearing: PAM string-matches "rate limited" and "IR camera
-/// required", so they must flow through every mapping byte-identical.
+/// handler's own request/response enums (D5).
 #[derive(Debug, Clone)]
 pub enum AuthOutcome {
     /// The comparison loop ran (or a gate produced a definitive non-match).
@@ -34,7 +168,27 @@ pub enum AuthOutcome {
     Suppressed,
     /// A recoverable error (rate limited, IR required, storage/camera
     /// failure) that must not read as "no match".
-    Error { message: String },
+    ///
+    /// `kind` is what consumers switch on. `message` is its rendering, kept
+    /// alongside because it is what crosses the D-Bus wire and what the user
+    /// sees; nothing on this side of the wire may re-derive `kind` from it.
+    Error { kind: ErrorKind, message: String },
+}
+
+impl AuthOutcome {
+    /// A rejection of a class whose message is fixed.
+    pub fn error(kind: ErrorKind) -> Self {
+        Self::error_with(kind, "")
+    }
+
+    /// A rejection of a class that interpolates an underlying error
+    /// ([`Storage`](ErrorKind::Storage),
+    /// [`RateLimitCheckFailed`](ErrorKind::RateLimitCheckFailed),
+    /// [`Internal`](ErrorKind::Internal)).
+    pub fn error_with(kind: ErrorKind, detail: impl std::fmt::Display) -> Self {
+        let message = kind.render(&detail.to_string());
+        Self::Error { kind, message }
+    }
 }
 
 /// Which of [`pre_check`]'s environment gates a caller may skip.
@@ -107,31 +261,23 @@ pub fn pre_check_with_context(
 ) -> Option<AuthOutcome> {
     if config.security.disabled {
         warn!(user, "facelock is disabled");
-        return Some(AuthOutcome::Error {
-            message: "facelock is disabled".into(),
-        });
+        return Some(AuthOutcome::error(ErrorKind::Disabled));
     }
 
     if !ctx.skip_ssh_gate && config.security.abort_if_ssh && is_ssh_session() {
         info!(user, "SSH session detected, aborting");
-        return Some(AuthOutcome::Error {
-            message: "SSH session detected".into(),
-        });
+        return Some(AuthOutcome::error(ErrorKind::SshSession));
     }
 
     if !ctx.skip_lid_gate && config.security.abort_if_lid_closed && is_lid_closed() {
         info!(user, "lid closed, aborting");
-        return Some(AuthOutcome::Error {
-            message: "lid closed".into(),
-        });
+        return Some(AuthOutcome::error(ErrorKind::LidClosed));
     }
 
     let has_models = match store.has_models(user) {
         Ok(v) => v,
         Err(e) => {
-            return Some(AuthOutcome::Error {
-                message: format!("storage error: {e}"),
-            });
+            return Some(AuthOutcome::error_with(ErrorKind::Storage, e));
         }
     };
     if !has_models {
@@ -155,23 +301,17 @@ pub fn pre_check_with_context(
         Ok(true) => {}
         Ok(false) => {
             warn!(user, "rate limited");
-            return Some(AuthOutcome::Error {
-                message: "rate limited".into(),
-            });
+            return Some(AuthOutcome::error(ErrorKind::RateLimited));
         }
         Err(e) => {
             warn!(user, error = %e, "rate limit check failed");
-            return Some(AuthOutcome::Error {
-                message: format!("rate limit check failed: {e}"),
-            });
+            return Some(AuthOutcome::error_with(ErrorKind::RateLimitCheckFailed, e));
         }
     }
 
     if config.security.require_ir && !caps.is_ir {
         warn!(user, "IR camera required but device is not IR");
-        return Some(AuthOutcome::Error {
-            message: "IR camera required for authentication. Set security.require_ir = false to override (NOT RECOMMENDED).".into(),
-        });
+        return Some(AuthOutcome::error(ErrorKind::IrRequired));
     }
 
     None
@@ -213,10 +353,11 @@ pub fn pre_check_audited_with_context(
 ) -> Option<AuthOutcome> {
     let resp = pre_check_with_context(config, store, user, rate_limiter, caps, ctx)?;
     let (result, error) = match &resp {
-        AuthOutcome::Error { message } if message.contains("rate limited") => {
-            ("rate_limited".to_string(), Some(message.clone()))
+        // The label comes from the rejection's class, never from its prose
+        // (review C4): rewording a message must not relabel the audit trail.
+        AuthOutcome::Error { kind, message } => {
+            (kind.audit_result().to_string(), Some(message.clone()))
         }
-        AuthOutcome::Error { message } => ("error".to_string(), Some(message.clone())),
         AuthOutcome::AuthResult(mr) if !mr.matched => ("failure".to_string(), None),
         AuthOutcome::Suppressed => ("suppressed".to_string(), None),
         _ => ("error".to_string(), None),
@@ -646,13 +787,11 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                 duration_ms: Some(duration.as_millis() as u64),
                 device: config.device.path.clone(),
                 model_label: None,
-                error: Some("all frames dark".into()),
+                error: Some(ErrorKind::AllFramesDark.render("")),
             },
         );
         // No snapshot for all-dark: last_frame is None since dark frames are skipped
-        return AuthOutcome::Error {
-            message: "all frames dark".into(),
-        };
+        return AuthOutcome::error(ErrorKind::AllFramesDark);
     }
 
     info!(
@@ -709,6 +848,96 @@ fn is_lid_closed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two strings PAM substring-matches to choose `PAM_AUTH_ERR` over
+    /// `PAM_IGNORE` are frozen protocol (docs/contracts.md). They now come out
+    /// of [`ErrorKind::render`]; this pins that they come out byte-identical.
+    /// `tests/server_authz.rs` pins them again where they reach the wire.
+    #[test]
+    fn frozen_protocol_strings_render_byte_exactly() {
+        assert_eq!(ErrorKind::RateLimited.render(""), "rate limited");
+        assert_eq!(
+            ErrorKind::IrRequired.render(""),
+            "IR camera required for authentication. Set security.require_ir = false to override (NOT RECOMMENDED)."
+        );
+    }
+
+    /// PAM's own predicates, replicated here because `pam-facelock` cannot
+    /// depend on this crate (its dependency ceiling is libc/toml/serde/zbus),
+    /// so nothing else can catch the two classifications drifting apart.
+    ///
+    /// The converse direction is the one that used to be invisible: if some
+    /// *other* class started containing PAM's needles, it would silently
+    /// inherit that class's PAM code.
+    #[test]
+    fn only_the_two_intended_classes_trip_pams_matchers() {
+        // Verbatim from `pam_code_for_daemon_error`.
+        let is_rate_limited = |m: &str| m.contains("rate_limit") || m.contains("rate limited");
+        let is_ir_required =
+            |m: &str| m.contains("IR camera required") || m.contains("ir_required");
+
+        assert!(is_rate_limited(&ErrorKind::RateLimited.render("")));
+        assert!(is_ir_required(&ErrorKind::IrRequired.render("")));
+
+        for kind in ErrorKind::ALL {
+            // `Internal` renders arbitrary text from elsewhere, so it cannot
+            // be constrained — it is the class for messages this build does
+            // not name.
+            if *kind == ErrorKind::Internal {
+                continue;
+            }
+            let message = kind.render("boom");
+            if *kind != ErrorKind::RateLimited {
+                assert!(
+                    !is_rate_limited(&message),
+                    "{kind:?} renders {message:?}, which PAM would read as a rate-limit lockout"
+                );
+            }
+            if *kind != ErrorKind::IrRequired {
+                assert!(
+                    !is_ir_required(&message),
+                    "{kind:?} renders {message:?}, which PAM would read as an IR rejection"
+                );
+            }
+        }
+    }
+
+    /// The D-Bus wire has no field for the class, so the CLI's client rebuilds
+    /// it from the rendered message. That reconstruction must be the exact
+    /// inverse of the rendering, or the one remaining text matcher reintroduces
+    /// the defect it replaced.
+    #[test]
+    fn classify_inverts_render() {
+        for kind in ErrorKind::ALL {
+            // `Internal` renders its detail verbatim and so has no
+            // recognizable form; it is what unrecognized text lands on.
+            if *kind == ErrorKind::Internal {
+                continue;
+            }
+            let message = kind.render("boom");
+            assert_eq!(
+                ErrorKind::classify(&message),
+                *kind,
+                "{kind:?} rendered {message:?}, which classified as something else"
+            );
+        }
+        assert_eq!(
+            ErrorKind::classify("a message from a daemon of another version"),
+            ErrorKind::Internal
+        );
+    }
+
+    /// A rate-limit *check* that fails is a storage fault, not a lockout.
+    /// PAM must not read it as a deliberate rejection, and the audit trail
+    /// must not label it one — the substring matcher this replaced got both
+    /// right only by accident of wording.
+    #[test]
+    fn a_failed_rate_limit_check_is_not_a_rate_limit_rejection() {
+        let broken = ErrorKind::RateLimitCheckFailed;
+        assert_ne!(broken.audit_result(), ErrorKind::RateLimited.audit_result());
+        assert_eq!(broken.audit_result(), "error");
+        assert!(!broken.render("disk gone").contains("rate limited"));
+    }
 
     /// `SSH_CONNECTION` is process-global state; `cargo test` runs this
     /// file's tests on multiple threads, and four of them now mutate it
@@ -862,7 +1091,7 @@ mod tests {
         }
 
         assert!(
-            matches!(resp, Some(AuthOutcome::Error { ref message }) if message.contains("SSH")),
+            matches!(resp, Some(AuthOutcome::Error { kind, .. }) if kind == ErrorKind::SshSession),
             "the default/enforced context must still reject an SSH session, got: {resp:?}"
         );
     }
@@ -892,7 +1121,7 @@ mod tests {
         }
 
         assert!(
-            matches!(resp, Some(AuthOutcome::Error { ref message }) if message.contains("SSH")),
+            matches!(resp, Some(AuthOutcome::Error { kind, .. }) if kind == ErrorKind::SshSession),
             "pre_check() must stay fully enforced, got: {resp:?}"
         );
     }

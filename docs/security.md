@@ -488,6 +488,13 @@ budget exhausted, password modules still run), everything else to
 `PAM_IGNORE`. D-Bus errors remain reserved for authorization failures and
 transport-level problems, which do fall back to the oneshot path.
 
+Daemon-side, the rejection's *class* is a type
+(`facelock_daemon::auth::ErrorKind`) and the message is rendered from it; the
+audit label and the oneshot exit code derive from the class, not from the text.
+PAM still matches the message because it cannot link the daemon crate, so the
+two strings it matches (`rate limited`, `IR camera required`) are frozen
+protocol — see docs/contracts.md, "Rejection classes".
+
 #### A4. Auth-Attempt Signal Hygiene (Implemented)
 
 **Attack**: Any local user adds a match rule (or runs `dbus-monitor`) and passively observes `AuthAttempted` broadcast signals to learn who authenticates when — and, if the payload carried the raw similarity score, uses it as a spoof-tuning oracle (iterate on a photo/mask until the score climbs).

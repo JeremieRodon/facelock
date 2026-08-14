@@ -150,7 +150,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
                 similarity: 0.0,
                 failure_reason: None,
             }),
-            AuthOutcome::Error { message } => bail!("{message}"),
+            AuthOutcome::Error { message, .. } => bail!("{message}"),
         };
     }
 
@@ -180,7 +180,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
 
     match response {
         AuthOutcome::AuthResult(result) => Ok(result),
-        AuthOutcome::Error { message } => bail!("{message}"),
+        AuthOutcome::Error { message, .. } => bail!("{message}"),
         AuthOutcome::Suppressed => bail!("unexpected auth response"),
     }
 }

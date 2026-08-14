@@ -267,7 +267,7 @@ impl<'a> Backend<'a> {
                     similarity: 0.0,
                     failure_reason: None,
                 }),
-                AuthOutcome::Error { message } => bail!("daemon error: {message}"),
+                AuthOutcome::Error { message, .. } => bail!("daemon error: {message}"),
             },
             _ => direct::authenticate(self.config, user),
         }

@@ -11,7 +11,7 @@ use facelock_core::types::CameraCaps;
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::{self, AuditEntry, AuditSource};
 use facelock_daemon::auth;
-use facelock_daemon::auth::AuthOutcome;
+use facelock_daemon::auth::{AuthOutcome, ErrorKind};
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
@@ -113,8 +113,16 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         // password rather than registering a failed match (exit 1). The
         // suppressed / not-enrolled / rate-limited distinction is carried by
         // the audit record and the tracing output, not the exit code.
+        //
+        // `oneshot_exit_code` is the single table, so the recommendation to
+        // stop collapsing these classes has one place to land. It cannot
+        // change anything today: no pre-flight gate produces the one class
+        // that maps to 1 (the camera is not open yet).
         debug!(?resp, "pre-check short-circuit");
-        return 2;
+        return match resp {
+            AuthOutcome::Error { kind, .. } => oneshot_exit_code(kind),
+            _ => 2,
+        };
     }
 
     // Quirk override takes precedence over the config's warmup value.
@@ -215,19 +223,25 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             );
             1
         }
-        AuthOutcome::Error { message } if message.contains("all frames dark") => {
+        AuthOutcome::Error {
+            kind: ErrorKind::AllFramesDark,
+            ..
+        } => {
+            // `authenticate_inner` already audited this one, so unlike the
+            // arm below there is nothing to write here.
             info!(user = %user, "all frames dark");
-            1
+            oneshot_exit_code(ErrorKind::AllFramesDark)
         }
-        AuthOutcome::Error { message } => {
-            // Errors from authenticate() that aren't "all frames dark" are storage errors
-            // which happen before the auth loop — audit those here.
+        AuthOutcome::Error { kind, message } => {
+            // Errors from authenticate() other than all-frames-dark are
+            // storage errors which happen before the auth loop — audit those
+            // here, under the class's own label.
             audit::write_audit_entry(
                 &config.audit,
                 &AuditEntry {
                     timestamp: audit::now_iso8601(),
                     user: user.clone(),
-                    result: "error".into(),
+                    result: kind.audit_result().into(),
                     source: Some(AuditSource::Oneshot),
                     similarity: None,
                     frame_count: None,
@@ -238,7 +252,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
                 },
             );
             error!(user = %user, "auth error: {message}");
-            2
+            oneshot_exit_code(kind)
         }
         _ => {
             error!("unexpected response");
@@ -247,13 +261,124 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     }
 }
 
+/// The process exit code for a rejection of class `kind`.
+///
+/// The oneshot binary is spawned by the PAM module, which turns this number
+/// into a PAM code, so this table is auth policy — it used to be
+/// `message.contains("all frames dark")`, one reword away from changing it.
+///
+/// Exhaustive on purpose: a new class must be assigned a code here.
+///
+/// Today only the camera-produced class earns exit 1; every rejection reached
+/// before the camera collapses to 2 (PAM_IGNORE). That collapse is itself a
+/// defect — it softens a rate-limited rejection whenever the daemon is
+/// unavailable and PAM falls back to this path — but fixing it changes PAM
+/// semantics under `required`/`requisite` stacks and belongs in its own
+/// reviewed change. This function is where that fix will land.
+fn oneshot_exit_code(kind: ErrorKind) -> i32 {
+    match kind {
+        // The camera produced no usable image. Not an error the stack should
+        // ignore, and not a non-match either; exit 1 keeps PAM falling
+        // through to the password.
+        ErrorKind::AllFramesDark => 1,
+        ErrorKind::Disabled
+        | ErrorKind::SshSession
+        | ErrorKind::LidClosed
+        | ErrorKind::Storage
+        | ErrorKind::RateLimited
+        | ErrorKind::RateLimitCheckFailed
+        | ErrorKind::IrRequired
+        | ErrorKind::Internal => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::oneshot_exit_code;
     use facelock_core::config::Config;
     use facelock_core::types::MatchResult;
     use facelock_daemon::audit::AuditSource;
-    use facelock_daemon::auth::AuthOutcome;
     use facelock_daemon::auth::pre_check_audited;
+    use facelock_daemon::auth::{AuthOutcome, ErrorKind};
+
+    /// The coupling, in one place.
+    ///
+    /// A rejection class has four consequences, and they used to be derived
+    /// from four independent substring matches on the same English sentence:
+    /// the text the user and the wire see, the audit log's `result` label, the
+    /// PAM return code, and this binary's exit code. Rewording a message
+    /// silently changed PAM policy, and no test spanned the four.
+    ///
+    /// This table is that test. The first three columns are asserted directly;
+    /// the fourth — PAM's code — is asserted where it can be: the two messages
+    /// PAM substring-matches are pinned byte-exactly here, in
+    /// `facelock-daemon`'s `frozen_protocol_strings_render_byte_exactly`, and
+    /// at the wire in `server_authz.rs`. `pam-facelock` cannot be linked here
+    /// (its dependency ceiling is libc/toml/serde/zbus), so its matcher is
+    /// pinned by those strings rather than by calling it.
+    ///
+    /// Changing a value here is changing auth policy. Do it deliberately.
+    #[test]
+    fn every_rejection_class_pins_its_message_audit_label_and_exit_code() {
+        // (class, rendered message with detail "boom", audit result, exit code)
+        let table: &[(ErrorKind, &str, &str, i32)] = &[
+            (ErrorKind::Disabled, "facelock is disabled", "error", 2),
+            (ErrorKind::SshSession, "SSH session detected", "error", 2),
+            (ErrorKind::LidClosed, "lid closed", "error", 2),
+            (ErrorKind::Storage, "storage error: boom", "error", 2),
+            // Frozen: PAM reads this one as a deliberate lockout
+            // (PAM_AUTH_ERR, no oneshot retry).
+            (ErrorKind::RateLimited, "rate limited", "rate_limited", 2),
+            (
+                ErrorKind::RateLimitCheckFailed,
+                "rate limit check failed: boom",
+                "error",
+                2,
+            ),
+            // Frozen: PAM reads this one as PAM_IGNORE.
+            (
+                ErrorKind::IrRequired,
+                "IR camera required for authentication. Set security.require_ir = false to override (NOT RECOMMENDED).",
+                "error",
+                2,
+            ),
+            (ErrorKind::AllFramesDark, "all frames dark", "error", 1),
+            (ErrorKind::Internal, "boom", "error", 2),
+        ];
+
+        for (kind, message, audit_result, exit_code) in table {
+            assert_eq!(
+                &kind.render("boom"),
+                message,
+                "{kind:?}: wire/user message changed — PAM and docs/contracts.md read this"
+            );
+            assert_eq!(
+                kind.audit_result(),
+                *audit_result,
+                "{kind:?}: audit label changed — log consumers read this"
+            );
+            assert_eq!(
+                oneshot_exit_code(*kind),
+                *exit_code,
+                "{kind:?}: exit code changed — PAM maps this to a return code"
+            );
+        }
+
+        // A new class must be given a row, not silently inherit a neighbour's
+        // policy. `render`, `audit_result` and `oneshot_exit_code` are all
+        // exhaustive matches, so this is the only gap left to close.
+        assert_eq!(
+            table.len(),
+            ErrorKind::ALL.len(),
+            "every ErrorKind needs a row here"
+        );
+        for kind in ErrorKind::ALL {
+            assert!(
+                table.iter().any(|(k, ..)| k == kind),
+                "{kind:?} has no row in the coupling table"
+            );
+        }
+    }
     use facelock_daemon::rate_limit::RateLimiter;
     use facelock_store::FaceStore;
     use std::path::Path;
@@ -331,7 +456,7 @@ path = "{audit_path}"
         )
         .expect("rate-limited user must short-circuit");
         assert!(
-            matches!(resp, AuthOutcome::Error { ref message } if message.contains("rate limited")),
+            matches!(resp, AuthOutcome::Error { kind, .. } if kind == ErrorKind::RateLimited),
             "expected rate-limited error, got {resp:?}"
         );
 

@@ -5,7 +5,7 @@ use zbus::blocking::Proxy;
 use facelock_core::dbus_interface::*;
 use facelock_core::ipc::{IpcDeviceInfo, PreviewFace};
 use facelock_core::types::{FaceModelInfo, MatchResult};
-use facelock_daemon::auth::AuthOutcome;
+use facelock_daemon::auth::{AuthOutcome, ErrorKind};
 
 /// Check if running as root; if not, offer to re-exec via sudo.
 ///
@@ -236,9 +236,14 @@ pub fn test_authenticate(user: &str) -> anyhow::Result<AuthOutcome> {
 /// short-circuit. Split from the transport so the sentinel decoding is
 /// testable without a bus, and so any future method replying with an
 /// `AuthResult` decodes it identically.
+///
+/// The wire has no field for the rejection's class, so `-2` is re-classified
+/// from its message here. [`ErrorKind::classify`] is the inverse of the
+/// daemon's renderer and the one place that match lives on this side.
 fn decode_auth_result(result: AuthResult) -> AuthOutcome {
     if !result.matched && result.model_id == -2 {
         return AuthOutcome::Error {
+            kind: ErrorKind::classify(&result.label),
             message: result.label,
         };
     }
@@ -494,7 +499,12 @@ mod tests {
     #[test]
     fn recoverable_error_sentinel_decodes_with_the_message_intact() {
         match decode_auth_result(reply(false, -2, "rate limited")) {
-            AuthOutcome::Error { message } => assert_eq!(message, "rate limited"),
+            AuthOutcome::Error { kind, message } => {
+                assert_eq!(message, "rate limited");
+                // ...and the class is recovered from it, so nothing
+                // downstream has to match the text again.
+                assert_eq!(kind, ErrorKind::RateLimited);
+            }
             other => panic!("expected a recoverable error, got {other:?}"),
         }
     }

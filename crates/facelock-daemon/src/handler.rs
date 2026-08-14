@@ -139,7 +139,7 @@ impl From<AuthOutcome> for DaemonResponse {
         match outcome {
             AuthOutcome::AuthResult(result) => DaemonResponse::AuthResult(result),
             AuthOutcome::Suppressed => DaemonResponse::Suppressed,
-            AuthOutcome::Error { message } => DaemonResponse::Error { message },
+            AuthOutcome::Error { message, .. } => DaemonResponse::Error { message },
         }
     }
 }

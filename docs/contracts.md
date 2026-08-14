@@ -492,6 +492,30 @@ daemon is unavailable". D-Bus errors remain for authorization failures,
 daemon-busy, and transport problems. In particular, a rate-limited state is a
 daemon decision and must never make the PAM client retry via a root oneshot.
 
+### Rejection classes (`AuthOutcome::Error`)
+
+The class of a rejection is carried as a type
+(`facelock_daemon::auth::ErrorKind`), not inferred from its message. The audit
+`result` label, the oneshot exit code, and the message itself all derive from
+it; `ErrorKind::render` is the only place any of these sentences is written.
+The wire has no field for the class, so the CLI's D-Bus client reconstructs it
+with `ErrorKind::classify`, the exact inverse of `render`.
+
+Two rendered messages are **frozen protocol** because the PAM module
+substring-matches them to choose its return code, and it cannot link the daemon
+crate to share the type (its dependency ceiling is libc/toml/serde/zbus):
+
+| Substring PAM matches | Class | PAM code |
+|---|---|---|
+| `rate limited` | `RateLimited` | `PAM_AUTH_ERR` |
+| `IR camera required` | `IrRequired` | `PAM_IGNORE` |
+
+Changing either string is a protocol break. They are pinned byte-exactly in
+`crates/facelock-daemon/src/auth.rs` (renderer) and
+`crates/facelock-daemon/tests/server_authz.rs` (wire), and every class's
+message, audit label and exit code are pinned together in
+`crates/facelock-cli/src/commands/auth.rs`.
+
 ### Daemon peer verification (PAM client)
 
 Before trusting an `Authenticate` reply, the PAM module resolves the owner of
