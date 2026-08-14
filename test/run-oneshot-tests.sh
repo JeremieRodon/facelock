@@ -241,14 +241,26 @@ rm -f "$PREV6" "$PREV6-wal" "$PREV6-shm" /tmp/facelock-prev6.toml
 run_test "facelock auth authenticates (oneshot)" \
     "timeout --foreground $LIVE_TIMEOUT facelock auth --user testuser --config /etc/facelock/config.toml"
 
-# Anti-spoof (Plan 01, H1 fix): with require_ir = true, a camera that is NOT a
-# confirmed IR device MUST be refused (exit 2). To make this deterministic on any
-# host — including hosts whose test camera is a genuine IR device with a quirks
-# force_ir entry — we temporarily move the system quirks DB aside so the camera is
-# classified by the heuristic alone. Under the fixed heuristic, a camera that only
-# enumerates GREY/YUYV with no "ir"/"infrared" name token is NOT IR (previously it
-# was misclassified as IR by the mere presence of a GREY format), so require_ir
-# refuses. Restores the quirks DB afterward.
+# Anti-spoof (Plan 01, H1 fix): with require_ir = true, a camera that is NOT an IR
+# device MUST be refused (exit 2).
+#
+# The rule being exercised (crates/facelock-camera/src/device.rs): IR-ness is
+# DERIVED from the capture formats a node actually enumerates. A node whose format
+# set is ENTIRELY mono (GREY/Y8/Y10/Y12/Y16) is a genuine IR sensor node; a node
+# that enumerates any colour format (YUYV/MJPG/NV12/...) is NOT IR, even when it
+# also offers a mono mode. The free-text device name is never sufficient either
+# way (#98) — it is only a tiebreak hint during auto-detection.
+#
+# The camera under test therefore has to be CHOSEN, not auto-detected. On a host
+# whose best camera is a real IR sensor — the Logitech BRIO's /dev/video2
+# enumerates GREY and nothing else — auto-detection correctly returns an IR
+# device, require_ir correctly admits it and auth correctly succeeds; asserting a
+# refusal there fails while the product behaves exactly right. So: pick a node
+# that enumerates at least one colour format, pin it via device.path, and skip
+# when the host exposes no such node (e.g. only an IR camera is passed through).
+#
+# The system quirks DB is still moved aside for the duration, so the pinned node
+# is classified by its format evidence alone and not by a shipped force_ir entry.
 # CAMERA-REQUIRED: only meaningful on a host with /dev/video*; skipped headless.
 QUIRKS_SYS="/usr/share/facelock/quirks.d"
 QUIRKS_BAK="/tmp/facelock-quirks.bak"
@@ -258,6 +270,17 @@ restore_quirks() {
     if [ -d "$QUIRKS_BAK" ]; then
         rm -rf "$QUIRKS_SYS"
         mv "$QUIRKS_BAK" "$QUIRKS_SYS"
+    fi
+}
+# Pin device.path in a config copy. Inserted under the [device] header rather than
+# sed-replacing `path` lines: `path` is not a unique key name (the [audit] section
+# has one too), so a blind substitution would rewrite the wrong line.
+pin_device_path() {
+    local cfg="$1" node="$2"
+    if grep -qE '^\[device\]' "$cfg"; then
+        sed -i "/^\[device\]/a path = \"$node\"" "$cfg"
+    else
+        printf '\n[device]\npath = "%s"\n' "$node" >> "$cfg"
     fi
 }
 rm -rf "$QUIRKS_BAK"
@@ -272,9 +295,58 @@ if grep -q '^require_ir' /tmp/facelock-requireir.toml; then
 else
     sed -i '/^\[security\]/a require_ir = true' /tmp/facelock-requireir.toml
 fi
-run_test "facelock auth refuses non-IR camera when require_ir=true (anti-spoof, H1)" \
-    "facelock auth --user testuser --config /tmp/facelock-requireir.toml" \
-    2
+# Enumerated with the quirks DB already aside, so the [IR] tags here mean exactly
+# what the auth gate will decide for the same nodes. `facelock devices` is the
+# only format enumerator in the image (no v4l-utils), and the BRIO assertions
+# above already parse this same listing.
+NOQUIRK_DEVICES="$(facelock devices)"
+# The first node offering a non-mono format, i.e. one the rule above classifies as
+# NOT IR. The fourcc list mirrors IR_TYPICAL_FOURCCS in facelock-camera's
+# device.rs. Format lines read `      FOURCC (description) — sizes`, so a `(` in
+# the second field is what tells them from Name:/Driver:/Formats: and from any log
+# line the binary writes to stdout. Selecting on format evidence rather than on
+# the absence of the [IR] tag is deliberate: if the classifier ever regressed and
+# tagged a colour node [IR], this picks it anyway and the assertion says so
+# instead of quietly skipping.
+NON_IR_NODE="$(printf '%s\n' "$NOQUIRK_DEVICES" | awk '
+    $1 ~ /^\/dev\/video/ { node = $1; next }
+    node != "" && NF >= 2 && $2 ~ /^\(/ && $1 !~ /^(GREY|Y8|Y10|Y12|Y16)$/ && pick == "" { pick = node }
+    END { print pick }
+')"
+if [ -n "$NON_IR_NODE" ]; then
+    cp /tmp/facelock-requireir.toml /tmp/facelock-requireir-nonir.toml
+    pin_device_path /tmp/facelock-requireir-nonir.toml "$NON_IR_NODE"
+    run_test "facelock auth refuses non-IR camera when require_ir=true (anti-spoof, H1; pinned $NON_IR_NODE)" \
+        "facelock auth --user testuser --config /tmp/facelock-requireir-nonir.toml" \
+        2
+    # Exit 2 is shared by every pre-flight rejection — and by a config parse error,
+    # which is what a stale device.path pin in the source config would produce. Pin
+    # the rejection to the IR gate itself so neither can read as a pass. Piping
+    # into grep makes the test's status grep's, as in the auto-detect assertion above.
+    run_test "the refusal above is the IR gate, not another pre-flight rejection" \
+        "facelock auth --user testuser --config /tmp/facelock-requireir-nonir.toml 2>&1 | grep -q 'IR camera required but device is not IR'"
+else
+    echo "TEST: facelock auth refuses non-IR camera when require_ir=true ... SKIP (no node enumerates a colour format; nothing on this host classifies as non-IR)"
+fi
+# Converse half of the contract: with a genuinely IR node pinned, that same
+# require_ir = true config must NOT refuse. Asserted as "the gate did not fire and
+# the run reached capture" rather than "auth exited 0": a successful match would
+# additionally need a live face in front of THIS node at this instant and a
+# template enrolled from it, neither of which holds on an arbitrary host. The exit
+# code is ignored for the same reason; the probe log is teed so a failure here
+# reports the camera error that caused it instead of an empty output.
+IR_NODE_NOQUIRK="$(printf '%s\n' "$NOQUIRK_DEVICES" | awk '
+    $1 ~ /^\/dev\/video/ && $2 == "[IR]" && pick == "" { pick = $1 }
+    END { print pick }
+')"
+if [ -n "$IR_NODE_NOQUIRK" ]; then
+    cp /tmp/facelock-requireir.toml /tmp/facelock-requireir-ir.toml
+    pin_device_path /tmp/facelock-requireir-ir.toml "$IR_NODE_NOQUIRK"
+    run_test "require_ir=true admits a genuine IR node (converse, H1; pinned $IR_NODE_NOQUIRK)" \
+        "RUST_LOG=info timeout --foreground 20 facelock auth --user testuser --config /tmp/facelock-requireir-ir.toml 2>&1 | tee /tmp/ir-admit-probe.log || true; ! grep -q 'IR camera required but device is not IR' /tmp/ir-admit-probe.log && grep -q 'camera format negotiated' /tmp/ir-admit-probe.log"
+else
+    echo "TEST: require_ir=true admits a genuine IR node ... SKIP (no [IR]-classified node; this host exposes no mono-only sensor)"
+fi
 # Restore the system quirks DB inline so the remaining tests see it, then drop the
 # trap now that shared state is consistent again.
 restore_quirks
