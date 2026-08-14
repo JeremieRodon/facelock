@@ -1160,12 +1160,30 @@ fn handle_orphan_models_before_keygen(
     config: &Config,
     theme: Option<&ColorfulTheme>,
 ) -> anyhow::Result<()> {
+    // Fail closed on both reads (C2, issue #105): a database that cannot be
+    // opened, or a query that fails on an open one, does NOT mean "nothing to
+    // protect" — it means facelock cannot tell, and minting a key on "cannot
+    // tell" is what orphans real templates.
     let store = match crate::direct::open_store(config) {
         Ok(s) => s,
-        Err(_) => return Ok(()),
+        Err(e) => bail!(
+            "refusing to generate a new encryption key: the face database could \
+             not be read, so facelock cannot tell whether existing templates \
+             would be orphaned ({e:#}). Fix access to {} and re-run, or clear \
+             models first with: sudo facelock clear",
+            config.storage.db_path
+        ),
     };
-    if !store.has_any_models().unwrap_or(false) {
-        return Ok(());
+    match store.has_any_models() {
+        Ok(false) => return Ok(()),
+        Ok(true) => {}
+        Err(e) => bail!(
+            "refusing to generate a new encryption key: could not determine \
+             whether face models exist in {} ({e}), so facelock cannot tell \
+             whether existing templates would be orphaned. Fix the database and \
+             re-run, or clear models first with: sudo facelock clear",
+            config.storage.db_path
+        ),
     }
 
     println!();
@@ -1197,6 +1215,116 @@ fn handle_orphan_models_before_keygen(
         .map_err(|e| anyhow::anyhow!("failed to clear orphaned models: {e}"))?;
     println!("  Removed {removed} orphaned model(s).");
     Ok(())
+}
+
+/// Tests for the pre-keygen orphan guard (C2, issue #105). The guard must
+/// fail closed on *both* reads: an unopenable database and a failing query on
+/// an open one are equally "cannot tell whether templates exist", and neither
+/// may be read as "nothing to protect".
+#[cfg(test)]
+mod orphan_guard_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn config_with_db(db_path: &Path) -> Config {
+        let mut config = Config::parse("").expect("defaults parse");
+        config.storage.db_path = db_path.to_string_lossy().into_owned();
+        config
+    }
+
+    /// (a) Unreadable store: not a SQLite database at all. The guard must
+    /// error out (so the caller never reaches keygen), not conclude "nothing
+    /// to protect".
+    #[test]
+    fn unreadable_database_aborts_before_keygen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let err = handle_orphan_models_before_keygen(&config_with_db(&db_path), None).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("refusing to generate a new encryption key"),
+            "guard must refuse keygen on an unreadable store: {chain}"
+        );
+    }
+
+    /// (b) The store opens, but the models query fails. Injection: allocate
+    /// donor pages of the *opposite* btree type (an index page for the table,
+    /// table pages for its indexes), orphan them, and point `face_models` and
+    /// its indexes at them via `writable_schema`. Every rootpage stays unique
+    /// and within the file, so a fresh connection opens and migrates cleanly —
+    /// but the page-type mismatch makes any query that walks `face_models`
+    /// (or its indexes) report corruption.
+    #[test]
+    fn failing_models_query_on_open_store_aborts_before_keygen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        drop(facelock_store::FaceStore::create(&db_path).unwrap());
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE d1(x); CREATE INDEX di1 ON d1(x); CREATE TABLE d2(x);")
+            .unwrap();
+        let page = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (p_d1, p_di1, p_d2) = (page("d1"), page("di1"), page("d2"));
+        conn.execute_batch(&format!(
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master SET rootpage={p_di1} WHERE name='face_models';
+             UPDATE sqlite_master SET rootpage={p_d1} WHERE name='idx_face_models_user';
+             UPDATE sqlite_master SET rootpage={p_d2} WHERE name='sqlite_autoindex_face_models_1';
+             DELETE FROM sqlite_master WHERE name IN ('d1','di1','d2');
+             PRAGMA writable_schema=OFF;",
+        ))
+        .unwrap();
+        drop(conn);
+
+        let err = handle_orphan_models_before_keygen(&config_with_db(&db_path), None).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("could not determine whether face models exist"),
+            "guard must refuse keygen when the query fails on an open store: {chain}"
+        );
+    }
+
+    /// (c) Fresh install: no database yet, zero models once created. The
+    /// guard must let keygen proceed — this is the case the old fail-open
+    /// behavior was (correctly) serving.
+    #[test]
+    fn zero_models_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+
+        handle_orphan_models_before_keygen(&config_with_db(&db_path), None)
+            .expect("a fresh store with zero models must not block keygen");
+    }
+
+    /// (d) Models present, non-interactive: the existing orphaned-models bail
+    /// path, unchanged.
+    #[test]
+    fn models_present_non_interactive_bails_with_orphan_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        {
+            let store = facelock_store::FaceStore::create(&db_path).unwrap();
+            store
+                .add_model("alice", "front", &[0.5f32; 512], "embedder")
+                .unwrap();
+        }
+
+        let err = handle_orphan_models_before_keygen(&config_with_db(&db_path), None).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("orphaned encrypted models found"),
+            "models present must keep the existing prompt/bail path: {chain}"
+        );
+    }
 }
 
 fn wizard_encryption_setup(theme: &ColorfulTheme, config: &mut Config) -> anyhow::Result<()> {
