@@ -6,6 +6,12 @@ use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use crate::ipc_client;
 
 pub fn run(model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()> {
+    // C6: root check must run before the confirmation prompt below — a group
+    // member confirming a destructive action only to then hit AccessDenied
+    // is exactly the bug this ordering fixes. RemoveModel is root-only on the
+    // daemon side too, so this applies regardless of transport.
+    ipc_client::require_root(&format!("sudo facelock remove {model_id}"))?;
+
     let config = Config::load().context("failed to load config")?;
     let user = ipc_client::resolve_user(user.as_deref());
 
@@ -19,7 +25,6 @@ pub fn run(model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()>
     }
 
     if ipc_client::should_use_direct(&config) {
-        ipc_client::require_root(&format!("sudo facelock remove {model_id}"))?;
         let store = crate::direct::open_store(&config)?;
         let removed = store
             .remove_model(&user, model_id)
