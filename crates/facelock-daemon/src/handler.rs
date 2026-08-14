@@ -37,7 +37,9 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
     jpeg_buf: Vec<u8>,
     /// Quirk-overridden warmup frames (takes precedence over config if `Some`).
     warmup_frames_override: Option<u32>,
-    #[cfg(feature = "tpm")]
+    /// Held TPM sealer for `tpm.seal_database` stores. Without the `tpm`
+    /// feature this is the passthrough sealer, whose per-row unseal reports a
+    /// clear "compile with tpm" error instead of misreading sealed blobs.
     tpm_sealer: Option<facelock_tpm::TpmSealer>,
     software_sealer: Option<facelock_tpm::SoftwareSealer>,
     /// Why the software sealer could not be initialized for a configured
@@ -57,7 +59,6 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         camera_factory: Option<CameraFactory<C>>,
         warmup_frames_override: Option<u32>,
     ) -> Result<Self, String> {
-        #[cfg(feature = "tpm")]
         let tpm_sealer = if config.tpm.seal_database {
             match facelock_tpm::TpmSealer::new(&config.tpm.tcti) {
                 Ok(sealer) => {
@@ -164,7 +165,6 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             camera_last_used: Instant::now(),
             jpeg_buf: Vec::with_capacity(JPEG_BUF_CAPACITY),
             warmup_frames_override,
-            #[cfg(feature = "tpm")]
             tpm_sealer,
             software_sealer,
             sealer_init_error,
@@ -219,18 +219,15 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         }
     }
 
-    /// Load user embeddings, decrypting TPM-sealed or software-encrypted blobs.
-    /// Falls back to the standard `get_user_embeddings` path when no encryption is active.
+    /// Load user embeddings, decrypting TPM-sealed or software-encrypted blobs
+    /// through the shared per-row implementation (`crate::embeddings`, N10).
+    /// Falls back to the standard `get_user_embeddings` path when nothing could
+    /// have written an encrypted row.
     fn load_user_embeddings(
         &mut self,
         user: &str,
     ) -> Result<Vec<(u32, facelock_core::types::FaceEmbedding)>, DaemonResponse> {
-        // Check if any encryption is configured that requires raw blob handling
-        let needs_raw = self.software_sealer.is_some();
-        #[cfg(feature = "tpm")]
-        let needs_raw = needs_raw || self.tpm_sealer.is_some();
-
-        if !needs_raw {
+        if !crate::embeddings::needs_raw_rows(&self.config, self.software_sealer.is_some()) {
             // Fast path: no encryption, use standard method (no overhead)
             return self
                 .store
@@ -249,70 +246,13 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 message: format!("storage error: {e}"),
             })?;
 
-        let mut results = Vec::with_capacity(raw_rows.len());
-        for (id, blob, sealed, device_id) in &raw_rows {
-            let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
-                // Software-encrypted (version byte 0x02)
-                let sealer =
-                    self.software_sealer
-                        .as_ref()
-                        .ok_or_else(|| DaemonResponse::Error {
-                            message: format!(
-                                "embedding {id} is software-encrypted but no key is configured"
-                            ),
-                        })?;
-                // Hard device binding (opt-in): derive AAD from this template's
-                // own device id. `None` when disabled — matching enroll.
-                let aad = self.config.security.device_aad(device_id.as_deref());
-                sealer
-                    .unseal_embedding_with_aad(blob, aad.as_deref())
-                    .map_err(|e| DaemonResponse::Error {
-                        message: format!("software decryption failed for embedding {id}: {e}"),
-                    })?
-            } else if *sealed {
-                // TPM-sealed (version byte 0x01)
-                #[cfg(feature = "tpm")]
-                {
-                    let sealer = self
-                        .tpm_sealer
-                        .as_mut()
-                        .ok_or_else(|| DaemonResponse::Error {
-                            message: "TPM-sealed embeddings exist but TPM is not available".into(),
-                        })?;
-                    sealer
-                        .unseal_embedding(blob)
-                        .map_err(|e| DaemonResponse::Error {
-                            message: format!("TPM unseal failed for embedding {id}: {e}"),
-                        })?
-                }
-                #[cfg(not(feature = "tpm"))]
-                {
-                    return Err(DaemonResponse::Error {
-                        message: format!(
-                            "embedding {id} is TPM-sealed but TPM support is not compiled in"
-                        ),
-                    });
-                }
-            } else {
-                // Plaintext raw embedding
-                if blob.len() != 512 * 4 {
-                    return Err(DaemonResponse::Error {
-                        message: format!(
-                            "invalid raw embedding size for id {id}: expected {} bytes, got {}",
-                            512 * 4,
-                            blob.len()
-                        ),
-                    });
-                }
-                let floats: &[f32] = bytemuck::cast_slice(blob);
-                let mut emb = [0f32; 512];
-                emb.copy_from_slice(floats);
-                emb
-            };
-
-            results.push((*id, embedding));
-        }
-        Ok(results)
+        crate::embeddings::decrypt_user_embeddings(
+            &raw_rows,
+            &self.config,
+            self.software_sealer.as_ref(),
+            crate::embeddings::TpmAccess::Held(self.tpm_sealer.as_mut()),
+        )
+        .map_err(|message| DaemonResponse::Error { message })
     }
 
     pub fn handle(&mut self, request: DaemonRequest) -> DaemonResponse {

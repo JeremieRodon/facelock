@@ -247,10 +247,10 @@ fn init_software_sealer(config: &Config) -> anyhow::Result<Option<facelock_tpm::
 }
 
 /// Load user embeddings, decrypting software-encrypted or TPM-sealed blobs as
-/// needed. Mirrors `Handler::load_user_embeddings` from the daemon path,
-/// including directly TPM-sealed rows (version byte 0x01/0x03) written when
-/// `tpm.seal_database` is enabled — previously those failed here, which broke
-/// `bench`, `preview --text-only`, `test` and oneshot on sealed stores (B3).
+/// needed. The per-row decrypt is the daemon handler's own implementation
+/// (`facelock_daemon::embeddings`, N10) — a local copy previously lived here
+/// and drifted (B3: it predated `tpm.seal_database` rows, which broke `bench`,
+/// `preview --text-only`, `test` and oneshot on sealed stores).
 pub fn load_user_embeddings(
     store: &FaceStore,
     config: &Config,
@@ -261,62 +261,28 @@ pub fn load_user_embeddings(
     // Fast path: nothing is configured that could have written encrypted rows.
     // `seal_database` forces the raw path even without a software sealer, so a
     // TPM-sealed blob is never misread as a raw embedding.
-    if software_sealer.is_none() && !config.tpm.seal_database {
+    if !facelock_daemon::embeddings::needs_raw_rows(config, software_sealer.is_some()) {
         return store
             .get_user_embeddings(user)
             .context("storage error loading embeddings");
     }
 
-    // Slow path: load raw blobs (with device ids for opt-in AAD) and decrypt
+    // Slow path: load raw blobs (with device ids for opt-in AAD) and decrypt.
+    // The TPM connection is lazy — only made when a TPM-sealed row is present.
     let raw_rows = store
         .get_user_embeddings_raw_with_device(user)
         .context("storage error loading raw embeddings")?;
 
-    // Connect to the TPM lazily, only when a TPM-sealed row is present.
-    let mut tpm_sealer: Option<facelock_tpm::TpmSealer> = None;
-
-    let mut results = Vec::with_capacity(raw_rows.len());
-    for (id, blob, sealed, device_id) in &raw_rows {
-        let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
-            let sealer = software_sealer.as_ref().with_context(|| {
-                format!("embedding {id} is software-encrypted but no key is configured")
-            })?;
-            let aad = config.security.device_aad(device_id.as_deref());
-            sealer
-                .unseal_embedding_with_aad(blob, aad.as_deref())
-                .with_context(|| format!("software decryption failed for embedding {id}"))?
-        } else if *sealed {
-            // TPM-sealed (version byte 0x01/0x03), matching the daemon at
-            // `Handler::load_user_embeddings`. Without the `tpm` feature the
-            // passthrough sealer reports a clear "compile with tpm" error
-            // instead of misreading the blob.
-            let sealer = match tpm_sealer.as_mut() {
-                Some(s) => s,
-                None => {
-                    let s = facelock_tpm::TpmSealer::new(&config.tpm.tcti)
-                        .context("TPM initialization failed")?;
-                    tpm_sealer.insert(s)
-                }
-            };
-            sealer
-                .unseal_embedding(blob)
-                .with_context(|| format!("TPM unseal failed for embedding {id}"))?
-        } else {
-            // Plaintext raw embedding
-            anyhow::ensure!(
-                blob.len() == 512 * 4,
-                "invalid raw embedding size for id {id}: expected {} bytes, got {}",
-                512 * 4,
-                blob.len()
-            );
-            let floats: &[f32] = bytemuck::cast_slice(blob);
-            let mut emb = [0f32; 512];
-            emb.copy_from_slice(floats);
-            emb
-        };
-        results.push((*id, embedding));
-    }
-    Ok(results)
+    facelock_daemon::embeddings::decrypt_user_embeddings(
+        &raw_rows,
+        config,
+        software_sealer.as_ref(),
+        facelock_daemon::embeddings::TpmAccess::Lazy {
+            tcti: &config.tpm.tcti,
+            sealer: None,
+        },
+    )
+    .map_err(|message| anyhow::anyhow!(message))
 }
 
 /// Direct enrollment — returns (model_id, embedding_count).
