@@ -7,13 +7,12 @@
 //! per-method authorization (denials, the Authenticate self-scope, the
 //! root-only catch-all), the in-band `-2`/`-3` sentinel encoding with its
 //! byte-exact protocol strings, similarity redaction for non-root callers,
-//! which entry point charges the rate limit (N11), and the rule that a
-//! denied caller never starts a polkit round-trip.
+//! and which entry point charges the rate limit (N11).
 //!
 //! NOT covered here, deliberately: the zbus wiring — caller-identity
 //! resolution from message headers (`GetConnectionUnixUser`), signal
-//! emission, D-Bus activation, the bus policy, and real polkit round-trips.
-//! A live system bus in unit-style tests is fragile; the container tiers
+//! emission, D-Bus activation, and the bus policy. A live system bus in
+//! unit-style tests is fragile; the container tiers
 //! (`just test-arch-pam`, `just test-arch-integration`) prove that layer
 //! against a real bus and PAM stack.
 
@@ -185,8 +184,8 @@ fn assert_not_denied<T: std::fmt::Debug>(result: fdo::Result<T>, entry_point: &s
 /// N13 through the real service: every entry point except Authenticate
 /// denies a non-root caller with AccessDenied — including the metadata
 /// surfaces (ListModels, ListDevices, Ping) and the continuous-score feed
-/// (PreviewDetectFrame). A denied caller must never reach the handler, the
-/// capture slot, or polkit.
+/// (PreviewDetectFrame). A denied caller must never reach the handler or the
+/// capture slot.
 #[tokio::test]
 async fn every_entry_point_except_authenticate_denies_non_root() {
     let svc = matching_service_for("alice");
@@ -208,15 +207,10 @@ async fn every_entry_point_except_authenticate_denies_non_root() {
     assert_denied(svc.release_camera_as(a.clone()).await, "ReleaseCamera");
     assert_denied(svc.ping_as(a.clone()).await, "Ping");
     assert_denied(svc.shutdown_as(a.clone()).await, "Shutdown");
-
-    // The denial must fire before any polkit work: the check-starter panics
-    // if a denied caller ever gets as far as the frame-authz lookup.
-    let result = svc
-        .preview_detect_frame_as(a, "alice", Some(":1.5".into()), |_sender| {
-            panic!("a denied caller must not start a polkit round-trip")
-        })
-        .await;
-    assert_denied(result, "PreviewDetectFrame");
+    assert_denied(
+        svc.preview_detect_frame_as(a, "alice").await,
+        "PreviewDetectFrame",
+    );
 }
 
 /// Root passes authorization on every entry point. Handler-side outcomes
@@ -501,17 +495,12 @@ async fn test_authenticate_denies_a_non_root_caller() {
 }
 
 /// The root preview path end to end: frames and per-face metadata with the
-/// unredacted score (root-only), and no polkit involvement.
+/// unredacted score (root-only).
 #[tokio::test]
 async fn preview_detect_frame_for_root_returns_frames_and_scores() {
     let svc = matching_service_for("alice");
 
-    let (jpeg, faces) = svc
-        .preview_detect_frame_as(root(), "alice", None, |_sender| {
-            panic!("root must never need a polkit round-trip")
-        })
-        .await
-        .unwrap();
+    let (jpeg, faces) = svc.preview_detect_frame_as(root(), "alice").await.unwrap();
 
     assert!(!jpeg.is_empty(), "root gets raw frame bytes");
     assert_eq!(faces.len(), 1);
