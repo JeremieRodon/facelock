@@ -244,32 +244,34 @@ impl From<&facelock_camera::ResolvedCamera> for InterrogatedCamera {
 fn probe_camera(config: &Config) -> Fact<CameraHealth> {
     // Presence via the shared probe (D7); interrogation via the camera
     // domain's one implementation (D8) — never re-derived here.
-    match CameraPresence::probe(config) {
-        CameraPresence::AutoDetect => {
-            let resolved = crate::direct::resolve_camera_device(config)
-                .ok()
-                .map(|r| InterrogatedCamera::from(&r));
-            match resolved {
-                // Nothing detected right now: the config's claim is all we
-                // have.
-                None => Fact::claimed(CameraHealth::AutoDetect { resolved: None }),
-                some => Fact::probed(CameraHealth::AutoDetect { resolved: some }),
-            }
-        }
-        CameraPresence::Configured { path, present } => {
-            let interrogated = if present {
-                crate::direct::resolve_camera_device(config)
-                    .ok()
-                    .map(|r| InterrogatedCamera::from(&r))
-            } else {
-                None
-            };
-            Fact::probed(CameraHealth::Configured {
-                path,
-                present,
-                interrogated,
-            })
-        }
+    camera_fact(CameraPresence::probe(config), || {
+        crate::direct::resolve_camera_device(config)
+            .ok()
+            .map(|r| InterrogatedCamera::from(&r))
+    })
+}
+
+/// The camera rule, split from the device interrogation so it is testable
+/// without hardware (same shape as `backend::classify`).
+///
+/// Every arm is [`Fact::Probed`], including auto-detect finding nothing:
+/// detection *ran*, and its coming back empty is an observation about this
+/// machine, not an unverified reading of the config.
+fn camera_fact(
+    presence: CameraPresence,
+    interrogate: impl FnOnce() -> Option<InterrogatedCamera>,
+) -> Fact<CameraHealth> {
+    match presence {
+        CameraPresence::AutoDetect => Fact::probed(CameraHealth::AutoDetect {
+            resolved: interrogate(),
+        }),
+        CameraPresence::Configured { path, present } => Fact::probed(CameraHealth::Configured {
+            // An absent node has nothing to interrogate; don't open a device
+            // to confirm what the stat already answered.
+            interrogated: present.then(interrogate).flatten(),
+            path,
+            present,
+        }),
     }
 }
 
@@ -508,6 +510,47 @@ mod tests {
 
     fn config_with(toml: &str) -> Config {
         Config::parse(toml).expect("test config parses")
+    }
+
+    // -----------------------------------------------------------------------
+    // Camera: what was probed vs what was merely claimed
+    // -----------------------------------------------------------------------
+
+    /// Auto-detection running and finding nothing is a *probed* absence. It
+    /// used to be tagged `Claimed`, which said the opposite — that the config
+    /// had been taken at its word and nothing checked.
+    #[test]
+    fn auto_detect_finding_nothing_is_a_probed_absence() {
+        let fact = camera_fact(CameraPresence::AutoDetect, || None);
+        assert!(
+            matches!(
+                fact,
+                Fact::Probed(CameraHealth::AutoDetect { resolved: None })
+            ),
+            "expected a probed absence, got {fact:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_configured_node_is_never_interrogated() {
+        let fact = camera_fact(
+            CameraPresence::Configured {
+                path: "/dev/facelock-no-such-video".into(),
+                present: false,
+            },
+            || panic!("an absent node must not be opened"),
+        );
+        assert!(
+            matches!(
+                fact,
+                Fact::Probed(CameraHealth::Configured {
+                    present: false,
+                    interrogated: None,
+                    ..
+                })
+            ),
+            "{fact:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
