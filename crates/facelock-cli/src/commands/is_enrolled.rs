@@ -45,7 +45,7 @@
 //! why `list --json` cannot be reused: `commands::list` tries daemon IPC
 //! first, which *activates* the system daemon. Nothing in this module may call
 //! [`crate::ipc_client::send_request`],
-//! [`crate::ipc_client::should_use_direct`] (it probes the system bus), or
+//! [`crate::backend::Backend::select`] (it probes the system bus), or
 //! [`crate::direct::open_store`] or [`crate::direct::open_store_existing`].
 //!
 //! The only syscalls on the hot path are: read `/etc/facelock/config.toml` (for
@@ -208,7 +208,7 @@ mod tests {
 
     /// `is-enrolled` must answer from the marker alone: no database, no D-Bus.
     /// The database path here does not exist, and
-    /// `should_use_direct`/`send_request` are never on this call path.
+    /// `Backend::select`/`send_request` are never on this call path.
     #[test]
     fn answers_without_a_database() {
         let tmp = tempfile::tempdir().unwrap();

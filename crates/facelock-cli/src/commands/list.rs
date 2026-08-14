@@ -1,22 +1,25 @@
 use chrono::{Local, TimeZone};
 
 use facelock_core::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_core::types::FaceModelInfo;
 
+use crate::backend::Backend;
 use crate::ipc_client;
 
 pub fn run(config: &Config, user: Option<String>, json: bool) -> anyhow::Result<()> {
     // DEC-6/N4: `ListModels` is root-only now (was facelock-group). The
-    // direct-mode fallback in `fetch_models` already required root when the
-    // 0600 root:root database wasn't readable; checking up front here gives
-    // the same interactive escalation prompt on the D-Bus path too, instead
-    // of a bare AccessDenied.
+    // direct fallback needs read access to the 0600 root:root database;
+    // checking up front here gives the same interactive escalation prompt on
+    // the D-Bus path too, instead of a bare AccessDenied.
     ipc_client::require_root("sudo facelock list")?;
 
     let user = ipc_client::resolve_user(user.as_deref());
 
-    let models = fetch_models(config, &user)?;
+    // One selection, one list operation (D1). The seam's direct read opens
+    // the existing store — a fresh install lists as empty without an empty
+    // database materializing at the path as a side effect.
+    let backend = Backend::select(config);
+    let models = backend.list_models(&user)?;
 
     if json {
         print_json(&models);
@@ -25,24 +28,6 @@ pub fn run(config: &Config, user: Option<String>, json: bool) -> anyhow::Result<
     }
 
     Ok(())
-}
-
-fn fetch_models(config: &Config, user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
-    // Try D-Bus first — `run` already required root above.
-    if !ipc_client::should_use_direct(config) {
-        let request = DaemonRequest::ListModels {
-            user: user.to_string(),
-        };
-        let response = ipc_client::send_request(&request)?;
-        return match response {
-            DaemonResponse::Models(models) => Ok(models),
-            other => anyhow::bail!("unexpected response from daemon: {other:?}"),
-        };
-    }
-
-    // Direct mode: needs read access to the 0600 root:root database.
-    let store = crate::direct::open_store(config)?;
-    store.list_models(user).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn print_table(user: &str, models: &[FaceModelInfo]) {

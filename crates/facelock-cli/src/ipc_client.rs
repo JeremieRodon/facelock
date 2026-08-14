@@ -1,6 +1,5 @@
 use anyhow::{Context, bail};
 use nix::unistd::Uid;
-use zbus::blocking::Connection;
 use zbus::blocking::Proxy;
 
 use facelock_core::dbus_interface::*;
@@ -67,29 +66,6 @@ pub fn require_root_scripted(hint: &str) -> anyhow::Result<()> {
             hint: hint.to_string(),
         },
     ))
-}
-
-/// Check whether we should use direct (daemonless) mode.
-/// Returns true if config says "oneshot" OR if the D-Bus service isn't available.
-/// When falling back from daemon mode, logs a warning.
-pub fn should_use_direct(config: &facelock_core::Config) -> bool {
-    if config.daemon.mode == facelock_core::DaemonMode::Oneshot {
-        return true;
-    }
-    // Daemon mode -- check if D-Bus service is available
-    match Connection::system() {
-        Ok(conn) => {
-            let proxy = zbus::blocking::fdo::DBusProxy::new(&conn);
-            match proxy {
-                Ok(p) => match BUS_NAME.try_into() {
-                    Ok(name) => !p.name_has_owner(name).unwrap_or(false),
-                    Err(_) => true,
-                },
-                Err(_) => true,
-            }
-        }
-        Err(_) => true,
-    }
 }
 
 /// Process-wide daemon proxy, built once and reused for every request.

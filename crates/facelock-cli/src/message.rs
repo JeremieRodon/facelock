@@ -161,6 +161,11 @@ pub enum UserMessage {
     AccessDeniedGroupHint,
     EnrollTimedOutClientSide,
 
+    // -- backend selection (D1) --
+    DaemonUnreachableFallback,
+    PreviewGraphicalNeedsDaemonOneshot,
+    PreviewGraphicalDaemonUnreachable,
+
     // -- enroll --
     SetupNotCompleted,
     ConfirmRunSetupNow,
@@ -528,6 +533,16 @@ impl UserMessage {
             ),
             EnrollTimedOutClientSide => translate(
                 "enrollment timed out client-side; the daemon may have completed it — run `facelock list` before retrying",
+            ),
+
+            DaemonUnreachableFallback => translate(
+                "Warning: daemon.mode = \"daemon\" but the facelock daemon is unreachable — falling back to direct camera access.\nStart it with: sudo systemctl start facelock-daemon",
+            ),
+            PreviewGraphicalNeedsDaemonOneshot => translate(
+                "Graphical preview requires the daemon. In oneshot mode, use --text-only.\nFalling back to text-only mode.\n",
+            ),
+            PreviewGraphicalDaemonUnreachable => translate(
+                "Graphical preview requires the daemon, which is configured but not reachable.\nFalling back to text-only mode. Start the daemon with: sudo systemctl start facelock-daemon\n",
             ),
 
             SetupNotCompleted => translate("Setup has not been completed."),
@@ -1393,6 +1408,9 @@ mod tests {
             AccessDeniedRootHint,
             AccessDeniedGroupHint,
             EnrollTimedOutClientSide,
+            DaemonUnreachableFallback,
+            PreviewGraphicalNeedsDaemonOneshot,
+            PreviewGraphicalDaemonUnreachable,
             SetupNotCompleted,
             ConfirmRunSetupNow,
             SetupDidNotComplete,

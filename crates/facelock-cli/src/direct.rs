@@ -327,52 +327,37 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
     }
 }
 
-/// Direct device listing (no daemon needed).
-pub fn list_devices_direct() -> anyhow::Result<()> {
+/// Direct device enumeration (no daemon needed), in the transport shape the
+/// backend seam hands to the renderer.
+///
+/// The quirks DB is consulted so the reported `is_ir` matches the
+/// authoritative decision the auth path makes (e.g. a quirks `force_ir`
+/// camera), with node-level disambiguation for multi-node USB devices.
+/// Formats survive here — the D-Bus `DeviceInfo` type does not carry them
+/// (`BackendCaps::device_formats`).
+pub fn list_devices_info() -> anyhow::Result<Vec<facelock_core::ipc::IpcDeviceInfo>> {
     let devices = list_devices().context("failed to enumerate devices")?;
-
-    if devices.is_empty() {
-        println!("No video devices found.");
-        return Ok(());
-    }
-
-    // Consult the quirks DB so the displayed [IR] tag matches the authoritative
-    // decision the auth path makes (e.g. a quirks `force_ir` camera), with
-    // node-level disambiguation for multi-node USB devices.
     let quirks = facelock_camera::QuirksDb::load();
     let sources = facelock_camera::classify_ir_sources(&devices, Some(&quirks));
-    println!("Available video devices:\n");
-    for (dev, source) in devices.iter().zip(&sources) {
-        let ir_tag = if *source != facelock_camera::IrSource::None {
-            " [IR]"
-        } else {
-            ""
-        };
-        println!("  {}{ir_tag}", dev.path);
-        println!("    Name:    {}", dev.name);
-        println!("    Driver:  {}", dev.driver);
-
-        if !dev.formats.is_empty() {
-            println!("    Formats:");
-            for fmt in &dev.formats {
-                let sizes: Vec<String> =
-                    fmt.sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect();
-                println!(
-                    "      {} ({}) — {}",
-                    fmt.fourcc.trim(),
-                    fmt.description,
-                    if sizes.is_empty() {
-                        "no sizes reported".to_string()
-                    } else {
-                        sizes.join(", ")
-                    }
-                );
-            }
-        }
-        println!();
-    }
-
-    Ok(())
+    Ok(devices
+        .iter()
+        .zip(&sources)
+        .map(|(dev, source)| facelock_core::ipc::IpcDeviceInfo {
+            path: dev.path.clone(),
+            name: dev.name.clone(),
+            driver: dev.driver.clone(),
+            is_ir: *source != facelock_camera::IrSource::None,
+            formats: dev
+                .formats
+                .iter()
+                .map(|f| facelock_core::ipc::IpcFormatInfo {
+                    fourcc: f.fourcc.clone(),
+                    description: f.description.clone(),
+                    sizes: f.sizes.clone(),
+                })
+                .collect(),
+        })
+        .collect())
 }
 
 #[cfg(test)]

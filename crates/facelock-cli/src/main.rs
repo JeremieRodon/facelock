@@ -1,3 +1,4 @@
+pub mod backend;
 mod commands;
 pub mod direct;
 mod ipc_client;

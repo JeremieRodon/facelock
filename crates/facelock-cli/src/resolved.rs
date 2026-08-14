@@ -88,9 +88,10 @@ impl ConfigLoad {
 ///
 /// Deliberately minimal: H8 (Health) will grow this into a richer `Fact`
 /// type carrying *unknown-is-not-false* across privilege and reachability;
-/// until then, a provenance tag per fact is all resolution promises. A
-/// daemon-reachability fact slots in beside the existing ones the same way
-/// (H6 — Backend owns that probe, not this module).
+/// until then, a provenance tag per fact is all resolution promises. The
+/// daemon-reachability fact sits beside the existing ones the same way
+/// (`crate::backend::DaemonReachability` — Backend owns that probe, not
+/// this module).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
     /// Verified against the live system by this process (file stat, ORT
@@ -537,7 +538,8 @@ mod tests {
             "ResolvedConfig",
             "resolved::",
             "send_request(",
-            "should_use_direct(",
+            "Backend::select(",
+            "backend::",
             "open_store",
             "Camera",
         ];

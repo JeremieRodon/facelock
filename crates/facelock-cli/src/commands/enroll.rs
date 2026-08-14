@@ -1,10 +1,8 @@
 use chrono::Local;
 
 use facelock_core::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
-use facelock_core::types::FaceModelInfo;
-use facelock_store::StoreError;
 
+use crate::backend::Backend;
 use crate::ipc_client;
 use crate::message::{Terminal, UserMessage, fail};
 
@@ -61,35 +59,33 @@ pub fn run(
 
     let user = ipc_client::resolve_user(user.as_deref());
 
+    // One selection for the whole enrollment (D1). The probe is
+    // `name_has_owner`, which never triggers D-Bus activation — the old
+    // per-site convention this replaces existed because an unconditional
+    // D-Bus call here would *activate* the daemon and silently flip the
+    // subsequent enrollment from direct to daemon mode (issue #89 validation
+    // fallout). Now the transport cannot change between the label scan and
+    // the enrollment.
+    let backend = Backend::select(config);
+
     let label = match label {
         Some(label) => label,
         None => {
             let date = Local::now().format("%Y-%m-%d").to_string();
-            next_label(&date, &user, config)?
+            next_label(&date, &user, &backend)?
         }
     };
 
     // Warn if existing models use a different embedder than currently
-    // configured. One failure policy (C4, issue #105): a store or daemon
-    // failure propagates instead of silently skipping the warning — the
-    // enrollment ahead needs the very store this check just failed to read.
+    // configured. One failure policy (C4, issue #105), owned by the seam: a
+    // store or daemon failure propagates instead of silently skipping the
+    // warning — the enrollment ahead needs the very store this check just
+    // failed to read. A provably absent store reads as "no models, nothing
+    // stale" without being created.
     {
         let config_embedder = &config.recognition.embedder_model;
-        let has_stale = if ipc_client::should_use_direct(config) {
-            direct_has_stale_embedder(config, &user, config_embedder)?
-        } else {
-            let request = DaemonRequest::ListModels { user: user.clone() };
-            match ipc_client::send_request(&request)? {
-                DaemonResponse::Models(m) => {
-                    !m.is_empty()
-                        && !m
-                            .iter()
-                            .any(|model| model.embedder_model == *config_embedder)
-                }
-                DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
-                other => anyhow::bail!("unexpected response from daemon: {other:?}"),
-            }
-        };
+        let has_stale = backend.has_models(&user)?
+            && !backend.has_models_for_embedder(&user, config_embedder)?;
         if has_stale {
             Terminal.info(&UserMessage::StaleEmbedderNote {
                 embedder: config_embedder.clone(),
@@ -103,93 +99,27 @@ pub fn run(
     });
     Terminal.info(&UserMessage::EnrollLookAtCamera);
 
-    if ipc_client::should_use_direct(config) {
-        ipc_client::require_root("sudo facelock enroll")?;
-        let (model_id, embedding_count) = crate::direct::enroll(config, &user, &label)?;
-        Terminal.info(&UserMessage::EnrollComplete {
-            model_id,
-            count: embedding_count,
-            label: label.clone(),
-        });
-        super::enrollment_marker::refresh(config, &user);
-        check_model_count(&user, config);
-        return Ok(());
-    }
+    let (model_id, embedding_count) = backend.enroll(&user, &label)?;
 
-    // Dedicated call with a timeout derived from the daemon's enrollment
-    // deadline — the shared 15s proxy would abort mid-enrollment (issue #89).
-    // send_enroll yields Enrolled or an error, so there is no other arm.
-    let response = ipc_client::send_enroll(&user, &label, config)?;
-
-    if let DaemonResponse::Enrolled {
+    Terminal.info(&UserMessage::EnrollComplete {
         model_id,
-        embedding_count,
-    } = response
-    {
-        Terminal.info(&UserMessage::EnrollComplete {
-            model_id,
-            count: embedding_count,
-            label: label.clone(),
-        });
-        super::enrollment_marker::refresh(config, &user);
-        check_model_count(&user, config);
-    }
+        count: embedding_count,
+        label: label.clone(),
+    });
+    super::enrollment_marker::refresh(&backend, config, &user);
+    check_model_count(&user, &backend);
 
     Ok(())
 }
 
-/// List a user's models, honoring direct mode. Unlike a bare `send_request`,
-/// this never touches D-Bus in direct mode — an unconditional D-Bus call here
-/// would *activate* the system daemon and silently flip the subsequent
-/// enrollment from direct to daemon mode (issue #89 validation fallout).
-///
-/// One failure policy (C4, issue #105): failures propagate; they must not
-/// read as "this user has no models".
-fn list_user_models(user: &str, config: &Config) -> anyhow::Result<Vec<FaceModelInfo>> {
-    if ipc_client::should_use_direct(config) {
-        let store = match crate::direct::open_store_existing(config) {
-            Ok(store) => store,
-            // Fresh install: no models yet. Picking the first free label must
-            // not create the database enrollment itself is about to create.
-            Err(StoreError::Absent { .. }) => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        store
-            .list_models(user)
-            .map_err(|e| anyhow::anyhow!("storage error: {e}"))
-    } else {
-        match ipc_client::send_request(&DaemonRequest::ListModels {
-            user: user.to_string(),
-        })? {
-            DaemonResponse::Models(models) => Ok(models),
-            DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
-            other => anyhow::bail!("unexpected response from daemon: {other:?}"),
-        }
-    }
-}
-
-/// Direct-transport half of the stale-embedder warning. [`StoreError::Absent`]
-/// reads as "no models, nothing stale" without creating the database; any
-/// other failure class propagates (C4) — the enrollment ahead needs the very
-/// store this check just failed to read.
-fn direct_has_stale_embedder(config: &Config, user: &str, embedder: &str) -> anyhow::Result<bool> {
-    let store = match crate::direct::open_store_existing(config) {
-        Ok(store) => store,
-        Err(StoreError::Absent { .. }) => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    let has_any = store
-        .has_models(user)
-        .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
-    let has_matching = store
-        .has_models_for_embedder(user, embedder)
-        .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
-    Ok(has_any && !has_matching)
-}
-
 /// Generate the next available label like "2026-03-15-1", "2026-03-15-2", etc.
-fn next_label(date_prefix: &str, user: &str, config: &Config) -> anyhow::Result<String> {
-    let max_suffix = list_user_models(user, config)?
+///
+/// One failure policy (C4, issue #105): a store failure while picking the
+/// label propagates via the seam; it must not silently fall back to a "-1"
+/// suffix.
+fn next_label(date_prefix: &str, user: &str, backend: &Backend) -> anyhow::Result<String> {
+    let max_suffix = backend
+        .list_models(user)?
         .iter()
         .filter_map(|m| {
             m.label
@@ -203,11 +133,11 @@ fn next_label(date_prefix: &str, user: &str, config: &Config) -> anyhow::Result<
     Ok(format!("{date_prefix}-{}", max_suffix + 1))
 }
 
-fn check_model_count(user: &str, config: &Config) {
+fn check_model_count(user: &str, backend: &Backend) {
     // Post-success advisory only: the enrollment already committed, so a
     // failed count here must not turn a successful enrollment into a
     // reported failure.
-    if let Ok(models) = list_user_models(user, config) {
+    if let Ok(models) = backend.list_models(user) {
         if models.len() > 5 {
             Terminal.info(&UserMessage::TooManyModels {
                 user: user.to_string(),
@@ -222,7 +152,8 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// `mode = "oneshot"` pins `should_use_direct` without touching D-Bus.
+    /// `mode = "oneshot"` pins a DirectByConfig selection without touching
+    /// D-Bus.
     fn oneshot_config_with_db(db_path: &Path) -> Config {
         let mut config = Config::parse("[daemon]\nmode = \"oneshot\"\n").expect("config parses");
         config.storage.db_path = db_path.to_string_lossy().into_owned();
@@ -237,10 +168,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("facelock.db");
         let config = oneshot_config_with_db(&db_path);
+        let backend = Backend::select(&config);
 
-        assert!(!direct_has_stale_embedder(&config, "alice", "embedder").unwrap());
+        let has_stale = backend.has_models("alice").unwrap()
+            && !backend
+                .has_models_for_embedder("alice", "embedder")
+                .unwrap();
+        assert!(!has_stale);
         assert_eq!(
-            next_label("2026-08-13", "alice", &config).unwrap(),
+            next_label("2026-08-13", "alice", &backend).unwrap(),
             "2026-08-13-1"
         );
         assert!(
@@ -258,7 +194,8 @@ mod tests {
         std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
         let config = oneshot_config_with_db(&db_path);
-        assert!(direct_has_stale_embedder(&config, "alice", "embedder").is_err());
+        let backend = Backend::select(&config);
+        assert!(backend.has_models("alice").is_err());
     }
 
     /// C4: a store failure while picking the next label propagates — it must
@@ -270,7 +207,8 @@ mod tests {
         std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
         let config = oneshot_config_with_db(&db_path);
-        assert!(next_label("2026-08-13", "alice", &config).is_err());
+        let backend = Backend::select(&config);
+        assert!(next_label("2026-08-13", "alice", &backend).is_err());
     }
 
     #[test]
@@ -289,17 +227,18 @@ mod tests {
         }
 
         let config = oneshot_config_with_db(&db_path);
+        let backend = Backend::select(&config);
         assert_eq!(
-            next_label("2026-08-13", "alice", &config).unwrap(),
+            next_label("2026-08-13", "alice", &backend).unwrap(),
             "2026-08-13-3"
         );
         // A fresh prefix (or user) starts at -1.
         assert_eq!(
-            next_label("2026-08-14", "alice", &config).unwrap(),
+            next_label("2026-08-14", "alice", &backend).unwrap(),
             "2026-08-14-1"
         );
         assert_eq!(
-            next_label("2026-08-13", "bob", &config).unwrap(),
+            next_label("2026-08-13", "bob", &backend).unwrap(),
             "2026-08-13-1"
         );
     }

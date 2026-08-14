@@ -1,6 +1,6 @@
 use facelock_core::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
+use crate::backend::Backend;
 use crate::ipc_client;
 use crate::message::{Terminal, UserMessage};
 
@@ -13,6 +13,9 @@ pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> a
 
     let user = ipc_client::resolve_user(user.as_deref());
 
+    // One selection for the whole command (D1), before the unbounded prompt.
+    let backend = Backend::select(config);
+
     if !yes {
         let confirmed = Terminal.confirm(&UserMessage::ConfirmRemoveModel {
             model_id,
@@ -24,51 +27,20 @@ pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> a
         }
     }
 
-    if ipc_client::should_use_direct(config) {
-        let store = crate::direct::open_store(config)?;
-        let removed = store
-            .remove_model(&user, model_id)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if removed {
-            Terminal.info(&UserMessage::RemovedModel {
-                model_id,
-                user: user.clone(),
-            });
-        } else {
-            Terminal.info(&UserMessage::ModelNotFound {
-                model_id,
-                user: user.clone(),
-            });
-        }
-        // Recompute from the list we already have open rather than decrementing:
-        // same cost, and it cannot drift from the database.
-        let remaining = store.list_models(&user).ok().map(|m| m.len() as u32);
-        drop(store);
-        if let Some(remaining) = remaining {
-            super::enrollment_marker::set(config, &user, remaining);
-        }
-        return Ok(());
+    match backend.remove_model(&user, model_id)? {
+        Some(false) => Terminal.info(&UserMessage::ModelNotFound {
+            model_id,
+            user: user.clone(),
+        }),
+        // `None`: the daemon reply cannot say whether the model existed
+        // (wire-stable), so a completed request reports as removed — as the
+        // daemon path always has.
+        Some(true) | None => Terminal.info(&UserMessage::RemovedModel {
+            model_id,
+            user: user.clone(),
+        }),
     }
 
-    let request = DaemonRequest::RemoveModel {
-        user: user.clone(),
-        model_id,
-    };
-
-    let response = ipc_client::send_request(&request)?;
-
-    match response {
-        DaemonResponse::Removed => {
-            Terminal.info(&UserMessage::RemovedModel {
-                model_id,
-                user: user.clone(),
-            });
-            super::enrollment_marker::refresh(config, &user);
-        }
-        other => {
-            anyhow::bail!("unexpected response from daemon: {other:?}");
-        }
-    }
-
+    super::enrollment_marker::refresh(&backend, config, &user);
     Ok(())
 }

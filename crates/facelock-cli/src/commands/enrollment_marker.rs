@@ -38,9 +38,6 @@ use serde::{Deserialize, Serialize};
 
 use facelock_core::Config;
 use facelock_core::fs_security::{ensure_private_dir, write_file};
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
-
-use crate::ipc_client;
 
 /// Fallback marker directory when the configured DB path yields no parent.
 pub const DEFAULT_MARKER_DIR: &str = "/var/lib/facelock/enrolled";
@@ -271,10 +268,10 @@ pub fn set_marker_in(
 /// Best-effort by contract: a marker is only a UI hint, so a failure here is
 /// logged and swallowed rather than failing the enroll/remove that triggered it.
 ///
-/// Uses whichever transport the calling command is already using — it may talk
-/// to the daemon. **Never call this from `is-enrolled`.**
-pub fn refresh(config: &Config, user: &str) {
-    let Some(models) = count_models(config, user) else {
+/// Uses the backend the calling command already selected — it may talk to the
+/// daemon. **Never call this from `is-enrolled`.**
+pub fn refresh(backend: &crate::backend::Backend, config: &Config, user: &str) {
+    let Some(models) = count_models(backend, user) else {
         tracing::warn!(
             user,
             "could not read model count; enrollment marker not updated"
@@ -306,25 +303,12 @@ pub fn forget(config: &Config, user: &str) {
     }
 }
 
-/// Count a user's stored models, honoring direct vs daemon mode.
+/// Count a user's stored models through the caller's selected backend.
 ///
 /// Returns `None` when the count could not be determined — the caller then
 /// leaves the existing marker alone rather than guessing.
-fn count_models(config: &Config, user: &str) -> Option<u32> {
-    if ipc_client::should_use_direct(config) {
-        crate::direct::open_store(config)
-            .ok()?
-            .list_models(user)
-            .ok()
-            .map(|m| m.len() as u32)
-    } else {
-        match ipc_client::send_request(&DaemonRequest::ListModels {
-            user: user.to_string(),
-        }) {
-            Ok(DaemonResponse::Models(models)) => Some(models.len() as u32),
-            _ => None,
-        }
-    }
+fn count_models(backend: &crate::backend::Backend, user: &str) -> Option<u32> {
+    backend.list_models(user).ok().map(|m| m.len() as u32)
 }
 
 // ---------------------------------------------------------------------------

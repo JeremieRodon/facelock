@@ -1,0 +1,732 @@
+//! Backend selection and the transport seam (D1).
+//!
+//! Every user-facing operation is answered either by the daemon over D-Bus or
+//! by direct (in-process) store/camera access. That used to be a boolean
+//! (`should_use_direct`) consulted independently at 13 call sites, each with
+//! its own failure policy and its own fresh bus probe — real TOCTOU windows
+//! (`clear` probed, prompted for an unbounded time, then probed again) and an
+//! activation asymmetry (`name_has_owner` does not start the daemon, but a
+//! `send_request` on the "wrong" branch would, silently flipping a later
+//! operation from direct to daemon mode — issue #89 validation fallout).
+//!
+//! Now selection is made **once per invocation**, at the top of each
+//! backend-using command, with **at most one** deliberate, non-activating bus
+//! probe. The outcome is a [`BackendKind`], not a boolean, because "direct"
+//! means two different things that deserve different messages and log levels;
+//! and every operation that used to fork per call site forks in exactly one
+//! method here.
+//!
+//! What stays outside this seam, on the merits:
+//! - **PAM** performs one operation and needs things the CLI must not have
+//!   (pinned-peer verification, a hard deadline, an env-cleared subprocess
+//!   fallback). It shares test vectors, not code.
+//! - **`is-enrolled`** is dispatched in `main` before any config parse and
+//!   must never probe the bus; `hyprlock` and `config` touch no backend.
+//! - **`status`** renders its own probes for now — H8 (Health) will consume
+//!   the [`DaemonReachability`] fact this module records.
+//! - Maintenance commands (`bench`, `encrypt`, `tpm`, `audit`, `auth`,
+//!   `daemon`) are direct-by-nature and never select.
+
+use anyhow::bail;
+use zbus::blocking::Connection;
+
+use facelock_core::Config;
+use facelock_core::config::DaemonMode;
+use facelock_core::dbus_interface::BUS_NAME;
+use facelock_core::ipc::{DaemonRequest, DaemonResponse, IpcDeviceInfo};
+use facelock_core::types::{FaceModelInfo, MatchResult};
+use facelock_store::StoreError;
+
+use crate::message::{Terminal, UserMessage};
+use crate::resolved::{Provenance, Resolved};
+use crate::{direct, ipc_client};
+
+/// Which implementation answers this invocation's questions — and, for the
+/// direct answers, *why* it is direct. The distinction carries the failure
+/// policy: an expected configuration is not a degraded state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// `daemon.mode = "daemon"` and the bus name has an owner.
+    Daemon,
+    /// `daemon.mode = "oneshot"` — direct access is the configuration.
+    /// Expected; no warning.
+    DirectByConfig,
+    /// `daemon.mode = "daemon"` but the bus name has no owner — degraded.
+    /// WARNed once, at selection.
+    DirectByFallback,
+}
+
+impl BackendKind {
+    pub fn is_direct(self) -> bool {
+        !matches!(self, BackendKind::Daemon)
+    }
+}
+
+/// What the one probe observed, recorded beside the resolved-config facts
+/// (D7) with the same provenance discipline: `NotProbed` is a distinct value,
+/// never a guessed `Unreachable`. H8 (Health) lifts this into its `Fact`
+/// model; until then it is logged at selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonReachability {
+    /// `mode = "oneshot"`: the bus is deliberately never asked.
+    NotProbed,
+    Reachable,
+    Unreachable,
+}
+
+/// What a backend cannot do, stated once at selection instead of discovered
+/// at the failure site.
+///
+/// Deliberately not carried here: `facelock test`'s remaining posture
+/// asymmetries. Both transports now run the same `pre_check` gates (N11), so
+/// the old `enforces_auth_gates` flag would state a falsehood; what still
+/// differs — the direct path skips the SSH/lid *physical-presence* aborts via
+/// `PreCheckContext::test` and stamps `AuditSource::Test` instead of
+/// `AuditSource::Daemon` — is documented at [`Backend::recognize`], because no
+/// caller branches on it.
+pub struct BackendCaps {
+    /// Streaming JPEG preview frames come from the daemon; a direct backend
+    /// has only the local text preview.
+    pub graphical_preview: bool,
+    /// Per-device format/resolution detail is a V4L2 interrogation; the D-Bus
+    /// `DeviceInfo` type does not carry it.
+    pub device_formats: bool,
+}
+
+/// The transport seam. Holds the selection made by [`Backend::select`]; every
+/// method forks on it in exactly one place, with one failure policy per
+/// operation: daemon replies and store failures propagate — they never fold
+/// into "no models" (C4) — and on direct reads a provably absent database is
+/// a benign answer that must not materialize one (C7).
+pub struct Backend<'a> {
+    kind: BackendKind,
+    config: &'a Config,
+}
+
+impl<'a> Backend<'a> {
+    /// Select the backend for this invocation. Called once, at the top of
+    /// each backend-using command; probes the bus at most once (never for
+    /// `mode = "oneshot"`), non-activating by construction.
+    pub fn select(config: &'a Config) -> Backend<'a> {
+        let (kind, reachability) = classify(&config.daemon.mode, daemon_bus_reachable);
+        let (level, notice) = announcement(kind);
+        // The one machine-facing record of the selection and the probed
+        // reachability fact. `tracing::event!` needs a const level, hence the
+        // match.
+        match level {
+            tracing::Level::WARN => tracing::warn!(
+                target: "facelock::backend",
+                ?kind,
+                ?reachability,
+                "backend selected"
+            ),
+            _ => tracing::debug!(
+                target: "facelock::backend",
+                ?kind,
+                ?reachability,
+                "backend selected"
+            ),
+        }
+        if let Some(msg) = notice {
+            Terminal.error(&msg);
+        }
+        Backend { kind, config }
+    }
+
+    pub fn kind(&self) -> BackendKind {
+        self.kind
+    }
+
+    pub fn caps(&self) -> BackendCaps {
+        match self.kind {
+            BackendKind::Daemon => BackendCaps {
+                graphical_preview: true,
+                device_formats: false,
+            },
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => BackendCaps {
+                graphical_preview: false,
+                device_formats: true,
+            },
+        }
+    }
+
+    /// Does `user` have any enrolled models?
+    pub fn has_models(&self, user: &str) -> anyhow::Result<bool> {
+        match self.kind {
+            BackendKind::Daemon => Ok(!self.daemon_list_models(user)?.is_empty()),
+            _ => self.direct_read(false, |store| {
+                store
+                    .has_models(user)
+                    .map_err(|e| anyhow::anyhow!("storage error: {e}"))
+            }),
+        }
+    }
+
+    /// Does `user` have models produced by `embedder`?
+    pub fn has_models_for_embedder(&self, user: &str, embedder: &str) -> anyhow::Result<bool> {
+        match self.kind {
+            BackendKind::Daemon => Ok(self
+                .daemon_list_models(user)?
+                .iter()
+                .any(|model| model.embedder_model == embedder)),
+            _ => self.direct_read(false, |store| {
+                store
+                    .has_models_for_embedder(user, embedder)
+                    .map_err(|e| anyhow::anyhow!("storage error: {e}"))
+            }),
+        }
+    }
+
+    /// All of `user`'s models.
+    pub fn list_models(&self, user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
+        match self.kind {
+            BackendKind::Daemon => self.daemon_list_models(user),
+            _ => self.direct_read(Vec::new(), |store| {
+                store
+                    .list_models(user)
+                    .map_err(|e| anyhow::anyhow!("storage error: {e}"))
+            }),
+        }
+    }
+
+    /// Remove one model. `Some(removed)` when this backend can tell whether
+    /// the model existed; `None` on the daemon path, whose wire reply does not
+    /// carry it (a P1-3 wire change deferred to keep this PR wire-stable).
+    pub fn remove_model(&self, user: &str, model_id: u32) -> anyhow::Result<Option<bool>> {
+        match self.kind {
+            BackendKind::Daemon => {
+                removed_reply(ipc_client::send_request(&DaemonRequest::RemoveModel {
+                    user: user.to_string(),
+                    model_id,
+                }))?;
+                Ok(None)
+            }
+            // An absent store provably holds nothing to remove: report "not
+            // found" without materializing a database (the per-site version
+            // used the creating opener here).
+            _ => self.direct_read(Some(false), |store| {
+                store
+                    .remove_model(user, model_id)
+                    .map(Some)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            }),
+        }
+    }
+
+    /// Remove all of `user`'s models. `Some(count)` when this backend can
+    /// count them; `None` on the daemon path (same wire limitation as
+    /// [`Backend::remove_model`]).
+    pub fn clear_models(&self, user: &str) -> anyhow::Result<Option<usize>> {
+        match self.kind {
+            BackendKind::Daemon => {
+                removed_reply(ipc_client::send_request(&DaemonRequest::ClearModels {
+                    user: user.to_string(),
+                }))?;
+                Ok(None)
+            }
+            _ => {
+                // No `Absent` shortcut: callers check `has_models` first, so
+                // a vanished database is an error — erroring beats
+                // re-creating an empty database in its place.
+                let store = direct::open_store_existing(self.config)?;
+                let count = store.clear_user(user).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(Some(count as usize))
+            }
+        }
+    }
+
+    /// Enroll a face for `user`, returning `(model_id, embedding_count)`.
+    /// The daemon call runs on a dedicated connection whose timeout is
+    /// derived from the daemon's own enrollment deadline (issue #89).
+    pub fn enroll(&self, user: &str, label: &str) -> anyhow::Result<(u32, u32)> {
+        match self.kind {
+            BackendKind::Daemon => match ipc_client::send_enroll(user, label, self.config)? {
+                DaemonResponse::Enrolled {
+                    model_id,
+                    embedding_count,
+                } => Ok((model_id, embedding_count)),
+                other => bail!("unexpected response from daemon: {other:?}"),
+            },
+            _ => direct::enroll(self.config, user, label),
+        }
+    }
+
+    /// Recognition only — backs `facelock test` (root-only, N11). NEVER the
+    /// PAM/auth path.
+    ///
+    /// Both transports run the same `pre_check` gates. The surviving posture
+    /// difference: the direct path skips the SSH/lid physical-presence aborts
+    /// (`PreCheckContext::test` — they exist to stop an attacker's shortcuts,
+    /// not a root operator testing over SSH) and audits as `Test`, while the
+    /// daemon path enforces them and audits as `Daemon`. Neither path charges
+    /// the rate limit for a failed test: direct never records failures, and
+    /// the daemon exempts root callers.
+    pub fn recognize(&self, user: &str) -> anyhow::Result<MatchResult> {
+        match self.kind {
+            BackendKind::Daemon => {
+                match ipc_client::send_request(&DaemonRequest::Authenticate {
+                    user: user.to_string(),
+                })? {
+                    DaemonResponse::AuthResult(result) => Ok(result),
+                    // `suppress_unknown` short-circuit: same "no result"
+                    // shape the direct path reports.
+                    DaemonResponse::Suppressed => Ok(MatchResult {
+                        matched: false,
+                        model_id: None,
+                        label: None,
+                        similarity: 0.0,
+                        failure_reason: None,
+                    }),
+                    DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+                    other => bail!("unexpected response from daemon: {other:?}"),
+                }
+            }
+            _ => direct::authenticate(self.config, user),
+        }
+    }
+
+    /// Enumerate camera devices. Formats are present only when
+    /// [`BackendCaps::device_formats`] says so.
+    pub fn list_devices(&self) -> anyhow::Result<Vec<IpcDeviceInfo>> {
+        match self.kind {
+            BackendKind::Daemon => {
+                // Only blame a missing daemon when the request wasn't
+                // refused: an AccessDenied already carries its own hint as
+                // the headline.
+                let response =
+                    ipc_client::send_request(&DaemonRequest::ListDevices).map_err(|e| {
+                        if ipc_client::is_access_denied(&e) {
+                            e
+                        } else {
+                            e.context("failed to query daemon — is facelock-daemon running?")
+                        }
+                    })?;
+                match response {
+                    DaemonResponse::Devices(devices) => Ok(devices),
+                    DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+                    _ => bail!("unexpected response from daemon"),
+                }
+            }
+            _ => direct::list_devices_info(),
+        }
+    }
+
+    /// Interpret the daemon's `ListModels` reply. One failure policy (C4):
+    /// transport failures and error replies propagate — they must never read
+    /// as "no models enrolled".
+    fn daemon_list_models(&self, user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
+        models_reply(ipc_client::send_request(&DaemonRequest::ListModels {
+            user: user.to_string(),
+        }))
+    }
+
+    /// Direct-transport read with the C7 discrimination carried by
+    /// [`StoreError`]: [`StoreError::Absent`] (fresh install) answers
+    /// `absent_value` without creating the database the probe would otherwise
+    /// materialize; every other failure class propagates.
+    fn direct_read<T>(
+        &self,
+        absent_value: T,
+        read: impl FnOnce(&facelock_store::FaceStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let store = match direct::open_store_existing(self.config) {
+            Ok(store) => store,
+            Err(StoreError::Absent { .. }) => return Ok(absent_value),
+            Err(e) => return Err(e.into()),
+        };
+        read(&store)
+    }
+}
+
+/// The selection rule, split from the probe so it is testable without a bus.
+fn classify(
+    mode: &DaemonMode,
+    probe: impl FnOnce() -> bool,
+) -> (BackendKind, Resolved<DaemonReachability>) {
+    match mode {
+        DaemonMode::Oneshot => (
+            BackendKind::DirectByConfig,
+            Resolved {
+                value: DaemonReachability::NotProbed,
+                provenance: Provenance::Claimed,
+            },
+        ),
+        DaemonMode::Daemon => {
+            if probe() {
+                (
+                    BackendKind::Daemon,
+                    Resolved {
+                        value: DaemonReachability::Reachable,
+                        provenance: Provenance::Probed,
+                    },
+                )
+            } else {
+                (
+                    BackendKind::DirectByFallback,
+                    Resolved {
+                        value: DaemonReachability::Unreachable,
+                        provenance: Provenance::Probed,
+                    },
+                )
+            }
+        }
+    }
+}
+
+/// What selection says, per kind: the log level for the machine line, and
+/// the user-facing stderr message, if any. Three kinds, three treatments —
+/// an expected configuration is silent, a degraded fallback warns once.
+fn announcement(kind: BackendKind) -> (tracing::Level, Option<UserMessage>) {
+    match kind {
+        BackendKind::Daemon => (tracing::Level::DEBUG, None),
+        BackendKind::DirectByConfig => (tracing::Level::DEBUG, None),
+        BackendKind::DirectByFallback => (
+            tracing::Level::WARN,
+            Some(UserMessage::DaemonUnreachableFallback),
+        ),
+    }
+}
+
+/// The one deliberate bus probe. `name_has_owner` asks the bus about the
+/// daemon's name without triggering D-Bus activation — the asymmetry that
+/// made per-site probing hazardous (`send_request` on a freshly booted
+/// system would *start* the daemon). Any failure to ask reads as
+/// unreachable.
+fn daemon_bus_reachable() -> bool {
+    let Ok(conn) = Connection::system() else {
+        return false;
+    };
+    let Ok(proxy) = zbus::blocking::fdo::DBusProxy::new(&conn) else {
+        return false;
+    };
+    let Ok(name) = BUS_NAME.try_into() else {
+        return false;
+    };
+    proxy.name_has_owner(name).unwrap_or(false)
+}
+
+/// Interpret a daemon reply that should be `Models`. Failure policy: C4.
+fn models_reply(response: anyhow::Result<DaemonResponse>) -> anyhow::Result<Vec<FaceModelInfo>> {
+    match response? {
+        DaemonResponse::Models(models) => Ok(models),
+        DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+/// Interpret a daemon reply that should be `Removed`.
+fn removed_reply(response: anyhow::Result<DaemonResponse>) -> anyhow::Result<()> {
+    match response? {
+        DaemonResponse::Removed => Ok(()),
+        DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // -----------------------------------------------------------------------
+    // Selection: config mode x reachability -> kind, message, log level.
+    // The probe is a closure, so no test touches a bus.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oneshot_config_selects_direct_without_probing() {
+        let (kind, fact) = classify(&DaemonMode::Oneshot, || {
+            panic!("oneshot must never probe the bus")
+        });
+        assert_eq!(kind, BackendKind::DirectByConfig);
+        assert_eq!(fact.value, DaemonReachability::NotProbed);
+        assert_eq!(fact.provenance, Provenance::Claimed);
+    }
+
+    #[test]
+    fn daemon_mode_with_owner_selects_daemon() {
+        let (kind, fact) = classify(&DaemonMode::Daemon, || true);
+        assert_eq!(kind, BackendKind::Daemon);
+        assert_eq!(fact.value, DaemonReachability::Reachable);
+        assert_eq!(fact.provenance, Provenance::Probed);
+    }
+
+    #[test]
+    fn daemon_mode_without_owner_is_fallback_not_config() {
+        let (kind, fact) = classify(&DaemonMode::Daemon, || false);
+        assert_eq!(kind, BackendKind::DirectByFallback);
+        assert_eq!(fact.value, DaemonReachability::Unreachable);
+        assert_eq!(fact.provenance, Provenance::Probed);
+    }
+
+    /// Three kinds, three treatments: normal operation and an expected
+    /// configuration stay quiet at DEBUG; only the degraded fallback WARNs
+    /// and tells the human.
+    #[test]
+    fn announcement_levels_and_messages() {
+        let (level, msg) = announcement(BackendKind::Daemon);
+        assert_eq!(level, tracing::Level::DEBUG);
+        assert_eq!(msg, None);
+
+        let (level, msg) = announcement(BackendKind::DirectByConfig);
+        assert_eq!(level, tracing::Level::DEBUG);
+        assert_eq!(msg, None);
+
+        let (level, msg) = announcement(BackendKind::DirectByFallback);
+        assert_eq!(level, tracing::Level::WARN);
+        assert_eq!(msg, Some(UserMessage::DaemonUnreachableFallback));
+    }
+
+    #[test]
+    fn caps_state_the_transport_differences_up_front() {
+        let config = oneshot_config("/nonexistent/facelock.db");
+        let backend = Backend::select(&config);
+        assert!(backend.kind().is_direct());
+        let caps = backend.caps();
+        assert!(!caps.graphical_preview);
+        assert!(caps.device_formats);
+
+        // The daemon caps are the mirror image (constructed directly — no
+        // bus in unit tests).
+        let daemon = Backend {
+            kind: BackendKind::Daemon,
+            config: &config,
+        };
+        assert!(!daemon.kind().is_direct());
+        let caps = daemon.caps();
+        assert!(caps.graphical_preview);
+        assert!(!caps.device_formats);
+    }
+
+    // -----------------------------------------------------------------------
+    // Daemon reply interpretation (C4 pins, moved here with the fork: these
+    // lived in clear.rs as daemon_user_has_models tests).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn daemon_transport_failure_propagates() {
+        let err = models_reply(Err(anyhow::anyhow!("D-Bus timeout"))).unwrap_err();
+        assert!(format!("{err:#}").contains("D-Bus timeout"));
+    }
+
+    #[test]
+    fn daemon_error_reply_propagates() {
+        let err = models_reply(Ok(DaemonResponse::Error {
+            message: "storage error: disk I/O error".into(),
+        }))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("storage error"));
+    }
+
+    #[test]
+    fn daemon_unexpected_reply_propagates() {
+        let err = models_reply(Ok(DaemonResponse::Ok)).unwrap_err();
+        assert!(format!("{err:#}").contains("unexpected response"));
+
+        let err = removed_reply(Ok(DaemonResponse::Ok)).unwrap_err();
+        assert!(format!("{err:#}").contains("unexpected response"));
+    }
+
+    #[test]
+    fn daemon_model_lists_map_to_bool() {
+        assert!(
+            models_reply(Ok(DaemonResponse::Models(vec![])))
+                .unwrap()
+                .is_empty()
+        );
+        let model = FaceModelInfo {
+            id: 1,
+            user: "alice".into(),
+            label: "front".into(),
+            created_at: 0,
+            embedder_model: String::new(),
+            device_id: None,
+        };
+        assert_eq!(
+            models_reply(Ok(DaemonResponse::Models(vec![model])))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct reads: the C4/C7 failure policy, uniform across operations.
+    // `mode = "oneshot"` pins DirectByConfig without touching D-Bus.
+    // -----------------------------------------------------------------------
+
+    fn oneshot_config(db_path: &str) -> Config {
+        let mut config = Config::parse("[daemon]\nmode = \"oneshot\"\n").expect("config parses");
+        config.storage.db_path = db_path.to_string();
+        config
+    }
+
+    fn oneshot_config_at(db_path: &Path) -> Config {
+        oneshot_config(&db_path.to_string_lossy())
+    }
+
+    /// C4/C7, direct: a fresh (absent) store answers benign reads as values
+    /// — and the probe must not create the database it reports empty.
+    #[test]
+    fn absent_store_reads_are_benign_and_create_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        let config = oneshot_config_at(&db_path);
+        let backend = Backend::select(&config);
+
+        assert!(!backend.has_models("alice").unwrap());
+        assert!(
+            !backend
+                .has_models_for_embedder("alice", "embedder")
+                .unwrap()
+        );
+        assert!(backend.list_models("alice").unwrap().is_empty());
+        assert_eq!(backend.remove_model("alice", 3).unwrap(), Some(false));
+        assert!(
+            !db_path.exists(),
+            "benign reads must not create the database they report empty"
+        );
+    }
+
+    /// C4, direct: an unreadable (present) store is an error on every read —
+    /// never "no models", never "assume yes".
+    #[test]
+    fn unreadable_store_propagates_on_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+        let config = oneshot_config_at(&db_path);
+        let backend = Backend::select(&config);
+
+        assert!(backend.has_models("alice").is_err());
+        assert!(backend.has_models_for_embedder("alice", "e").is_err());
+        assert!(backend.list_models("alice").is_err());
+        assert!(backend.remove_model("alice", 1).is_err());
+        assert!(backend.clear_models("alice").is_err());
+    }
+
+    /// The direct fork, end to end against a real store: one representative
+    /// per-operation behavioral pin.
+    #[test]
+    fn direct_operations_answer_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        {
+            let store = facelock_store::FaceStore::create(&db_path).unwrap();
+            store
+                .add_model("alice", "front", &[0.5f32; 512], "embedder-a")
+                .unwrap();
+            store
+                .add_model("alice", "side", &[0.4f32; 512], "embedder-b")
+                .unwrap();
+        }
+        let config = oneshot_config_at(&db_path);
+        let backend = Backend::select(&config);
+
+        assert!(backend.has_models("alice").unwrap());
+        assert!(!backend.has_models("bob").unwrap());
+        assert!(
+            backend
+                .has_models_for_embedder("alice", "embedder-a")
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .has_models_for_embedder("alice", "embedder-c")
+                .unwrap()
+        );
+        assert_eq!(backend.list_models("alice").unwrap().len(), 2);
+
+        let removed = backend.remove_model("alice", 1).unwrap();
+        assert_eq!(removed, Some(true));
+        assert_eq!(backend.remove_model("alice", 99).unwrap(), Some(false));
+
+        assert_eq!(backend.clear_models("alice").unwrap(), Some(1));
+        assert!(!backend.has_models("alice").unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Structural pins (source scan, same discipline as resolved.rs): the
+    // boolean fork stays deleted, and the daemon transport entry points stay
+    // single-sited.
+    // -----------------------------------------------------------------------
+
+    fn source_files() -> Vec<(std::path::PathBuf, String)> {
+        fn walk(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    out.push((path, content));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+        out
+    }
+
+    fn code_contains(content: &str, needle: &str) -> bool {
+        content
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains(needle))
+    }
+
+    /// The 13-site boolean fork (`should_use_direct`) is gone and must stay
+    /// gone: transport is selected once, here.
+    #[test]
+    fn the_boolean_fork_stays_deleted() {
+        // Assembled at runtime so this test's own literal doesn't count.
+        let needle = format!("should_use_{}", "direct");
+        for (path, content) in source_files() {
+            assert!(
+                !code_contains(&content, &needle),
+                "{}: `{needle}` reappeared — transport is selected once via \
+                 backend::Backend::select, not per call site (D1)",
+                path.display()
+            );
+        }
+    }
+
+    /// Daemon transport entry points appear only at the allowed sites. A new
+    /// `send_request` call site outside the seam is a per-site fork trying to
+    /// come back.
+    #[test]
+    fn daemon_transport_entry_points_are_single_sited() {
+        let allowed_send_request = [
+            "ipc_client.rs",                       // the definition
+            "backend.rs",                          // the seam (this module)
+            "commands/status.rs",                  // its own Ping probe until H8
+            "commands/preview/text_only.rs",       // daemon frame loop
+            "commands/preview/wayland_preview.rs", // daemon frame loop
+            "resolved.rs",                         // token literal in its own pin test
+        ];
+        let allowed_send_enroll = ["ipc_client.rs", "backend.rs"];
+
+        for (path, content) in source_files() {
+            let rel = path
+                .to_string_lossy()
+                .split("/src/")
+                .last()
+                .unwrap()
+                .to_string();
+            if code_contains(&content, "send_request(") {
+                assert!(
+                    allowed_send_request.iter().any(|a| rel == *a),
+                    "{rel}: send_request( outside the backend seam — route the \
+                     operation through backend::Backend (D1)"
+                );
+            }
+            if code_contains(&content, "send_enroll(") {
+                assert!(
+                    allowed_send_enroll.iter().any(|a| rel == *a),
+                    "{rel}: send_enroll( outside the backend seam — route \
+                     enrollment through backend::Backend::enroll (D1)"
+                );
+            }
+        }
+    }
+}

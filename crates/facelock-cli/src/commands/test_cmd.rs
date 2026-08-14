@@ -1,10 +1,10 @@
 use std::time::Instant;
 
 use facelock_core::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
 use facelock_core::notify::{NotifyEvent, notify_desktop_if_enabled};
 
+use crate::backend::{Backend, BackendKind};
 use crate::ipc_client;
 use crate::message::{Terminal, UserMessage, fail};
 use crate::notifications::DesktopNotifier;
@@ -44,23 +44,16 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     let notif_config = &config.notification;
     let notifier = DesktopNotifier::for_current_session();
 
+    // One selection for the whole test (D1) — after the setup offer above,
+    // which may have just installed and started the daemon.
+    let backend = Backend::select(config);
+
     // Check if user has enrolled models before attempting auth. Three-way
-    // discrimination (C7, issue #105): a store that opens with zero models
-    // and a store that doesn't exist yet both mean "not enrolled" — but a
-    // store that is present and cannot be read is an error, and must never be
-    // reported as "no models enrolled".
-    let has_models = if ipc_client::should_use_direct(config) {
-        direct_user_has_models(config, &user)?
-    } else {
-        // Propagate a failed query instead of folding it into "no models
-        // enrolled" — an AccessDenied here carries its own actionable hint.
-        let request = DaemonRequest::ListModels { user: user.clone() };
-        match ipc_client::send_request(&request)? {
-            DaemonResponse::Models(m) => !m.is_empty(),
-            DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
-            other => anyhow::bail!("unexpected response from daemon: {other:?}"),
-        }
-    };
+    // discrimination (C7, issue #105), owned by the backend seam: a store
+    // that opens with zero models and a store that doesn't exist yet both
+    // mean "not enrolled" — but a store that is present and cannot be read
+    // is an error, and must never be reported as "no models enrolled".
+    let has_models = enrolled_check(&backend, config, &user)?;
     if !has_models {
         Terminal.info(&UserMessage::NoModelsEnrolled { user: user.clone() });
         Terminal.info(&UserMessage::RunEnrollFirst);
@@ -73,25 +66,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     // branches used to guess in opposite directions).
     {
         let config_embedder = &config.recognition.embedder_model;
-        let has_matching = if ipc_client::should_use_direct(config) {
-            // `open_store_existing`: the store answered has_models one query
-            // ago, so it exists; if it vanished since, that is an error, not
-            // a cue to create an empty one and warn about a stale embedder.
-            let store = crate::direct::open_store_existing(config)?;
-            store
-                .has_models_for_embedder(&user, config_embedder)
-                .map_err(|e| anyhow::anyhow!("storage error: {e}"))?
-        } else {
-            let request = DaemonRequest::ListModels { user: user.clone() };
-            match ipc_client::send_request(&request)? {
-                DaemonResponse::Models(m) => m
-                    .iter()
-                    .any(|model| model.embedder_model == *config_embedder),
-                DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
-                other => anyhow::bail!("unexpected response from daemon: {other:?}"),
-            }
-        };
-        if !has_matching {
+        if !backend.has_models_for_embedder(&user, config_embedder)? {
             Terminal.info(&UserMessage::NoMatchingEmbedder {
                 embedder: config_embedder.clone(),
             });
@@ -105,77 +80,30 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
 
     notify_desktop_if_enabled(notif_config, &notifier, &NotifyEvent::Scanning);
 
-    if ipc_client::should_use_direct(config) {
-        let start = Instant::now();
-        match crate::direct::authenticate(config, &user) {
-            Ok(result) if result.matched => {
-                let elapsed = start.elapsed();
-                Terminal.info(&UserMessage::TestMatched {
-                    similarity: result.similarity,
-                    seconds: elapsed.as_secs_f64(),
-                });
-                notify_desktop_if_enabled(
-                    notif_config,
-                    &notifier,
-                    &NotifyEvent::Success {
-                        label: result.label.clone(),
-                        similarity: result.similarity,
-                    },
-                );
-            }
-            Ok(result) => {
-                let elapsed = start.elapsed();
-                if result.failure_reason
-                    == Some(facelock_core::types::AuthFailureReason::VarianceNotSatisfied)
-                {
-                    Terminal.info(&UserMessage::TestVarianceBlocked {
-                        similarity: result.similarity,
-                        seconds: elapsed.as_secs_f64(),
-                    });
-                    notify_desktop_if_enabled(
-                        notif_config,
-                        &notifier,
-                        &NotifyEvent::Failure {
-                            reason: "face matched but liveness variance not satisfied".to_string(),
-                        },
-                    );
-                } else {
-                    Terminal.info(&UserMessage::TestNoMatch {
-                        similarity: result.similarity,
-                        seconds: elapsed.as_secs_f64(),
-                    });
-                    notify_desktop_if_enabled(
-                        notif_config,
-                        &notifier,
-                        &NotifyEvent::Failure {
-                            reason: format!("no match (best similarity: {:.2})", result.similarity),
-                        },
-                    );
-                }
-            }
-            Err(e) => {
-                notify_desktop_if_enabled(
-                    notif_config,
-                    &notifier,
-                    &NotifyEvent::Failure {
-                        reason: e.to_string(),
-                    },
-                );
-                return Err(e);
-            }
-        }
-        return Ok(());
-    }
-
-    let request = DaemonRequest::Authenticate { user: user.clone() };
-
     let start = Instant::now();
-    let response = ipc_client::send_request(&request)?;
+    let result = match backend.recognize(&user) {
+        Ok(result) => result,
+        Err(e) => {
+            // One failure policy for both transports: the error's own text is
+            // the notification body, and the error propagates.
+            notify_desktop_if_enabled(
+                notif_config,
+                &notifier,
+                &NotifyEvent::Failure {
+                    reason: e.to_string(),
+                },
+            );
+            return Err(e);
+        }
+    };
     let elapsed = start.elapsed();
 
-    match response {
-        DaemonResponse::AuthResult(result) => {
-            if result.matched {
+    if result.matched {
+        // Presentation, not transport: the two renderings predate the seam
+        // and are kept byte-stable. The direct line has always omitted the
+        // model id/label.
+        match backend.kind() {
+            BackendKind::Daemon => {
                 let model_id = result.model_id.unwrap_or(0);
                 let label = result.label.as_deref().unwrap_or("unknown");
                 Terminal.info(&UserMessage::TestMatchedModel {
@@ -184,86 +112,84 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                     similarity: result.similarity,
                     seconds: elapsed.as_secs_f64(),
                 });
-                notify_desktop_if_enabled(
-                    notif_config,
-                    &notifier,
-                    &NotifyEvent::Success {
-                        label: result.label.clone(),
-                        similarity: result.similarity,
-                    },
-                );
-            } else if config.security.require_frame_variance
-                && result.similarity >= config.recognition.threshold
-            {
-                // The D-Bus AuthResult contract carries no failure reason, but
-                // matched=false with similarity above the recognition threshold
-                // means a liveness gate (frame variance) blocked the attempt.
-                Terminal.info(&UserMessage::TestVarianceBlocked {
+            }
+            _ => {
+                Terminal.info(&UserMessage::TestMatched {
                     similarity: result.similarity,
                     seconds: elapsed.as_secs_f64(),
                 });
-                notify_desktop_if_enabled(
-                    notif_config,
-                    &notifier,
-                    &NotifyEvent::Failure {
-                        reason: "face matched but liveness variance not satisfied".to_string(),
-                    },
-                );
-            } else {
-                Terminal.info(&UserMessage::TestNoMatch {
-                    similarity: result.similarity,
-                    seconds: elapsed.as_secs_f64(),
-                });
-                notify_desktop_if_enabled(
-                    notif_config,
-                    &notifier,
-                    &NotifyEvent::Failure {
-                        reason: format!("no match (best similarity: {:.2})", result.similarity),
-                    },
-                );
             }
         }
-        other => {
-            notify_desktop_if_enabled(
-                notif_config,
-                &notifier,
-                &NotifyEvent::Failure {
-                    reason: "unexpected daemon response".to_string(),
-                },
-            );
-            anyhow::bail!("unexpected response from daemon: {other:?}");
+        notify_desktop_if_enabled(
+            notif_config,
+            &notifier,
+            &NotifyEvent::Success {
+                label: result.label.clone(),
+                similarity: result.similarity,
+            },
+        );
+        return Ok(());
+    }
+
+    // Not matched: name the liveness gate when it was the blocker. The direct
+    // result carries the reason; the D-Bus AuthResult contract does not, so
+    // the daemon side infers it — matched=false with similarity above the
+    // recognition threshold means frame variance blocked the attempt.
+    let variance_blocked = match backend.kind() {
+        BackendKind::Daemon => {
+            config.security.require_frame_variance
+                && result.similarity >= config.recognition.threshold
         }
+        _ => {
+            result.failure_reason
+                == Some(facelock_core::types::AuthFailureReason::VarianceNotSatisfied)
+        }
+    };
+
+    if variance_blocked {
+        Terminal.info(&UserMessage::TestVarianceBlocked {
+            similarity: result.similarity,
+            seconds: elapsed.as_secs_f64(),
+        });
+        notify_desktop_if_enabled(
+            notif_config,
+            &notifier,
+            &NotifyEvent::Failure {
+                reason: "face matched but liveness variance not satisfied".to_string(),
+            },
+        );
+    } else {
+        Terminal.info(&UserMessage::TestNoMatch {
+            similarity: result.similarity,
+            seconds: elapsed.as_secs_f64(),
+        });
+        notify_desktop_if_enabled(
+            notif_config,
+            &notifier,
+            &NotifyEvent::Failure {
+                reason: format!("no match (best similarity: {:.2})", result.similarity),
+            },
+        );
     }
 
     Ok(())
 }
 
-/// Direct-transport "does this user have enrolled models?" with the C7
-/// three-way discrimination, now carried by [`StoreError`]'s variants:
-///
-/// - store opens, zero models      → `Ok(false)` ("no models enrolled" is true)
-/// - `StoreError::Absent` (fresh)  → `Ok(false)` (no database created; same message)
-/// - any other failure class       → `Err`, never "no models"
-///
-/// For the error, the per-user enrollment marker is consulted **for the
-/// message only** — it is readable in exactly the cases the database is not,
-/// and lets the error say what the user actually wants to know ("you appear
-/// to be enrolled; the database is the problem"). The marker can be stale,
-/// hence "appear to"; it never influences the decision, only the wording.
-fn direct_user_has_models(config: &Config, user: &str) -> anyhow::Result<bool> {
-    let store = match crate::direct::open_store_existing(config) {
-        Ok(store) => store,
-        Err(facelock_store::StoreError::Absent { .. }) => return Ok(false),
-        Err(e) => return Err(unreadable_store_error(config, user, &anyhow::Error::new(e))),
-    };
-    match store.has_models(user) {
-        Ok(v) => Ok(v),
-        Err(e) => Err(unreadable_store_error(
-            config,
-            user,
-            &anyhow::anyhow!("storage error: {e}"),
-        )),
-    }
+/// The C7 enrolled check, with the direct transport's store failures reworded
+/// for the human running `test`: the per-user enrollment marker is consulted
+/// **for the message only** — it is readable in exactly the cases the
+/// database is not, and lets the error say what the user actually wants to
+/// know ("you appear to be enrolled; the database is the problem"). Daemon
+/// errors pass through untouched: they are not store reads, and an
+/// AccessDenied already carries its own actionable hint.
+fn enrolled_check(backend: &Backend, config: &Config, user: &str) -> anyhow::Result<bool> {
+    backend.has_models(user).map_err(|e| {
+        if backend.kind().is_direct() {
+            unreadable_store_error(config, user, &e)
+        } else {
+            e
+        }
+    })
 }
 
 /// Build the "store present but unreadable" error (C7). With a readable
@@ -290,8 +216,10 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// `mode = "oneshot"` pins a DirectByConfig selection without touching
+    /// D-Bus.
     fn config_with_db(db_path: &Path) -> Config {
-        let mut config = Config::parse("").expect("defaults parse");
+        let mut config = Config::parse("[daemon]\nmode = \"oneshot\"\n").expect("config parses");
         config.storage.db_path = db_path.to_string_lossy().into_owned();
         config
     }
@@ -303,10 +231,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("facelock.db");
         let config = config_with_db(&db_path);
+        let backend = Backend::select(&config);
 
         // Absent (fresh): the StoreError::Absent variant, read as "not
         // enrolled" without creating anything.
-        assert!(!direct_user_has_models(&config, "alice").unwrap());
+        assert!(!enrolled_check(&backend, &config, "alice").unwrap());
 
         // Open store, models for someone else only.
         {
@@ -315,8 +244,8 @@ mod tests {
                 .add_model("bob", "front", &[0.5f32; 512], "embedder")
                 .unwrap();
         }
-        assert!(!direct_user_has_models(&config, "alice").unwrap());
-        assert!(direct_user_has_models(&config, "bob").unwrap());
+        assert!(!enrolled_check(&backend, &config, "alice").unwrap());
+        assert!(enrolled_check(&backend, &config, "bob").unwrap());
     }
 
     /// The `Absent` arm answers "not enrolled" as a *value*: the probe must
@@ -326,8 +255,10 @@ mod tests {
     fn absent_store_probe_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("facelock.db");
+        let config = config_with_db(&db_path);
+        let backend = Backend::select(&config);
 
-        assert!(!direct_user_has_models(&config_with_db(&db_path), "alice").unwrap());
+        assert!(!enrolled_check(&backend, &config, "alice").unwrap());
         assert!(
             !db_path.exists(),
             "probing enrollment must not create the database it reports absent"
@@ -342,8 +273,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("facelock.db");
         std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+        let config = config_with_db(&db_path);
+        let backend = Backend::select(&config);
 
-        let err = direct_user_has_models(&config_with_db(&db_path), "alice").unwrap_err();
+        let err = enrolled_check(&backend, &config, "alice").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("can't be read"),
@@ -364,10 +297,11 @@ mod tests {
         std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
         let config = config_with_db(&db_path);
+        let backend = Backend::select(&config);
         let marker_base = super::super::enrollment_marker::marker_dir(&config);
         super::super::enrollment_marker::write_marker_in(&marker_base, "alice", 3, None).unwrap();
 
-        let err = direct_user_has_models(&config, "alice").unwrap_err();
+        let err = enrolled_check(&backend, &config, "alice").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("appear to have 3 enrolled model(s)"),
@@ -386,10 +320,11 @@ mod tests {
         std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
         let config = config_with_db(&db_path);
+        let backend = Backend::select(&config);
         let marker_base = super::super::enrollment_marker::marker_dir(&config);
         super::super::enrollment_marker::write_marker_in(&marker_base, "alice", 3, None).unwrap();
 
-        let err = direct_user_has_models(&config, "someone-else").unwrap_err();
+        let err = enrolled_check(&backend, &config, "someone-else").unwrap_err();
         let msg = format!("{err:#}");
         assert!(!msg.contains("appear to have"), "{msg}");
         assert!(msg.contains("can't be read"), "{msg}");

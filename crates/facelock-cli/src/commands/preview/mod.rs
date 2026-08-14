@@ -6,7 +6,9 @@ mod wayland_preview;
 
 use facelock_core::Config;
 
+use crate::backend::{Backend, BackendKind};
 use crate::ipc_client;
+use crate::message::{Terminal, UserMessage};
 
 pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Result<()> {
     // DEC-6/N13: `PreviewDetectFrame` is root-only now — it was the last
@@ -19,12 +21,16 @@ pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Re
     // to *root*, so the preview never recognized the actual user.
     let user = ipc_client::resolve_user(user.as_deref());
 
-    if ipc_client::should_use_direct(config) {
+    let backend = Backend::select(config);
+
+    if !backend.caps().graphical_preview {
+        // A direct backend has only the local text preview — a capability
+        // stated by the selection, not discovered at a failure site. Why it
+        // is unavailable depends on the kind: a stopped daemon is a degraded
+        // state, not a configuration choice (the old single message blamed
+        // "oneshot mode" for both).
         if !text_only {
-            eprintln!(
-                "Graphical preview requires the daemon. In oneshot mode, use --text-only.\n\
-                 Falling back to text-only mode.\n"
-            );
+            Terminal.error(&graphical_unavailable_message(backend.kind()));
         }
         return text_only::run_direct(config, &user);
     }
@@ -34,6 +40,15 @@ pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Re
     }
 
     run_graphical(&user)
+}
+
+/// Why graphical preview is unavailable on a direct backend, accurately per
+/// kind.
+fn graphical_unavailable_message(kind: BackendKind) -> UserMessage {
+    match kind {
+        BackendKind::DirectByFallback => UserMessage::PreviewGraphicalDaemonUnreachable,
+        _ => UserMessage::PreviewGraphicalNeedsDaemonOneshot,
+    }
 }
 
 #[cfg(feature = "wayland")]
@@ -62,6 +77,24 @@ fn run_graphical(user: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The misattribution pin (D1): a *stopped* daemon must render the
+    /// degraded fallback message, never the "configured off" oneshot wording
+    /// — the old single message told users with a crashed daemon that they
+    /// had chosen oneshot mode.
+    #[test]
+    fn stopped_daemon_is_not_blamed_on_configuration() {
+        assert_eq!(
+            graphical_unavailable_message(BackendKind::DirectByFallback),
+            UserMessage::PreviewGraphicalDaemonUnreachable
+        );
+        assert_eq!(
+            graphical_unavailable_message(BackendKind::DirectByConfig),
+            UserMessage::PreviewGraphicalNeedsDaemonOneshot
+        );
+    }
+
     /// C5 (issue #105): preview resolves its user through the one shared
     /// resolver, whose precedence honors SUDO_USER — the deleted local
     /// implementation used getpwuid only, so `sudo facelock preview`
