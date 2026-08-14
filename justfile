@@ -36,8 +36,28 @@ fmt:
 audit:
     cargo audit --deny unmaintained --deny unsound
 
-# Run all checks (test + lint + format + audit)
-check: test lint fmt-check audit
+# Verify the PAM module compiles on its OWN and stays off the async-io backend.
+# `cargo build --workspace` unifies zbus features with facelock-cli/-polkit, so it
+# hides an incoherent feature set in pam-facelock; only a standalone build catches
+# it. The dep guard then forbids the async-io runtime backend (async-io/async-signal/
+# polling + the async-executor/async-fs/async-lock trio) while allowing
+# signal-hook-registry, which the correct tokio backend legitimately pulls via
+# tokio's "process" feature. Keep in sync with .github/workflows/ci.yml
+# ("Build pam-facelock in isolation" + "Verify pam-facelock dependency surface").
+check-pam-standalone:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p pam-facelock
+    cargo tree -p pam-facelock --edges normal --prefix none | awk '{print $1}' | sort -u > /tmp/pam-deps
+    echo "pam-facelock crate count: $(wc -l < /tmp/pam-deps)"
+    if grep -Eq '^(async-io|async-signal|async-executor|async-fs|async-lock|polling)$' /tmp/pam-deps; then
+        echo "forbidden async-io backend crates in pam-facelock (expected the tokio backend)" >&2
+        exit 1
+    fi
+    echo "pam-facelock dependency guard passed"
+
+# Run all checks (test + lint + format + audit + PAM standalone surface)
+check: test lint fmt-check audit check-pam-standalone
 
 # Build the PAM test container image (uses host-built release binaries).
 # Keep in sync with .github/workflows/ci.yml, which builds this same image
