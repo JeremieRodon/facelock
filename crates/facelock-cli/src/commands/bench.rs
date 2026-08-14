@@ -206,7 +206,6 @@ fn cmd_warm_auth(config: &Config) -> Result<()> {
 }
 
 fn cmd_preview(config: &Config) -> Result<()> {
-
     println!("=== Preview Frame Benchmark ===");
     println!(
         "Measuring: frame capture + face detection ({} iterations)",
@@ -263,7 +262,6 @@ fn cmd_preview(config: &Config) -> Result<()> {
 }
 
 fn cmd_enrollment(config: &Config) -> Result<()> {
-
     println!("=== Enrollment Benchmark ===");
     println!(
         "Measuring: time to capture and embed {} snapshots",
@@ -310,7 +308,6 @@ fn cmd_enrollment(config: &Config) -> Result<()> {
 }
 
 fn cmd_model_load(config: &Config) -> Result<()> {
-
     println!("=== Model Load Benchmark ===");
     println!("Measuring: ONNX model load time (SCRFD + ArcFace)");
     println!();

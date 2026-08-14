@@ -1,4 +1,3 @@
-
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_store::StoreError;

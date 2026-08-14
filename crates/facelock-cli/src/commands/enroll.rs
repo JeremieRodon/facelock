@@ -50,11 +50,12 @@ pub fn run(
         }
     }
 
-    // Check models exist
-    let model_dir = std::path::Path::new(&config.daemon.model_dir);
-    let detector = model_dir.join(&config.recognition.detector_model);
-    let embedder = model_dir.join(&config.recognition.embedder_model);
-    if !detector.exists() || !embedder.exists() {
+    // Models must exist before anything opens a camera. One probe through the
+    // shared fact (D7) instead of a per-command re-derivation.
+    if !crate::resolved::ModelFiles::probe(config)
+        .value
+        .all_present()
+    {
         anyhow::bail!(
             "Face recognition models not found in {}.\nRun `sudo facelock setup` to download them.",
             config.daemon.model_dir

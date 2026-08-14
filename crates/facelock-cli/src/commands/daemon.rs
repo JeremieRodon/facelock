@@ -1175,6 +1175,43 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
         }
     };
 
+    // Explicit resolution before construction (D7): name what is missing or
+    // misconfigured up front — the engine's load error is opaque about
+    // missing model files, and ORT falls back to CPU silently when the
+    // configured provider isn't compiled into the installed runtime.
+    let models = crate::resolved::ModelFiles::probe(&config);
+    if !models.value.all_present() {
+        let missing: Vec<String> = models
+            .value
+            .missing()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        return Err(format!(
+            "model files missing: {} — run 'sudo facelock setup' to download them",
+            missing.join(", ")
+        ));
+    }
+    let ep = crate::resolved::ExecutionProviderFact::probe(&config);
+    match &ep.value.status {
+        crate::resolved::EpStatus::Available => {
+            info!(provider = %ep.value.configured, "execution provider resolved");
+        }
+        crate::resolved::EpStatus::NotBuiltIn => {
+            warn!(
+                provider = %ep.value.configured,
+                "configured execution provider is not built into the installed \
+                 ONNX Runtime; inference will fall back to CPU"
+            );
+        }
+        crate::resolved::EpStatus::Unqueryable(e) => {
+            warn!("could not query ONNX Runtime for provider availability: {e}");
+        }
+        // The engine load below fails with the provider registry's error,
+        // which names the valid values.
+        crate::resolved::EpStatus::UnknownName => {}
+    }
+
     let engine = FaceEngine::load(&config.recognition, Path::new(&config.daemon.model_dir))
         .map_err(|e| format!("failed to load face engine: {e}"))?;
 

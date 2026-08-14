@@ -9,7 +9,6 @@ pub fn run(config: &Config, tail: bool, lines: usize) -> Result<()> {
     // hard-errors rather than offering the usual sudo re-exec prompt.
     crate::ipc_client::require_root_scripted("sudo facelock audit")?;
 
-
     if !config.audit.enabled {
         println!("Audit logging is not enabled.");
         println!("Enable it in config:");

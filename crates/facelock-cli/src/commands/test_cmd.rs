@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
@@ -15,16 +14,22 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     // to the rate-limit table). Must run before any prompt or output (C6).
     ipc_client::require_root("sudo facelock test")?;
 
-
     // Check models exist — offer to run setup if missing
-    let model_dir = std::path::Path::new(&config.daemon.model_dir);
-    let detector = model_dir.join(&config.recognition.detector_model);
-    let embedder = model_dir.join(&config.recognition.embedder_model);
-    if !detector.exists() || !embedder.exists() {
+    if !crate::resolved::ModelFiles::probe(config)
+        .value
+        .all_present()
+    {
         println!("Face recognition models not found.");
         if crate::ipc_client::confirm("Download models now?")? {
             crate::commands::setup::run(false)?;
-            if !detector.exists() || !embedder.exists() {
+            // Deliberate re-probe: setup just changed the disk. The judgment
+            // still uses the Config this process parsed, as it always has —
+            // setup may have rewritten the file, and picking that up would be
+            // a mid-command re-read.
+            if !crate::resolved::ModelFiles::probe(config)
+                .value
+                .all_present()
+            {
                 anyhow::bail!("Models still not found after setup.");
             }
         } else {

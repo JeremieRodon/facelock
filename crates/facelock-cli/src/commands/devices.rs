@@ -7,7 +7,6 @@ pub fn run(config: &Config) -> anyhow::Result<()> {
     // DEC-6/N13: `ListDevices` is root-only now (was facelock-group).
     ipc_client::require_root("sudo facelock devices")?;
 
-
     if ipc_client::should_use_direct(config) {
         return crate::direct::list_devices_direct();
     }

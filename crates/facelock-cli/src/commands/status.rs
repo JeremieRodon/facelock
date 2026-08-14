@@ -107,17 +107,20 @@ fn check_camera(config: Option<&Config>) {
         return;
     };
 
-    let device_path = config.device.path.as_deref().unwrap_or("(auto-detect)");
-    print_status_item("Camera device", device_path);
-
-    match &config.device.path {
-        Some(p) if Path::new(p).exists() => {
-            print_result(true, "device exists");
+    match crate::resolved::CameraPresence::probe(config).value {
+        crate::resolved::CameraPresence::Configured { path, present } => {
+            print_status_item("Camera device", &path);
+            print_result(
+                present,
+                if present {
+                    "device exists"
+                } else {
+                    "device not found"
+                },
+            );
         }
-        Some(_) => {
-            print_result(false, "device not found");
-        }
-        None => {
+        crate::resolved::CameraPresence::AutoDetect => {
+            print_status_item("Camera device", "(auto-detect)");
             print_result(true, "auto-detect enabled");
         }
     }
@@ -130,32 +133,28 @@ fn check_models(config: Option<&Config>) {
         return;
     };
 
-    let model_dir = &config.daemon.model_dir;
-    print_status_item("Model directory", model_dir);
+    // The configured model files (not just defaults), through the shared
+    // probe (D7).
+    let models = crate::resolved::ModelFiles::probe(config).value;
+    print_status_item("Model directory", &models.dir.display().to_string());
 
-    if !Path::new(model_dir).exists() {
+    if !models.dir_present {
         print_result(false, "directory not found");
         return;
     }
 
-    // Check for the configured model files (not just defaults)
-    let models = [
-        ("detector", config.recognition.detector_model.as_str()),
-        ("embedder", config.recognition.embedder_model.as_str()),
-    ];
-
-    let mut all_present = true;
-    for (purpose, filename) in &models {
-        let path = Path::new(model_dir).join(filename);
-        if path.exists() {
-            print_detail(&format!("{purpose} ({filename})"), "present");
-        } else {
-            print_detail(&format!("{purpose} ({filename})"), "MISSING");
-            all_present = false;
-        }
+    for (purpose, file) in [
+        ("detector", &models.detector),
+        ("embedder", &models.embedder),
+    ] {
+        let filename = file.path.file_name().unwrap_or_default().to_string_lossy();
+        print_detail(
+            &format!("{purpose} ({filename})"),
+            if file.present { "present" } else { "MISSING" },
+        );
     }
 
-    if all_present {
+    if models.all_present() {
         print_result(true, "all configured models present");
     } else {
         print_result(false, "some models missing (run 'facelock setup')");
@@ -167,8 +166,12 @@ fn check_inference(config: Option<&Config>) {
         return;
     };
 
-    let provider = &config.recognition.execution_provider;
-    let label = match provider.as_str() {
+    // Resolved against the installed ONNX Runtime (D7): the old check listed
+    // .so paths — a copy of the provider module's search list that could
+    // drift, and one that said nothing about whether the *configured*
+    // provider is actually compiled into that runtime.
+    let ep = crate::resolved::ExecutionProviderFact::probe(config).value;
+    let label = match ep.configured.as_str() {
         "cpu" => "CPU",
         "cuda" => "CUDA (NVIDIA GPU)",
         "rocm" => "ROCm (AMD GPU)",
@@ -177,16 +180,25 @@ fn check_inference(config: Option<&Config>) {
     };
     print_status_item("Execution provider", label);
 
-    // Check that the ORT library is loadable
-    let ort_paths = [
-        "/usr/lib/libonnxruntime.so",
-        "/usr/lib64/libonnxruntime.so",
-        "/usr/lib/facelock/libonnxruntime.so",
-    ];
-    if let Some(path) = ort_paths.iter().find(|p| Path::new(p).exists()) {
-        print_result(true, &format!("ONNX Runtime found at {path}"));
-    } else {
-        print_result(false, "ONNX Runtime not found (install onnxruntime)");
+    match &ep.status {
+        crate::resolved::EpStatus::Available => {
+            print_result(true, "supported by the installed ONNX Runtime");
+        }
+        crate::resolved::EpStatus::NotBuiltIn => {
+            print_result(
+                false,
+                "not built into the installed ONNX Runtime — inference will fall back to CPU",
+            );
+        }
+        crate::resolved::EpStatus::UnknownName => {
+            print_result(
+                false,
+                "unknown execution provider (valid: cpu, cuda, rocm, openvino)",
+            );
+        }
+        crate::resolved::EpStatus::Unqueryable(e) => {
+            print_result(false, &format!("ONNX Runtime not loadable: {e}"));
+        }
     }
 }
 

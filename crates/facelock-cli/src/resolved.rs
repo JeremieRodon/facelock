@@ -10,6 +10,15 @@
 //!   `config` displays/edits the file itself, and `is-enrolled` tolerates a
 //!   missing config on its unprivileged path).
 //!
+//! - [`ResolvedConfig`] — **what is actually true.** A config value like
+//!   `execution_provider = "cuda"` or `device.path = "/dev/video2"` is a
+//!   *claim*; whether CUDA exists in the installed ONNX Runtime or the device
+//!   node is present is discovered by an explicit probe, once, instead of
+//!   being re-derived ad hoc at each use site. Each fact carries a
+//!   [`Provenance`] tag. Resolution is for the heavyweight paths only
+//!   (daemon startup, status, enroll, test); lighter commands probe just the
+//!   fact they consume.
+//!
 //! # `is-enrolled` never comes here
 //!
 //! `is-enrolled` is dispatched in `main` *before* [`ConfigLoad::read`] runs
@@ -17,10 +26,11 @@
 //! store, no probes. See the module docs in `commands/is_enrolled.rs`; a
 //! source-level pin lives in this module's tests.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use facelock_core::Config;
 use facelock_core::config::ConfigError;
+use facelock_face::ProviderKind;
 
 /// The outcome of the process's single config read.
 ///
@@ -63,6 +73,206 @@ impl ConfigLoad {
     /// (`status`) that degrade instead of failing.
     pub fn config(&self) -> Option<&Config> {
         self.result.as_ref().ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResolvedConfig — what is actually true
+// ---------------------------------------------------------------------------
+
+/// How a resolved fact was determined.
+///
+/// Deliberately minimal: H8 (Health) will grow this into a richer `Fact`
+/// type carrying *unknown-is-not-false* across privilege and reachability;
+/// until then, a provenance tag per fact is all resolution promises. A
+/// daemon-reachability fact slots in beside the existing ones the same way
+/// (H6 — Backend owns that probe, not this module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Verified against the live system by this process (file stat, ORT
+    /// query).
+    Probed,
+    /// Taken from the config without verification — a claim, not a checked
+    /// fact.
+    Claimed,
+}
+
+/// A fact plus how it was established.
+#[derive(Debug, Clone)]
+pub struct Resolved<T> {
+    pub value: T,
+    pub provenance: Provenance,
+}
+
+/// One file the config names, and whether it is on disk.
+#[derive(Debug, Clone)]
+pub struct ProbedFile {
+    pub path: PathBuf,
+    pub present: bool,
+}
+
+impl ProbedFile {
+    fn probe(path: PathBuf) -> Self {
+        let present = path.is_file();
+        ProbedFile { path, present }
+    }
+}
+
+/// Presence of the configured detector/embedder ONNX files.
+///
+/// Presence only, by design: content integrity stays where it already lives —
+/// `FaceEngine` verifies SHA256 at load time, and setup's download flow
+/// checks hashes as part of its repair loop.
+#[derive(Debug, Clone)]
+pub struct ModelFiles {
+    pub dir: PathBuf,
+    pub dir_present: bool,
+    pub detector: ProbedFile,
+    pub embedder: ProbedFile,
+}
+
+impl ModelFiles {
+    pub fn probe(config: &Config) -> Resolved<ModelFiles> {
+        let dir = PathBuf::from(&config.daemon.model_dir);
+        let value = ModelFiles {
+            dir_present: dir.is_dir(),
+            detector: ProbedFile::probe(dir.join(&config.recognition.detector_model)),
+            embedder: ProbedFile::probe(dir.join(&config.recognition.embedder_model)),
+            dir,
+        };
+        Resolved {
+            value,
+            provenance: Provenance::Probed,
+        }
+    }
+
+    pub fn all_present(&self) -> bool {
+        self.detector.present && self.embedder.present
+    }
+
+    /// Paths of the configured model files that are not on disk.
+    pub fn missing(&self) -> Vec<&Path> {
+        [&self.detector, &self.embedder]
+            .into_iter()
+            .filter(|f| !f.present)
+            .map(|f| f.path.as_path())
+            .collect()
+    }
+}
+
+/// What the config claims about the camera, resolved as far as a presence
+/// check can take it.
+///
+/// Only "does the configured node exist" — which is what `status` and setup
+/// were each re-deriving. Full device interrogation (formats, IR
+/// classification, quirks, siblings) is the camera domain's job (D8,
+/// `direct::resolve_camera_device` and friends) and is *not* duplicated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CameraPresence {
+    /// No path configured: detection happens at open time; nothing to probe
+    /// yet, so this fact stays a claim.
+    AutoDetect,
+    Configured {
+        path: String,
+        present: bool,
+    },
+}
+
+impl CameraPresence {
+    pub fn probe(config: &Config) -> Resolved<CameraPresence> {
+        match config.device.path.as_deref() {
+            None => Resolved {
+                value: CameraPresence::AutoDetect,
+                provenance: Provenance::Claimed,
+            },
+            Some(path) => Resolved {
+                value: CameraPresence::Configured {
+                    path: path.to_string(),
+                    present: Path::new(path).exists(),
+                },
+                provenance: Provenance::Probed,
+            },
+        }
+    }
+}
+
+/// The configured execution provider, resolved against the ONNX Runtime that
+/// is actually installed — availability is a property of the ORT *build*, not
+/// the hardware (see `facelock_face::detect_execution_provider`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionProviderFact {
+    pub configured: String,
+    pub status: EpStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpStatus {
+    /// Not a name the provider registry knows; engine load will fail with the
+    /// registry's error naming the valid values.
+    UnknownName,
+    /// The installed ONNX Runtime can use it (CPU is available by
+    /// construction).
+    Available,
+    /// A valid name, but the installed ORT was not built with it — ORT falls
+    /// back to CPU silently at session creation, which is exactly the
+    /// misconfiguration this fact exists to surface.
+    NotBuiltIn,
+    /// The ONNX Runtime shared library could not be loaded or queried.
+    Unqueryable(String),
+}
+
+impl ExecutionProviderFact {
+    /// Probe the installed ONNX Runtime. Loads the ORT shared library unless
+    /// the configured provider is `cpu` (or unknown), so call this only on
+    /// paths that will load the engine anyway or exist to diagnose (status).
+    pub fn probe(config: &Config) -> Resolved<ExecutionProviderFact> {
+        let value = Self::status_of(&config.recognition.execution_provider, || {
+            facelock_face::detect_execution_provider().map(|d| d.available)
+        });
+        Resolved {
+            value,
+            provenance: Provenance::Probed,
+        }
+    }
+
+    /// The decision rule, split from the ORT query so it is testable without
+    /// a GPU-enabled runtime (same shape as `select_by_priority` upstream).
+    fn status_of(
+        configured: &str,
+        detect: impl FnOnce() -> Result<Vec<ProviderKind>, String>,
+    ) -> ExecutionProviderFact {
+        let status = match ProviderKind::parse(configured) {
+            None => EpStatus::UnknownName,
+            Some(ProviderKind::Cpu) => EpStatus::Available,
+            Some(kind) => match detect() {
+                Ok(available) if available.contains(&kind) => EpStatus::Available,
+                Ok(_) => EpStatus::NotBuiltIn,
+                Err(e) => EpStatus::Unqueryable(e),
+            },
+        };
+        ExecutionProviderFact {
+            configured: configured.to_string(),
+            status,
+        }
+    }
+}
+
+/// The full resolution pass, for the paths that consume every fact (daemon
+/// startup logging, `status`). Commands that need one fact probe it directly.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub models: Resolved<ModelFiles>,
+    pub camera: Resolved<CameraPresence>,
+    pub execution_provider: Resolved<ExecutionProviderFact>,
+}
+
+impl ResolvedConfig {
+    pub fn resolve(config: &Config) -> Self {
+        ResolvedConfig {
+            models: ModelFiles::probe(config),
+            camera: CameraPresence::probe(config),
+            execution_provider: ExecutionProviderFact::probe(config),
+        }
     }
 }
 
@@ -115,6 +325,119 @@ mod tests {
             ConfigLoad::read_from(path).result,
             Err(ConfigError::NotFound(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Facts
+    // -----------------------------------------------------------------------
+
+    fn config_with(toml: &str) -> Config {
+        Config::parse(toml).expect("test config parses")
+    }
+
+    #[test]
+    fn model_probe_reports_each_file_and_the_missing_set() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("det.onnx"), b"x").unwrap();
+
+        let config = config_with(&format!(
+            "[daemon]\nmodel_dir = \"{}\"\n\n[recognition]\n\
+             detector_model = \"det.onnx\"\nembedder_model = \"emb.onnx\"\n",
+            dir.path().display()
+        ));
+        let models = ModelFiles::probe(&config);
+
+        assert_eq!(models.provenance, Provenance::Probed);
+        assert!(models.value.dir_present);
+        assert!(models.value.detector.present);
+        assert!(!models.value.embedder.present);
+        assert!(!models.value.all_present());
+        assert_eq!(
+            models.value.missing(),
+            vec![dir.path().join("emb.onnx").as_path()]
+        );
+
+        fs::write(dir.path().join("emb.onnx"), b"x").unwrap();
+        let models = ModelFiles::probe(&config).value;
+        assert!(models.all_present());
+        assert!(models.missing().is_empty());
+    }
+
+    #[test]
+    fn model_probe_on_missing_directory_is_all_absent() {
+        let config = config_with("[daemon]\nmodel_dir = \"/nonexistent/facelock-test-models\"\n");
+        let models = ModelFiles::probe(&config).value;
+        assert!(!models.dir_present);
+        assert!(!models.all_present());
+        assert_eq!(models.missing().len(), 2);
+    }
+
+    #[test]
+    fn camera_probe_distinguishes_claim_from_probed_presence() {
+        // No path: a claim — detection is deferred to open time.
+        let auto = CameraPresence::probe(&config_with(""));
+        assert_eq!(auto.value, CameraPresence::AutoDetect);
+        assert_eq!(auto.provenance, Provenance::Claimed);
+
+        // Configured and present.
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("video9");
+        fs::write(&node, b"").unwrap();
+        let present = CameraPresence::probe(&config_with(&format!(
+            "[device]\npath = \"{}\"\n",
+            node.display()
+        )));
+        assert_eq!(present.provenance, Provenance::Probed);
+        assert_eq!(
+            present.value,
+            CameraPresence::Configured {
+                path: node.display().to_string(),
+                present: true
+            }
+        );
+
+        // Configured and absent.
+        let absent = CameraPresence::probe(&config_with(
+            "[device]\npath = \"/dev/facelock-no-such-video\"\n",
+        ));
+        assert_eq!(
+            absent.value,
+            CameraPresence::Configured {
+                path: "/dev/facelock-no-such-video".into(),
+                present: false
+            }
+        );
+    }
+
+    #[test]
+    fn ep_status_unknown_name_never_queries_ort() {
+        let fact = ExecutionProviderFact::status_of("tensorrt", || {
+            panic!("an unknown name must not trigger an ORT query")
+        });
+        assert_eq!(fact.status, EpStatus::UnknownName);
+    }
+
+    #[test]
+    fn ep_status_cpu_is_available_without_querying_ort() {
+        let fact =
+            ExecutionProviderFact::status_of("cpu", || panic!("cpu must not trigger an ORT query"));
+        assert_eq!(fact.status, EpStatus::Available);
+    }
+
+    #[test]
+    fn ep_status_gpu_resolves_against_the_ort_build() {
+        let cuda_in = ExecutionProviderFact::status_of("cuda", || Ok(vec![ProviderKind::Cuda]));
+        assert_eq!(cuda_in.status, EpStatus::Available);
+
+        let cuda_out = ExecutionProviderFact::status_of("cuda", || Ok(vec![]));
+        assert_eq!(cuda_out.status, EpStatus::NotBuiltIn);
+
+        let rocm_elsewhere =
+            ExecutionProviderFact::status_of("rocm", || Ok(vec![ProviderKind::Cuda]));
+        assert_eq!(rocm_elsewhere.status, EpStatus::NotBuiltIn);
+
+        let broken = ExecutionProviderFact::status_of("cuda", || Err("no dylib".into()));
+        assert_eq!(broken.status, EpStatus::Unqueryable("no dylib".into()));
     }
 
     // -----------------------------------------------------------------------
