@@ -16,6 +16,8 @@ use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{MatchResult, zeroize_stored_embeddings};
 use facelock_daemon::audit::AuditSource;
+use facelock_daemon::auth::{PreCheckContext, pre_check_audited_with_context};
+use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
 use tracing::debug;
@@ -123,21 +125,51 @@ pub fn load_engine(config: &Config) -> anyhow::Result<FaceEngine> {
 /// Direct authentication — returns the full match result (including an
 /// internal failure reason when frames matched but a liveness gate blocked).
 ///
-/// This backs `facelock test` only, and it deliberately skips `pre_check`
-/// (rate limiting, `require_ir`, SSH/lid abort), so its audit entries are
-/// stamped `AuditSource::Test`: a success here is a recognition result, not a
-/// policy-approved authentication.
+/// This backs `facelock test` only (root-only, N11/issue #96). It runs the
+/// same pre-flight gates real authentication does — disabled check,
+/// enrollment/`suppress_unknown`, rate-limit *check*, `require_ir` — via
+/// `pre_check_audited_with_context`, except SSH/lid abort, which exist to
+/// stop an *attacker*'s physical-access shortcuts and are explicitly skipped
+/// for `test` via [`PreCheckContext::test`]. A failed attempt here never
+/// consumes the shared rate-limit budget: unlike the daemon and oneshot
+/// paths, this function simply never calls `RateLimiter::record_failure`.
+/// Audit entries are stamped `AuditSource::Test`.
 pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> {
     let store = open_store(config)?;
 
-    if !store.has_models(user).context("storage error")? {
-        return Ok(MatchResult {
-            matched: false,
-            model_id: None,
-            label: None,
-            similarity: 0.0,
-            failure_reason: None,
-        });
+    // Cheap device classification only (no camera I/O), so a pre-check
+    // rejection never touches the camera. `open_camera_context` below
+    // re-resolves the same device once opening actually proceeds.
+    let device_is_ir = resolve_camera_device(config)
+        .context("failed to resolve camera device")?
+        .device_is_ir;
+
+    let rl = &config.security.rate_limit;
+    let rate_limiter = RateLimiter::new(rl.max_attempts, rl.window_secs);
+
+    if let Some(resp) = pre_check_audited_with_context(
+        config,
+        &store,
+        user,
+        &rate_limiter,
+        device_is_ir,
+        AuditSource::Test,
+        PreCheckContext::test(),
+    ) {
+        return match resp {
+            DaemonResponse::AuthResult(mr) => Ok(mr),
+            // `suppress_unknown` short-circuit: no result to report, same as
+            // the plain not-enrolled case below from `test`'s point of view.
+            DaemonResponse::Suppressed => Ok(MatchResult {
+                matched: false,
+                model_id: None,
+                label: None,
+                similarity: 0.0,
+                failure_reason: None,
+            }),
+            DaemonResponse::Error { message } => bail!("{message}"),
+            _ => bail!("unexpected pre-check response"),
+        };
     }
 
     let OpenedCamera {

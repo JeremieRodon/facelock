@@ -9,6 +9,13 @@ use crate::ipc_client;
 use crate::notifications::{NotifyEvent, notify_if_enabled};
 
 pub fn run(user: Option<String>) -> anyhow::Result<()> {
+    // N11 (issue #96): `facelock test` is root-only regardless of transport
+    // (direct or daemon-mediated) — keeps similarity scores and full detail,
+    // and lets both the daemon and direct paths safely exempt failed test
+    // runs from rate-limit consumption (root already has unrestricted access
+    // to the rate-limit table). Must run before any prompt or output (C6).
+    ipc_client::require_root("sudo facelock test")?;
+
     let config = Config::load().context("failed to load config")?;
 
     // Check models exist — offer to run setup if missing
@@ -16,7 +23,6 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     let detector = model_dir.join(&config.recognition.detector_model);
     let embedder = model_dir.join(&config.recognition.embedder_model);
     if !detector.exists() || !embedder.exists() {
-        crate::ipc_client::require_root("sudo facelock setup")?;
         println!("Face recognition models not found.");
         if crate::ipc_client::confirm("Download models now?")? {
             crate::commands::setup::run(false)?;
@@ -84,7 +90,6 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     notify_if_enabled(notif_config, &NotifyEvent::Scanning);
 
     if ipc_client::should_use_direct(&config) {
-        ipc_client::require_root("sudo facelock test")?;
         let start = Instant::now();
         match crate::direct::authenticate(&config, &user) {
             Ok(result) if result.matched => {
