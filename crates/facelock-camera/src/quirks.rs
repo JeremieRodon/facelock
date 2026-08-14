@@ -85,7 +85,12 @@ impl QuirksDb {
     /// Load quirks from both system and user directories.
     /// System: `/usr/share/facelock/quirks.d/`
     /// User overrides: `/etc/facelock/quirks.d/`
-    /// Files are loaded in alphabetical order; later files can override earlier ones.
+    ///
+    /// Files are loaded in alphabetical order within each directory, and the
+    /// system directory before the user one. Later entries override earlier
+    /// ones for the same device: matching is last-wins per pass, so an
+    /// operator's `/etc` entry shadows the shipped entry it corrects. See
+    /// [`find_match_with_kind`](Self::find_match_with_kind).
     pub fn load() -> Self {
         let mut db = Self::default();
         for dir in &["/usr/share/facelock/quirks.d", "/etc/facelock/quirks.d"] {
@@ -133,7 +138,8 @@ impl QuirksDb {
     }
 
     /// Find a matching quirk for the given device.
-    /// Matches by USB vendor:product ID first, then by name pattern.
+    /// Matches by USB vendor:product ID first, then by name pattern; within
+    /// each pass the LAST-loaded entry wins (see [`find_match_with_kind`](Self::find_match_with_kind)).
     pub fn find_match(&self, device: &DeviceInfo) -> Option<&Quirk> {
         self.find_match_with_ids(device, read_usb_ids(&device.path).as_ref())
     }
@@ -158,44 +164,58 @@ impl QuirksDb {
     /// free-text device name, which is attacker-controlled on virtual
     /// devices such as v4l2loopback, and should not be trusted the same way
     /// as a [`QuirkMatchKind::UsbId`] match.
+    ///
+    /// A USB-ID match always beats a name match — that is specificity, and it
+    /// is independent of load order. *Within* each pass the LAST-loaded entry
+    /// wins, which is what makes [`load`](Self::load)'s ordering an override
+    /// mechanism: `/usr/share/facelock/quirks.d` is loaded first and
+    /// `/etc/facelock/quirks.d` second, so an operator's `/etc` entry shadows
+    /// the shipped entry for the same device. First-match-wins would have
+    /// silently ignored that override — and since `force_ir = false` is
+    /// authoritative unconditionally, the entry an operator writes precisely
+    /// to disable a bad shipped `force_ir` is the one that most needs to win.
     pub fn find_match_with_kind(
         &self,
         device: &DeviceInfo,
         usb_ids: Option<&(String, String)>,
     ) -> Option<(&Quirk, QuirkMatchKind)> {
-        // First pass: match by USB vendor:product ID (most specific)
+        // First pass: match by USB vendor:product ID (most specific).
         if let Some((vendor, product)) = usb_ids {
-            for quirk in &self.quirks {
-                if let (Some(qv), Some(qp)) = (&quirk.vendor_id, &quirk.product_id) {
-                    if qv.eq_ignore_ascii_case(vendor) && qp.eq_ignore_ascii_case(product) {
-                        debug!(
-                            device = %device.path,
-                            vendor, product,
-                            notes = quirk.notes.as_deref().unwrap_or(""),
-                            "matched quirk by USB ID"
-                        );
-                        return Some((quirk, QuirkMatchKind::UsbId));
-                    }
-                }
+            let matched = self.quirks.iter().rev().find(|quirk| {
+                matches!(
+                    (&quirk.vendor_id, &quirk.product_id),
+                    (Some(qv), Some(qp))
+                        if qv.eq_ignore_ascii_case(vendor) && qp.eq_ignore_ascii_case(product)
+                )
+            });
+            if let Some(quirk) = matched {
+                debug!(
+                    device = %device.path,
+                    vendor, product,
+                    notes = quirk.notes.as_deref().unwrap_or(""),
+                    "matched quirk by USB ID"
+                );
+                return Some((quirk, QuirkMatchKind::UsbId));
             }
         }
 
-        // Second pass: match by name pattern
-        for quirk in &self.quirks {
-            if let Some(pattern) = &quirk.name_pattern {
-                // Simple case-insensitive substring/pattern matching
-                // We avoid the regex crate dependency by using a simple approach
-                if name_matches(pattern, &device.name) {
-                    debug!(
-                        device = %device.path,
-                        name = %device.name,
-                        pattern,
-                        notes = quirk.notes.as_deref().unwrap_or(""),
-                        "matched quirk by name pattern"
-                    );
-                    return Some((quirk, QuirkMatchKind::NameOnly));
-                }
-            }
+        // Second pass: match by name pattern. Simple case-insensitive
+        // pattern matching (see `name_matches`); we avoid the regex crate.
+        let matched = self.quirks.iter().rev().find(|quirk| {
+            quirk
+                .name_pattern
+                .as_deref()
+                .is_some_and(|pattern| name_matches(pattern, &device.name))
+        });
+        if let Some(quirk) = matched {
+            debug!(
+                device = %device.path,
+                name = %device.name,
+                pattern = quirk.name_pattern.as_deref().unwrap_or(""),
+                notes = quirk.notes.as_deref().unwrap_or(""),
+                "matched quirk by name pattern"
+            );
+            return Some((quirk, QuirkMatchKind::NameOnly));
         }
 
         None
@@ -613,6 +633,91 @@ notes = "Test camera"
         assert!(fp.is_unknown());
     }
 
+    /// An `/etc/facelock/quirks.d` entry must beat the shipped
+    /// `/usr/share/facelock/quirks.d` entry for the same device, in both
+    /// match passes.
+    ///
+    /// `load()` loads the shipped directory first and the operator's second,
+    /// and the shipped TOML comments direct operators to `/etc` to correct a
+    /// bad entry. That promise is only kept if matching honors load order, so
+    /// this exercises the real `load_dir` path rather than an in-memory
+    /// vector. The override under test disables a shipped `force_ir = true`,
+    /// which is the case that matters most: `force_ir = false` is
+    /// authoritative unconditionally, so a shadowed override is silent.
+    #[test]
+    fn etc_override_beats_shipped_quirk_for_same_device() {
+        let root =
+            std::env::temp_dir().join(format!("facelock-quirks-load-order-{}", std::process::id()));
+        let shipped = root.join("usr-share");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&shipped).unwrap();
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            shipped.join("00-defaults.toml"),
+            r#"
+[[quirk]]
+name_pattern = "(?i).* ir camera.*"
+force_ir = true
+warmup_frames = 8
+notes = "shipped"
+
+[[quirk]]
+vendor_id = "dead"
+product_id = "beef"
+force_ir = true
+notes = "shipped by usb id"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            etc.join("99-local.toml"),
+            r#"
+[[quirk]]
+name_pattern = "(?i).* ir camera.*"
+force_ir = false
+notes = "local override"
+
+[[quirk]]
+vendor_id = "dead"
+product_id = "beef"
+force_ir = false
+notes = "local override by usb id"
+"#,
+        )
+        .unwrap();
+
+        let mut db = QuirksDb::default();
+        db.load_dir(&shipped);
+        db.load_dir(&etc); // same order as QuirksDb::load()
+        std::fs::remove_dir_all(&root).ok();
+
+        // Name pass.
+        let device = make_device("Integrated IR Camera");
+        let (quirk, kind) = db
+            .find_match_with_kind(&device, None)
+            .expect("a name pattern matches");
+        assert_eq!(kind, QuirkMatchKind::NameOnly);
+        assert_eq!(
+            quirk.notes.as_deref(),
+            Some("local override"),
+            "the /etc name entry must win over the shipped one"
+        );
+        assert_eq!(quirk.force_ir, Some(false));
+
+        // USB-ID pass.
+        let ids = ("dead".to_string(), "beef".to_string());
+        let (quirk, kind) = db
+            .find_match_with_kind(&device, Some(&ids))
+            .expect("a USB id matches");
+        assert_eq!(kind, QuirkMatchKind::UsbId);
+        assert_eq!(
+            quirk.notes.as_deref(),
+            Some("local override by usb id"),
+            "the /etc USB-ID entry must win over the shipped one"
+        );
+        assert_eq!(quirk.force_ir, Some(false));
+    }
+
     #[test]
     fn quirks_load_dir_nonexistent() {
         let mut db = QuirksDb::default();
@@ -661,15 +766,19 @@ notes = "Full test quirk"
         }
     }
 
-    /// Table-driven regression for #99: every shipped `name_pattern` quirk
-    /// in `config/quirks.d/00-defaults.toml` must still match a plausible
-    /// real device name after anchoring, and none of them may match an
-    /// ordinary RGB webcam name — including the specific decoys ("Sirius
-    /// Camera", "AIR-Cam") that the pre-anchoring substring matcher was
-    /// fooled by. This mirrors `device::tests::ir_classification_corpus`'s
-    /// decoy corpus.
-    #[test]
-    fn shipped_quirk_name_patterns_match_intended_devices_and_reject_decoys() {
+    /// Ordinary RGB webcam names that no shipped `name_pattern` may match.
+    /// Includes the specific decoys ("Sirius Camera", "AIR-Cam") that the
+    /// pre-anchoring substring matcher was fooled by (#99). Mirrors
+    /// `device::tests::ir_classification_corpus`.
+    const QUIRK_NAME_DECOYS: &[&str] = &[
+        "Integrated Webcam",
+        "USB2.0 HD UVC WebCam",
+        "AIR-Cam",
+        "Sirius Camera",
+        "Chicony USB2.0 Camera",
+    ];
+
+    fn shipped_default_quirks() -> Option<Vec<Quirk>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -677,25 +786,35 @@ notes = "Full test quirk"
             .unwrap()
             .join("config/quirks.d/00-defaults.toml");
         if !path.exists() {
-            return;
+            return None;
         }
-        let quirks = QuirksDb::load_file(&path).expect("defaults file parses");
+        Some(QuirksDb::load_file(&path).expect("defaults file parses"))
+    }
 
-        // (substring identifying which pattern this is, a representative
-        // real device name it must still match)
+    /// Table-driven regression for #99: every shipped `name_pattern` quirk in
+    /// `config/quirks.d/00-defaults.toml` must still match a device name of
+    /// the shape it is written for, and none of them may match an ordinary
+    /// RGB webcam name.
+    ///
+    /// Keyed on the EXACT pattern string, not a substring of it. The earlier
+    /// substring keying silently collapsed several patterns onto one case, so
+    /// a pattern could be added without any name being asserted against it.
+    #[test]
+    fn shipped_quirk_name_patterns_match_intended_devices_and_reject_decoys() {
+        let Some(quirks) = shipped_default_quirks() else {
+            return;
+        };
+
+        // (exact shipped pattern, a device name of the shape it targets)
         let cases: &[(&str, &str)] = &[
-            ("ir camera", "IR Camera"),
-            ("surface", "Surface Pro IR Camera"),
-            ("hp", "HP IR Camera 5MP"),
-            ("dell", "Dell IR Camera"),
-        ];
-
-        let decoys = [
-            "Integrated Webcam",
-            "USB2.0 HD UVC WebCam",
-            "AIR-Cam",
-            "Sirius Camera",
-            "Chicony USB2.0 Camera",
+            ("(?i)ir camera.*", "IR Camera"),
+            ("(?i).* ir camera.*", "Integrated IR Camera"),
+            ("(?i)surface.* ir.*", "Surface Pro IR Camera"),
+            ("(?i).* surface.* ir.*", "Microsoft Surface IR Camera"),
+            ("(?i)hp.* ir.*", "HP IR Camera 5MP"),
+            ("(?i).* hp.* ir.*", "Chicony HP IR Camera"),
+            ("(?i)dell.* ir.*", "Dell IR Camera"),
+            ("(?i).* dell.* ir.*", "Integrated Dell IR Camera"),
         ];
 
         let mut exercised = 0;
@@ -703,18 +822,17 @@ notes = "Full test quirk"
             let Some(pattern) = &quirk.name_pattern else {
                 continue;
             };
-            let lower = pattern.to_lowercase();
             let (_, expected_name) = cases
                 .iter()
-                .find(|(needle, _)| lower.contains(needle))
+                .find(|(shipped, _)| shipped == pattern)
                 .unwrap_or_else(|| {
                     panic!("no test case wired up for shipped pattern {pattern:?} — add one")
                 });
             assert!(
                 name_matches(pattern, expected_name),
-                "pattern {pattern:?} should still match {expected_name:?} after anchoring"
+                "pattern {pattern:?} should match {expected_name:?}"
             );
-            for decoy in decoys {
+            for decoy in QUIRK_NAME_DECOYS {
                 assert!(
                     !name_matches(pattern, decoy),
                     "pattern {pattern:?} must NOT match decoy {decoy:?}"
@@ -727,5 +845,51 @@ notes = "Full test quirk"
             cases.len(),
             "every expected shipped name_pattern quirk was exercised"
         );
+    }
+
+    /// Card strings real IR cameras report, each of which must be matched by
+    /// at least ONE shipped `name_pattern`.
+    ///
+    /// The companion test above only proves each pattern matches *something*.
+    /// After #99's anchoring the shipped patterns were checked against names
+    /// derived from the patterns themselves, so nothing caught that
+    /// `(?i)ir camera.*` — the ThinkPad entry — could no longer match the
+    /// "Integrated IR Camera" nodes its own notes name. That false negative
+    /// is silent: the device still works, it just loses `warmup_frames`. This
+    /// test is keyed on hardware-reported names instead, so a pattern that
+    /// matches no real device fails here.
+    #[test]
+    fn shipped_quirk_name_patterns_match_real_hardware_names() {
+        let Some(quirks) = shipped_default_quirks() else {
+            return;
+        };
+        let patterns: Vec<&str> = quirks
+            .iter()
+            .filter_map(|q| q.name_pattern.as_deref())
+            .collect();
+
+        // V4L2 card strings are capped at 31 chars, hence the truncated forms.
+        let real_names = [
+            "IR Camera",
+            "Integrated IR Camera",
+            "Integrated IR Camera: Integrate",
+            "Chicony HP IR Camera",
+            "Microsoft Surface IR Camera",
+        ];
+
+        for name in real_names {
+            assert!(
+                patterns.iter().any(|p| name_matches(p, name)),
+                "no shipped name_pattern matches the real device name {name:?}"
+            );
+        }
+
+        // The corpus above must not have been bought with false positives.
+        for decoy in QUIRK_NAME_DECOYS {
+            assert!(
+                !patterns.iter().any(|p| name_matches(p, decoy)),
+                "a shipped name_pattern matches decoy {decoy:?}"
+            );
+        }
     }
 }
