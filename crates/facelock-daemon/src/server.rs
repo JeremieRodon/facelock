@@ -457,9 +457,10 @@ async fn resolve_caller_identity(
 }
 
 /// Every method on the `org.facelock.Daemon` D-Bus interface. Keep in sync
-/// with the `#[interface]` block below — the daemon has no integration seam
-/// for its D-Bus layer, so this enum plus [`Method::scope`] is the testable
-/// authorization matrix.
+/// with the `#[interface]` block below. This enum plus [`Method::scope`] is
+/// the authorization matrix; the in-module unit tests pin the table itself,
+/// and tests/server_authz.rs exercises it through the method-level entry
+/// points (D6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Method {
     Authenticate,
