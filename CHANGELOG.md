@@ -59,9 +59,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invoking user can be determined), so daemon commands like `facelock
   preview`/`test` work after setup without a manual `usermod`. A log-out/log-in
   reminder is printed.
+- **`facelock status` reports whether the PAM oneshot fallback is usable**: a
+  new "Oneshot fallback" section says whether root-invoked PAM could
+  authenticate via `/usr/bin/facelock auth` with the daemon unreachable — the
+  binary, both configured model files, and the database must be present — and
+  names whichever prerequisite is missing.
+- **`facelock status` explains the camera**: when the configured (or
+  auto-detected) device can be interrogated, the report shows its
+  evidence-based IR classification and any camera-quirks entries that will
+  shape how it is opened, so "why does this camera behave that way" is
+  answerable from the report. Auto-detect additionally names the device it
+  would select right now.
+- **`facelock status` flags a stale `is-enrolled` marker**: running as root it
+  compares the target user's marker against the database and prints a
+  diagnostic when they disagree (or when the marker is unreadable), pointing
+  at `sudo facelock setup` to reconcile. `is-enrolled` itself is unchanged.
 
 ### Changed
 
+- **`facelock status` says "cannot determine" instead of guessing**: a section
+  whose probe failed — an unreadable database, a config that did not parse —
+  now reports exactly that, and a daemon that is unreachable can never render
+  as "no faces enrolled". Previously a broken config silently dropped several
+  sections from the report; every section now always renders, as its value or
+  as honestly unknown. Internally the command is a pure renderer over a
+  `Health` fact model, so the report — including the exact bytes the container
+  tests grep — is pinned by unit tests.
 - **State directory and log permissions tightened — no paths moved, no data
   migration**. The database stays at `/var/lib/facelock/facelock.db` and the
   models at `/var/lib/facelock/models`; what changes are modes and ownership:

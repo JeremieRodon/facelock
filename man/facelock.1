@@ -218,7 +218,12 @@ Open config file in editor.
 .TP
 .B status
 Check system status including daemon connectivity, enrolled faces, camera
-availability, and model integrity.
+availability, and model integrity. Also reports whether the PAM module's
+oneshot fallback could authenticate with the daemon unreachable, and whether
+the target user's
+.B is\-enrolled
+marker agrees with the database. Requires root. A check that cannot be
+performed is reported as such; the report never substitutes a guessed value.
 .TP
 .B devices
 List available camera devices.

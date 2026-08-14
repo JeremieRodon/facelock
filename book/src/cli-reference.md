@@ -331,7 +331,10 @@ Shows device path, name, driver, formats, resolutions, and IR status.
 
 ## facelock status
 
-Check system status -- config, daemon, camera, models.
+Check system status -- config, daemon, oneshot fallback, camera, models,
+encryption, enrollment, security posture, notifications, PAM wiring. Requires
+root. A check that cannot be performed (unreadable database, broken config) is
+reported as "cannot determine" -- never as a guessed value.
 
 ```bash
 facelock status
