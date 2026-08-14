@@ -229,10 +229,12 @@ fn main() -> anyhow::Result<()> {
     match command {
         // Daemon and auth init their own tracing, so handle them separately
         Commands::Daemon { config } => {
-            if let Some(ref path) = config {
+            // The override is how `--config` reaches the daemon: startup, the
+            // live reload and the mtime watch all resolve the path through it.
+            if let Some(path) = config {
                 facelock_core::paths::set_process_config_override(PathBuf::from(path));
             }
-            commands::daemon::run(config, notifications::daemon_notifier_factory())
+            commands::daemon::run(notifications::daemon_notifier_factory())
         }
         Commands::Auth { user, config } => {
             if let Some(ref path) = config {

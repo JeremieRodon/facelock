@@ -9,8 +9,7 @@ use anyhow::{Context, bail};
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{Camera, ResolvedCamera, auto_detect_device, list_devices, validate_device};
 use facelock_core::config::{Config, EncryptionMethod};
-use facelock_core::traits::{CameraSource, FaceProcessor};
-use facelock_core::types::{MatchResult, zeroize_stored_embeddings};
+use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
 use facelock_daemon::auth::AuthOutcome;
 use facelock_daemon::auth::{PreCheckContext, pre_check_audited_with_context};
@@ -169,7 +168,8 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
 
     // Shared with daemon mode (crates/facelock-daemon/src/auth.rs). A local copy
     // of this loop previously lived here and silently drifted — do not re-fork it.
-    let response = authenticate_and_wipe(
+    // It wipes `stored` (D11), so nothing below may read it again.
+    let response = facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
         &mut stored,
@@ -184,26 +184,6 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         AuthOutcome::Error { message, .. } => bail!("{message}"),
         AuthOutcome::Suppressed => bail!("unexpected auth response"),
     }
-}
-
-/// Run the shared camera auth loop, then wipe the caller-side decrypted
-/// embeddings (#100). `authenticate_with_embeddings` copies the compare set
-/// and zeroizes only its own copies, so without this the plaintext templates
-/// passed in would outlive authentication in the caller's memory.
-pub fn authenticate_and_wipe<C: CameraSource, E: FaceProcessor>(
-    camera: &mut C,
-    engine: &mut E,
-    stored: &mut [(u32, facelock_core::types::FaceEmbedding)],
-    models: &[facelock_core::types::FaceModelInfo],
-    config: &Config,
-    user: &str,
-    source: AuditSource,
-) -> AuthOutcome {
-    let response = facelock_daemon::auth::authenticate_with_embeddings(
-        camera, engine, stored, models, config, user, source,
-    );
-    zeroize_stored_embeddings(stored);
-    response
 }
 
 /// Initialize a software sealer based on encryption config.
@@ -501,73 +481,5 @@ warmup_frames = 9
         let loaded = load_user_embeddings(&store, &config, "alice").unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, emb);
-    }
-
-    // --- D11 (#100): caller-side wipe of decrypted embeddings ---
-
-    /// The compare set handed to `authenticate_with_embeddings` is copied
-    /// internally and only the copies are zeroized; `authenticate_and_wipe`
-    /// must wipe the caller's buffer too. Covers the `facelock auth` and
-    /// direct-mode callers, which both go through this helper; the daemon
-    /// handler's inline wipe at its call site cannot be black-box asserted
-    /// from here.
-    #[test]
-    fn authenticate_and_wipe_zeroizes_caller_embeddings() {
-        use facelock_test_support::{MockCamera, MockFaceEngine, fixtures};
-
-        let emb = fixtures::known_embedding(1);
-        let mut camera = MockCamera::bright(64, 64, 4);
-        let mut engine = MockFaceEngine::one_face(emb);
-        let config = Config::parse(
-            r#"
-[recognition]
-threshold = 0.45
-timeout_secs = 2
-
-[security]
-require_ir = false
-require_frame_variance = false
-require_landmark_liveness = false
-abort_if_ssh = false
-abort_if_lid_closed = false
-"#,
-        )
-        .unwrap();
-
-        let mut stored = vec![(1u32, emb)];
-        let models = vec![facelock_core::types::FaceModelInfo {
-            id: 1,
-            user: "alice".into(),
-            label: "front".into(),
-            created_at: 0,
-            embedder_model: String::new(),
-            device_id: None,
-        }];
-
-        // The mock's default caps are non-IR with an all-None fingerprint —
-        // the same facts the removed loose parameters used to carry.
-        let response = authenticate_and_wipe(
-            &mut camera,
-            &mut engine,
-            &mut stored,
-            &models,
-            &config,
-            "alice",
-            AuditSource::Test,
-        );
-
-        assert!(
-            matches!(
-                response,
-                AuthOutcome::AuthResult(MatchResult { matched: true, .. })
-            ),
-            "auth loop must run to completion: {response:?}"
-        );
-        for (id, e) in &stored {
-            assert!(
-                e.iter().all(|&v| v == 0.0),
-                "caller-side embedding {id} was not wiped"
-            );
-        }
     }
 }

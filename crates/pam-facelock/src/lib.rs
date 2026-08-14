@@ -38,8 +38,10 @@ const DEFAULT_TIMEOUT_SECS: u32 = 5;
 
 /// The binary spawned for oneshot authentication. Hardcoded: a configurable
 /// path would let anyone who can influence the config select which binary a
-/// root PAM context executes (E7/N9). The path is still validated as
-/// root-owned and non-writable before spawning.
+/// root PAM context executes (E7/N9). It and its ancestors are still checked
+/// for root ownership and non-writability before spawning
+/// ([`verify_binary_trust`]) — the constant says which binary, the check says
+/// whether that binary is still trustworthy.
 const AUTH_BIN: &str = "/usr/bin/facelock";
 
 // D-Bus constants
@@ -109,18 +111,31 @@ impl Default for PamSecurityConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)] // Variants used via deserialization
 enum PamNotificationMode {
     Off,
-    /// Default must agree with `PamNotificationConfig::default()` below and
-    /// with facelock-core's `NotificationMode` (Terminal). This enum-level
-    /// default is what a present `[notification]` section with `mode` omitted
-    /// produces; the struct `Default` is what an absent section produces.
-    /// The two had drifted (`Both` here, `Terminal` there) — benign only
-    /// because `terminal()` treats Both and Terminal identically.
-    #[default]
+    /// The default mode, named once in [`PamNotificationConfig::default`] and
+    /// nowhere else. It must equal facelock-core's `NotificationMode`
+    /// default.
+    ///
+    /// This enum deliberately has no `Default` impl. It carried a second
+    /// answer to the same question and the two drifted (`Both` here,
+    /// `Terminal` there), undetected because `terminal()` treats Both and
+    /// Terminal identically. Deleting it is not just tidying: with no
+    /// `Default`, re-adding `#[serde(default)]` to the `mode` field does not
+    /// compile, so the drift cannot come back the way it arrived. The one
+    /// remaining route — `#[serde(default = "some_fn")]`, which needs no
+    /// `Default` — is caught by
+    /// `notification_section_present_with_keys_omitted_equals_absent`.
+    ///
+    /// facelock-core's mirror of this enum KEEPS its `Default`, deliberately:
+    /// two sibling enums there (`SnapshotMode`, `EncryptionMethod`) still
+    /// have live field-level defaults, so removing only this one would be a
+    /// locally-invisible asymmetry. The two crates must agree on the default
+    /// *value*, not on how each spells it. Do not "restore" this impl for
+    /// symmetry with core.
     Terminal,
     Desktop,
     Both,
@@ -133,13 +148,18 @@ enum PamNotificationMode {
 /// vocabulary as `facelock_core::notify::NotifyEvent`: `notify_prompt` ↔
 /// Scanning, `notify_on_success` ↔ Success. (This module renders them as
 /// PAM conversation text; desktop delivery is the daemon's job.)
+///
+/// `#[serde(default)]` sits on the container, not on the fields: every
+/// omitted key falls back to the [`Default`] impl below, so "section present,
+/// key omitted" and "section absent" produce the same values by construction
+/// instead of by two lists happening to agree. They did not agree once (D9),
+/// and the same shape in facelock-core's `NotificationConfig` shipped the
+/// same class of bug.
 #[derive(Deserialize)]
+#[serde(default)]
 struct PamNotificationConfig {
-    #[serde(default)]
     mode: PamNotificationMode,
-    #[serde(default = "default_true")]
     notify_prompt: bool,
-    #[serde(default = "default_true")]
     notify_on_success: bool,
 }
 
@@ -684,31 +704,32 @@ fn read_trusted_config(path: &str) -> Result<String, String> {
     Ok(content)
 }
 
-fn validate_auth_bin(path: &str) -> Result<PathBuf, String> {
-    if path.is_empty() {
-        return Err("auth_bin must not be empty".into());
-    }
-
-    let candidate = Path::new(path);
-    if !candidate.is_absolute() {
-        return Err("auth_bin must be an absolute path".into());
-    }
-
-    let canonical = candidate
+/// Establish that `path` is a binary this module may exec as root.
+///
+/// The trust is entirely in the filesystem checks: resolve symlinks, then
+/// require the target *and every ancestor directory* to be root-owned and not
+/// group- or world-writable. Nothing else about the path is validated —
+/// `AUTH_BIN` is a compiled-in absolute constant (there has been no
+/// configurable `auth_bin` since N9), and `canonicalize` returns an absolute
+/// path regardless, so the walk below establishes trust on its own.
+///
+/// Returns the canonical path to exec, or the reason it is not trusted.
+fn verify_binary_trust(path: &str) -> Result<PathBuf, String> {
+    let canonical = Path::new(path)
         .canonicalize()
-        .map_err(|e| format!("failed to resolve auth_bin: {e}"))?;
+        .map_err(|e| format!("failed to resolve {path}: {e}"))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let metadata = std::fs::metadata(&canonical)
-            .map_err(|e| format!("failed to stat auth_bin {}: {e}", canonical.display()))?;
+            .map_err(|e| format!("failed to stat {}: {e}", canonical.display()))?;
 
         validate_root_owned_nonwritable(
             metadata.uid(),
             metadata.permissions().mode(),
-            &format!("auth_bin {}", canonical.display()),
+            &format!("auth binary {}", canonical.display()),
         )?;
 
         let mut current = canonical.parent();
@@ -769,12 +790,12 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
 
     let timeout_secs = config.recognition.timeout_secs as u64 + 3; // buffer for model load
 
-    let auth_bin = match validate_auth_bin(AUTH_BIN) {
+    let auth_bin = match verify_binary_trust(AUTH_BIN) {
         Ok(path) => path,
         Err(e) => {
             log_auth(
                 service,
-                &format!("error: unsafe_auth_bin: {e}"),
+                &format!("error: untrusted_auth_binary: {e}"),
                 user,
                 LOG_WARNING,
             );
@@ -1217,30 +1238,27 @@ auth_bin = "/usr/local/bin/evil"
         assert_eq!(config.daemon.mode, "oneshot");
     }
 
+    /// An absent binary is untrusted, not "assume it's fine": the module
+    /// falls through to the next PAM module rather than exec'ing something
+    /// that appears later at that path.
     #[test]
-    fn validate_auth_bin_rejects_relative_paths() {
-        let err = validate_auth_bin("facelock").unwrap_err();
-        assert!(err.contains("absolute"));
-    }
-
-    #[test]
-    fn validate_auth_bin_rejects_missing_paths() {
-        let err = validate_auth_bin("/definitely/missing/facelock").unwrap_err();
+    fn verify_binary_trust_rejects_missing_paths() {
+        let err = verify_binary_trust("/definitely/missing/facelock").unwrap_err();
         assert!(err.contains("failed to resolve"));
     }
 
     #[cfg(unix)]
     #[test]
     fn validate_root_owned_nonwritable_rejects_group_writable_mode() {
-        let err =
-            validate_root_owned_nonwritable(0, 0o100775, "auth_bin /usr/bin/facelock").unwrap_err();
+        let err = validate_root_owned_nonwritable(0, 0o100775, "auth binary /usr/bin/facelock")
+            .unwrap_err();
         assert!(err.contains("group- or world-writable"));
     }
 
     #[cfg(unix)]
     #[test]
     fn validate_root_owned_nonwritable_rejects_non_root_owner() {
-        let err = validate_root_owned_nonwritable(1000, 0o100755, "auth_bin /usr/bin/facelock")
+        let err = validate_root_owned_nonwritable(1000, 0o100755, "auth binary /usr/bin/facelock")
             .unwrap_err();
         assert!(err.contains("owned by root"));
     }

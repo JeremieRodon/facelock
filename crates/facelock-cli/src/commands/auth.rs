@@ -177,7 +177,8 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     let models = store.list_models(&user).unwrap_or_default();
 
     let start = std::time::Instant::now();
-    let response = crate::direct::authenticate_and_wipe(
+    // Wipes `stored` (D11): nothing below may read the plaintext set again.
+    let response = facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
         &mut stored,
@@ -188,9 +189,9 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     );
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    // Note: authenticate_inner already writes audit entries for the camera-based
-    // auth loop. The oneshot path relies on those entries, so no additional audit
-    // logging is needed here for the auth result itself.
+    // Note: authenticate_with_embeddings already writes audit entries for the
+    // camera-based auth loop. The oneshot path relies on those entries, so no
+    // additional audit logging is needed here for the auth result itself.
 
     if matches!(
         response,
@@ -230,8 +231,8 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             kind: ErrorKind::AllFramesDark,
             ..
         } => {
-            // `authenticate_inner` already audited this one, so unlike the
-            // arm below there is nothing to write here.
+            // `authenticate_with_embeddings` already audited this one, so
+            // unlike the arm below there is nothing to write here.
             info!(user = %user, "all frames dark");
             oneshot_exit_code(ErrorKind::AllFramesDark)
         }

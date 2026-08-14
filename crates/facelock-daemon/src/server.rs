@@ -184,61 +184,64 @@ async fn resolve_caller_identity(
     Ok(CallerIdentity { uid, username })
 }
 
-/// Every method on the `org.facelock.Daemon` D-Bus interface. Keep in sync
-/// with the `#[interface]` block below. This enum plus [`Method::scope`] is
-/// the authorization matrix; the in-module unit tests pin the table itself,
-/// and tests/server_authz.rs exercises it through the method-level entry
-/// points (D6).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Method {
-    Authenticate,
-    TestAuthenticate,
-    Enroll,
-    ListModels,
-    RemoveModel,
-    ClearModels,
-    PreviewFrame,
-    PreviewDetectFrame,
-    ListDevices,
-    ReleaseCamera,
-    Ping,
-    Shutdown,
+/// Declare the D-Bus method vocabulary once: the variants, their wire names,
+/// and [`Method::ALL`] all come from this single list.
+///
+/// The matrix tests iterate `ALL`, so `ALL` being *complete* is what makes
+/// them mean anything — and a hand-written second copy of the variant list is
+/// exactly the thing that drifts. Generating it removes the possibility: a
+/// method added here lands in `ALL` and in `name()` or does not exist. (Drift
+/// could only ever under-test, since [`Method::scope`]'s catch-all keeps an
+/// unlisted method root-only, but a test that claims completeness should have
+/// it.)
+macro_rules! declare_methods {
+    ($($variant:ident => $wire:literal,)+) => {
+        /// Every method on the `org.facelock.Daemon` D-Bus interface. Keep in
+        /// sync with the `#[interface]` block below — the one direction no
+        /// type can enforce, and what
+        /// `interface_methods_and_the_authz_matrix_are_the_same_set` pins by
+        /// scanning this file. This enum plus [`Method::scope`] is the
+        /// authorization matrix; the in-module unit tests pin the table
+        /// itself, and tests/server_authz.rs exercises it through the
+        /// method-level entry points (D6).
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Method {
+            $($variant,)+
+        }
+
+        impl Method {
+            /// Every variant, complete by construction — see
+            /// [`declare_methods`].
+            #[cfg(test)]
+            const ALL: &'static [Method] = &[$(Method::$variant,)+];
+
+            /// The wire name, which is what denial messages and capture-slot
+            /// contention errors quote.
+            fn name(self) -> &'static str {
+                match self {
+                    $(Method::$variant => $wire,)+
+                }
+            }
+        }
+    };
+}
+
+declare_methods! {
+    Authenticate => "Authenticate",
+    TestAuthenticate => "TestAuthenticate",
+    Enroll => "Enroll",
+    ListModels => "ListModels",
+    RemoveModel => "RemoveModel",
+    ClearModels => "ClearModels",
+    PreviewFrame => "PreviewFrame",
+    PreviewDetectFrame => "PreviewDetectFrame",
+    ListDevices => "ListDevices",
+    ReleaseCamera => "ReleaseCamera",
+    Ping => "Ping",
+    Shutdown => "Shutdown",
 }
 
 impl Method {
-    #[cfg(test)]
-    const ALL: [Method; 12] = [
-        Method::Authenticate,
-        Method::TestAuthenticate,
-        Method::Enroll,
-        Method::ListModels,
-        Method::RemoveModel,
-        Method::ClearModels,
-        Method::PreviewFrame,
-        Method::PreviewDetectFrame,
-        Method::ListDevices,
-        Method::ReleaseCamera,
-        Method::Ping,
-        Method::Shutdown,
-    ];
-
-    fn name(self) -> &'static str {
-        match self {
-            Method::Authenticate => "Authenticate",
-            Method::TestAuthenticate => "TestAuthenticate",
-            Method::Enroll => "Enroll",
-            Method::ListModels => "ListModels",
-            Method::RemoveModel => "RemoveModel",
-            Method::ClearModels => "ClearModels",
-            Method::PreviewFrame => "PreviewFrame",
-            Method::PreviewDetectFrame => "PreviewDetectFrame",
-            Method::ListDevices => "ListDevices",
-            Method::ReleaseCamera => "ReleaseCamera",
-            Method::Ping => "Ping",
-            Method::Shutdown => "Shutdown",
-        }
-    }
-
     /// Authorization target for each method.
     ///
     /// `Authenticate` is the only user-scoped method: screen lockers run
@@ -470,12 +473,11 @@ where
             .and_then(|m| m.modified())
             .ok();
 
-        let needs_reload = {
-            let stored = self.config_mtime.lock().unwrap();
-            match (*stored, current_mtime) {
-                (Some(old), Some(new)) => new > old,
-                _ => false,
-            }
+        // A poisoned lock is not a reason to reload: keep serving with the
+        // handler already built, exactly as the two swap sites below do.
+        let needs_reload = match self.config_mtime.lock() {
+            Ok(stored) => matches!((*stored, current_mtime), (Some(old), Some(new)) if new > old),
+            Err(_) => false,
         };
 
         if !needs_reload {
@@ -588,7 +590,15 @@ where
             drop(capture_guard);
             match response {
                 DaemonResponse::AuthResult(result) => {
-                    // Send desktop notification (fire-and-forget, runs as root → setpriv)
+                    // Desktop notification, delivered as root via setpriv. NOT
+                    // fire-and-forget: the delivery path runs the helper with
+                    // `Command::output()`, which waits for the child, and this
+                    // runs before the reply below is built — so an auth reply
+                    // waits on it. The `Notifier` contract is that delivery
+                    // must not FAIL an authentication (errors are logged and
+                    // swallowed); staying cheap enough not to delay one is an
+                    // obligation of the implementation, not a guarantee of
+                    // this call site.
                     notify_auth_outcome(&notify_config, notifier_factory(&user).as_ref(), &result);
 
                     Ok(AuthResult {
@@ -1082,8 +1092,6 @@ pub fn run(
     rebuild: Option<ProductionRebuild>,
     notifier_factory: NotifierFactory,
 ) -> Result<(), ServerError> {
-    let handler = Arc::new(Mutex::new(handler));
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -1195,21 +1203,20 @@ fn drop_capabilities() -> std::result::Result<(), String> {
 }
 
 async fn run_dbus_server(
-    handler: Arc<Mutex<ProductionHandler>>,
+    handler: ProductionHandler,
     idle_timeout_secs: u64,
     startup_config_mtime: Option<std::time::SystemTime>,
     rebuild: Option<ProductionRebuild>,
     notifier_factory: NotifierFactory,
 ) -> Result<(), ServerError> {
-    let last_activity = Arc::new(AtomicU64::new(now_secs()));
-    let service = FacelockService {
-        handler: handler.clone(),
-        last_activity: last_activity.clone(),
-        config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
-        capture_slot: Arc::new(CaptureSlot::default()),
-        notifier_factory,
-        rebuild,
-    };
+    // Production builds the service through the same constructor the tests
+    // use, so an invariant added to `new` cannot silently skip the only
+    // instance that authenticates anyone. The struct literal this replaces
+    // existed to keep the two handles below; cloning them back off the
+    // service is what that cost.
+    let service = FacelockService::new(handler, startup_config_mtime, rebuild, notifier_factory);
+    let handler = service.handler.clone();
+    let last_activity = service.last_activity.clone();
 
     let _connection = zbus::connection::Builder::system()?
         .name(BUS_NAME)?
@@ -1444,8 +1451,9 @@ mod tests {
     // --- Authorization matrix (N13) ---
     //
     // Authenticate is the only user-scoped method; everything else is
-    // root-only. These tests iterate Method::ALL so a new method cannot be
-    // added without landing in the matrix.
+    // root-only. These tests iterate Method::ALL, which `declare_methods!`
+    // generates from the same list as the variants — so a new method really
+    // cannot be added without landing in the matrix.
 
     /// The wire method set and the authorization matrix must be the same
     /// set. `Method` is what [`authorize_method`] keys on, and zbus derives
@@ -1496,9 +1504,9 @@ mod tests {
         );
     }
 
-    /// `Method::name` is the wire name: it is what the denial messages and
-    /// the capture-slot contention errors quote, and what the scan above
-    /// compares against the interface block.
+    /// The wire name in the snake_case form zbus derives for the
+    /// `#[interface]` function, which is what the scan above compares
+    /// against.
     fn snake_case(name: &str) -> String {
         let mut out = String::with_capacity(name.len() + 3);
         for (i, ch) in name.char_indices() {
@@ -1517,7 +1525,7 @@ mod tests {
     #[test]
     fn authz_matrix_root_is_allowed_everywhere() {
         let root = caller(0, Some("root"));
-        for method in Method::ALL {
+        for method in Method::ALL.iter().copied() {
             assert!(
                 authorize_method(&root, method, Some("alice")).is_ok(),
                 "root must be allowed to call {method:?}"
@@ -1527,7 +1535,7 @@ mod tests {
 
     #[test]
     fn authz_matrix_every_method_is_root_only_except_authenticate() {
-        for method in Method::ALL {
+        for method in Method::ALL.iter().copied() {
             let expected = if method == Method::Authenticate {
                 Scope::UserScoped
             } else {
@@ -1540,7 +1548,7 @@ mod tests {
     #[test]
     fn authz_matrix_non_root_is_denied_every_root_scoped_method() {
         let alice = caller(1000, Some("alice"));
-        for method in Method::ALL {
+        for method in Method::ALL.iter().copied() {
             if method == Method::Authenticate {
                 continue;
             }

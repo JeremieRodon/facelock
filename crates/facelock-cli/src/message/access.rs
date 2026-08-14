@@ -61,13 +61,13 @@ impl Message for AccessMessage {
                 "enrollment timed out client-side; the daemon may have completed it — run `facelock list` before retrying",
             ),
             DaemonUnreachableFallback => translate(
-                "Warning: daemon.mode = \"daemon\" but the facelock daemon is unreachable — falling back to direct camera access.\nStart it with: sudo systemctl start facelock-daemon",
+                "Warning: daemon.mode = \"daemon\" but the facelock daemon is unreachable — falling back to direct camera access.\nStart the facelock-daemon service to use it.",
             ),
             PreviewGraphicalNeedsDaemonOneshot => translate(
                 "Graphical preview requires the daemon. In oneshot mode, use --text-only.\nFalling back to text-only mode.\n",
             ),
             PreviewGraphicalDaemonUnreachable => translate(
-                "Graphical preview requires the daemon, which is configured but not reachable.\nFalling back to text-only mode. Start the daemon with: sudo systemctl start facelock-daemon\n",
+                "Graphical preview requires the daemon, which is configured but not reachable.\nFalling back to text-only mode. Start the facelock-daemon service to use it.\n",
             ),
         }
     }

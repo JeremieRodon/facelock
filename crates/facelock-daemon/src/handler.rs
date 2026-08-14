@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use facelock_core::config::{Config, EncryptionMethod};
 use facelock_core::ipc::PreviewFace;
 use facelock_core::traits::{CameraSource, FaceProcessor};
-use facelock_core::types::{best_match, zeroize_stored_embeddings};
+use facelock_core::types::best_match;
 use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
@@ -635,18 +635,17 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
 
         // Split borrows: take camera out, run auth, put it back
         let mut camera = self.camera.take().unwrap();
+        // `stored` is wiped by the callee (D11) — this plaintext set must not
+        // be read again below.
         let result = auth::authenticate_with_embeddings(
             &mut camera,
             &mut self.engine,
-            &stored,
+            &mut stored,
             &models,
             &self.config,
             &user,
             intent.audit_source(),
         );
-        // `authenticate_with_embeddings` works on an internal copy;
-        // wipe the caller-side plaintext set too (#100).
-        zeroize_stored_embeddings(&mut stored);
         self.camera = Some(camera);
         self.camera_last_used = Instant::now();
         // Only failed auths count against the rate limit, and only for the

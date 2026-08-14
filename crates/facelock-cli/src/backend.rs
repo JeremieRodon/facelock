@@ -60,7 +60,10 @@ pub enum BackendKind {
 
 impl BackendKind {
     pub fn is_direct(self) -> bool {
-        !matches!(self, BackendKind::Daemon)
+        match self {
+            BackendKind::Daemon => false,
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => true,
+        }
     }
 }
 
@@ -157,11 +160,13 @@ impl<'a> Backend<'a> {
     pub fn has_models(&self, user: &str) -> anyhow::Result<bool> {
         match self.kind {
             BackendKind::Daemon => Ok(!self.daemon_list_models(user)?.is_empty()),
-            _ => self.direct_read(false, |store| {
-                store
-                    .has_models(user)
-                    .map_err(|e| anyhow::anyhow!("storage error: {e}"))
-            }),
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                self.direct_read(false, |store| {
+                    store
+                        .has_models(user)
+                        .map_err(|e| anyhow::anyhow!("storage error: {e}"))
+                })
+            }
         }
     }
 
@@ -172,11 +177,13 @@ impl<'a> Backend<'a> {
                 .daemon_list_models(user)?
                 .iter()
                 .any(|model| model.embedder_model == embedder)),
-            _ => self.direct_read(false, |store| {
-                store
-                    .has_models_for_embedder(user, embedder)
-                    .map_err(|e| anyhow::anyhow!("storage error: {e}"))
-            }),
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                self.direct_read(false, |store| {
+                    store
+                        .has_models_for_embedder(user, embedder)
+                        .map_err(|e| anyhow::anyhow!("storage error: {e}"))
+                })
+            }
         }
     }
 
@@ -184,11 +191,13 @@ impl<'a> Backend<'a> {
     pub fn list_models(&self, user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
         match self.kind {
             BackendKind::Daemon => self.daemon_list_models(user),
-            _ => self.direct_read(Vec::new(), |store| {
-                store
-                    .list_models(user)
-                    .map_err(|e| anyhow::anyhow!("storage error: {e}"))
-            }),
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                self.direct_read(Vec::new(), |store| {
+                    store
+                        .list_models(user)
+                        .map_err(|e| anyhow::anyhow!("storage error: {e}"))
+                })
+            }
         }
     }
 
@@ -204,12 +213,14 @@ impl<'a> Backend<'a> {
             // An absent store provably holds nothing to remove: report "not
             // found" without materializing a database (the per-site version
             // used the creating opener here).
-            _ => self.direct_read(Some(false), |store| {
-                store
-                    .remove_model(user, model_id)
-                    .map(Some)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            }),
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                self.direct_read(Some(false), |store| {
+                    store
+                        .remove_model(user, model_id)
+                        .map(Some)
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                })
+            }
         }
     }
 
@@ -222,13 +233,19 @@ impl<'a> Backend<'a> {
                 ipc_client::clear_models(user)?;
                 Ok(None)
             }
-            _ => {
-                // No `Absent` shortcut: callers check `has_models` first, so
-                // a vanished database is an error — erroring beats
-                // re-creating an empty database in its place.
-                let store = direct::open_store_existing(self.config)?;
-                let count = store.clear_user(user).map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(Some(count as usize))
+            // An absent store provably holds nothing to clear, so the honest
+            // answer is "cleared 0" — same as [`Backend::remove_model`]'s
+            // `Some(false)` for the same state, and without materializing the
+            // database (C7). This used to error on the grounds that callers
+            // check `has_models` first, which made the answer depend on call
+            // ordering the type could not express.
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                self.direct_read(Some(0), |store| {
+                    store
+                        .clear_user(user)
+                        .map(|count| Some(count as usize))
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                })
             }
         }
     }
@@ -239,7 +256,9 @@ impl<'a> Backend<'a> {
     pub fn enroll(&self, user: &str, label: &str) -> anyhow::Result<(u32, u32)> {
         match self.kind {
             BackendKind::Daemon => ipc_client::send_enroll(user, label, self.config),
-            _ => direct::enroll(self.config, user, label),
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                direct::enroll(self.config, user, label)
+            }
         }
     }
 
@@ -270,7 +289,9 @@ impl<'a> Backend<'a> {
                 }),
                 AuthOutcome::Error { message, .. } => bail!("daemon error: {message}"),
             },
-            _ => direct::authenticate(self.config, user),
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                direct::authenticate(self.config, user)
+            }
         }
     }
 
@@ -290,7 +311,9 @@ impl<'a> Backend<'a> {
                     }
                 })
             }
-            _ => direct::list_devices_info(),
+            BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
+                direct::list_devices_info()
+            }
         }
     }
 
@@ -554,6 +577,9 @@ mod tests {
         );
         assert!(backend.list_models("alice").unwrap().is_empty());
         assert_eq!(backend.remove_model("alice", 3).unwrap(), Some(false));
+        // Nothing enrolled anywhere is nothing to clear — not an error, and
+        // not a different answer from `remove_model`'s for the same state.
+        assert_eq!(backend.clear_models("alice").unwrap(), Some(0));
         assert!(
             !db_path.exists(),
             "benign reads must not create the database they report empty"

@@ -383,39 +383,6 @@ pub fn pre_check_audited_with_context(
     Some(resp)
 }
 
-/// Run the camera-based authentication loop with pre-loaded (decrypted) embeddings.
-///
-/// This is the only entry point: callers MUST load embeddings through their
-/// decryption-aware path (the daemon handler and the oneshot `facelock auth`
-/// binary both do), because embeddings are encrypted at rest by default
-/// (Plan 04). There is deliberately no store-reading variant here — reading
-/// `get_user_embeddings` directly would treat an encrypted blob as a raw
-/// embedding and fail.
-///
-/// `source` records which code path ran the loop; it is stamped into every
-/// audit entry written here. It marks the enforcement path, not caller intent:
-/// only `Test` (direct-mode `facelock test`) skips `pre_check`, so a `success`
-/// stamped `test` is a recognition result rather than an approved
-/// authentication.
-///
-/// The device's IR-ness (gating the IR texture liveness check) and its
-/// fingerprint (restricting the compare set to templates enrolled on this
-/// camera) are asked of `camera.capabilities()` — the camera in use, not a
-/// parameter a caller could get out of sync with it (gap D8).
-pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
-    camera: &mut C,
-    engine: &mut E,
-    stored: &[(u32, FaceEmbedding)],
-    models: &[facelock_core::types::FaceModelInfo],
-    config: &Config,
-    user: &str,
-    source: AuditSource,
-) -> AuthOutcome {
-    let mut stored = stored.to_vec();
-    let models = models.to_vec();
-    authenticate_inner(camera, engine, &mut stored, &models, config, user, source)
-}
-
 /// Save a snapshot of the last captured frame to disk.
 /// Failures are logged but never propagate — snapshots must not block auth.
 fn save_snapshot(snapshot_config: &SnapshotConfig, user: &str, similarity: f32, frame: &Frame) {
@@ -457,7 +424,66 @@ fn save_snapshot(snapshot_config: &SnapshotConfig, user: &str, similarity: f32, 
     debug!(path = %path.display(), "saved auth snapshot");
 }
 
-fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
+/// Plaintext embeddings wiped when the guard leaves scope — on every return
+/// path *and* on an unwind, which the hand-written per-return-site wipes this
+/// replaces could not cover (D11).
+///
+/// Generic over how the plaintext is held so the same guard covers both sets
+/// this module handles: the caller's buffer (`&mut [_]`, borrowed) and the
+/// device-filtered compare set (`Vec<_>`, owned). `zeroize`'s own `Zeroizing`
+/// cannot: it needs `T: Zeroize`, which `(u32, FaceEmbedding)` is not.
+struct Wiped<T>(T)
+where
+    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>;
+
+impl<T> std::ops::Deref for Wiped<T>
+where
+    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+{
+    type Target = [(u32, FaceEmbedding)];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl<T> Drop for Wiped<T>
+where
+    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+{
+    fn drop(&mut self) {
+        zeroize_stored_embeddings(self.0.as_mut());
+    }
+}
+
+/// Run the camera-based authentication loop with pre-loaded (decrypted) embeddings.
+///
+/// This is the only entry point: callers MUST load embeddings through their
+/// decryption-aware path (the daemon handler and the oneshot `facelock auth`
+/// binary both do), because embeddings are encrypted at rest by default
+/// (Plan 04). There is deliberately no store-reading variant here — reading
+/// `get_user_embeddings` directly would treat an encrypted blob as a raw
+/// embedding and fail.
+///
+/// **`stored` is consumed, not borrowed** (D11): this function wipes the
+/// caller's plaintext buffer as soon as it has filtered its own compare set
+/// out of it, so no caller has to remember to. That is why the parameter is
+/// `&mut` — the rule used to be caller-side convention, implemented once in a
+/// CLI-only wrapper and again inline in the daemon handler, which the daemon
+/// could not share. Every embedding here is zeroized on every exit path,
+/// including an unwind (see [`Wiped`]). Do not read `stored` after the call.
+///
+/// `source` records which code path ran the loop; it is stamped into every
+/// audit entry written here. It marks the enforcement path, not caller intent:
+/// only `Test` (direct-mode `facelock test`) skips `pre_check`, so a `success`
+/// stamped `test` is a recognition result rather than an approved
+/// authentication.
+///
+/// The device's IR-ness (gating the IR texture liveness check) and its
+/// fingerprint (restricting the compare set to templates enrolled on this
+/// camera) are asked of `camera.capabilities()` — the camera in use, not a
+/// parameter a caller could get out of sync with it (gap D8).
+pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
     stored: &mut [(u32, FaceEmbedding)],
@@ -466,6 +492,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     user: &str,
     source: AuditSource,
 ) -> AuthOutcome {
+    let stored = Wiped(stored);
     let device_is_ir = camera.capabilities().is_ir;
     let live_fingerprint = camera.capabilities().fingerprint.clone();
     let start = Instant::now();
@@ -480,11 +507,13 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     // a lockout. Fail SOFT by construction.
     let policy = config.security.device_binding_policy();
     let allowed = device_allowed_model_ids(models, &live_fingerprint, &policy);
-    let mut compare_set: Vec<(u32, FaceEmbedding)> = stored
-        .iter()
-        .filter(|(id, _)| allowed.contains(id))
-        .cloned()
-        .collect();
+    let compare_set = Wiped(
+        stored
+            .iter()
+            .filter(|(id, _)| allowed.contains(id))
+            .cloned()
+            .collect::<Vec<(u32, FaceEmbedding)>>(),
+    );
     if policy.enabled && compare_set.len() != stored.len() {
         let skipped = stored.len() - compare_set.len();
         warn!(
@@ -505,10 +534,11 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
             "device coupling: authenticating legacy template(s) with no device id (bind_legacy_templates); re-enroll to couple them to this camera"
         );
     }
-    // `compare_set` holds independent copies of the allowed embeddings; zero the
-    // original full set now that we no longer need it.
-    zeroize_stored_embeddings(stored);
-    let stored = compare_set.as_mut_slice();
+    // `compare_set` holds independent copies of the allowed embeddings, so the
+    // caller's full set is done here — dropping the guard wipes it (D11). This
+    // is the contract stated on this function: the caller keeps no plaintext
+    // after the call and has nothing to remember.
+    drop(stored);
 
     let deadline =
         Instant::now() + std::time::Duration::from_secs(config.recognition.timeout_secs as u64);
@@ -517,7 +547,9 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     // Sliding window over the most recent matched-frame embeddings. The gate
     // evaluates only this window, so an early too-still moment is forgotten
     // once the user moves (a static input still never passes: every window
-    // of a static sequence stays above the cutoff).
+    // of a static sequence stays above the cutoff). Like `compare_set` and the
+    // captured `Frame`s, it zeroizes itself on drop, so every exit path from
+    // here on — including an unwind — wipes it.
     let mut variance_window = FrameVarianceWindow::new(config.security.min_auth_frames);
     let mut matched_frames_total: u32 = 0;
     let mut variance_ever_passed = false;
@@ -616,7 +648,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                 );
                 continue;
             }
-            let (frame_best_sim, frame_best_id) = best_match(embedding, stored);
+            let (frame_best_sim, frame_best_id) = best_match(embedding, &compare_set);
 
             if frame_best_sim > best_similarity {
                 best_similarity = frame_best_sim;
@@ -706,9 +738,6 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                     face_detected,
                     failure_reason: None,
                 });
-                // Zero sensitive data before returning
-                zeroize_stored_embeddings(stored);
-                variance_window.zeroize_all();
                 return response;
             }
         } else if best_similarity >= threshold {
@@ -758,8 +787,6 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                 face_detected,
                 failure_reason: None,
             });
-            zeroize_stored_embeddings(stored);
-            variance_window.zeroize_all();
             return response;
         }
     }
@@ -776,10 +803,6 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     } else {
         None
     };
-
-    // Zero sensitive data before returning
-    zeroize_stored_embeddings(stored);
-    variance_window.zeroize_all();
 
     if dark_count == frame_count && frame_count > 0 {
         warn!(

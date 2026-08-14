@@ -28,6 +28,12 @@ use facelock_store::FaceStore;
 use facelock_test_support::fixtures;
 use facelock_test_support::{MockCamera, MockFaceEngine};
 
+/// The camera factory `Handler::new` takes. Named because the spelled-out
+/// type trips `clippy::type_complexity`, which the `--all-targets` lint gate
+/// makes a hard failure. Each integration test file is its own crate, so this
+/// cannot be shared without exporting a test-only type from production code.
+type MockCameraFactory = Box<dyn Fn(&Config) -> Result<MockCamera, String> + Send + Sync>;
+
 #[tokio::test]
 async fn test_authenticate_skips_the_ssh_gate_that_authenticate_enforces() {
     let config = Config::parse(
@@ -61,8 +67,7 @@ enabled = false
         config.security.rate_limit.max_attempts,
         config.security.rate_limit.window_secs,
     );
-    let factory: Box<dyn Fn(&Config) -> Result<MockCamera, String> + Send + Sync> =
-        Box::new(|_| Ok(MockCamera::bright(64, 64, 60)));
+    let factory: MockCameraFactory = Box::new(|_| Ok(MockCamera::bright(64, 64, 60)));
     let handler = Handler::new(
         config,
         MockFaceEngine::one_face(emb),
