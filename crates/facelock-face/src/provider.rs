@@ -115,12 +115,21 @@ pub enum ProviderKind {
 
 impl ProviderKind {
     /// Every provider, in the order the "valid values" error message lists them.
-    const ALL: [ProviderKind; 4] = [
+    ///
+    /// Public so user-facing text that enumerates providers can be checked
+    /// against it instead of hardcoding a parallel list — see
+    /// [`ProviderKind::all_names`].
+    pub const ALL: [ProviderKind; 4] = [
         ProviderKind::Cpu,
         ProviderKind::Cuda,
         ProviderKind::Rocm,
         ProviderKind::OpenVino,
     ];
+
+    /// The config-file spellings of every provider, in message order.
+    pub fn all_names() -> impl Iterator<Item = &'static str> {
+        ProviderKind::ALL.into_iter().map(ProviderKind::as_str)
+    }
 
     /// GPU providers in auto-selection priority order: the first one the
     /// installed ONNX Runtime actually supports wins. CPU is not listed —

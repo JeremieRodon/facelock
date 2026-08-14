@@ -164,7 +164,7 @@ fn render_fallback(out: &mut String, fallback: &Fact<OneshotFallback>) {
                 &StatusMessage::StatusLabelOneshotFallback,
                 &fallback.auth_bin,
             );
-            if fallback.usable() {
+            if fallback.prerequisites_present() {
                 result(out, true, &StatusMessage::StatusFallbackUsable);
             } else {
                 let missing = StatusMessage::StatusMissing.localized();
@@ -622,7 +622,7 @@ facelock system status
   Daemon: org.facelock.Daemon (D-Bus system bus)
     [ok] responding
   Oneshot fallback: /usr/bin/facelock
-    [ok] usable (root-invoked PAM can authenticate via 'facelock auth' without the daemon)
+    [ok] prerequisites present (binary, models and database in place for daemon-less auth)
   Camera device: /dev/video2
     [ok] device exists
     - ir: yes
@@ -802,7 +802,7 @@ facelock system status
         let report = render(&healthy());
         assert!(
             report.contains(
-                "    [ok] usable (root-invoked PAM can authenticate via 'facelock auth' without the daemon)\n"
+                "    [ok] prerequisites present (binary, models and database in place for daemon-less auth)\n"
             ),
             "{report}"
         );
@@ -820,7 +820,7 @@ facelock system status
         assert!(!report.contains("    - binary: MISSING\n"), "{report}");
         assert!(
             report.contains(
-                "    [!!] not usable (PAM would fall through to the next auth method if the daemon is unreachable)\n"
+                "    [!!] prerequisites missing (PAM would fall through to the next auth method if the daemon is unreachable)\n"
             ),
             "{report}"
         );
