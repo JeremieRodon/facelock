@@ -45,6 +45,8 @@ bytemuck = "1"
 [dev-dependencies]
 tempfile = "3"
 facelock-test-support = { path = "../facelock-test-support" }
+# Raw SQL access for schema-level failure injection in tests.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [features]
 default = ["wayland"]

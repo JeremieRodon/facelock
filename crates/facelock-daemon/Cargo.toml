@@ -29,3 +29,5 @@ tpm = ["facelock-tpm/tpm"]
 
 [dev-dependencies]
 facelock-test-support = { path = "../facelock-test-support" }
+# Raw SQL access for schema-level failure injection in integration tests.
+rusqlite = { version = "0.40", features = ["bundled"] }
