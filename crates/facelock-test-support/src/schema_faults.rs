@@ -93,12 +93,9 @@ pub fn break_face_models_table(db_path: &Path) {
 /// Remove the `embedder_model` column from `face_models`, so a query that
 /// selects it fails while the database as a whole stays open and usable.
 ///
-/// Its caller — the daemon's `authenticate_storage_failure_*` integration
-/// test — is **not** on this branch: `crates/facelock-daemon` belongs to a
-/// concurrent change, and still carries the raw `ALTER TABLE` this replaces
-/// (along with the `rusqlite` dev-dependency it needs). Converting that call
-/// site is a cross-branch follow-up; this half is exported and documented so
-/// the conversion is a one-line change when it lands.
+/// Its only caller is the daemon's
+/// `authenticate_storage_failure_is_error_and_charges_no_rate_limit`
+/// integration test.
 ///
 /// **Schema coupling, two ways.** First, the column must actually be in the
 /// select list of the query under test — drop a column nothing reads and the
