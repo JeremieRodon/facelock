@@ -9,21 +9,6 @@ use facelock_core::Config;
 
 use crate::ipc_client;
 
-fn resolve_user(user: Option<String>) -> anyhow::Result<String> {
-    match user {
-        Some(u) => Ok(u),
-        None => {
-            let uid = unsafe { libc::getuid() };
-            let pw = unsafe { libc::getpwuid(uid) };
-            if pw.is_null() {
-                anyhow::bail!("could not determine current user");
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) };
-            Ok(name.to_string_lossy().into_owned())
-        }
-    }
-}
-
 pub fn run(text_only: bool, user: Option<String>) -> anyhow::Result<()> {
     // DEC-6/N13: `PreviewDetectFrame` is root-only now — it was the last
     // unprivileged consumer of a per-frame similarity score (the
@@ -31,7 +16,10 @@ pub fn run(text_only: bool, user: Option<String>) -> anyhow::Result<()> {
     ipc_client::require_root("sudo facelock preview")?;
 
     let config = Config::load().context("failed to load config")?;
-    let user = resolve_user(user)?;
+    // One user-resolution implementation (C5, issue #105). The local
+    // getpwuid-only version this replaces resolved `sudo facelock preview`
+    // to *root*, so the preview never recognized the actual user.
+    let user = ipc_client::resolve_user(user.as_deref());
 
     if ipc_client::should_use_direct(&config) {
         if !text_only {
@@ -72,4 +60,29 @@ fn run_graphical(user: &str) -> anyhow::Result<()> {
          Using text-only mode.\n"
     );
     text_only::run(user)
+}
+
+#[cfg(test)]
+mod tests {
+    /// C5 (issue #105): preview resolves its user through the one shared
+    /// resolver, whose precedence honors SUDO_USER — the deleted local
+    /// implementation used getpwuid only, so `sudo facelock preview`
+    /// previewed for root and never recognized anyone. The euid-0 half of
+    /// the bug cannot be reproduced in a unit test; what this pins is the
+    /// resolver's SUDO_USER precedence, which is exactly the behavior the
+    /// getpwuid-only version lacked.
+    #[test]
+    fn shared_resolver_honors_sudo_user() {
+        // SAFETY: process-global env mutation; no other test in this binary
+        // asserts on SUDO_USER (checked), and the one concurrent reader
+        // (`resolve_user_no_flag_falls_through`) only requires a non-empty
+        // result.
+        unsafe { std::env::set_var("SUDO_USER", "preview-c5-alice") };
+        let resolved = crate::ipc_client::resolve_user(None);
+        unsafe { std::env::remove_var("SUDO_USER") };
+        assert_eq!(resolved, "preview-c5-alice");
+
+        // The explicit flag still wins over the environment.
+        assert_eq!(crate::ipc_client::resolve_user(Some("bob")), "bob");
+    }
 }

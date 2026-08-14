@@ -267,9 +267,10 @@ fn check_enrolled(config: &Option<Config>) {
         return;
     };
 
-    let user = std::env::var("SUDO_USER")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown".into());
+    // One user-resolution implementation (C5, issue #105): the local
+    // SUDO_USER→USER chain this replaces omitted DOAS_USER and the getpwuid
+    // fallback, so `doas facelock status` reported root's enrollment.
+    let user = crate::ipc_client::resolve_user(None);
 
     print_status_item("Enrolled faces", &user);
 
