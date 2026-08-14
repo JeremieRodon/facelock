@@ -1,6 +1,7 @@
 mod commands;
 pub mod direct;
 mod ipc_client;
+pub mod message;
 pub mod notifications;
 pub mod resolved;
 pub mod state_layout;
@@ -217,6 +218,10 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Localization first: user-facing text (D10) may render before any
+    // subcommand dispatch. Log/tracing output is unaffected by design (D2).
+    message::init();
+
     let cli = Cli::parse();
     let Cli { config, command } = cli;
 

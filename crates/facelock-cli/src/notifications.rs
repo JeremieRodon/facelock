@@ -8,19 +8,14 @@
 use facelock_core::notify::{Notifier, NotifierFactory, NotifyEvent};
 use tracing::debug;
 
-/// Body text for the notification.
+use crate::message::UserMessage;
+
+/// Body text for the notification: user-facing, so it renders through the
+/// message seam (gettext at this edge, D10). The `reason` inside
+/// `NotifyEvent::Failure` is still free text composed upstream — making it
+/// structured is an H4 vocabulary follow-up.
 fn body(event: &NotifyEvent) -> String {
-    match event {
-        NotifyEvent::Scanning => "Scanning face...".to_string(),
-        NotifyEvent::Success { label, similarity } => {
-            if let Some(label) = label {
-                format!("Welcome, {label}")
-            } else {
-                format!("Face recognized ({similarity:.2})")
-            }
-        }
-        NotifyEvent::Failure { reason } => format!("Face auth failed: {reason}"),
-    }
+    UserMessage::from(event).localized()
 }
 
 /// Freedesktop icon name for the notification.
