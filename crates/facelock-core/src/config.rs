@@ -331,6 +331,27 @@ impl Default for SecurityConfig {
 /// - `"terminal"` — PAM conversation text only ("Identifying face...", "Face recognized.")
 /// - `"desktop"` — desktop popups only (via D-Bus/notify-send)
 /// - `"both"` — terminal text and desktop popups
+///
+/// **This `Default` is kept deliberately, and its PAM mirror is deliberately
+/// deleted.** After [`NotificationConfig`] moved to a container-level
+/// `#[serde(default)]`, nothing calls this impl — the section default names
+/// the mode explicitly. It stays because its two siblings in this file,
+/// [`SnapshotMode`] and [`EncryptionMethod`], still have live `Default`s via
+/// their own field-level defaults, so one enum here silently lacking one
+/// would read as an oversight rather than a decision.
+///
+/// The cost of keeping it is a second answer to "what is the default mode",
+/// and this is the impl that drifted to `Both` in a shipped release — so
+/// `notification_mode_default_agrees_with_the_section_default` pins the two
+/// equal. `pam-facelock`'s `PamNotificationMode` deleted its `Default`
+/// instead, which is stronger where it applies: with no impl, re-adding
+/// `#[serde(default)]` to the field is a compile error rather than a test
+/// failure. That option is not open here while the siblings need theirs.
+///
+/// The contract between the two crates is agreement on the default *value*
+/// (`Terminal` on both sides), not on how each spells it. Do not delete this
+/// impl for symmetry with PAM, and do not restore PAM's for symmetry with
+/// this one.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationMode {
@@ -828,19 +849,13 @@ path = "/dev/video0"
         }
     }
 
-    /// `NotificationMode`'s own `Default` went unused when the container-level
-    /// `#[serde(default)]` above removed the field-level default that called
-    /// it — `NotificationConfig::default()` names the mode explicitly. It is
-    /// kept rather than deleted, because its two sibling enums in this file
-    /// (`SnapshotMode`, `EncryptionMethod`) still have live `Default`s via
-    /// their own field-level defaults, and one enum silently lacking a
-    /// `Default` reads as an oversight rather than a decision.
-    ///
-    /// Keeping it means two answers to "what is the default mode" exist, and
-    /// that impl is the one that drifted to `Both` in a shipped release — so
-    /// pin them equal. This also covers the case a deletion could not: if
-    /// `#[serde(default)]` is ever re-added to the `mode` field, the enum's
-    /// answer becomes authoritative again, and this catches it disagreeing.
+    /// `NotificationMode::default()` is unused but deliberately kept — see
+    /// its own docs for why, and for why PAM's mirror deleted theirs. Keeping
+    /// it leaves two answers to "what is the default mode", and this impl is
+    /// the one that drifted to `Both` in a shipped release, so pin them
+    /// equal. Also covers what a deletion could not: if `#[serde(default)]`
+    /// is ever re-added to the `mode` field, the enum's answer becomes
+    /// authoritative again and this catches it disagreeing.
     #[test]
     fn notification_mode_default_agrees_with_the_section_default() {
         assert_eq!(
