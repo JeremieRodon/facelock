@@ -1,4 +1,3 @@
-use anyhow::Context;
 use chrono::Local;
 
 use facelock_core::Config;
@@ -9,6 +8,7 @@ use facelock_store::StoreError;
 use crate::ipc_client;
 
 pub fn run(
+    config: &Config,
     user: Option<String>,
     label: Option<String>,
     skip_setup_check: bool,
@@ -36,8 +36,6 @@ pub fn run(
     }
 
     ipc_client::require_root("sudo facelock enroll")?;
-
-    let config = Config::load().context("failed to load config")?;
 
     // Encryption posture (Plan 04): refuse plaintext enrollment unless opted in;
     // warn prominently when the opt-in is active.
@@ -69,7 +67,7 @@ pub fn run(
         Some(label) => label,
         None => {
             let date = Local::now().format("%Y-%m-%d").to_string();
-            next_label(&date, &user, &config)?
+            next_label(&date, &user, config)?
         }
     };
 
@@ -79,8 +77,8 @@ pub fn run(
     // enrollment ahead needs the very store this check just failed to read.
     {
         let config_embedder = &config.recognition.embedder_model;
-        let has_stale = if ipc_client::should_use_direct(&config) {
-            direct_has_stale_embedder(&config, &user, config_embedder)?
+        let has_stale = if ipc_client::should_use_direct(config) {
+            direct_has_stale_embedder(config, &user, config_embedder)?
         } else {
             let request = DaemonRequest::ListModels { user: user.clone() };
             match ipc_client::send_request(&request)? {
@@ -107,21 +105,21 @@ pub fn run(
     println!("Enrolling face for user '{user}' with label '{label}'...");
     println!("Look at the camera. Slowly turn your head left and right.");
 
-    if ipc_client::should_use_direct(&config) {
+    if ipc_client::should_use_direct(config) {
         ipc_client::require_root("sudo facelock enroll")?;
-        let (model_id, embedding_count) = crate::direct::enroll(&config, &user, &label)?;
+        let (model_id, embedding_count) = crate::direct::enroll(config, &user, &label)?;
         println!(
             "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
         );
-        super::enrollment_marker::refresh(&config, &user);
-        check_model_count(&user, &config);
+        super::enrollment_marker::refresh(config, &user);
+        check_model_count(&user, config);
         return Ok(());
     }
 
     // Dedicated call with a timeout derived from the daemon's enrollment
     // deadline — the shared 15s proxy would abort mid-enrollment (issue #89).
     // send_enroll yields Enrolled or an error, so there is no other arm.
-    let response = ipc_client::send_enroll(&user, &label, &config)?;
+    let response = ipc_client::send_enroll(&user, &label, config)?;
 
     if let DaemonResponse::Enrolled {
         model_id,
@@ -131,8 +129,8 @@ pub fn run(
         println!(
             "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
         );
-        super::enrollment_marker::refresh(&config, &user);
-        check_model_count(&user, &config);
+        super::enrollment_marker::refresh(config, &user);
+        check_model_count(&user, config);
     }
 
     Ok(())

@@ -710,6 +710,10 @@ impl FacelockService {
             // without this a few `facelock test` runs would lock the user
             // out of real authentication. See `Handler::handle_authenticate`.
             let response = handler.handle_authenticate(user.clone(), !caller_is_root);
+            // Notification settings come from the handler's config — the
+            // freshest parse, since maybe_reload_handler ran at method entry.
+            // No mid-request file re-read (D7).
+            let notify_config = handler.config.notification.clone();
             drop(handler);
             // Capture finished — free the slot before slower follow-up work
             // (notifications) so the next auth isn't rejected needlessly.
@@ -727,9 +731,6 @@ impl FacelockService {
                             reason: "no match".into(),
                         }
                     };
-                    // Re-read notification config from disk so changes
-                    // take effect without daemon restart
-                    let notify_config = Config::load().map(|c| c.notification).unwrap_or_default();
                     crate::notifications::notify_if_enabled_for_user(&notify_config, &event, &user);
 
                     Ok(AuthResult {
@@ -1134,6 +1135,9 @@ type CameraFactory = Box<dyn Fn(&Config) -> Result<Camera<'static>, String> + Se
 /// Build a new handler from config. Used at startup and for live config reload.
 /// Returns the handler and idle_timeout_secs from the loaded config.
 fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), String> {
+    // Deliberate re-read (D7): this is the daemon's config lifecycle — one
+    // parse at startup, one per mtime-triggered reload (maybe_reload_handler).
+    // Everything downstream consumes the Config held by the handler.
     let config = match config_path {
         Some(p) => Config::load_from(Path::new(p)),
         None => Config::load(),

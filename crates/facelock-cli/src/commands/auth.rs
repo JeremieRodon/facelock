@@ -17,6 +17,8 @@ use facelock_store::FaceStore;
 use tracing::{debug, error, info};
 
 pub fn run(user: String, config_path: Option<String>) -> i32 {
+    // Deliberate parse (D7): `facelock auth` is its own one-shot process
+    // spawned by PAM, so this is its top-of-process read — not a re-read.
     let config = match config_path {
         Some(ref p) => Config::load_from(Path::new(p)),
         None => Config::load(),

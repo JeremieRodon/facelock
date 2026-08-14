@@ -1,4 +1,3 @@
-use anyhow::Context;
 use chrono::{Local, TimeZone};
 
 use facelock_core::Config;
@@ -7,7 +6,7 @@ use facelock_core::types::FaceModelInfo;
 
 use crate::ipc_client;
 
-pub fn run(user: Option<String>, json: bool) -> anyhow::Result<()> {
+pub fn run(config: &Config, user: Option<String>, json: bool) -> anyhow::Result<()> {
     // DEC-6/N4: `ListModels` is root-only now (was facelock-group). The
     // direct-mode fallback in `fetch_models` already required root when the
     // 0600 root:root database wasn't readable; checking up front here gives
@@ -15,10 +14,9 @@ pub fn run(user: Option<String>, json: bool) -> anyhow::Result<()> {
     // of a bare AccessDenied.
     ipc_client::require_root("sudo facelock list")?;
 
-    let config = Config::load().context("failed to load config")?;
     let user = ipc_client::resolve_user(user.as_deref());
 
-    let models = fetch_models(&config, &user)?;
+    let models = fetch_models(config, &user)?;
 
     if json {
         print_json(&models);

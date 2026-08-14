@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use anyhow::Context;
 
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
@@ -8,7 +7,7 @@ use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use crate::ipc_client;
 use crate::notifications::{NotifyEvent, notify_if_enabled};
 
-pub fn run(user: Option<String>) -> anyhow::Result<()> {
+pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     // N11 (issue #96): `facelock test` is root-only regardless of transport
     // (direct or daemon-mediated) — keeps similarity scores and full detail,
     // and lets both the daemon and direct paths safely exempt failed test
@@ -16,7 +15,6 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     // to the rate-limit table). Must run before any prompt or output (C6).
     ipc_client::require_root("sudo facelock test")?;
 
-    let config = Config::load().context("failed to load config")?;
 
     // Check models exist — offer to run setup if missing
     let model_dir = std::path::Path::new(&config.daemon.model_dir);
@@ -42,8 +40,8 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     // and a store that doesn't exist yet both mean "not enrolled" — but a
     // store that is present and cannot be read is an error, and must never be
     // reported as "no models enrolled".
-    let has_models = if ipc_client::should_use_direct(&config) {
-        direct_user_has_models(&config, &user)?
+    let has_models = if ipc_client::should_use_direct(config) {
+        direct_user_has_models(config, &user)?
     } else {
         // Propagate a failed query instead of folding it into "no models
         // enrolled" — an AccessDenied here carries its own actionable hint.
@@ -66,11 +64,11 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     // branches used to guess in opposite directions).
     {
         let config_embedder = &config.recognition.embedder_model;
-        let has_matching = if ipc_client::should_use_direct(&config) {
+        let has_matching = if ipc_client::should_use_direct(config) {
             // `open_store_existing`: the store answered has_models one query
             // ago, so it exists; if it vanished since, that is an error, not
             // a cue to create an empty one and warn about a stale embedder.
-            let store = crate::direct::open_store_existing(&config)?;
+            let store = crate::direct::open_store_existing(config)?;
             store
                 .has_models_for_embedder(&user, config_embedder)
                 .map_err(|e| anyhow::anyhow!("storage error: {e}"))?
@@ -98,9 +96,9 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
 
     notify_if_enabled(notif_config, &NotifyEvent::Scanning);
 
-    if ipc_client::should_use_direct(&config) {
+    if ipc_client::should_use_direct(config) {
         let start = Instant::now();
-        match crate::direct::authenticate(&config, &user) {
+        match crate::direct::authenticate(config, &user) {
             Ok(result) if result.matched => {
                 let elapsed = start.elapsed();
                 println!(

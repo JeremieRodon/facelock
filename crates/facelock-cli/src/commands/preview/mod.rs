@@ -4,31 +4,29 @@ mod text_only;
 #[cfg(feature = "wayland")]
 mod wayland_preview;
 
-use anyhow::Context;
 use facelock_core::Config;
 
 use crate::ipc_client;
 
-pub fn run(text_only: bool, user: Option<String>) -> anyhow::Result<()> {
+pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Result<()> {
     // DEC-6/N13: `PreviewDetectFrame` is root-only now — it was the last
     // unprivileged consumer of a per-frame similarity score (the
     // hill-climbing oracle N12/N13 close by construction).
     ipc_client::require_root("sudo facelock preview")?;
 
-    let config = Config::load().context("failed to load config")?;
     // One user-resolution implementation (C5, issue #105). The local
     // getpwuid-only version this replaces resolved `sudo facelock preview`
     // to *root*, so the preview never recognized the actual user.
     let user = ipc_client::resolve_user(user.as_deref());
 
-    if ipc_client::should_use_direct(&config) {
+    if ipc_client::should_use_direct(config) {
         if !text_only {
             eprintln!(
                 "Graphical preview requires the daemon. In oneshot mode, use --text-only.\n\
                  Falling back to text-only mode.\n"
             );
         }
-        return text_only::run_direct(&config, &user);
+        return text_only::run_direct(config, &user);
     }
 
     if text_only {

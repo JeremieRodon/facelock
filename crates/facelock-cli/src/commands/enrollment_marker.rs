@@ -103,6 +103,9 @@ fn marker_dir_for_db(db_path: &Path) -> Option<PathBuf> {
 /// [`DEFAULT_MARKER_DIR`] when the config is missing or unreadable.
 ///
 /// Reads a file and nothing else — safe on the unprivileged `is-enrolled` path.
+///
+/// Deliberate load (D7): `is-enrolled` is dispatched before main's shared
+/// config parse precisely so it can tolerate a missing or broken config here.
 pub fn marker_dir_or_default() -> PathBuf {
     Config::load()
         .map(|config| marker_dir(&config))

@@ -6,7 +6,7 @@ use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
 use crate::ipc_client;
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(loaded: crate::resolved::ConfigLoad) -> anyhow::Result<()> {
     // DEC-6/N4: every D-Bus method `status` calls (`Ping`, and `ListModels`
     // via `check_enrolled`) is root-only now, and its direct-mode reads hit
     // the same 0600 root:root database. Check before the first line of
@@ -15,32 +15,34 @@ pub fn run() -> anyhow::Result<()> {
 
     println!("facelock system status\n");
 
-    // 1. Config
-    check_config();
+    // 1. Config — renders the process's one parse outcome (D7); a broken
+    // config file is a finding to report, not an exit.
+    check_config(&loaded);
+    let config = loaded.config();
 
     // 2. Daemon
-    let config = check_daemon();
+    check_daemon(config);
 
     // 3. Camera
-    check_camera(&config);
+    check_camera(config);
 
     // 4. Models
-    check_models(&config);
+    check_models(config);
 
     // 5. Inference
-    check_inference(&config);
+    check_inference(config);
 
     // 6. Encryption
-    check_encryption(&config);
+    check_encryption(config);
 
     // 7. Enrolled faces
-    check_enrolled(&config);
+    check_enrolled(config);
 
     // 8. Security
-    check_security(&config);
+    check_security(config);
 
     // 9. Notifications
-    check_notifications(&config);
+    check_notifications(config);
 
     // 10. PAM
     check_pam();
@@ -48,16 +50,10 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn check_config() {
-    let config_path = facelock_core::paths::config_path();
-    print_status_item("Config file", &config_path.display().to_string());
+fn check_config(loaded: &crate::resolved::ConfigLoad) {
+    print_status_item("Config file", &loaded.path.display().to_string());
 
-    if !config_path.exists() {
-        print_result(false, "not found");
-        return;
-    }
-
-    match Config::load_from(&config_path) {
+    match &loaded.result {
         Ok(config) => {
             print_result(true, "valid");
             print_detail(
@@ -65,27 +61,27 @@ fn check_config() {
                 config.device.path.as_deref().unwrap_or("(auto-detect)"),
             );
         }
+        Err(facelock_core::config::ConfigError::NotFound(_)) => {
+            print_result(false, "not found");
+        }
         Err(e) => {
             print_result(false, &format!("invalid: {e}"));
         }
     }
 }
 
-fn check_daemon() -> Option<Config> {
-    let config = match Config::load() {
-        Ok(c) => c,
-        Err(_) => {
-            print_status_item("Daemon", "");
-            print_result(false, "config not loaded, cannot check daemon");
-            return None;
-        }
+fn check_daemon(config: Option<&Config>) {
+    let Some(config) = config else {
+        print_status_item("Daemon", "");
+        print_result(false, "config not loaded, cannot check daemon");
+        return;
     };
 
     print_status_item("Daemon", "org.facelock.Daemon (D-Bus system bus)");
 
     if config.daemon.mode == facelock_core::config::DaemonMode::Oneshot {
         print_result(true, "oneshot mode (no daemon)");
-        return Some(config);
+        return;
     }
 
     // Try to ping — this may trigger D-Bus activation if the daemon
@@ -102,11 +98,9 @@ fn check_daemon() -> Option<Config> {
             print_result(false, &format!("not responding: {e}"));
         }
     }
-
-    Some(config)
 }
 
-fn check_camera(config: &Option<Config>) {
+fn check_camera(config: Option<&Config>) {
     let Some(config) = config else {
         print_status_item("Camera", "");
         print_result(false, "config not available");
@@ -129,7 +123,7 @@ fn check_camera(config: &Option<Config>) {
     }
 }
 
-fn check_models(config: &Option<Config>) {
+fn check_models(config: Option<&Config>) {
     let Some(config) = config else {
         print_status_item("Models", "");
         print_result(false, "config not available");
@@ -168,7 +162,7 @@ fn check_models(config: &Option<Config>) {
     }
 }
 
-fn check_inference(config: &Option<Config>) {
+fn check_inference(config: Option<&Config>) {
     let Some(config) = config else {
         return;
     };
@@ -196,7 +190,7 @@ fn check_inference(config: &Option<Config>) {
     }
 }
 
-fn check_encryption(config: &Option<Config>) {
+fn check_encryption(config: Option<&Config>) {
     let Some(config) = config else {
         return;
     };
@@ -262,7 +256,7 @@ fn check_encryption(config: &Option<Config>) {
     }
 }
 
-fn check_enrolled(config: &Option<Config>) {
+fn check_enrolled(config: Option<&Config>) {
     let Some(config) = config else {
         return;
     };
@@ -295,7 +289,7 @@ fn check_enrolled(config: &Option<Config>) {
     }
 }
 
-fn check_security(config: &Option<Config>) {
+fn check_security(config: Option<&Config>) {
     let Some(config) = config else {
         return;
     };
@@ -335,7 +329,7 @@ fn check_security(config: &Option<Config>) {
     );
 }
 
-fn check_notifications(config: &Option<Config>) {
+fn check_notifications(config: Option<&Config>) {
     let Some(config) = config else {
         return;
     };

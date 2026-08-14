@@ -2,6 +2,7 @@ mod commands;
 pub mod direct;
 mod ipc_client;
 pub mod notifications;
+pub mod resolved;
 pub mod state_layout;
 
 use std::path::PathBuf;
@@ -246,6 +247,25 @@ fn main() -> anyhow::Result<()> {
                 .init();
 
             match other {
+                // -- Dispatched before the shared config parse (D7). --
+                //
+                // `is-enrolled` runs unprivileged on lock screens and must stay
+                // in front of all config/resolution machinery: it tolerates a
+                // missing or broken config and probes nothing (see
+                // commands/is_enrolled.rs). `hyprlock` edits the user's own
+                // dotfiles, `config` operates on the config file itself, and
+                // `restart` only talks to systemd — none consume a parsed
+                // Config.
+                Commands::IsEnrolled { user, json, quiet } => {
+                    std::process::exit(commands::is_enrolled::run(user, json, quiet))
+                }
+                Commands::Hyprlock { command } => commands::hyprlock::run(command),
+                Commands::Config { edit } => commands::config::run(edit),
+                Commands::Restart => commands::config::restart(),
+
+                // Setup bootstraps the config file — creates the default when
+                // missing and edits it in place — so it owns its own load; see
+                // the commented sites in commands/setup.rs.
                 Commands::Setup {
                     non_interactive,
                     yes,
@@ -279,36 +299,58 @@ fn main() -> anyhow::Result<()> {
                     execution_provider,
                     encryption,
                 })),
-                Commands::IsEnrolled { user, json, quiet } => {
-                    std::process::exit(commands::is_enrolled::run(user, json, quiet))
+
+                other => {
+                    // The one parse for this process (D7): every remaining
+                    // command consumes this Config and none re-reads the file.
+                    let loaded = resolved::ConfigLoad::read();
+
+                    // `status` reports on the config file itself, so a load
+                    // failure is a finding to render, not an exit.
+                    if matches!(other, Commands::Status) {
+                        return commands::status::run(loaded);
+                    }
+                    let config = loaded.require()?;
+
+                    match other {
+                        Commands::Enroll {
+                            user,
+                            label,
+                            skip_setup_check,
+                        } => commands::enroll::run(&config, user, label, skip_setup_check),
+                        Commands::Remove {
+                            model_id,
+                            user,
+                            yes,
+                        } => commands::remove::run(&config, model_id, user, yes),
+                        Commands::Clear { user, yes } => commands::clear::run(&config, user, yes),
+                        Commands::List { user, json } => commands::list::run(&config, user, json),
+                        Commands::Test { user } => commands::test_cmd::run(&config, user),
+                        Commands::Preview { text_only, user } => {
+                            commands::preview::run(&config, text_only, user)
+                        }
+                        Commands::Devices => commands::devices::run(&config),
+                        Commands::Bench { command } => commands::bench::run(&config, command),
+                        Commands::Tpm { command } => commands::tpm::run(&config, command),
+                        Commands::Encrypt { generate_key } => {
+                            commands::encrypt::run_encrypt(&config, generate_key)
+                        }
+                        Commands::Decrypt => commands::encrypt::run_decrypt(&config),
+                        Commands::Reseal => commands::tpm::run_reseal(&config),
+                        Commands::Audit { follow, lines } => {
+                            commands::audit::run(&config, follow, lines)
+                        }
+                        // Already handled above
+                        Commands::Daemon { .. }
+                        | Commands::Auth { .. }
+                        | Commands::IsEnrolled { .. }
+                        | Commands::Hyprlock { .. }
+                        | Commands::Config { .. }
+                        | Commands::Restart
+                        | Commands::Setup { .. }
+                        | Commands::Status => unreachable!(),
+                    }
                 }
-                Commands::Enroll {
-                    user,
-                    label,
-                    skip_setup_check,
-                } => commands::enroll::run(user, label, skip_setup_check),
-                Commands::Remove {
-                    model_id,
-                    user,
-                    yes,
-                } => commands::remove::run(model_id, user, yes),
-                Commands::Clear { user, yes } => commands::clear::run(user, yes),
-                Commands::List { user, json } => commands::list::run(user, json),
-                Commands::Test { user } => commands::test_cmd::run(user),
-                Commands::Preview { text_only, user } => commands::preview::run(text_only, user),
-                Commands::Config { edit } => commands::config::run(edit),
-                Commands::Status => commands::status::run(),
-                Commands::Devices => commands::devices::run(),
-                Commands::Bench { command } => commands::bench::run(command),
-                Commands::Tpm { command } => commands::tpm::run(command),
-                Commands::Hyprlock { command } => commands::hyprlock::run(command),
-                Commands::Encrypt { generate_key } => commands::encrypt::run_encrypt(generate_key),
-                Commands::Decrypt => commands::encrypt::run_decrypt(),
-                Commands::Reseal => commands::tpm::run_reseal(),
-                Commands::Restart => commands::config::restart(),
-                Commands::Audit { follow, lines } => commands::audit::run(follow, lines),
-                // Already handled above
-                Commands::Daemon { .. } | Commands::Auth { .. } => unreachable!(),
             }
         }
     }

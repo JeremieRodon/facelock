@@ -372,6 +372,8 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     println!();
 
     // -- Load or create config --
+    // Deliberate load (D7): setup bootstraps the config file — it may not
+    // exist yet, and the wizard edits it in place afterwards.
     let mut config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -466,7 +468,7 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     let enroll_steps = enroll_steps_for(plan);
     let enrolled = if enroll_steps.enroll {
         println!("\n--- Step 6: Face Enrollment ---\n");
-        match wizard_face_enroll(&theme, enroll_steps.assume_yes) {
+        match wizard_face_enroll(&config, &theme, enroll_steps.assume_yes) {
             Ok(did_enroll) => did_enroll,
             Err(e) => {
                 println!("  Enrollment failed: {e}");
@@ -482,7 +484,7 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     // -- Step 7: Test recognition --
     if test_recognition_runs(enroll_steps, enrolled) {
         println!("\n--- Step 7: Test Recognition ---\n");
-        match wizard_test_recognition(&theme, plan.yes) {
+        match wizard_test_recognition(&config, &theme, plan.yes) {
             Ok(()) => {}
             Err(e) => {
                 println!("  Test failed: {e}");
@@ -1545,9 +1547,8 @@ fn detect_tpm(config: &Config) -> bool {
 /// Update only the encryption method in the config file (no key_path changes).
 /// Used by `facelock tpm seal-key` / `unseal-key` for migration.
 #[cfg_attr(not(feature = "tpm"), allow(dead_code))]
-pub fn update_config_encryption_method(method: &str) -> anyhow::Result<()> {
-    let config = Config::load().context("failed to load config")?;
-    update_config_encryption(&config, method)
+pub fn update_config_encryption_method(config: &Config, method: &str) -> anyhow::Result<()> {
+    update_config_encryption(config, method)
 }
 
 /// Update the config file on disk with the chosen encryption method.
@@ -1860,7 +1861,11 @@ fn confirm_step(theme: &ColorfulTheme, prompt: &str, assume_yes: bool) -> anyhow
         .interact()?)
 }
 
-fn wizard_face_enroll(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Result<bool> {
+fn wizard_face_enroll(
+    config: &Config,
+    theme: &ColorfulTheme,
+    assume_yes: bool,
+) -> anyhow::Result<bool> {
     let proceed = confirm_step(theme, "Would you like to enroll a face now?", assume_yes)?;
 
     if !proceed {
@@ -1868,11 +1873,15 @@ fn wizard_face_enroll(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Result
         return Ok(false);
     }
 
-    super::enroll::run(None, None, true)?;
+    super::enroll::run(config, None, None, true)?;
     Ok(true)
 }
 
-fn wizard_test_recognition(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Result<()> {
+fn wizard_test_recognition(
+    config: &Config,
+    theme: &ColorfulTheme,
+    assume_yes: bool,
+) -> anyhow::Result<()> {
     let proceed = confirm_step(theme, "Would you like to test recognition?", assume_yes)?;
 
     if !proceed {
@@ -1880,7 +1889,7 @@ fn wizard_test_recognition(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::R
         return Ok(());
     }
 
-    super::test_cmd::run(None)?;
+    super::test_cmd::run(config, None)?;
     Ok(())
 }
 
@@ -2082,7 +2091,8 @@ fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
 fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
     println!("facelock setup: preparing system...\n");
 
-    // Load config (or use defaults for paths)
+    // Load config (or use defaults for paths). Deliberate load (D7): setup
+    // bootstraps the config file, which may not exist yet.
     let mut config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -2182,7 +2192,7 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
     let enrolled = plan.enroll == Some(true);
     if enrolled {
         println!("\nEnrolling face...");
-        super::enroll::run(None, None, true)?;
+        super::enroll::run(&config, None, None, true)?;
     }
 
     // See the matching call in `run_wizard`.

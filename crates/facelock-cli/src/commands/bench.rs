@@ -46,28 +46,21 @@ pub enum BenchCommand {
     Report,
 }
 
-pub fn run(command: BenchCommand) -> Result<()> {
+pub fn run(config: &Config, command: BenchCommand) -> Result<()> {
     // DEC-6: `bench` is root by default (direct-mode access needs the 0600
     // root:root database regardless of subcommand, and auth benchmarks may
     // need TPM access besides). Supersedes the old TPM-only conditional check.
     crate::ipc_client::require_root("sudo facelock bench <subcommand>")?;
 
     match command {
-        BenchCommand::ColdAuth => cmd_cold_auth(),
-        BenchCommand::WarmAuth => cmd_warm_auth(),
-        BenchCommand::Preview => cmd_preview(),
-        BenchCommand::Enrollment => cmd_enrollment(),
-        BenchCommand::ModelLoad => cmd_model_load(),
-        BenchCommand::Calibrate => cmd_calibrate(),
-        BenchCommand::Report => cmd_report(),
+        BenchCommand::ColdAuth => cmd_cold_auth(config),
+        BenchCommand::WarmAuth => cmd_warm_auth(config),
+        BenchCommand::Preview => cmd_preview(config),
+        BenchCommand::Enrollment => cmd_enrollment(config),
+        BenchCommand::ModelLoad => cmd_model_load(config),
+        BenchCommand::Calibrate => cmd_calibrate(config),
+        BenchCommand::Report => cmd_report(config),
     }
-}
-
-/// Load config, returning a helpful error if it fails.
-fn load_config() -> Result<Config> {
-    Config::load().context(
-        "Failed to load config. Set FACELOCK_CONFIG env var or ensure /etc/facelock/config.toml exists.",
-    )
 }
 
 /// Resolve the model directory from config.
@@ -90,8 +83,7 @@ fn load_engine(config: &Config) -> Result<FaceEngine> {
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
-fn cmd_cold_auth() -> Result<()> {
-    let config = load_config()?;
+fn cmd_cold_auth(config: &Config) -> Result<()> {
     let user = current_user();
 
     println!("=== Cold Auth Benchmark ===");
@@ -101,16 +93,16 @@ fn cmd_cold_auth() -> Result<()> {
     let start = Instant::now();
 
     // Load models (cold)
-    let mut engine = load_engine(&config)?;
+    let mut engine = load_engine(config)?;
 
     // Open camera
-    let mut camera = open_camera(&config)?;
+    let mut camera = open_camera(config)?;
 
     // Open store
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
 
-    let embeddings = direct::load_user_embeddings(&store, &config, &user)?;
+    let embeddings = direct::load_user_embeddings(&store, config, &user)?;
     if embeddings.is_empty() {
         bail!(
             "No enrolled faces for user '{}'. Enroll first with `facelock enroll`.",
@@ -156,8 +148,7 @@ fn cmd_cold_auth() -> Result<()> {
     Ok(())
 }
 
-fn cmd_warm_auth() -> Result<()> {
-    let config = load_config()?;
+fn cmd_warm_auth(config: &Config) -> Result<()> {
     let user = current_user();
 
     println!("=== Warm Auth Benchmark ===");
@@ -168,12 +159,12 @@ fn cmd_warm_auth() -> Result<()> {
     println!();
 
     // Pre-load everything
-    let mut engine = load_engine(&config)?;
-    let mut camera = open_camera(&config)?;
+    let mut engine = load_engine(config)?;
+    let mut camera = open_camera(config)?;
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
 
-    let embeddings = direct::load_user_embeddings(&store, &config, &user)?;
+    let embeddings = direct::load_user_embeddings(&store, config, &user)?;
     if embeddings.is_empty() {
         bail!(
             "No enrolled faces for user '{}'. Enroll first with `facelock enroll`.",
@@ -214,8 +205,7 @@ fn cmd_warm_auth() -> Result<()> {
     Ok(())
 }
 
-fn cmd_preview() -> Result<()> {
-    let config = load_config()?;
+fn cmd_preview(config: &Config) -> Result<()> {
 
     println!("=== Preview Frame Benchmark ===");
     println!(
@@ -224,8 +214,8 @@ fn cmd_preview() -> Result<()> {
     );
     println!();
 
-    let mut engine = load_engine(&config)?;
-    let mut camera = open_camera(&config)?;
+    let mut engine = load_engine(config)?;
+    let mut camera = open_camera(config)?;
 
     // Warm up
     let _ = camera.capture();
@@ -272,8 +262,7 @@ fn cmd_preview() -> Result<()> {
     Ok(())
 }
 
-fn cmd_enrollment() -> Result<()> {
-    let config = load_config()?;
+fn cmd_enrollment(config: &Config) -> Result<()> {
 
     println!("=== Enrollment Benchmark ===");
     println!(
@@ -283,8 +272,8 @@ fn cmd_enrollment() -> Result<()> {
     println!("NOTE: embeddings are NOT stored (dry run)");
     println!();
 
-    let mut engine = load_engine(&config)?;
-    let mut camera = open_camera(&config)?;
+    let mut engine = load_engine(config)?;
+    let mut camera = open_camera(config)?;
 
     // Warm up
     let _ = camera.capture();
@@ -320,8 +309,7 @@ fn cmd_enrollment() -> Result<()> {
     Ok(())
 }
 
-fn cmd_model_load() -> Result<()> {
-    let config = load_config()?;
+fn cmd_model_load(config: &Config) -> Result<()> {
 
     println!("=== Model Load Benchmark ===");
     println!("Measuring: ONNX model load time (SCRFD + ArcFace)");
@@ -332,7 +320,7 @@ fn cmd_model_load() -> Result<()> {
 
     for i in 0..iterations {
         let start = Instant::now();
-        let _engine = load_engine(&config)?;
+        let _engine = load_engine(config)?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         times.push(elapsed_ms);
         info!(iteration = i + 1, elapsed_ms, "model load iteration");
@@ -352,20 +340,19 @@ fn cmd_model_load() -> Result<()> {
     Ok(())
 }
 
-fn cmd_calibrate() -> Result<()> {
-    let config = load_config()?;
+fn cmd_calibrate(config: &Config) -> Result<()> {
     let user = current_user();
 
     println!("=== Threshold Calibration ===");
     println!("Sweeping recognition.threshold from 0.20 to 0.80 (step 0.05)");
     println!();
 
-    let mut engine = load_engine(&config)?;
-    let mut camera = open_camera(&config)?;
+    let mut engine = load_engine(config)?;
+    let mut camera = open_camera(config)?;
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
 
-    let enrolled = direct::load_user_embeddings(&store, &config, &user)?;
+    let enrolled = direct::load_user_embeddings(&store, config, &user)?;
     if enrolled.is_empty() {
         bail!(
             "No enrolled faces for user '{}'. Enroll first with `facelock enroll`.",
@@ -471,7 +458,7 @@ fn cmd_calibrate() -> Result<()> {
         let mut sweep_config = config.recognition.clone();
         sweep_config.detection_confidence = confidence;
 
-        match FaceEngine::load(&sweep_config, model_dir(&config)) {
+        match FaceEngine::load(&sweep_config, model_dir(config)) {
             Ok(mut sweep_engine) => match sweep_engine.process(&frame) {
                 Ok(faces) => {
                     println!("{:<12.2} {:<15}", confidence, faces.len());
@@ -491,8 +478,7 @@ fn cmd_calibrate() -> Result<()> {
     Ok(())
 }
 
-fn cmd_report() -> Result<()> {
-    let config = load_config()?;
+fn cmd_report(config: &Config) -> Result<()> {
     let user = current_user();
 
     // Gather system info
@@ -518,13 +504,13 @@ fn cmd_report() -> Result<()> {
     // Model load benchmark
     let model_load_ms = {
         let start = Instant::now();
-        let _engine = load_engine(&config)?;
+        let _engine = load_engine(config)?;
         start.elapsed().as_millis() as u64
     };
 
     // Open camera for subsequent benchmarks
-    let mut engine = load_engine(&config)?;
-    let mut camera = open_camera(&config)?;
+    let mut engine = load_engine(config)?;
+    let mut camera = open_camera(config)?;
 
     // Warm up
     let _ = camera.capture();
@@ -544,7 +530,7 @@ fn cmd_report() -> Result<()> {
     // Warm auth benchmark
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
-    let embeddings = direct::load_user_embeddings(&store, &config, &user)?;
+    let embeddings = direct::load_user_embeddings(&store, config, &user)?;
     let has_enrolled = !embeddings.is_empty();
 
     let warm_auth_ms = if has_enrolled {
@@ -564,7 +550,7 @@ fn cmd_report() -> Result<()> {
     // Cold auth (approximate: model load + one auth)
     let cold_auth_ms = if has_enrolled {
         let start = Instant::now();
-        let mut cold_engine = load_engine(&config)?;
+        let mut cold_engine = load_engine(config)?;
         let frame = camera.capture().context("Failed to capture frame")?;
         let faces = cold_engine.process(&frame)?;
         let _matched = find_best_match(&faces, &embeddings, config.recognition.threshold);

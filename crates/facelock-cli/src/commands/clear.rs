@@ -1,4 +1,3 @@
-use anyhow::Context;
 
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
@@ -6,20 +5,19 @@ use facelock_store::StoreError;
 
 use crate::ipc_client;
 
-pub fn run(user: Option<String>, yes: bool) -> anyhow::Result<()> {
+pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<()> {
     // ClearModels is root-only on the daemon side too, so demand root up front.
     // Otherwise the user gets prompted Y/N first and only then hits AccessDenied.
     ipc_client::require_root("sudo facelock clear")?;
 
-    let config = Config::load().context("failed to load config")?;
     let user = ipc_client::resolve_user(user.as_deref());
 
     // Check if user has any models before prompting. One failure policy (C4,
     // issue #105): a failed check propagates. The old D-Bus branch folded any
     // failure into "no models enrolled" and exited 0 having deleted nothing,
     // while the direct branch on the identical failure proceeded to delete.
-    let has_models = if ipc_client::should_use_direct(&config) {
-        direct_user_has_models(&config, &user)?
+    let has_models = if ipc_client::should_use_direct(config) {
+        direct_user_has_models(config, &user)?
     } else {
         let request = DaemonRequest::ListModels { user: user.clone() };
         daemon_user_has_models(ipc_client::send_request(&request))?
@@ -37,17 +35,17 @@ pub fn run(user: Option<String>, yes: bool) -> anyhow::Result<()> {
         }
     }
 
-    if ipc_client::should_use_direct(&config) {
+    if ipc_client::should_use_direct(config) {
         // `open_store_existing`: has_models above just proved the database is
         // there. If it vanished since, deleting has nothing to do — erroring
         // beats re-creating an empty database in its place.
-        let store = crate::direct::open_store_existing(&config)?;
+        let store = crate::direct::open_store_existing(config)?;
         let count = store
             .clear_user(&user)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("Removed {count} face model(s) for user '{user}'.");
         // The user has no models by construction, so drop the marker outright.
-        super::enrollment_marker::forget(&config, &user);
+        super::enrollment_marker::forget(config, &user);
         return Ok(());
     }
 
@@ -58,7 +56,7 @@ pub fn run(user: Option<String>, yes: bool) -> anyhow::Result<()> {
     match response {
         DaemonResponse::Removed => {
             println!("All face models removed for user '{user}'.");
-            super::enrollment_marker::forget(&config, &user);
+            super::enrollment_marker::forget(config, &user);
         }
         other => {
             anyhow::bail!("unexpected response from daemon: {other:?}");
