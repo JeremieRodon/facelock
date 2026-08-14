@@ -35,9 +35,7 @@
 
 ### IR Cameras (recommended)
 
-IR cameras provide anti-spoofing protection. Facelock auto-detects IR cameras by:
-- Device name containing "ir" or "infrared"
-- Supporting GREY or Y16 pixel formats
+IR cameras provide anti-spoofing protection. Facelock auto-detects IR cameras from the pixel formats they report — a node that enumerates *only* IR-typical mono formats (GREY, Y8, Y10, Y12, Y16) with no color format (YUYV/MJPG) mixed in — or from a hardware quirk that matches the device. The device name is never used to classify a camera as IR.
 
 Known working:
 - Logitech BRIO (IR mode)

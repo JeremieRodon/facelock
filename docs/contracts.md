@@ -346,13 +346,19 @@ session and replays `PolicyPCR` — so a changed bound PCR makes unseal **fail**
 When `device.path` is omitted:
 1. Enumerate `/dev/video0` through `/dev/video63`
 2. Filter to VIDEO_CAPTURE devices
-3. Classify every node's IR provenance (quirks `force_ir` authoritative; name
-   token / format-corroboration heuristic otherwise), with node-level
-   disambiguation for multi-node USB devices: when several nodes share one
-   quirk-matched VID:PID and at least one has an IR-like format (GREY/Y16 or
-   the quirk's `format_preference`), only the format-bearing node(s) are IR
+3. Classify every node's IR provenance from queried evidence: a quirks
+   `force_ir` match (authoritative by USB vendor:product ID; a name-only match
+   only when corroborated by a real USB identity or the node's own mono-format
+   evidence), otherwise a node whose queried formats are mono-only/IR-typical
+   (GREY/Y8/Y10/Y12/Y16, with no color format mixed in). The device name never
+   classifies a node on its own. Node-level disambiguation for multi-node USB
+   devices: when several nodes share one quirk-matched VID:PID and at least one
+   has an IR-like format (GREY/Y16 or the quirk's `format_preference`), only the
+   format-bearing node(s) are IR
 4. Prefer a quirks-confirmed IR node with a native IR format, then any
-   quirks-confirmed IR node, then a name-token IR node
+   quirks-confirmed IR node, then an evidence-classified IR node (breaking ties
+   toward one whose name also carries an `ir`/`infrared` token — a hint only,
+   never a promotion of a node that lacks format evidence)
 5. Fall back to first available device
 
 ## Database Schema
@@ -564,11 +570,16 @@ treats a decline as a fall-through to another agent or as an outright denial.
 | Minimum auth frames (= variance window size) | `security.min_auth_frames` | 3 |
 | Frame variance default const | `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY` | 0.985 |
 
-IR classification requires a whole `ir`/`infrared` name token or a quirks `force_ir`
-entry; a GREY/Y16 format alone is not treated as IR. A `force_ir` quirk is
-device-level ("this USB device has an IR sensor"): when the device exposes multiple
-capture nodes and at least one has an IR-like format, only the format-bearing
-node(s) classify IR (see `docs/security.md` §A). Frame variance is passive
+IR classification is derived from queried device evidence: a node is IR when its
+enumerated pixel formats are mono-only/IR-typical (GREY/Y8/Y10/Y12/Y16, with no
+color format mixed in), or when a quirks `force_ir` entry matches (authoritative
+by USB vendor:product ID; a name-only match requires corroborating format
+evidence or a real USB identity). The free-text device name never classifies a
+device on its own, and a GREY/Y16 format offered *alongside* a color format is
+not treated as IR. A `force_ir` quirk is device-level ("this USB device has an
+IR sensor"): when the device exposes multiple capture nodes and at least one has
+an IR-like format, only the format-bearing node(s) classify IR (see
+`docs/security.md` §A). Frame variance is passive
 anti-photo only (does not stop video replay); it is evaluated over a sliding window
 of the most recent `min_auth_frames` matched frames (see `docs/security.md` §B), with
 a 0.985 cutoff rejecting truly static input (≳0.999) with margin; the

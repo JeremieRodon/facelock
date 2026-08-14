@@ -41,17 +41,22 @@ require_ir = true  # Refuse to authenticate on RGB-only cameras
 Implementation (`facelock-camera/src/device.rs`, `ir_source_with_quirks`):
 
 ```rust
-// IR classification is honest about its evidence, surfaced as IrSource:
-//   Quirk  – hardware quirks DB force_ir = true (authoritative, both directions)
-//   Format – native IR format (GREY/Y16) CORROBORATED by an IR name token
-//   Name   – an "ir"/"infrared" name *token* (tokenized, not substring)
-//   None   – not IR
+// IR classification is DERIVED from queried device evidence, surfaced as IrSource:
+//   Quirk  – hardware quirks DB force_ir, corroborated (authoritative, both directions)
+//   Format – the device's OWN queried capture formats are mono-only/IR-typical
+//            (GREY/Y8/Y10/Y12/Y16, with NO color format mixed in)
+//   None   – not classified as IR
 //
-// Per-node precedence:
-// 1. quirks DB force_ir is authoritative;
-// 2. a native GREY/Y16 format counts ONLY when corroborated by a name token;
-// 3. a name token alone is sufficient;
-// 4. otherwise not-IR.
+// The free-text device name is NEVER, by itself, sufficient to classify a
+// device as IR (#98): a crafted CARD_LABEL ("Fake IR Camera") on a
+// v4l2loopback node exposing only YUYV/MJPG does not classify as IR. Per-node:
+// 1. a quirks DB force_ir match is authoritative — by USB vendor:product ID
+//    unconditionally; by device NAME ONLY when corroborated by a real USB
+//    identity or the device's own mono-format evidence (#98 Task 3);
+// 2. otherwise IR-ness is derived SOLELY from the device's own queried
+//    formats: a mono-ONLY format set is IR, any set with a color format is not;
+// 3. the device name is consulted only as an auto-detection tiebreak hint,
+//    among nodes that ALREADY qualify by evidence — never to classify a node.
 pub fn ir_source_with_quirks(device, quirks) -> IrSource { ... }
 
 // Node-level disambiguation for multi-node USB devices: force_ir means "this
@@ -77,11 +82,15 @@ if config.security.require_ir && !device_is_ir {
 
 **Rationale**: Phone screens and printed photos do not emit infrared light correctly. An IR camera sees a flat, textureless surface where a real face would have depth and skin texture in IR. This single check eliminates the vast majority of spoofing attacks.
 
-**Why mere GREY/Y16 availability is not enough (H1)**: many ordinary RGB UVC webcams *enumerate* a GREY format alongside YUYV/MJPG. The previous heuristic (`contains("ir")` OR any GREY/Y16 format) misclassified those as IR, silently defeating `require_ir = true`. It also matched the substring "ir" inside unrelated names ("Sirius", "AIR-Cam"). The classifier now requires a whole `ir`/`infrared` **token** or a **quirks `force_ir`** entry, and treats a GREY/Y16 format as IR **only when corroborated** by one of those. This is why `require_ir` is now load-bearing rather than trivially bypassable.
+**Why the name alone is not enough, and what IS the evidence (H1, #98/#99)**: IR classification is derived **solely from queried device evidence** — the pixel formats the device actually enumerates — never from its free-text name. A node qualifies as IR only when it enumerates *exclusively* IR-typical mono formats (GREY/Y8/Y10/Y12/Y16) with **no color format mixed in**. Many ordinary RGB UVC webcams enumerate a GREY format *alongside* YUYV/MJPG; those do **not** qualify (this is what the old "H1" concern was about, now resolved by the mono-**only** requirement rather than by name corroboration). The previous heuristic (`contains("ir")` OR any GREY/Y16 format) misclassified plain webcams as IR and matched the substring "ir" inside unrelated names ("Sirius", "AIR-Cam"), silently defeating `require_ir = true`. Now a crafted `CARD_LABEL` on a color-only v4l2loopback device does not classify as IR no matter what it is named (#98), and the quirk `name_pattern` matcher is **anchored** (it matches the whole device name, not a substring) so it no longer fires on the "ir" inside those unrelated names (#99). The name is used only as a tiebreak hint when auto-detection chooses among nodes that *already* qualify by evidence, and as one corroboration path for a name-only `force_ir` quirk — never as a standalone classification signal. This is why `require_ir` is now load-bearing rather than trivially bypassable.
+
+**Quirk `force_ir` corroboration (#98 Task 3)**: a quirks `force_ir = true` entry that matched by **USB vendor:product ID** is authoritative on its own — a software-only virtual device (v4l2loopback) has no real USB node, so it can never win a USB-ID match. A `force_ir = true` entry that matched only by device **name**, however, requires corroboration before it is trusted: either the device has a real (even if DB-unlisted) USB identity, or its own queried formats independently support IR. Without either, a crafted name that happens to match a shipped pattern falls through to the evidence-only heuristic instead of being trusted. (`force_ir = false` remains authoritative unconditionally — the conservative "not IR" direction is always honored.)
+
+**Honest residual — format evidence is not unforgeable**: deriving IR-ness from queried formats raises the attacker's cost from "set a free-text `CARD_LABEL` string" to "also negotiate a mono-**only** pixel format", and removes the old path where a bare name token (or a name-only quirk) could escalate a device to IR. It does **not** make the evidence unforgeable. A `v4l2loopback` device (loading the module requires **root**) or a programmable USB gadget can present a mono-only (GREY/Y16/…) format set and **will** classify as IR — the format check cannot distinguish a genuine IR sensor from a device that merely advertises IR-typical formats. The remaining backstops against a fabricated IR device are the **liveness / frame-variance checks** (§B) and the **privilege required to create such a device** in the first place (root to load `v4l2loopback`, or physical access to attach USB-gadget hardware). `require_ir` is one layer of a layered defense, not a standalone attestation of a real IR sensor.
 
 **Why `force_ir` is device-level, not node-level (hardware-verified regression)**: on a real Logitech BRIO, treating every quirk-matched node as IR made *both* `/dev/video0` (the RGB sensor) and `/dev/video2` (the IR sensor) classify IR — so setup stopped auto-selecting and auto-detect captured from the RGB sensor (white LED) instead of the IR sensor. The sibling-format disambiguation above restores per-node honesty: exactly one BRIO node is `[IR]`, and auto-detection prefers the format-corroborated IR node.
 
-**Limitation**: classification is still heuristic without a hardware allow-list. Some genuine IR cameras report neither an IR name token nor a known quirk; add a quirks `force_ir` entry (`/etc/facelock/quirks.d/`) for such hardware (and set `format_preference` to the IR node's native format, e.g. `"GREY"`, when the camera exposes multiple capture nodes). The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
+**Limitation**: classification is capability-based, not a hardware allow-list. A genuine IR camera that exposes its IR and color streams on a *single* V4L2 node (so its format set is not mono-only) and is not covered by a shipped quirk will not auto-classify as IR. Add a quirks `force_ir` entry keyed by **USB vendor:product ID** (`/etc/facelock/quirks.d/`) for such hardware — a VID:PID match is authoritative — and set `format_preference` to the IR node's native format (e.g. `"GREY"`) when the camera exposes multiple capture nodes. Prefer a USB-ID quirk over a name-only one: a name-only `force_ir` is trusted only when corroborated by the device's own mono-format evidence or a real USB identity, so it is not a reliable override on its own. The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
 
 #### B. Frame Variance Check (Required)
 
