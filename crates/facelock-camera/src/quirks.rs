@@ -13,7 +13,11 @@ pub struct Quirk {
     /// USB product ID (hex string, e.g. "0b07")
     #[serde(default)]
     pub product_id: Option<String>,
-    /// Regex pattern to match against device name (fallback when IDs unavailable)
+    /// Glob-like pattern matched against the device name, a fallback when USB
+    /// IDs are unavailable. NOT a full regex: only a leading `(?i)` (case
+    /// insensitive) and `.*` (wildcard) are supported, and the pattern is
+    /// anchored — it must describe the WHOLE name, not a substring (#99). See
+    /// [`name_matches`].
     #[serde(default)]
     pub name_pattern: Option<String>,
     /// Force this device to be treated as an IR camera
@@ -46,8 +50,17 @@ struct QuirksFile {
     quirk: Vec<Quirk>,
 }
 
-/// Provenance of a [`QuirksDb`] match — how strongly the match is
-/// corroborated by evidence the device cannot forge.
+/// Provenance of a [`QuirksDb`] match — how the quirk matched, which bounds
+/// how far it can be trusted for a security-relevant decision like `force_ir`.
+///
+/// Neither kind is truly unforgeable; they differ only in the *cost* of
+/// forgery. A [`QuirkMatchKind::UsbId`] match rests on the sysfs USB identity,
+/// which a software-only virtual device (v4l2loopback) cannot present — though
+/// a programmable USB gadget could still advertise a chosen VID:PID. A
+/// [`QuirkMatchKind::NameOnly`] match rests only on the free-text device name,
+/// which is trivially attacker-controlled on virtual devices. This is why
+/// `force_ir` treats them differently (see
+/// [`crate::device::ir_source_with_quirks`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuirkMatchKind {
     /// Matched by USB vendor:product ID, read from sysfs. Not spoofable by

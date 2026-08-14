@@ -140,7 +140,16 @@ fn has_mono_only_formats(device: &DeviceInfo) -> bool {
 /// `CameraCaps.is_ir` (gap D8) should be derived from. Populated strictly
 /// from queried V4L2 data (the capture formats the device actually
 /// enumerates), NEVER from the free-text device/card name, which is
-/// attacker-controlled on virtual devices such as v4l2loopback (#98).
+/// trivially attacker-controlled on virtual devices such as v4l2loopback (#98).
+///
+/// Format evidence is stronger than the name, but it is NOT unforgeable:
+/// deriving IR-ness from the enumerated formats raises the attacker's cost from
+/// "set a `CARD_LABEL` string" to "also negotiate a mono-only pixel format", yet
+/// a root-loaded `v4l2loopback` device or a programmable USB gadget can still
+/// present a mono-only (GREY/Y16/…) format set and thus classify as IR. The
+/// backstops against a fabricated IR device are the liveness / frame-variance
+/// checks and the privilege required to create such a device — not this signal
+/// alone. See `docs/security.md` §A ("Honest residual").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IrEvidence {
     /// The device enumerates ONLY IR-typical mono capture formats — see
