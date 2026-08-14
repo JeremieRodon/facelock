@@ -219,21 +219,6 @@ impl Notifier for DesktopNotifier {
     }
 }
 
-/// Renders events as plain lines on stdout.
-///
-/// Terminal text in the auth path is the PAM conversation, which pam_facelock
-/// owns; no CLI command routes through this yet — it exists so terminal
-/// delivery has a seam-shaped home when the daemon server moves out of this
-/// crate (H7) and for the i18n message-type work (D10).
-#[allow(dead_code)] // exercised by unit tests; production wiring arrives with H7/D10
-pub struct TerminalNotifier;
-
-impl Notifier for TerminalNotifier {
-    fn notify(&self, event: &NotifyEvent) {
-        println!("{}", body(event));
-    }
-}
-
 /// The production [`NotifierFactory`] for the daemon: per-request, per-user
 /// desktop delivery. Injected into `commands::daemon::run` from `main` so the
 /// server code never names this module.
