@@ -1222,12 +1222,11 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
 pub fn run(config_path: Option<String>) -> anyhow::Result<()> {
     crate::ipc_client::require_root("sudo facelock daemon")?;
 
-    // Init tracing (daemon uses its own tracing setup with target=true)
+    // Init tracing (daemon uses its own tracing setup with target=true).
+    // See crate::logging's module doc for why this must not build its own
+    // fallback filter by hand.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "facelock_daemon=info,facelock=info".into()),
-        )
+        .with_env_filter(crate::logging::default_env_filter())
         .with_target(true)
         .init();
 
