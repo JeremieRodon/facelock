@@ -7,8 +7,8 @@
 //! per-method authorization (denials, the Authenticate self-scope, the
 //! root-only catch-all), the in-band `-2`/`-3` sentinel encoding with its
 //! byte-exact protocol strings, similarity redaction for non-root callers,
-//! the N11 root rate-limit exemption, and the rule that a denied caller
-//! never starts a polkit round-trip.
+//! which entry point charges the rate limit (N11), and the rule that a
+//! denied caller never starts a polkit round-trip.
 //!
 //! NOT covered here, deliberately: the zbus wiring — caller-identity
 //! resolution from message headers (`GetConnectionUnixUser`), signal
@@ -17,7 +17,9 @@
 //! (`just test-arch-pam`, `just test-arch-integration`) prove that layer
 //! against a real bus and PAM stack.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use facelock_core::config::Config;
 use facelock_core::notify::{Notifier, NullNotifier};
@@ -110,6 +112,46 @@ fn matching_service_for(user: &str) -> MockService {
     ))
 }
 
+/// A file-backed store, for the tests that must read the `rate_limit` table
+/// back through a *second* connection — the counter those tests are about is
+/// on disk, and an in-memory store is private to the handler holding it.
+fn temp_db_path(test_name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "facelock-authz-{test_name}-{}-{unique}.db",
+        std::process::id()
+    ))
+}
+
+fn cleanup_db(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+}
+
+/// A service whose store lives at `db_path` and holds one enrolled model for
+/// `user`, with an engine that never sees a face — so every attempt fails and
+/// the only question is what it costs. `max_attempts` sets the budget.
+fn failing_service_at(db_path: &Path, user: &str, max_attempts: u32) -> MockService {
+    let store = FaceStore::create(db_path).unwrap();
+    store
+        .add_model(
+            user,
+            "front",
+            &fixtures::known_embedding(1),
+            "test-embedder",
+        )
+        .unwrap();
+    service(handler_with(
+        test_config(max_attempts, 1),
+        MockFaceEngine::no_faces(),
+        store,
+    ))
+}
+
 fn caller(uid: u32, username: Option<&str>) -> CallerIdentity {
     CallerIdentity {
         uid,
@@ -150,6 +192,10 @@ async fn every_entry_point_except_authenticate_denies_non_root() {
     let svc = matching_service_for("alice");
     let a = alice();
 
+    assert_denied(
+        svc.test_authenticate_as(a.clone(), "alice").await,
+        "TestAuthenticate",
+    );
     assert_denied(svc.enroll_as(a.clone(), "alice", "front").await, "Enroll");
     assert_denied(svc.list_models_as(a.clone(), "alice").await, "ListModels");
     assert_denied(
@@ -183,6 +229,12 @@ async fn root_passes_authorization_on_every_entry_point() {
     let r = root();
 
     assert_eq!(svc.ping_as(r.clone()).await.unwrap(), "pong");
+    assert!(
+        svc.test_authenticate_as(r.clone(), "alice")
+            .await
+            .unwrap()
+            .matched
+    );
     assert_eq!(
         svc.list_models_as(r.clone(), "alice").await.unwrap().len(),
         1
@@ -324,45 +376,128 @@ async fn suppress_unknown_maps_to_the_minus_three_sentinel() {
     assert!(result.label.is_empty());
 }
 
-/// N11 wiring: the service exempts root callers from rate-limit consumption
-/// (`facelock test` reaches the daemon through Authenticate, and failed test
-/// runs must not lock the user out), while a user's own failed attempts
-/// still charge the shared budget.
+/// REGRESSION PIN: a ROOT caller's failed `Authenticate` charges the
+/// rate-limit budget.
+///
+/// The daemon used to exempt every root caller, on the theory that a root
+/// caller must be root-only `facelock test`. But `pam_facelock` runs inside
+/// the PAM stack of whatever program is authenticating, and `sudo` is
+/// setuid-root — as are `login`, `su`, and root-run display-manager
+/// greeters. PAM tries D-Bus first, so a real failed face authentication at
+/// a `sudo` prompt reached the daemon as UID 0 and was never charged: the
+/// documented 5-attempts/user/60s limit was inert on the project's primary
+/// documented PAM target, and an attacker presenting spoof material there
+/// had unlimited daemon-mediated attempts.
+///
+/// Asserted against the on-disk `rate_limit` table through a second
+/// connection, not just through the next reply, so this cannot pass on a
+/// coincidence of the in-band encoding.
 #[tokio::test]
-async fn root_failed_attempts_do_not_charge_the_rate_limit() {
-    let emb = fixtures::known_embedding(1);
-    let store = FaceStore::open_memory().unwrap();
-    store
-        .add_model("alice", "front", &emb, "test-embedder")
-        .unwrap();
+async fn root_failed_authenticate_charges_the_rate_limit() {
+    let db_path = temp_db_path("root-charges");
+    cleanup_db(&db_path);
+    // Budget of one failed attempt.
+    let svc = failing_service_at(&db_path, "alice", 1);
 
-    // Budget of one failed attempt; the engine never sees a face.
-    let svc = service(handler_with(
-        test_config(1, 1),
-        MockFaceEngine::no_faces(),
-        store,
-    ));
+    let first = svc.authenticate_as(root(), "alice").await.unwrap();
+    assert!(!first.matched);
+    assert_eq!(first.model_id, -1, "an ordinary non-match: {first:?}");
 
-    // Two consecutive failed ROOT attempts: neither is charged, so the
-    // second still runs the comparison instead of reporting "rate limited".
-    for attempt in 0..2 {
-        let result = svc.authenticate_as(root(), "alice").await.unwrap();
-        assert!(!result.matched);
-        assert_eq!(
-            result.model_id, -1,
-            "root attempt {attempt} must be an ordinary non-match, not a rate-limit rejection: {result:?}"
-        );
-    }
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        !inspect.check_rate_limit("alice", 1, 60).unwrap(),
+        "a root caller's failed Authenticate MUST consume budget — this is \
+         how a failed face auth at a sudo prompt gets counted"
+    );
 
-    // Alice's own failed attempt IS charged...
+    // And the charge is enforced: the next attempt is rejected in-band
+    // before the camera runs, root or not.
+    let limited = svc.authenticate_as(root(), "alice").await.unwrap();
+    assert_eq!(limited.model_id, -2);
+    assert_eq!(limited.label, "rate limited");
+
+    cleanup_db(&db_path);
+}
+
+/// The other half: a non-root user's own failed attempts are charged, as
+/// they always were.
+#[tokio::test]
+async fn user_failed_authenticate_charges_the_rate_limit() {
+    let db_path = temp_db_path("user-charges");
+    cleanup_db(&db_path);
+    let svc = failing_service_at(&db_path, "alice", 1);
+
     let charged = svc.authenticate_as(alice(), "alice").await.unwrap();
     assert!(!charged.matched);
     assert_eq!(charged.model_id, -1);
 
-    // ...so her next attempt is rejected in-band before the camera runs.
     let limited = svc.authenticate_as(alice(), "alice").await.unwrap();
     assert_eq!(limited.model_id, -2);
     assert_eq!(limited.label, "rate limited");
+
+    cleanup_db(&db_path);
+}
+
+/// N11, now explicit: the root-only `TestAuthenticate` method is the one
+/// entry point whose failures cost nothing. `facelock test` runs here, and a
+/// handful of failed test runs must not lock the user out of real
+/// authentication. The exemption is asked for by calling this method — it is
+/// no longer inferred from the caller being root.
+#[tokio::test]
+async fn test_authenticate_does_not_charge_the_rate_limit() {
+    let db_path = temp_db_path("test-charges-nothing");
+    cleanup_db(&db_path);
+    // Budget of one failed attempt — three failed test runs must not reach it.
+    let svc = failing_service_at(&db_path, "alice", 1);
+
+    for attempt in 0..3 {
+        let result = svc.test_authenticate_as(root(), "alice").await.unwrap();
+        assert!(!result.matched);
+        assert_eq!(
+            result.model_id, -1,
+            "test attempt {attempt} must be an ordinary non-match, not a \
+             rate-limit rejection: {result:?}"
+        );
+    }
+
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect.check_rate_limit("alice", 1, 60).unwrap(),
+        "the rate_limit table must be untouched by diagnostic runs"
+    );
+
+    // The *check* is not exempted: an already-limited user still sees it.
+    // (Charge through the real method, then test again.)
+    svc.authenticate_as(root(), "alice").await.unwrap();
+    let limited = svc.test_authenticate_as(root(), "alice").await.unwrap();
+    assert_eq!(limited.model_id, -2);
+    assert_eq!(
+        limited.label, "rate limited",
+        "an existing lockout must surface in `test`, not be masked by it"
+    );
+
+    cleanup_db(&db_path);
+}
+
+/// `TestAuthenticate` is root-only — that is what makes a
+/// budget-free authentication endpoint safe to expose at all. A non-root
+/// caller must be denied even for their own username, unlike `Authenticate`.
+#[tokio::test]
+async fn test_authenticate_denies_a_non_root_caller() {
+    let svc = matching_service_for("alice");
+
+    assert_denied(
+        svc.test_authenticate_as(alice(), "alice").await,
+        "TestAuthenticate (own user)",
+    );
+    assert_denied(
+        svc.test_authenticate_as(alice(), "bob").await,
+        "TestAuthenticate (cross-user)",
+    );
+
+    // Root runs the real comparison through it.
+    let as_root = svc.test_authenticate_as(root(), "alice").await.unwrap();
+    assert!(as_root.matched, "root must reach the comparison loop");
 }
 
 /// The root preview path end to end: frames and per-face metadata with the

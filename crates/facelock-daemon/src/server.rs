@@ -25,7 +25,7 @@ use nix::unistd::{Uid, User};
 use tracing::{error, info, warn};
 use zbus::{fdo, interface, object_server::SignalEmitter};
 
-use crate::handler::{DaemonRequest, DaemonResponse, Handler};
+use crate::handler::{AuthIntent, DaemonRequest, DaemonResponse, Handler};
 
 /// Production type alias for the handler with real Camera and FaceEngine.
 pub type ProductionHandler = Handler<Camera<'static>, FaceEngine>;
@@ -464,6 +464,7 @@ async fn resolve_caller_identity(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Method {
     Authenticate,
+    TestAuthenticate,
     Enroll,
     ListModels,
     RemoveModel,
@@ -478,8 +479,9 @@ enum Method {
 
 impl Method {
     #[cfg(test)]
-    const ALL: [Method; 11] = [
+    const ALL: [Method; 12] = [
         Method::Authenticate,
+        Method::TestAuthenticate,
         Method::Enroll,
         Method::ListModels,
         Method::RemoveModel,
@@ -495,6 +497,7 @@ impl Method {
     fn name(self) -> &'static str {
         match self {
             Method::Authenticate => "Authenticate",
+            Method::TestAuthenticate => "TestAuthenticate",
             Method::Enroll => "Enroll",
             Method::ListModels => "ListModels",
             Method::RemoveModel => "RemoveModel",
@@ -518,9 +521,15 @@ impl Method {
     /// an unprivileged caller: together with score redaction this closes the
     /// similarity hill-climbing oracle by construction. The catch-all arm
     /// makes any future method root-only until it is deliberately opened up.
+    ///
+    /// `TestAuthenticate` is listed explicitly rather than left to the
+    /// catch-all: it is the entry point that does *not* charge the rate
+    /// limit, so its root-only scope is the whole reason it is safe to
+    /// offer, not an incidental default.
     fn scope(self) -> Scope {
         match self {
             Method::Authenticate => Scope::UserScoped,
+            Method::TestAuthenticate => Scope::Root,
             _ => Scope::Root,
         }
     }
@@ -768,28 +777,71 @@ where
     // it from the message header in the `#[interface]` glue below.
     // ------------------------------------------------------------------
 
+    /// The real-authentication entry point: every PAM stack, every locker,
+    /// the polkit agent. A failed attempt ALWAYS charges the rate-limit
+    /// budget, whatever the caller's UID.
+    ///
+    /// It used to charge only non-root callers, on the theory that a root
+    /// caller must be root-only `facelock test` (N11). That inference was
+    /// wrong in the direction that matters: `sudo` is setuid-root, and
+    /// `login`, `su` and root-run greeters run their PAM stack as root too,
+    /// so real failed authentications arrived here as UID 0 and were never
+    /// charged. The diagnostic carve-out now lives in
+    /// [`FacelockService::test_authenticate_as`], where it is asked for
+    /// explicitly instead of inferred.
     pub async fn authenticate_as(
         &self,
         caller: CallerIdentity,
         user: &str,
     ) -> fdo::Result<AuthResult> {
+        self.run_authentication(caller, user, Method::Authenticate, AuthIntent::Authenticate)
+            .await
+    }
+
+    /// The root-only diagnostic entry point behind `facelock test` (N11,
+    /// issue #96). Same authentication, same reply shape, two deliberate
+    /// differences: a failed attempt charges no rate-limit budget, and the
+    /// SSH/lid physical-presence gates are skipped — an admin who is already
+    /// root may legitimately diagnose recognition over SSH or with the lid
+    /// closed on a docked laptop. Everything else (`disabled`, enrollment,
+    /// the rate-limit *check*, `require_ir`) still applies.
+    ///
+    /// Root-only is what makes that safe, and it is enforced by the same
+    /// table-driven [`authorize_method`] as every other privileged method.
+    pub async fn test_authenticate_as(
+        &self,
+        caller: CallerIdentity,
+        user: &str,
+    ) -> fdo::Result<AuthResult> {
+        self.run_authentication(caller, user, Method::TestAuthenticate, AuthIntent::Test)
+            .await
+    }
+
+    /// The body both authentication entry points share, so the diagnostic
+    /// method cannot drift from the real one: same authorization table, same
+    /// capture slot, same handler call, same in-band error encoding, same
+    /// notification, same redaction. Only `method` (which authorization
+    /// applies) and `intent` (what the attempt costs and which gates run)
+    /// differ.
+    async fn run_authentication(
+        &self,
+        caller: CallerIdentity,
+        user: &str,
+        method: Method,
+        intent: AuthIntent,
+    ) -> fdo::Result<AuthResult> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
-        authorize_method(&caller, Method::Authenticate, Some(user))?;
+        authorize_method(&caller, method, Some(user))?;
         let caller_is_root = caller.uid == 0;
         self.clear_camera_owner();
-        let capture_guard = self.capture_slot.try_acquire("Authenticate")?;
+        let capture_guard = self.capture_slot.try_acquire(method.name())?;
         let handler = self.handler.clone();
         let notifier_factory = self.notifier_factory.clone();
         let user = user.to_string();
         let result = tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
-            // N11: a root caller (e.g. root-only `facelock test`) is exempt
-            // from rate-limit consumption on a failed attempt — root already
-            // has unrestricted access to the rate-limit table directly, and
-            // without this a few `facelock test` runs would lock the user
-            // out of real authentication. See `Handler::handle_authenticate`.
-            let response = handler.handle_authenticate(user.clone(), !caller_is_root);
+            let response = handler.handle_authenticate(user.clone(), intent);
             // Notification settings come from the handler's config — the
             // freshest parse, since maybe_reload_handler ran at method entry.
             // No mid-request file re-read (D7).
@@ -1158,6 +1210,30 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         // fails). The payload deliberately carries no similarity score — the
         // raw biometric score is a spoof-tuning oracle for anyone able to
         // receive the broadcast; `matched` + user is enough for consumers.
+        if let Ok(ref auth_result) = result {
+            let _ = Self::auth_attempted(&ctxt, user, auth_result.matched).await;
+        }
+
+        result
+    }
+
+    /// The root-only diagnostic counterpart of `Authenticate`, behind
+    /// `facelock test`. Identical wire shape (`s` in, `AuthResult` out,
+    /// same `-1`/`-2`/`-3` sentinels) — see
+    /// [`FacelockService::test_authenticate_as`] for the two behavioral
+    /// differences.
+    async fn test_authenticate(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        user: &str,
+    ) -> fdo::Result<AuthResult> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        let result = self.test_authenticate_as(caller, user).await;
+
+        // Emitted for the same reason and with the same payload as
+        // `Authenticate`'s: a camera-backed attempt happened for `user`.
         if let Ok(ref auth_result) = result {
             let _ = Self::auth_attempted(&ctxt, user, auth_result.matched).await;
         }
@@ -1689,6 +1765,73 @@ mod tests {
     // Authenticate is the only user-scoped method; everything else is
     // root-only. These tests iterate Method::ALL so a new method cannot be
     // added without landing in the matrix.
+
+    /// The wire method set and the authorization matrix must be the same
+    /// set. `Method` is what [`authorize_method`] keys on, and zbus derives
+    /// the wire name from the `#[interface]` function name — nothing in the
+    /// type system ties the two together, so a method added to the interface
+    /// without a `Method` variant would be a wire method the matrix tests
+    /// above never see. Scanning the source is how the repo pins structural
+    /// facts a type cannot (same idiom as the CLI's backend-seam pins); the
+    /// live introspection XML is unavailable here because `#[interface]` is
+    /// implemented only for the production `Camera`/`FaceEngine` handler.
+    #[test]
+    fn interface_methods_and_the_authz_matrix_are_the_same_set() {
+        // Assembled at runtime so this literal doesn't match itself.
+        let marker = format!("#[{}(name = \"org.facelock.Daemon\")]", "interface");
+        let after_marker = include_str!("server.rs")
+            .split_once(&marker)
+            .expect("the #[interface] block")
+            .1;
+        // The impl ends at the first `}` in column 0; every brace inside it
+        // is indented.
+        let block = after_marker
+            .split_once("\n}\n")
+            .expect("the #[interface] block's closing brace")
+            .0;
+
+        let mut on_wire: Vec<String> = Vec::new();
+        let mut previous = "";
+        for line in block.lines() {
+            let line = line.trim();
+            // Signals are declared in the same block but are not methods.
+            if let Some(rest) = line.strip_prefix("async fn ") {
+                if !previous.contains("(signal)") {
+                    on_wire.push(rest.split('(').next().unwrap().to_string());
+                }
+            }
+            if !line.is_empty() {
+                previous = line;
+            }
+        }
+
+        let mut in_matrix: Vec<String> = Method::ALL.iter().map(|m| snake_case(m.name())).collect();
+        on_wire.sort();
+        in_matrix.sort();
+        assert_eq!(
+            on_wire, in_matrix,
+            "every #[interface] method needs a Method variant (and vice versa) — \
+             the authorization matrix is keyed on that enum"
+        );
+    }
+
+    /// `Method::name` is the wire name: it is what the denial messages and
+    /// the capture-slot contention errors quote, and what the scan above
+    /// compares against the interface block.
+    fn snake_case(name: &str) -> String {
+        let mut out = String::with_capacity(name.len() + 3);
+        for (i, ch) in name.char_indices() {
+            if ch.is_ascii_uppercase() {
+                if i > 0 {
+                    out.push('_');
+                }
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
 
     #[test]
     fn authz_matrix_root_is_allowed_everywhere() {

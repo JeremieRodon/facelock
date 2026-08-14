@@ -9,9 +9,65 @@ use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
 
 use crate::audit::AuditSource;
-use crate::auth::{self, AuthOutcome};
+use crate::auth::{self, AuthOutcome, PreCheckContext};
 use crate::enroll::{self, EnrollOutcome};
 use crate::rate_limit::RateLimiter;
+
+/// Why an authentication is being run.
+///
+/// This is the *declared purpose of the call*, never an inference from the
+/// caller's privilege. The daemon used to infer it — a root D-Bus caller was
+/// assumed to be root-only `facelock test` and had its failed attempts
+/// exempted from the rate limit — but "caller is root" is not a proxy for
+/// "this is a test run": `sudo` is setuid-root, and `login`, `su` and
+/// root-run display-manager greeters run their PAM stack as root too. Real
+/// failed authentications therefore reached the daemon as UID 0 and were
+/// never charged, leaving the documented 5-attempts/user/60s limit inert on
+/// the project's primary documented PAM target. The intent now travels with
+/// the request: the `Authenticate` D-Bus method is always
+/// [`AuthIntent::Authenticate`], and the root-only `TestAuthenticate` method
+/// is the only producer of [`AuthIntent::Test`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthIntent {
+    /// A real authentication — every PAM stack (sudo, login, screen
+    /// lockers), the polkit agent, `facelock auth`. Fully enforced, and a
+    /// failed attempt charges the shared rate-limit budget.
+    Authenticate,
+    /// A diagnostic run of root-only `facelock test` (N11, issue #96).
+    /// Skips only the SSH/lid physical-presence gates, and never charges the
+    /// budget — a handful of test runs must not lock the user out of real
+    /// authentication.
+    Test,
+}
+
+impl AuthIntent {
+    /// Does a failed attempt consume the shared (SQLite-backed) rate-limit
+    /// budget? Only real authentication does.
+    pub fn charges_rate_limit(self) -> bool {
+        matches!(self, AuthIntent::Authenticate)
+    }
+
+    /// Which of `pre_check`'s environment gates this intent may skip. Every
+    /// other gate — `disabled`, enrollment/`suppress_unknown`, the
+    /// rate-limit *check*, `require_ir` — applies to both intents.
+    pub fn pre_check_context(self) -> PreCheckContext {
+        match self {
+            AuthIntent::Authenticate => PreCheckContext::enforced(),
+            AuthIntent::Test => PreCheckContext::test(),
+        }
+    }
+
+    /// The audit `source` stamped on the entries this intent produces. The
+    /// field records the enforcement path, so a diagnostic run that skipped
+    /// the SSH/lid gates and charged nothing must not be logged as an
+    /// ordinary daemon authentication.
+    pub fn audit_source(self) -> AuditSource {
+        match self {
+            AuthIntent::Authenticate => AuditSource::Daemon,
+            AuthIntent::Test => AuditSource::Test,
+        }
+    }
+}
 
 /// The handler's input vocabulary — one variant per operation the daemon can
 /// perform. Internal to this crate (D5): the D-Bus server (`crate::server`)
@@ -362,7 +418,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 DaemonResponse::Ok
             }
 
-            DaemonRequest::Authenticate { user } => self.handle_authenticate(user, true),
+            DaemonRequest::Authenticate { user } => {
+                self.handle_authenticate(user, AuthIntent::Authenticate)
+            }
 
             DaemonRequest::Enroll { user, label } => {
                 // Refuse to enroll a plaintext template unless explicitly opted in.
@@ -524,35 +582,28 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         }
     }
 
-    /// Run an `Authenticate` request.
+    /// Run an authentication, enforced and audited according to `intent`.
     ///
-    /// `charge_failed_attempt` controls whether a non-matching result
-    /// consumes the shared (SQLite-backed) rate-limit budget for `user`.
-    /// `handle()` always passes `true`, preserving real-authentication
-    /// behavior exactly.
+    /// [`AuthIntent::Authenticate`] — every real authentication, whatever the
+    /// caller's privilege — runs every gate and charges the shared
+    /// (SQLite-backed) rate-limit budget on a failed attempt.
+    /// [`AuthIntent::Test`] is reached only from the root-only
+    /// `TestAuthenticate` D-Bus method: it skips the SSH/lid gates and
+    /// charges nothing.
     ///
-    /// The D-Bus layer (`commands/daemon.rs`) passes `false` when the caller
-    /// is root (N11, issue #96): `facelock test` is root-only and reaches
-    /// the daemon through this same `Authenticate` method, and a failed test
-    /// run must not lock the user out of real authentication. This costs
-    /// nothing security-wise — root already has unrestricted access to the
-    /// rate-limit table directly. `pre_check_audited`'s rate-limit *check*
-    /// (whether `user` is already over budget) is unaffected either way: an
-    /// already-limited user still sees "rate limited" here regardless of
-    /// `charge_failed_attempt`, because that decision is made before this
+    /// The rate-limit *check* (whether `user` is already over budget) is
+    /// unaffected by the intent: an already-limited user still sees "rate
+    /// limited" from `test`, because that decision is made before this
     /// function knows whether the attempt itself will fail.
-    pub fn handle_authenticate(
-        &mut self,
-        user: String,
-        charge_failed_attempt: bool,
-    ) -> DaemonResponse {
-        if let Some(resp) = auth::pre_check_audited(
+    pub fn handle_authenticate(&mut self, user: String, intent: AuthIntent) -> DaemonResponse {
+        if let Some(resp) = auth::pre_check_audited_with_context(
             &self.config,
             &self.store,
             &user,
             &self.rate_limiter,
             &self.device_caps,
-            AuditSource::Daemon,
+            intent.audit_source(),
+            intent.pre_check_context(),
         ) {
             return resp.into();
         }
@@ -591,17 +642,17 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             &models,
             &self.config,
             &user,
-            AuditSource::Daemon,
+            intent.audit_source(),
         );
         // `authenticate_with_embeddings` works on an internal copy;
         // wipe the caller-side plaintext set too (#100).
         zeroize_stored_embeddings(&mut stored);
         self.camera = Some(camera);
         self.camera_last_used = Instant::now();
-        // Only failed auths count against the rate limit, and only when the
-        // caller hasn't been exempted (see doc comment above).
+        // Only failed auths count against the rate limit, and only for the
+        // real-authentication intent (see [`AuthIntent`]).
         if let AuthOutcome::AuthResult(ref mr) = result {
-            if !mr.matched && charge_failed_attempt {
+            if !mr.matched && intent.charges_rate_limit() {
                 if let Err(e) = self.rate_limiter.record_failure(&self.store, &user) {
                     warn!(user, error = %e, "failed to record auth failure");
                 }
@@ -654,5 +705,42 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one table that decides what an authentication costs and how it is
+    /// enforced. Real authentication charges the rate limit; the diagnostic
+    /// intent does not. Nothing here consults the caller's UID — that
+    /// inference is exactly what let a failed face auth at a `sudo` prompt
+    /// (setuid-root, so UID 0 at the daemon) escape the limiter.
+    #[test]
+    fn only_real_authentication_charges_the_rate_limit() {
+        assert!(AuthIntent::Authenticate.charges_rate_limit());
+        assert!(!AuthIntent::Test.charges_rate_limit());
+    }
+
+    /// The SSH/lid physical-presence gates are skippable for the diagnostic
+    /// intent only (N11); every other gate applies to both.
+    #[test]
+    fn only_the_test_intent_skips_the_ssh_and_lid_gates() {
+        let real = AuthIntent::Authenticate.pre_check_context();
+        assert!(!real.skip_ssh_gate);
+        assert!(!real.skip_lid_gate);
+
+        let test = AuthIntent::Test.pre_check_context();
+        assert!(test.skip_ssh_gate);
+        assert!(test.skip_lid_gate);
+    }
+
+    /// The audit `source` names the enforcement path that ran, so the two
+    /// intents must never share a stamp.
+    #[test]
+    fn each_intent_stamps_its_own_audit_source() {
+        assert_eq!(AuthIntent::Authenticate.audit_source(), AuditSource::Daemon);
+        assert_eq!(AuthIntent::Test.audit_source(), AuditSource::Test);
     }
 }

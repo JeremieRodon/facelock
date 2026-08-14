@@ -5,7 +5,7 @@ use facelock_core::config::Config;
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
 use facelock_daemon::auth::AuthOutcome;
-use facelock_daemon::handler::{DaemonRequest, DaemonResponse};
+use facelock_daemon::handler::{AuthIntent, DaemonRequest, DaemonResponse};
 use facelock_store::FaceStore;
 use facelock_test_support::fixtures;
 use facelock_test_support::{MockCamera, MockFaceEngine};
@@ -751,14 +751,16 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
     cleanup_db(&db_path);
 }
 
-/// N11 (issue #96): `facelock test` runs through the daemon's `Authenticate`
-/// method exactly like real auth, but is root-only and must never consume
-/// the shared rate-limit budget on failure — the D-Bus layer calls
-/// `Handler::handle_authenticate(user, false)` for a root caller instead of
-/// `handle(DaemonRequest::Authenticate { .. })`. A handful of failed test
-/// runs must not lock the user out of real authentication afterward.
+/// N11 (issue #96): `facelock test` must never consume the shared
+/// rate-limit budget on failure — a handful of failed test runs must not
+/// lock the user out of real authentication afterward.
+///
+/// This pins the handler half of that: `AuthIntent::Test` charges nothing.
+/// The intent is no longer inferred from the caller's privilege (which was
+/// the bug — `sudo`'s PAM stack is root too); it arrives from the root-only
+/// `TestAuthenticate` D-Bus method, which `tests/server_authz.rs` covers.
 #[test]
-fn exempted_authenticate_does_not_consume_rate_limit_budget() {
+fn test_intent_does_not_consume_rate_limit_budget() {
     use facelock_daemon::handler::Handler;
     use facelock_daemon::rate_limit::RateLimiter;
 
@@ -797,17 +799,16 @@ fn exempted_authenticate_does_not_consume_rate_limit_budget() {
     )
     .unwrap();
 
-    // Run more failed attempts than max_attempts (1), all exempted from
-    // charging. None may report "rate limited" — the budget starts and stays
-    // at zero recorded failures.
+    // Run more failed attempts than max_attempts (1). None may report "rate
+    // limited" — the budget starts and stays at zero recorded failures.
     for i in 0..3 {
-        let resp = handler.handle_authenticate("testuser".into(), false);
+        let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Test);
         assert!(
             matches!(
                 resp,
                 DaemonResponse::AuthResult(MatchResult { matched: false, .. })
             ),
-            "exempted attempt {i} should run the auth loop normally, not report rate-limited: {resp:?}"
+            "test attempt {i} should run the auth loop normally, not report rate-limited: {resp:?}"
         );
     }
 
@@ -816,7 +817,7 @@ fn exempted_authenticate_does_not_consume_rate_limit_budget() {
     let inspect_store = FaceStore::create(&db_path).unwrap();
     assert!(
         inspect_store.check_rate_limit("testuser", 1, 60).unwrap(),
-        "rate_limit table must be untouched by exempted (root/test) failures"
+        "rate_limit table must be untouched by diagnostic (test) failures"
     );
 
     cleanup_db(&db_path);
@@ -886,9 +887,9 @@ fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
     )
     .unwrap();
 
-    // charge_failed_attempt = true: this is the real-authentication path
-    // (`handle()` always charges); the exemption exists only for root `test`.
-    let resp = handler.handle_authenticate("testuser".into(), true);
+    // The real-authentication intent, which always charges; the diagnostic
+    // carve-out exists only for `facelock test`.
+    let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Authenticate);
     match resp {
         DaemonResponse::Error { ref message } => {
             assert!(

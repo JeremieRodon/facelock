@@ -119,53 +119,52 @@ group) gets the group-membership hint. Telling a root-only rejection to
 
 `facelock test` is root-only (issue #96) and, being root, keeps full detail
 on both transports: on the daemon transport, `AuthResult.similarity` is
-redacted to non-root D-Bus callers only (`redact_similarity_unless_root` in
-`commands/daemon.rs`) — since `test` requires root, its `Authenticate` calls
-always get the real score. The direct transport never redacts.
+redacted to non-root D-Bus callers only (`redact_similarity_unless_root`) —
+since `test` requires root, it always gets the real score. The direct
+transport never redacts.
 
-It runs through the same pre-flight gates as real authentication —
-`security.disabled`, enrollment / `suppress_unknown`, the rate-limit check,
-and `require_ir` — via `facelock_daemon::auth::pre_check_audited*`, with one
-explicit, narrow exception: the `abort_if_ssh` / `abort_if_lid_closed` gates
-are skippable via `PreCheckContext::test()`. Those two gates exist to stop an
-*attacker*'s physical-access shortcuts, not to block an admin who is already
-root (by construction, since `test` requires root) and is deliberately
-diagnosing recognition over SSH or with the lid closed on a docked laptop.
-Every other gate stays enforced — this is a context flag threaded through
-`pre_check`, not a parallel copy of the gate logic (issue #95 was exactly
-that kind of drift).
+**`test` is a separate D-Bus method, not a privileged flavor of
+`Authenticate`.** On the daemon transport `facelock test` calls the
+root-only **`TestAuthenticate`** method; `Authenticate` is real
+authentication only. The daemon does not infer which it is serving from the
+caller's UID, and must not: `pam_facelock` runs inside the PAM stack of the
+authenticating program, and `sudo` is setuid-root — as are `login`, `su`,
+and root-run display-manager greeters — so a real failed face
+authentication at a `sudo` prompt reaches the daemon as UID 0. A design that
+exempted root callers from rate-limit consumption therefore left the limit
+inert on the primary documented PAM target. Intent travels with the method
+call instead (`AuthIntent` in `facelock_daemon::handler`).
 
-The override applies uniformly on the **direct** (daemonless) transport,
-where the pre-flight check runs in the same process that has the invoking
-session's actual `SSH_CONNECTION`/lid state. It does **not** apply
-separately on the **daemon** transport: `test` there is just another
-`Authenticate` D-Bus call, indistinguishable from real auth at that layer,
-so `abort_if_ssh` is evaluated against the long-running daemon process's own
-environment (never an SSH session) and is already inert there regardless;
-`abort_if_lid_closed` reads a system-wide hardware file and so still applies
-uniformly to every daemon-mediated `Authenticate` call, `test` included. In
-practice this means: diagnosing over SSH works on both transports (direct
-because it's overridden, daemon because the gate was already a no-op there);
-diagnosing with the lid closed only bypasses the gate in direct/oneshot mode.
+Both entry points run the same pre-flight gates — `security.disabled`,
+enrollment / `suppress_unknown`, the rate-limit check, and `require_ir` —
+via `facelock_daemon::auth::pre_check_audited*`. `TestAuthenticate` differs
+in exactly two documented ways:
 
-**Rate-limit consumption is exempted; the check is not.** A failed `test`
-attempt never consumes the shared (SQLite-backed) rate-limit budget:
-- Direct transport: `direct::authenticate` never calls
-  `RateLimiter::record_failure` — structurally, not conditionally.
-- Daemon transport: `test` reaches the daemon through the same
-  `Authenticate` D-Bus method as real auth. The D-Bus layer
-  (`commands/daemon.rs`) calls `Handler::handle_authenticate(user, charge)`
-  with `charge = !caller_is_root`; since `test` requires root, its D-Bus
-  calls are always exempted. Real end-user authentication (hyprlock, screen
-  lockers) runs as the *unprivileged user themselves*, so it is always
-  charged as before — this exemption only ever fires for a root caller.
+1. **The `abort_if_ssh` / `abort_if_lid_closed` gates are skipped**
+   (`PreCheckContext::test()`). Those two exist to stop an *attacker*'s
+   physical-access shortcuts, not to block an admin who is already root (by
+   construction, since `test` requires root) and is deliberately diagnosing
+   recognition over SSH or with the lid closed on a docked laptop. This is a
+   context flag threaded through `pre_check`, not a parallel copy of the gate
+   logic (issue #95 was exactly that kind of drift). It applies identically
+   on the direct transport, which calls `pre_check_audited_with_context`
+   directly — the two transports no longer diverge here, as they did while
+   `test` had no daemon-side method of its own to carry the context.
+2. **A failed attempt consumes no rate-limit budget.** The direct transport
+   gets this structurally (`direct::authenticate` never calls
+   `RateLimiter::record_failure`); the daemon transport gets it because
+   `TestAuthenticate` is the entry point that does not charge. Root-only is
+   what makes a budget-free authentication endpoint safe to offer at all —
+   root already owns the database and can clear the limiter directly, so
+   exempting *consumption* for it costs nothing.
 
-The rate-limit *check* (whether `user` is already over budget) is
-unaffected by any of the above and still runs on both transports: an
+`Authenticate` always charges a failed attempt, on every transport and for
+every caller including root.
+
+The rate-limit *check* (whether `user` is already over budget) is unaffected
+by any of the above and still runs on both methods and both transports: an
 already-limited user's `test` run reports "rate limited", exactly like real
-auth would. Root can already clear the limiter directly (it owns the
-database), so exempting *consumption* costs nothing security-wise, while
-still surfacing an existing lockout instead of masking it.
+auth would — surfacing an existing lockout instead of masking it.
 
 ## Operating Modes
 
@@ -281,7 +280,7 @@ binary; none of it touches the data itself.
 
 `audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
 
-`source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (direct-mode `facelock test`, which runs the recognition loop in-process). It records the **enforcement path, not the caller's intent**: `facelock test` against a running daemon goes through `Authenticate` and is logged as `daemon`, because it runs the full `pre_check` gates (rate limiting, `require_ir`, SSH/lid abort) and its failures count against the rate limit. Only `test` skips those gates, so a `success` stamped `test` is a recognition result, not a policy-approved authentication. The field is absent on entries written before it existed.
+`source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (`facelock test`, on either transport: the daemon's `TestAuthenticate` method or the in-process direct loop). It records the **enforcement path, not the caller's identity**: `daemon` and `oneshot` are fully-enforced authentications whose failures count against the rate limit, while `test` skips the SSH/lid physical-presence gates and charges nothing. So a `success` stamped `test` is a recognition result, not a policy-approved authentication — and a real authentication is never stamped `test`, whatever privilege its caller holds. The field is absent on entries written before it existed.
 
 ## Config Schema
 
@@ -406,7 +405,7 @@ The daemon registers on the system bus via D-Bus activation.
 - **Interface**: `org.facelock.Daemon`
 
 ### Methods
-`Authenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
+`Authenticate`, `TestAuthenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
 
 Method authorization contract (updated under DEC-6/N13 — the CLI's
 root-by-default privilege map left no unprivileged consumer for most of
@@ -414,16 +413,23 @@ these, so tightening them to root-only closes the per-frame similarity
 hill-climbing oracle by construction rather than by redacting fields):
 - `Authenticate`: root or the matching Unix user. The one user-scoped method
   — screen lockers run their PAM stack as the user, so this is architecture,
-  not policy.
+  not policy. It is **real authentication**: a failed attempt always
+  consumes rate-limit budget, whatever the caller's UID.
+- `TestAuthenticate`: **root only.** Same arguments and same `AuthResult`
+  reply as `Authenticate`, and the same gates except that it skips the
+  SSH/lid physical-presence aborts and charges no rate-limit budget on
+  failure (see "facelock test Semantics" above). It exists so the daemon
+  never has to infer a caller's purpose from their privilege; root-only is
+  what makes a budget-free endpoint safe to expose.
 - Every other method — `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`,
   `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`,
   `Ping`, `Shutdown` — is root only. The bus policy
   (`dbus/org.facelock.Daemon.conf`) stays interface-scoped (grants send
-  access to root and the `facelock` group for the whole interface); the
-  per-method root/user-scoped decision is the in-daemon check on the caller
-  UID from `GetConnectionUnixUser`, keyed by a table-driven scope
-  (`authorize_method` in `commands/daemon.rs`) so a new method is root-only
-  by default until deliberately opened up.
+  access to root and the `facelock` group for the whole interface, so adding
+  a method needs no policy edit); the per-method root/user-scoped decision is
+  the in-daemon check on the caller UID from `GetConnectionUnixUser`, keyed
+  by a table-driven scope (`authorize_method` in `facelock_daemon::server`)
+  so a new method is root-only by default until deliberately opened up.
 
 Raw camera frames require privilege. `PreviewFrame` remains root-only.
 `PreviewDetectFrame` returns the `jpeg_data` frame bytes to root
@@ -459,21 +465,22 @@ Enrollment behavior is mode-independent: oneshot (`facelock enroll` in direct
 mode) and the daemon's `Enroll` method run the same capture loop, so the
 quality gate and the angle-diversity check apply in both.
 
-Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and
-`PreviewDetectFrame` are serialized by an in-flight capture guard. While one
-capture is in progress, a concurrent call to any of these methods fails
-**immediately** with an `org.freedesktop.DBus.Error.Failed` error whose
-message contains `daemon busy` (no queuing on the internal handler lock).
+Capture concurrency: `Authenticate`, `TestAuthenticate`, `Enroll`,
+`PreviewFrame`, and `PreviewDetectFrame` are serialized by an in-flight
+capture guard. While one capture is in progress, a concurrent call to any of
+these methods fails **immediately** with an
+`org.freedesktop.DBus.Error.Failed` error whose message contains `daemon
+busy` (no queuing on the internal handler lock).
 Clients (PAM included) must treat this like any other daemon error — degrade
 to the next auth mechanism (password), never a lockout.
 
 ### Signals
-- `AuthAttempted(user: s, matched: b)` — emitted after each authentication
-  attempt. The payload intentionally carries **no similarity score** (the raw
-  biometric score is an information leak / spoof-tuning oracle). The system
-  bus policy (`dbus/org.facelock.Daemon.conf`) denies signal reception from
-  the daemon by default; only root and members of the `facelock` group may
-  receive it.
+- `AuthAttempted(user: s, matched: b)` — emitted after each camera-backed
+  attempt, from `Authenticate` and `TestAuthenticate` alike. The payload
+  intentionally carries **no similarity score** (the raw biometric score is
+  an information leak / spoof-tuning oracle). The system bus policy
+  (`dbus/org.facelock.Daemon.conf`) denies signal reception from the daemon
+  by default; only root and members of the `facelock` group may receive it.
 
 ### Response types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`
@@ -483,6 +490,8 @@ to the next auth mechanism (password), never a lockout.
 ### Authenticate error encoding
 
 `Authenticate` returns `AuthResult (matched: b, model_id: i, label: s, similarity: d)`.
+`TestAuthenticate` returns the same type with the same sentinels — one
+encoding, so the two cannot drift.
 Sentinel `model_id` values (only meaningful with `matched == false`):
 
 | model_id | Meaning |
