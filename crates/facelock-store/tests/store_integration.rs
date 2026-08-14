@@ -109,13 +109,11 @@ fn embedding_round_trip_bit_exact() {
     let results = store.get_user_embeddings("alice").unwrap();
     assert_eq!(results.len(), 1);
 
-    for i in 0..512 {
+    for (i, (retrieved, stored)) in results[0].1.iter().zip(emb.iter()).enumerate() {
         assert_eq!(
-            results[0].1[i].to_bits(),
-            emb[i].to_bits(),
-            "bit-exact mismatch at index {i}: stored={}, retrieved={}",
-            emb[i],
-            results[0].1[i]
+            retrieved.to_bits(),
+            stored.to_bits(),
+            "bit-exact mismatch at index {i}: stored={stored}, retrieved={retrieved}"
         );
     }
 }

@@ -3571,17 +3571,17 @@ account include   system-login
     fn pam_idempotent_detection() {
         // Exact match
         let content = format!("#%PAM-1.0\n{PAM_LINE}\nauth    include   system-login\n");
-        assert!(content.lines().any(|line| is_facelock_pam_line(line)));
+        assert!(content.lines().any(is_facelock_pam_line));
 
         // Different spacing should still match
         let content2 =
             "#%PAM-1.0\nauth  sufficient  pam_facelock.so\nauth    include   system-login\n";
-        assert!(content2.lines().any(|line| is_facelock_pam_line(line)));
+        assert!(content2.lines().any(is_facelock_pam_line));
 
         // Commented-out line should not match
         let content3 =
             "#%PAM-1.0\n#auth sufficient pam_facelock.so\nauth    include   system-login\n";
-        assert!(!content3.lines().any(|line| is_facelock_pam_line(line)));
+        assert!(!content3.lines().any(is_facelock_pam_line));
     }
 
     #[test]

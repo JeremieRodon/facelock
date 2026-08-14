@@ -333,9 +333,7 @@ fn warmup_frames_discarded_on_camera_open() {
     let capture_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _counter = capture_count.clone();
 
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| {
+    let factory: facelock_test_support::mock_camera::MockCameraFactory = Box::new(move |_cfg| {
         // Camera with enough frames for warmup + auth
         Ok(MockCamera::bright(64, 64, 20))
     });
@@ -379,9 +377,8 @@ fn warmup_frames_zero_skips_discard() {
         config.security.rate_limit.window_secs,
     );
 
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 5)));
+    let factory: facelock_test_support::mock_camera::MockCameraFactory =
+        Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 5)));
 
     let mut handler = Handler::new(
         config,
@@ -621,9 +618,8 @@ fn keyfile_sealer_init_failure_fails_enroll_closed_no_plaintext() {
 
     // A camera + engine that WOULD drive a valid enrollment, so the pre-fix code
     // path reaches plaintext storage (proving the downgrade the fix closes).
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(640, 480, 40)));
+    let factory: facelock_test_support::mock_camera::MockCameraFactory =
+        Box::new(move |_cfg| Ok(MockCamera::bright(640, 480, 40)));
     let engine = MockFaceEngine::cycling(vec![
         fixtures::known_embedding(0),
         fixtures::known_embedding(40),
@@ -696,9 +692,8 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
             .unwrap();
     }
 
-    let factory1: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+    let factory1: facelock_test_support::mock_camera::MockCameraFactory =
+        Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
 
     let mut first_handler = Handler::new(
         config.clone(),
@@ -722,9 +717,8 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
         DaemonResponse::AuthResult(MatchResult { matched: false, .. })
     ));
 
-    let factory2: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+    let factory2: facelock_test_support::mock_camera::MockCameraFactory =
+        Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
 
     let mut restarted_handler = Handler::new(
         config.clone(),
@@ -781,9 +775,8 @@ fn test_intent_does_not_consume_rate_limit_budget() {
             .unwrap();
     }
 
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+    let factory: facelock_test_support::mock_camera::MockCameraFactory =
+        Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
 
     let mut handler = Handler::new(
         config.clone(),
@@ -869,9 +862,8 @@ fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
             .unwrap();
     }
 
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+    let factory: facelock_test_support::mock_camera::MockCameraFactory =
+        Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
 
     let mut handler = Handler::new(
         config.clone(),

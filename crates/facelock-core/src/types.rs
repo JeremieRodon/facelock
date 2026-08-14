@@ -564,9 +564,7 @@ mod tests {
         let mut a = [0.0f32; 512];
         // Create a unit vector
         let val = 1.0 / (512.0f32).sqrt();
-        for x in &mut a {
-            *x = val;
-        }
+        a.fill(val);
         let result = cosine_similarity(&a, &a);
         assert!(
             (result - 1.0).abs() < 1e-5,
@@ -579,12 +577,8 @@ mod tests {
         let mut a = [0.0f32; 512];
         let mut b = [0.0f32; 512];
         // First half nonzero in a, second half nonzero in b
-        for i in 0..256 {
-            a[i] = 1.0 / (256.0f32).sqrt();
-        }
-        for i in 256..512 {
-            b[i] = 1.0 / (256.0f32).sqrt();
-        }
+        a[..256].fill(1.0 / (256.0f32).sqrt());
+        b[256..].fill(1.0 / (256.0f32).sqrt());
         let result = cosine_similarity(&a, &b);
         assert!(
             result.abs() < 1e-5,
@@ -1197,9 +1191,7 @@ mod tests {
     fn cosine_similarity_opposite() {
         let mut a = [0.0f32; 512];
         let val = 1.0 / (512.0f32).sqrt();
-        for x in &mut a {
-            *x = val;
-        }
+        a.fill(val);
         let mut b = a;
         for x in &mut b {
             *x = -*x;

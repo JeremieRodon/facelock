@@ -42,11 +42,14 @@ jobs:
       - name: Build workspace with TPM
         run: cargo build --workspace --features tpm
 
+      # --all-targets so test/bench code is linted too; without it a
+      # deny-by-default lint in a test never fails CI. Keep in sync with the
+      # justfile `lint` recipe, which is the same command.
       - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run clippy with TPM
-        run: cargo clippy --workspace --features tpm -- -D warnings
+        run: cargo clippy --workspace --all-targets --features tpm -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace

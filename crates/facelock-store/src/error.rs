@@ -99,6 +99,9 @@ impl From<StoreError> for facelock_core::error::FacelockError {
 mod tests {
     use super::*;
 
+    /// Does a classified error have the variant the case expects?
+    type IsExpectedClass = fn(&StoreError) -> bool;
+
     fn sqlite_error(code: std::os::raw::c_int) -> rusqlite::Error {
         rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), Some("detail".into()))
     }
@@ -106,7 +109,7 @@ mod tests {
     #[test]
     fn classify_maps_sqlite_codes_to_failure_classes() {
         let path = Path::new("/var/lib/facelock/facelock.db");
-        let cases: &[(std::os::raw::c_int, fn(&StoreError) -> bool)] = &[
+        let cases: &[(std::os::raw::c_int, IsExpectedClass)] = &[
             (rusqlite::ffi::SQLITE_NOTADB, |e| {
                 matches!(e, StoreError::Corrupt { .. })
             }),

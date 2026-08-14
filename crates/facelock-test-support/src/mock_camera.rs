@@ -4,6 +4,16 @@ use facelock_core::types::{CameraCaps, Frame};
 
 use crate::fixtures;
 
+/// The camera-factory box `Handler::new` takes in tests.
+///
+/// Named because it is spelled out at nine call sites across the daemon's
+/// integration tests, where the bare `Box<dyn Fn(..) -> .. + Send + Sync>` is
+/// both noise and a `clippy::type_complexity` error under the workspace's
+/// `--all-targets` lint gate.
+pub type MockCameraFactory = Box<
+    dyn Fn(&facelock_core::config::Config) -> std::result::Result<MockCamera, String> + Send + Sync,
+>;
+
 /// A mock camera that replays pre-built frames.
 pub struct MockCamera {
     frames: Vec<Frame>,
