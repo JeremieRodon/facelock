@@ -61,7 +61,7 @@ enabled = false
         config.security.rate_limit.max_attempts,
         config.security.rate_limit.window_secs,
     );
-    let factory: facelock_test_support::mock_camera::MockCameraFactory =
+    let factory: Box<dyn Fn(&Config) -> Result<MockCamera, String> + Send + Sync> =
         Box::new(|_| Ok(MockCamera::bright(64, 64, 60)));
     let handler = Handler::new(
         config,

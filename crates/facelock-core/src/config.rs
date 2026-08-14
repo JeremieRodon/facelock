@@ -828,6 +828,27 @@ path = "/dev/video0"
         }
     }
 
+    /// `NotificationMode`'s own `Default` went unused when the container-level
+    /// `#[serde(default)]` above removed the field-level default that called
+    /// it — `NotificationConfig::default()` names the mode explicitly. It is
+    /// kept rather than deleted, because its two sibling enums in this file
+    /// (`SnapshotMode`, `EncryptionMethod`) still have live `Default`s via
+    /// their own field-level defaults, and one enum silently lacking a
+    /// `Default` reads as an oversight rather than a decision.
+    ///
+    /// Keeping it means two answers to "what is the default mode" exist, and
+    /// that impl is the one that drifted to `Both` in a shipped release — so
+    /// pin them equal. This also covers the case a deletion could not: if
+    /// `#[serde(default)]` is ever re-added to the `mode` field, the enum's
+    /// answer becomes authoritative again, and this catches it disagreeing.
+    #[test]
+    fn notification_mode_default_agrees_with_the_section_default() {
+        assert_eq!(
+            NotificationMode::default(),
+            NotificationConfig::default().mode
+        );
+    }
+
     /// The same drift class, generalized past one section: every `Config`
     /// field is `#[serde(default)]`, so an empty document must produce
     /// exactly `Config::default()`. Any section that grows a field default

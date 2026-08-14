@@ -35,7 +35,7 @@ libc = "0.2"
 tpm = ["facelock-tpm/tpm"]
 
 [dev-dependencies]
-# Schema-level failure injection lives in facelock-test-support::schema_faults,
-# which owns the rusqlite dependency it needs.
 facelock-test-support = { path = "../facelock-test-support" }
+# Raw SQL access for schema-level failure injection in integration tests.
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"

@@ -10,6 +10,16 @@ use crate::fixtures;
 /// integration tests, where the bare `Box<dyn Fn(..) -> .. + Send + Sync>` is
 /// both noise and a `clippy::type_complexity` error under the workspace's
 /// `--all-targets` lint gate.
+///
+/// Those nine call sites are **not** on this branch: `crates/facelock-daemon`
+/// belongs to a concurrent change, which carries an identically-named local
+/// alias in each of its three test files. This is the definition all three
+/// collapse into once the branches merge, which is why it is exported with no
+/// in-tree caller yet.
+///
+/// `std::result::Result` is spelled out because this module imports
+/// `facelock_core::error::Result`, a one-parameter alias that cannot express
+/// the `String` error type.
 pub type MockCameraFactory = Box<
     dyn Fn(&facelock_core::config::Config) -> std::result::Result<MockCamera, String> + Send + Sync,
 >;
