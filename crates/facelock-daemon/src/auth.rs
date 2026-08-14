@@ -101,6 +101,47 @@ pub fn pre_check(
     None
 }
 
+/// Run [`pre_check`] and, when a gate short-circuits, write the audit entry
+/// for the rejection. The daemon handler and the oneshot `facelock auth`
+/// binary both go through this wrapper so rejection auditing cannot drift
+/// between the two paths (#95: rate-limit rejections on the oneshot path
+/// were never audited).
+pub fn pre_check_audited(
+    config: &Config,
+    store: &FaceStore,
+    user: &str,
+    rate_limiter: &RateLimiter,
+    device_is_ir: bool,
+    source: AuditSource,
+) -> Option<DaemonResponse> {
+    let resp = pre_check(config, store, user, rate_limiter, device_is_ir)?;
+    let (result, error) = match &resp {
+        DaemonResponse::Error { message } if message.contains("rate limited") => {
+            ("rate_limited".to_string(), Some(message.clone()))
+        }
+        DaemonResponse::Error { message } => ("error".to_string(), Some(message.clone())),
+        DaemonResponse::AuthResult(mr) if !mr.matched => ("failure".to_string(), None),
+        DaemonResponse::Suppressed => ("suppressed".to_string(), None),
+        _ => ("error".to_string(), None),
+    };
+    audit::write_audit_entry(
+        &config.audit,
+        &AuditEntry {
+            timestamp: audit::now_iso8601(),
+            user: user.to_string(),
+            result,
+            source: Some(source),
+            similarity: None,
+            frame_count: None,
+            duration_ms: None,
+            device: config.device.path.clone(),
+            model_label: None,
+            error,
+        },
+    );
+    Some(resp)
+}
+
 /// Run the camera-based authentication loop with pre-loaded (decrypted) embeddings.
 ///
 /// This is the only entry point: callers MUST load embeddings through their

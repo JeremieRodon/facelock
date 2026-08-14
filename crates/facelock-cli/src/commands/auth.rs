@@ -14,7 +14,7 @@ use facelock_daemon::auth;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub fn run(user: String, config_path: Option<String>) -> i32 {
     let config = match config_path {
@@ -51,70 +51,8 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         }
     }
 
-    // --- Pre-flight security checks (mirrors daemon pre_check) ---
-
-    if config.security.disabled {
-        error!("facelock is disabled");
-        return 2;
-    }
-
-    if config.security.abort_if_ssh
-        && (std::env::var("SSH_CONNECTION").is_ok() || std::env::var("SSH_TTY").is_ok())
-    {
-        error!("SSH session detected, aborting");
-        return 2;
-    }
-
-    if config.security.abort_if_lid_closed {
-        let lid_closed = std::fs::read_to_string("/proc/acpi/button/lid/LID0/state")
-            .map(|s| s.contains("closed"))
-            .unwrap_or(false);
-        if lid_closed {
-            error!("lid closed, aborting");
-            return 2;
-        }
-    }
-
-    // Open a writable store for rate limiting (the oneshot path runs as root
-    // or the facelock group, so write access is available).
-    let store = match FaceStore::open(Path::new(&config.storage.db_path)) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("database: {e}");
-            return 2;
-        }
-    };
-
-    // SQLite-based rate limiting: survives across oneshot process invocations.
-    // Only failed authentications consume the budget.
-    let rl = &config.security.rate_limit;
-    let rate_limiter = RateLimiter::new(rl.max_attempts, rl.window_secs);
-    match rate_limiter.check(&store, &user) {
-        Ok(true) => {}
-        Ok(false) => {
-            error!(user = %user, "rate limited");
-            return 2;
-        }
-        Err(e) => {
-            error!("rate limit check: {e}");
-            return 2;
-        }
-    }
-
-    match store.has_models(&user) {
-        Ok(true) => {}
-        Ok(false) => {
-            info!(user = %user, "no enrolled models");
-            return 2;
-        }
-        Err(e) => {
-            error!("storage: {e}");
-            return 2;
-        }
-    }
-
-    // --- End pre-flight checks ---
-
+    // Resolve the live device before the pre-flight gates so `pre_check` sees
+    // the real IR classification, exactly like the daemon does at startup.
     let device_path = config.device.path.clone().unwrap();
     let quirks = QuirksDb::load();
     let device_info = validate_device(&device_path);
@@ -125,11 +63,6 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         .map(|dev| is_ir_camera_resolved(dev, Some(&quirks)))
         .unwrap_or(false);
 
-    if config.security.require_ir && !device_is_ir {
-        error!("IR camera required but device is not IR");
-        return 2;
-    }
-
     // Device coupling (Plan 02): fingerprint the live camera so the compare loop
     // can skip templates enrolled on a different camera.
     let live_fingerprint = facelock_camera::device_fingerprint(&device_path);
@@ -137,6 +70,42 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     let device_quirk = device_info
         .ok()
         .and_then(|info| quirks.find_match(&info).cloned());
+
+    // Open a writable store (the oneshot path runs as root or the facelock
+    // group). The rate limiter is SQLite-backed through this database, so its
+    // window is shared with the daemon and survives across process invocations.
+    let store = match FaceStore::open(Path::new(&config.storage.db_path)) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("database: {e}");
+            return 2;
+        }
+    };
+
+    let rl = &config.security.rate_limit;
+    let rate_limiter = RateLimiter::new(rl.max_attempts, rl.window_secs);
+
+    // The daemon's pre-flight gates (disabled/SSH/lid, enrollment +
+    // suppress_unknown, rate limit, require_ir), with the daemon's rejection
+    // auditing. This used to be an inline mirror that drifted (#95): rate-limit
+    // rejections were never audited and suppress_unknown was ignored.
+    if let Some(resp) = auth::pre_check_audited(
+        &config,
+        &store,
+        &user,
+        &rate_limiter,
+        device_is_ir,
+        AuditSource::Oneshot,
+    ) {
+        // Every pre-flight rejection exits 2 ("error"), which the PAM module
+        // maps to PAM_IGNORE — the same code the deleted mirror used for each
+        // gate, so a rate-limited or not-enrolled user still falls through to
+        // password rather than registering a failed match (exit 1). The
+        // suppressed / not-enrolled / rate-limited distinction is carried by
+        // the audit record and the tracing output, not the exit code.
+        debug!(?resp, "pre-check short-circuit");
+        return 2;
+    }
 
     let mut camera = match Camera::open(&config.device, device_quirk.as_ref()) {
         Ok(c) => c,
@@ -167,7 +136,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     // handles encrypted templates (encrypt-by-default, Plan 04) — the bare
     // `auth::authenticate` helper reads plaintext only. Decrypt failure degrades
     // to no-match (exit 1 via an empty compare set), never a hard error.
-    let stored = match crate::direct::load_user_embeddings(&store, &config, &user) {
+    let mut stored = match crate::direct::load_user_embeddings(&store, &config, &user) {
         Ok(v) => v,
         Err(e) => {
             error!(user = %user, "failed to load embeddings: {e}");
@@ -177,10 +146,10 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     let models = store.list_models(&user).unwrap_or_default();
 
     let start = std::time::Instant::now();
-    let response = auth::authenticate_with_embeddings(
+    let response = crate::direct::authenticate_and_wipe(
         &mut camera,
         &mut engine,
-        &stored,
+        &mut stored,
         &models,
         &config,
         &user,
@@ -257,5 +226,173 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             error!("unexpected response");
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use facelock_core::config::Config;
+    use facelock_core::ipc::DaemonResponse;
+    use facelock_core::types::MatchResult;
+    use facelock_daemon::audit::AuditSource;
+    use facelock_daemon::auth::pre_check_audited;
+    use facelock_daemon::rate_limit::RateLimiter;
+    use facelock_store::FaceStore;
+    use std::path::Path;
+
+    /// Config for exercising the oneshot pre-flight gates: audit to a temp
+    /// file, SSH/lid gates off so the environment cannot short-circuit first.
+    fn gate_config(audit_path: &str, suppress_unknown: bool) -> Config {
+        Config::parse(&format!(
+            r#"
+[security]
+require_ir = false
+abort_if_ssh = false
+abort_if_lid_closed = false
+suppress_unknown = {suppress_unknown}
+
+[security.rate_limit]
+max_attempts = 2
+window_secs = 60
+
+[audit]
+enabled = true
+path = "{audit_path}"
+"#
+        ))
+        .unwrap()
+    }
+
+    fn audit_lines(path: &Path) -> Vec<serde_json::Value> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn rate_limiter(config: &Config) -> RateLimiter {
+        let rl = &config.security.rate_limit;
+        RateLimiter::new(rl.max_attempts, rl.window_secs)
+    }
+
+    /// #95 symptom (a): a rate-limited oneshot attempt used to be rejected
+    /// with no audit record. Unified on `pre_check_audited`, the rejection
+    /// must produce the same `rate_limited` entry the daemon path writes,
+    /// stamped with the oneshot source.
+    #[test]
+    fn rate_limit_rejection_on_oneshot_path_writes_audit_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let config = gate_config(audit_path.to_str().unwrap(), false);
+        let store = FaceStore::open_memory().unwrap();
+        store
+            .add_model("alice", "front", &[0.5f32; 512], "test-embedder")
+            .unwrap();
+
+        let limiter = rate_limiter(&config);
+        limiter.record_failure(&store, "alice").unwrap();
+        limiter.record_failure(&store, "alice").unwrap();
+
+        let resp = pre_check_audited(
+            &config,
+            &store,
+            "alice",
+            &limiter,
+            true,
+            AuditSource::Oneshot,
+        )
+        .expect("rate-limited user must short-circuit");
+        assert!(
+            matches!(resp, DaemonResponse::Error { ref message } if message.contains("rate limited")),
+            "expected rate-limited error, got {resp:?}"
+        );
+
+        let lines = audit_lines(&audit_path);
+        assert_eq!(lines.len(), 1, "exactly one audit record for the rejection");
+        assert_eq!(lines[0]["result"], "rate_limited");
+        assert_eq!(lines[0]["source"], "oneshot");
+        assert_eq!(lines[0]["user"], "alice");
+    }
+
+    /// #95 symptom (b): `suppress_unknown` was ignored on the oneshot path.
+    /// With it enabled, an un-enrolled user must yield `Suppressed` (audited
+    /// as such), not a plain not-enrolled failure.
+    #[test]
+    fn suppress_unknown_honored_on_oneshot_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let config = gate_config(audit_path.to_str().unwrap(), true);
+        let store = FaceStore::open_memory().unwrap();
+
+        let resp = pre_check_audited(
+            &config,
+            &store,
+            "nobody",
+            &rate_limiter(&config),
+            true,
+            AuditSource::Oneshot,
+        )
+        .expect("un-enrolled user must short-circuit");
+        assert!(matches!(resp, DaemonResponse::Suppressed));
+
+        let lines = audit_lines(&audit_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["result"], "suppressed");
+        assert_eq!(lines[0]["source"], "oneshot");
+    }
+
+    /// Counterpart to the suppress test: with `suppress_unknown` off, the
+    /// same un-enrolled user is a plain non-match, audited as `failure` —
+    /// matching the daemon path.
+    #[test]
+    fn no_models_without_suppress_audits_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let config = gate_config(audit_path.to_str().unwrap(), false);
+        let store = FaceStore::open_memory().unwrap();
+
+        let resp = pre_check_audited(
+            &config,
+            &store,
+            "nobody",
+            &rate_limiter(&config),
+            true,
+            AuditSource::Oneshot,
+        )
+        .expect("un-enrolled user must short-circuit");
+        assert!(matches!(
+            resp,
+            DaemonResponse::AuthResult(MatchResult { matched: false, .. })
+        ));
+
+        let lines = audit_lines(&audit_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["result"], "failure");
+        assert_eq!(lines[0]["source"], "oneshot");
+    }
+
+    /// An enrolled, un-limited user passes the gates with no audit record —
+    /// the auth loop itself owns success/failure auditing.
+    #[test]
+    fn passing_pre_check_writes_no_audit_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let config = gate_config(audit_path.to_str().unwrap(), false);
+        let store = FaceStore::open_memory().unwrap();
+        store
+            .add_model("alice", "front", &[0.5f32; 512], "test-embedder")
+            .unwrap();
+
+        let resp = pre_check_audited(
+            &config,
+            &store,
+            "alice",
+            &rate_limiter(&config),
+            true,
+            AuditSource::Oneshot,
+        );
+        assert!(resp.is_none(), "gates must pass, got {resp:?}");
+        assert!(audit_lines(&audit_path).is_empty());
     }
 }
