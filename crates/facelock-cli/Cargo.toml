@@ -5,6 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The domain layer (backend selection, health/status renderer, message seam,
+# resolved-config, logging default, state layout, transport client) lives in
+# this library so it can be integration-tested from `tests/` and shared, rather
+# than being sealed inside a bin-only crate (gap D6). `src/main.rs` is the thin
+# `facelock` binary: clap wiring plus dispatch into this library.
+[lib]
+name = "facelock_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "facelock"
 path = "src/main.rs"

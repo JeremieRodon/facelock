@@ -1,24 +1,19 @@
-pub mod backend;
-mod commands;
-pub mod direct;
-pub mod health;
-mod ipc_client;
-mod logging;
-pub mod message;
-pub mod notifications;
-pub mod resolved;
-pub mod state_layout;
+//! The `facelock` binary: clap wiring plus top-level dispatch into the
+//! `facelock_cli` library. The domain layer (backend, health, message,
+//! resolved, logging, …) lives in `lib.rs` so it stays testable and shareable
+//! (gap D6); this file keeps only the `Cli`/`Commands` types and `main`.
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use commands::TpmCommand;
-use commands::bench::BenchCommand;
-use commands::hyprlock::HyprlockCommand;
-use commands::setup::{
+use facelock_cli::commands::TpmCommand;
+use facelock_cli::commands::bench::BenchCommand;
+use facelock_cli::commands::hyprlock::HyprlockCommand;
+use facelock_cli::commands::setup::{
     EncryptionChoice, ExecutionProviderChoice, ModelPreset, SetupArgs, resolve_setup_plan,
 };
+use facelock_cli::{commands, logging, message, notifications, resolved};
 
 #[derive(Parser)]
 #[command(name = "facelock", about = "Linux face authentication", version)]
