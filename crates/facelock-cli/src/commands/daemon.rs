@@ -17,7 +17,7 @@ use facelock_camera::{
 use facelock_core::config::Config;
 use facelock_core::notify::NotifierFactory;
 use facelock_daemon::rate_limit::RateLimiter;
-use facelock_daemon::server::{HandlerRebuild, ProductionHandler};
+use facelock_daemon::server::{ProductionHandler, ProductionRebuild};
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
 use tracing::{error, info, warn};
@@ -204,7 +204,8 @@ pub fn run(config_path: Option<String>, notifier_factory: NotifierFactory) -> an
 
     // The reload recipe: same builder, no explicit path — `Config::load()`
     // honors the process-level config override `main` set for --config runs.
-    let rebuild: HandlerRebuild = Box::new(|| build_handler(None).map(|(handler, _idle)| handler));
+    let rebuild: ProductionRebuild =
+        Box::new(|| build_handler(None).map(|(handler, _idle)| handler));
 
     facelock_daemon::server::run(
         handler,

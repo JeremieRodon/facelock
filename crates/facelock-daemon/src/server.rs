@@ -18,6 +18,7 @@ use facelock_core::dbus_interface::{
     AuthResult, BUS_NAME, DeviceInfo, ModelInfo, OBJECT_PATH, PreviewFaceInfo,
 };
 use facelock_core::notify::{Notifier, NotifierFactory, NotifyEvent, notify_desktop_if_enabled};
+use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_face::FaceEngine;
 use futures_util::StreamExt;
 use nix::unistd::{Uid, User};
@@ -29,11 +30,14 @@ use crate::handler::{DaemonRequest, DaemonResponse, Handler};
 /// Production type alias for the handler with real Camera and FaceEngine.
 pub type ProductionHandler = Handler<Camera<'static>, FaceEngine>;
 
-/// Rebuilds the production handler from the on-disk config. Injected by the
-/// binary (which owns config parsing and handler construction) and invoked
-/// by the live config reload when the config file's mtime advances. `None`
-/// disables live reload (tests).
-pub type HandlerRebuild = Box<dyn Fn() -> Result<ProductionHandler, String> + Send + Sync>;
+/// Rebuilds the handler from the on-disk config. Injected by the binary
+/// (which owns config parsing and handler construction) and invoked by the
+/// live config reload when the config file's mtime advances. `None` disables
+/// live reload (tests).
+pub type HandlerRebuild<C, E> = Box<dyn Fn() -> Result<Handler<C, E>, String> + Send + Sync>;
+
+/// [`HandlerRebuild`] with the production camera and engine.
+pub type ProductionRebuild = HandlerRebuild<Camera<'static>, FaceEngine>;
 
 /// Failures bringing up or running the D-Bus server.
 #[derive(Debug, thiserror::Error)]
@@ -51,9 +55,9 @@ const HANDLER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Try to acquire the handler mutex with a timeout.
 /// Uses try_lock in a polling loop to avoid blocking the thread indefinitely.
-fn lock_handler_with_timeout(
-    handler: &Mutex<ProductionHandler>,
-) -> std::result::Result<MutexGuard<'_, ProductionHandler>, fdo::Error> {
+fn lock_handler_with_timeout<H>(
+    handler: &Mutex<H>,
+) -> std::result::Result<MutexGuard<'_, H>, fdo::Error> {
     let deadline = Instant::now() + HANDLER_LOCK_TIMEOUT;
     let mut waited = false;
     loop {
@@ -184,7 +188,7 @@ enum AuthzEntry {
 
 /// Result of a frame-authorization cache lookup.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum FrameAuthz {
+pub enum FrameAuthz {
     /// Polkit authorized this caller connection (cached, unexpired).
     Granted,
     /// Polkit denied this caller (or the check errored) — fail closed.
@@ -414,10 +418,14 @@ async fn watch_bus_disconnects(
     Ok(())
 }
 
+/// A resolved D-Bus caller: the UID the bus daemon vouches for
+/// (`GetConnectionUnixUser`) and its resolved username. Public (with public
+/// fields) so integration tests can drive the method-level entry points with
+/// synthetic identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CallerIdentity {
-    uid: u32,
-    username: Option<String>,
+pub struct CallerIdentity {
+    pub uid: u32,
+    pub username: Option<String>,
 }
 
 impl CallerIdentity {
@@ -629,8 +637,20 @@ fn recoverable_auth_error(message: String) -> AuthResult {
     }
 }
 
-struct FacelockService {
-    handler: Arc<Mutex<ProductionHandler>>,
+/// The `org.facelock.Daemon` service.
+///
+/// Generic over the handler's camera and engine so integration tests can
+/// construct it around mocks ([`FacelockService::new`]) and drive the
+/// method-level entry points (`*_as`) with synthetic caller identities (D6).
+/// The `#[interface]` block below binds the production types and owns only
+/// the zbus glue: caller-identity resolution, the polkit round-trip spawn,
+/// and signal emission.
+pub struct FacelockService<C, E>
+where
+    C: CameraSource + Send + 'static,
+    E: FaceProcessor + Send + 'static,
+{
+    handler: Arc<Mutex<Handler<C, E>>>,
     /// Timestamp of last D-Bus method call (seconds since daemon start).
     last_activity: Arc<AtomicU64>,
     /// Config file mtime when the handler was last built.
@@ -648,10 +668,34 @@ struct FacelockService {
     notifier_factory: NotifierFactory,
     /// Rebuilds the handler from on-disk config for the live reload. `None`
     /// disables reload (tests).
-    rebuild: Option<HandlerRebuild>,
+    rebuild: Option<HandlerRebuild<C, E>>,
 }
 
-impl FacelockService {
+impl<C, E> FacelockService<C, E>
+where
+    C: CameraSource + Send + 'static,
+    E: FaceProcessor + Send + 'static,
+{
+    /// Construct the service around a built handler. [`run_dbus_server`]
+    /// does this with production types; integration tests with mocks.
+    pub fn new(
+        handler: Handler<C, E>,
+        startup_config_mtime: Option<std::time::SystemTime>,
+        rebuild: Option<HandlerRebuild<C, E>>,
+        notifier_factory: NotifierFactory,
+    ) -> Self {
+        Self {
+            handler: Arc::new(Mutex::new(handler)),
+            last_activity: Arc::new(AtomicU64::new(now_secs())),
+            config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
+            camera_owner_uid: Arc::new(Mutex::new(None)),
+            capture_slot: Arc::new(CaptureSlot::default()),
+            preview_authz: Arc::new(PreviewAuthzCache::default()),
+            notifier_factory,
+            rebuild,
+        }
+    }
+
     fn clear_camera_owner(&self) {
         if let Ok(mut owner) = self.camera_owner_uid.lock() {
             *owner = None;
@@ -713,20 +757,23 @@ impl FacelockService {
 
         info!("handler reloaded with new config");
     }
-}
 
-#[interface(name = "org.facelock.Daemon")]
-impl FacelockService {
-    async fn authenticate(
+    // ------------------------------------------------------------------
+    // Method-level entry points (D6): everything each wire method does
+    // except zbus mechanics — activity/reload bookkeeping, authorization,
+    // capture-slot contention, handler dispatch, response mapping, and
+    // similarity redaction. `caller` arrives resolved, so integration tests
+    // exercise the full path with synthetic identities; production resolves
+    // it from the message header in the `#[interface]` glue below.
+    // ------------------------------------------------------------------
+
+    pub async fn authenticate_as(
         &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        caller: CallerIdentity,
         user: &str,
     ) -> fdo::Result<AuthResult> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::Authenticate, Some(user))?;
         let caller_is_root = caller.uid == 0;
         self.clear_camera_owner();
@@ -734,7 +781,6 @@ impl FacelockService {
         let handler = self.handler.clone();
         let notifier_factory = self.notifier_factory.clone();
         let user = user.to_string();
-        let signal_user = user.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
             // N11: a root caller (e.g. root-only `facelock test`) is exempt
@@ -786,29 +832,17 @@ impl FacelockService {
         // The similarity score is root-only (a hill-climbing oracle
         // otherwise); the score has already reached the audit log unredacted
         // inside the handler.
-        let result = result.map(|auth| auth.redact_similarity_unless_root(caller_is_root));
-
-        // Emit auth_attempted signal (best-effort, don't fail auth if signal
-        // fails). The payload deliberately carries no similarity score — the
-        // raw biometric score is a spoof-tuning oracle for anyone able to
-        // receive the broadcast; `matched` + user is enough for consumers.
-        if let Ok(ref auth_result) = result {
-            let _ = Self::auth_attempted(&ctxt, &signal_user, auth_result.matched).await;
-        }
-
-        result
+        result.map(|auth| auth.redact_similarity_unless_root(caller_is_root))
     }
 
-    async fn enroll(
+    pub async fn enroll_as(
         &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
+        caller: CallerIdentity,
         user: &str,
         label: &str,
     ) -> fdo::Result<(u32, u32)> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::Enroll, None)?;
         self.clear_camera_owner();
         let capture_guard = self.capture_slot.try_acquire("Enroll")?;
@@ -835,14 +869,12 @@ impl FacelockService {
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
-    async fn list_models(
+    pub async fn list_models_as(
         &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
+        caller: CallerIdentity,
         user: &str,
     ) -> fdo::Result<Vec<ModelInfo>> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::ListModels, None)?;
         let handler = self.handler.clone();
         let user = user.to_string();
@@ -873,15 +905,13 @@ impl FacelockService {
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
-    async fn remove_model(
+    pub async fn remove_model_as(
         &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
+        caller: CallerIdentity,
         user: &str,
         model_id: u32,
     ) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::RemoveModel, None)?;
         let handler = self.handler.clone();
         let user = user.to_string();
@@ -890,6 +920,8 @@ impl FacelockService {
             let request = DaemonRequest::RemoveModel { user, model_id };
             let response = handler.handle(request);
             match response {
+                // C8 (Phase E): the wire reply is unit, so "removed" and
+                // "nothing to remove" are indistinguishable to the caller.
                 DaemonResponse::Removed => Ok(()),
                 DaemonResponse::Error { message } => Err(fdo::Error::Failed(message)),
                 other => Err(fdo::Error::Failed(format!(
@@ -901,14 +933,8 @@ impl FacelockService {
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
-    async fn clear_models(
-        &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-        user: &str,
-    ) -> fdo::Result<()> {
+    pub async fn clear_models_as(&self, caller: CallerIdentity, user: &str) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::ClearModels, None)?;
         let handler = self.handler.clone();
         let user = user.to_string();
@@ -928,13 +954,8 @@ impl FacelockService {
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
-    async fn preview_frame(
-        &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-    ) -> fdo::Result<Vec<u8>> {
+    pub async fn preview_frame_as(&self, caller: CallerIdentity) -> fdo::Result<Vec<u8>> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::PreviewFrame, None)?;
         let capture_guard = self.capture_slot.try_acquire("PreviewFrame")?;
         let handler = self.handler.clone();
@@ -959,14 +980,18 @@ impl FacelockService {
         result
     }
 
-    async fn preview_detect_frame(
+    /// `sender` is the caller's unique bus name (the polkit subject and cache
+    /// key); `start_authz_check` is invoked at most once, when a caller has
+    /// no usable cached verdict, and must start the one polkit round-trip
+    /// (production spawns [`run_frame_authz_check`]).
+    pub async fn preview_detect_frame_as(
         &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
+        caller: CallerIdentity,
         user: &str,
+        sender: Option<String>,
+        start_authz_check: impl FnOnce(String),
     ) -> fdo::Result<(Vec<u8>, Vec<PreviewFaceInfo>)> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         // Root-only: preview runs per-frame with neither pre_check nor the
         // rate limiter, so for any weaker caller this method would be a
         // continuous similarity feed at camera framerate.
@@ -979,19 +1004,13 @@ impl FacelockService {
         let authz = if caller_is_root {
             FrameAuthz::Granted
         } else {
-            let sender = hdr
-                .sender()
-                .ok_or_else(|| fdo::Error::Failed("no sender in D-Bus message".into()))?
-                .to_string();
+            let sender =
+                sender.ok_or_else(|| fdo::Error::Failed("no sender in D-Bus message".into()))?;
             let authz = self.preview_authz.begin_or_lookup(&sender, Instant::now());
             if authz == FrameAuthz::NeedsCheck {
                 // Exactly one polkit round-trip per caller connection; the
                 // verdict lands in the cache for subsequent frame requests.
-                tokio::spawn(run_frame_authz_check(
-                    connection.clone(),
-                    self.preview_authz.clone(),
-                    sender,
-                ));
+                start_authz_check(sender);
             }
             authz
         };
@@ -1042,13 +1061,8 @@ impl FacelockService {
         result
     }
 
-    async fn list_devices(
-        &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-    ) -> fdo::Result<Vec<DeviceInfo>> {
+    pub async fn list_devices_as(&self, caller: CallerIdentity) -> fdo::Result<Vec<DeviceInfo>> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::ListDevices, None)?;
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
@@ -1056,6 +1070,8 @@ impl FacelockService {
             let request = DaemonRequest::ListDevices;
             let response = handler.handle(request);
             match response {
+                // C9 (Phase E): the wire DeviceInfo carries no formats, so
+                // per-device format/resolution detail is dropped here.
                 DaemonResponse::Devices(devices) => Ok(devices
                     .into_iter()
                     .map(|d| DeviceInfo {
@@ -1075,13 +1091,8 @@ impl FacelockService {
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
     }
 
-    async fn release_camera(
-        &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-    ) -> fdo::Result<()> {
+    pub async fn release_camera_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::ReleaseCamera, None)?;
         let handler = self.handler.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -1104,24 +1115,14 @@ impl FacelockService {
         result
     }
 
-    async fn ping(
-        &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-    ) -> fdo::Result<String> {
+    pub async fn ping_as(&self, caller: CallerIdentity) -> fdo::Result<String> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::Ping, None)?;
         Ok("pong".to_string())
     }
 
-    async fn shutdown(
-        &self,
-        #[zbus(header)] hdr: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &zbus::Connection,
-    ) -> fdo::Result<()> {
+    pub async fn shutdown_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let caller = resolve_caller_identity(&hdr, connection).await?;
         authorize_method(&caller, Method::Shutdown, None)?;
         self.clear_camera_owner();
         let handler = self.handler.clone();
@@ -1137,6 +1138,133 @@ impl FacelockService {
         })
         .await
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?
+    }
+}
+
+#[interface(name = "org.facelock.Daemon")]
+impl FacelockService<Camera<'static>, FaceEngine> {
+    async fn authenticate(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        user: &str,
+    ) -> fdo::Result<AuthResult> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        let result = self.authenticate_as(caller, user).await;
+
+        // Emit auth_attempted signal (best-effort, don't fail auth if signal
+        // fails). The payload deliberately carries no similarity score — the
+        // raw biometric score is a spoof-tuning oracle for anyone able to
+        // receive the broadcast; `matched` + user is enough for consumers.
+        if let Ok(ref auth_result) = result {
+            let _ = Self::auth_attempted(&ctxt, user, auth_result.matched).await;
+        }
+
+        result
+    }
+
+    async fn enroll(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        user: &str,
+        label: &str,
+    ) -> fdo::Result<(u32, u32)> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.enroll_as(caller, user, label).await
+    }
+
+    async fn list_models(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        user: &str,
+    ) -> fdo::Result<Vec<ModelInfo>> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.list_models_as(caller, user).await
+    }
+
+    async fn remove_model(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        user: &str,
+        model_id: u32,
+    ) -> fdo::Result<()> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.remove_model_as(caller, user, model_id).await
+    }
+
+    async fn clear_models(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        user: &str,
+    ) -> fdo::Result<()> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.clear_models_as(caller, user).await
+    }
+
+    async fn preview_frame(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<Vec<u8>> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.preview_frame_as(caller).await
+    }
+
+    async fn preview_detect_frame(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        user: &str,
+    ) -> fdo::Result<(Vec<u8>, Vec<PreviewFaceInfo>)> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        let sender = hdr.sender().map(|s| s.to_string());
+        let cache = self.preview_authz.clone();
+        let connection = connection.clone();
+        self.preview_detect_frame_as(caller, user, sender, move |sender| {
+            tokio::spawn(run_frame_authz_check(connection, cache, sender));
+        })
+        .await
+    }
+
+    async fn list_devices(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<Vec<DeviceInfo>> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.list_devices_as(caller).await
+    }
+
+    async fn release_camera(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.release_camera_as(caller).await
+    }
+
+    async fn ping(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<String> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.ping_as(caller).await
+    }
+
+    async fn shutdown(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.shutdown_as(caller).await
     }
 
     /// Signal emitted after each authentication attempt.
@@ -1182,7 +1310,7 @@ pub fn run(
     handler: ProductionHandler,
     idle_timeout_secs: u64,
     startup_config_mtime: Option<std::time::SystemTime>,
-    rebuild: Option<HandlerRebuild>,
+    rebuild: Option<ProductionRebuild>,
     notifier_factory: NotifierFactory,
 ) -> Result<(), ServerError> {
     let handler = Arc::new(Mutex::new(handler));
@@ -1301,7 +1429,7 @@ async fn run_dbus_server(
     handler: Arc<Mutex<ProductionHandler>>,
     idle_timeout_secs: u64,
     startup_config_mtime: Option<std::time::SystemTime>,
-    rebuild: Option<HandlerRebuild>,
+    rebuild: Option<ProductionRebuild>,
     notifier_factory: NotifierFactory,
 ) -> Result<(), ServerError> {
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
