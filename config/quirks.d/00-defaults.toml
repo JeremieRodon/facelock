@@ -43,8 +43,15 @@ notes = "Intel RealSense D455 IR module"
 
 # --- Lenovo ThinkPad IR cameras ---
 
+# Anchored (#99): name_pattern now matches the WHOLE device name, not a
+# substring of it, so this requires the name to literally START with
+# "IR Camera" (a trailing wildcard still allows a model-number suffix, e.g.
+# "IR Camera 5MP"). It intentionally does NOT match names where "IR Camera"
+# isn't the leading text (e.g. "Integrated IR Camera") — add a corrected,
+# still-anchored pattern for your exact device string (see `facelock
+# list-devices`) rather than reintroducing a bare leading wildcard here.
 [[quirk]]
-name_pattern = "(?i)ir.*camera"
+name_pattern = "(?i)ir camera.*"
 force_ir = true
 warmup_frames = 8
 notes = "ThinkPad integrated IR camera (various models)"
@@ -65,8 +72,13 @@ notes = "Logitech BRIO 4K with IR sensor"
 
 # --- Microsoft Surface cameras ---
 
+# Anchored (#99): requires the name to START with "surface", then a
+# word-bounded " ir" later (the literal leading space stops an unrelated
+# word ending in "...ir", e.g. "Air", from matching). Does NOT match names
+# where "Microsoft" precedes "Surface" — add a corrected pattern for your
+# exact device string if needed.
 [[quirk]]
-name_pattern = "(?i)surface.*ir"
+name_pattern = "(?i)surface.* ir.*"
 force_ir = true
 warmup_frames = 8
 notes = "Microsoft Surface IR camera"
@@ -80,8 +92,10 @@ notes = "Microsoft Surface Pro IR camera"
 
 # --- HP IR cameras ---
 
+# Anchored (#99): see the ThinkPad/Surface entries above for the pattern
+# rationale (start-anchored vendor prefix + word-bounded " ir").
 [[quirk]]
-name_pattern = "(?i)hp.*ir"
+name_pattern = "(?i)hp.* ir.*"
 force_ir = true
 warmup_frames = 8
 notes = "HP IR camera (various models)"
@@ -89,7 +103,7 @@ notes = "HP IR camera (various models)"
 # --- Dell IR cameras ---
 
 [[quirk]]
-name_pattern = "(?i)dell.*ir"
+name_pattern = "(?i)dell.* ir.*"
 force_ir = true
 warmup_frames = 8
 notes = "Dell IR camera (various models)"
