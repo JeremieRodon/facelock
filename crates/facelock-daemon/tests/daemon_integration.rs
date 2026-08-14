@@ -744,3 +744,75 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
 
     cleanup_db(&db_path);
 }
+
+/// N11 (issue #96): `facelock test` runs through the daemon's `Authenticate`
+/// method exactly like real auth, but is root-only and must never consume
+/// the shared rate-limit budget on failure — the D-Bus layer calls
+/// `Handler::handle_authenticate(user, false)` for a root caller instead of
+/// `handle(DaemonRequest::Authenticate { .. })`. A handful of failed test
+/// runs must not lock the user out of real authentication afterward.
+#[test]
+fn exempted_authenticate_does_not_consume_rate_limit_budget() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    let db_path = temp_db_path("rate-limit-exempt");
+    cleanup_db(&db_path);
+
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+    config.recognition.timeout_secs = 0;
+    config.security.rate_limit.max_attempts = 1;
+    config.security.require_frame_variance = false;
+    config.security.require_landmark_liveness = false;
+
+    {
+        let store = FaceStore::create(&db_path).unwrap();
+        store
+            .add_model("testuser", "front", &fixtures::known_embedding(0), "")
+            .unwrap();
+    }
+
+    let factory: Box<
+        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
+    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+
+    let mut handler = Handler::new(
+        config.clone(),
+        MockFaceEngine::no_faces(),
+        FaceStore::create(&db_path).unwrap(),
+        RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        ),
+        false,
+        facelock_core::types::DeviceFingerprint::default(),
+        Some(factory),
+        None,
+    )
+    .unwrap();
+
+    // Run more failed attempts than max_attempts (1), all exempted from
+    // charging. None may report "rate limited" — the budget starts and stays
+    // at zero recorded failures.
+    for i in 0..3 {
+        let resp = handler.handle_authenticate("testuser".into(), false);
+        assert!(
+            matches!(
+                resp,
+                DaemonResponse::AuthResult(MatchResult { matched: false, .. })
+            ),
+            "exempted attempt {i} should run the auth loop normally, not report rate-limited: {resp:?}"
+        );
+    }
+
+    // Directly assert the on-disk rate_limit table is untouched: a fresh
+    // check against the same database must still report "not rate limited".
+    let inspect_store = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect_store.check_rate_limit("testuser", 1, 60).unwrap(),
+        "rate_limit table must be untouched by exempted (root/test) failures"
+    );
+
+    cleanup_db(&db_path);
+}

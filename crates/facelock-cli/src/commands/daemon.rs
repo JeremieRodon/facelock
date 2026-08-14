@@ -704,8 +704,12 @@ impl FacelockService {
         let signal_user = user.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
-            let request = DaemonRequest::Authenticate { user: user.clone() };
-            let response = handler.handle(request);
+            // N11: a root caller (e.g. root-only `facelock test`) is exempt
+            // from rate-limit consumption on a failed attempt — root already
+            // has unrestricted access to the rate-limit table directly, and
+            // without this a few `facelock test` runs would lock the user
+            // out of real authentication. See `Handler::handle_authenticate`.
+            let response = handler.handle_authenticate(user.clone(), !caller_is_root);
             drop(handler);
             // Capture finished — free the slot before slower follow-up work
             // (notifications) so the next auth isn't rejected needlessly.

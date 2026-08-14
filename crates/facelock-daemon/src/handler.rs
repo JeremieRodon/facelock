@@ -333,57 +333,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 DaemonResponse::Ok
             }
 
-            DaemonRequest::Authenticate { user } => {
-                if let Some(resp) = auth::pre_check_audited(
-                    &self.config,
-                    &self.store,
-                    &user,
-                    &self.rate_limiter,
-                    self.device_is_ir,
-                    AuditSource::Daemon,
-                ) {
-                    return resp;
-                }
-
-                if let Err(resp) = self.acquire_camera() {
-                    return resp;
-                }
-
-                // Pre-load and decrypt embeddings (handles TPM + software encryption)
-                let mut stored = match self.load_user_embeddings(&user) {
-                    Ok(s) => s,
-                    Err(resp) => return resp,
-                };
-
-                // Split borrows: take camera out, run auth, put it back
-                let mut camera = self.camera.take().unwrap();
-                let models = self.store.list_models(&user).unwrap_or_default();
-                let result = auth::authenticate_with_embeddings(
-                    &mut camera,
-                    &mut self.engine,
-                    &stored,
-                    &models,
-                    &self.config,
-                    &user,
-                    self.device_is_ir,
-                    &self.device_fingerprint,
-                    AuditSource::Daemon,
-                );
-                // `authenticate_with_embeddings` works on an internal copy;
-                // wipe the caller-side plaintext set too (#100).
-                zeroize_stored_embeddings(&mut stored);
-                self.camera = Some(camera);
-                self.camera_last_used = Instant::now();
-                // Only failed auths count against the rate limit
-                if let DaemonResponse::AuthResult(ref mr) = result {
-                    if !mr.matched {
-                        if let Err(e) = self.rate_limiter.record_failure(&self.store, &user) {
-                            warn!(user, error = %e, "failed to record auth failure");
-                        }
-                    }
-                }
-                result
-            }
+            DaemonRequest::Authenticate { user } => self.handle_authenticate(user, true),
 
             DaemonRequest::Enroll { user, label } => {
                 // Refuse to enroll a plaintext template unless explicitly opted in.
@@ -541,6 +491,80 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 result
             }
         }
+    }
+
+    /// Run an `Authenticate` request.
+    ///
+    /// `charge_failed_attempt` controls whether a non-matching result
+    /// consumes the shared (SQLite-backed) rate-limit budget for `user`.
+    /// `handle()` always passes `true`, preserving real-authentication
+    /// behavior exactly.
+    ///
+    /// The D-Bus layer (`commands/daemon.rs`) passes `false` when the caller
+    /// is root (N11, issue #96): `facelock test` is root-only and reaches
+    /// the daemon through this same `Authenticate` method, and a failed test
+    /// run must not lock the user out of real authentication. This costs
+    /// nothing security-wise — root already has unrestricted access to the
+    /// rate-limit table directly. `pre_check_audited`'s rate-limit *check*
+    /// (whether `user` is already over budget) is unaffected either way: an
+    /// already-limited user still sees "rate limited" here regardless of
+    /// `charge_failed_attempt`, because that decision is made before this
+    /// function knows whether the attempt itself will fail.
+    pub fn handle_authenticate(
+        &mut self,
+        user: String,
+        charge_failed_attempt: bool,
+    ) -> DaemonResponse {
+        if let Some(resp) = auth::pre_check_audited(
+            &self.config,
+            &self.store,
+            &user,
+            &self.rate_limiter,
+            self.device_is_ir,
+            AuditSource::Daemon,
+        ) {
+            return resp;
+        }
+
+        if let Err(resp) = self.acquire_camera() {
+            return resp;
+        }
+
+        // Pre-load and decrypt embeddings (handles TPM + software encryption)
+        let mut stored = match self.load_user_embeddings(&user) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+
+        // Split borrows: take camera out, run auth, put it back
+        let mut camera = self.camera.take().unwrap();
+        let models = self.store.list_models(&user).unwrap_or_default();
+        let result = auth::authenticate_with_embeddings(
+            &mut camera,
+            &mut self.engine,
+            &stored,
+            &models,
+            &self.config,
+            &user,
+            self.device_is_ir,
+            &self.device_fingerprint,
+            AuditSource::Daemon,
+        );
+        // `authenticate_with_embeddings` works on an internal copy;
+        // wipe the caller-side plaintext set too (#100).
+        zeroize_stored_embeddings(&mut stored);
+        self.camera = Some(camera);
+        self.camera_last_used = Instant::now();
+        // Only failed auths count against the rate limit, and only when the
+        // caller hasn't been exempted (see doc comment above).
+        if let DaemonResponse::AuthResult(ref mr) = result {
+            if !mr.matched && charge_failed_attempt {
+                if let Err(e) = self.rate_limiter.record_failure(&self.store, &user) {
+                    warn!(user, error = %e, "failed to record auth failure");
+                }
+            }
+        }
+        result
     }
 
     fn encode_frame_response(&mut self, rgb: &[u8], width: u32, height: u32) -> DaemonResponse {
