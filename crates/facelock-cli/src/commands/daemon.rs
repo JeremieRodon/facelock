@@ -16,7 +16,7 @@ use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
 use futures_util::StreamExt;
-use nix::unistd::{Group, Uid, User};
+use nix::unistd::{Uid, User};
 use tracing::{error, info, warn};
 use zbus::{fdo, interface, object_server::SignalEmitter};
 
@@ -397,7 +397,6 @@ async fn watch_bus_disconnects(
 struct CallerIdentity {
     uid: u32,
     username: Option<String>,
-    in_facelock_group: bool,
 }
 
 impl CallerIdentity {
@@ -425,11 +424,106 @@ async fn resolve_caller_identity(
         .map_err(|e| fdo::Error::Failed(format!("failed to get caller UID: {e}")))?;
 
     let username = uid_to_username(uid);
-    Ok(CallerIdentity {
-        uid,
-        in_facelock_group: is_facelock_group_member(uid, username.as_deref()),
-        username,
-    })
+    Ok(CallerIdentity { uid, username })
+}
+
+/// Every method on the `org.facelock.Daemon` D-Bus interface. Keep in sync
+/// with the `#[interface]` block below — the daemon has no integration seam
+/// for its D-Bus layer, so this enum plus [`Method::scope`] is the testable
+/// authorization matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Method {
+    Authenticate,
+    Enroll,
+    ListModels,
+    RemoveModel,
+    ClearModels,
+    PreviewFrame,
+    PreviewDetectFrame,
+    ListDevices,
+    ReleaseCamera,
+    Ping,
+    Shutdown,
+}
+
+impl Method {
+    #[cfg(test)]
+    const ALL: [Method; 11] = [
+        Method::Authenticate,
+        Method::Enroll,
+        Method::ListModels,
+        Method::RemoveModel,
+        Method::ClearModels,
+        Method::PreviewFrame,
+        Method::PreviewDetectFrame,
+        Method::ListDevices,
+        Method::ReleaseCamera,
+        Method::Ping,
+        Method::Shutdown,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Method::Authenticate => "Authenticate",
+            Method::Enroll => "Enroll",
+            Method::ListModels => "ListModels",
+            Method::RemoveModel => "RemoveModel",
+            Method::ClearModels => "ClearModels",
+            Method::PreviewFrame => "PreviewFrame",
+            Method::PreviewDetectFrame => "PreviewDetectFrame",
+            Method::ListDevices => "ListDevices",
+            Method::ReleaseCamera => "ReleaseCamera",
+            Method::Ping => "Ping",
+            Method::Shutdown => "Shutdown",
+        }
+    }
+
+    /// Authorization target for each method.
+    ///
+    /// `Authenticate` is the only user-scoped method: screen lockers run
+    /// their PAM stack as the user, so a user must be able to request
+    /// authentication for themselves — that is architecture, not policy.
+    /// Everything else is root-only. In particular `PreviewDetectFrame`,
+    /// which runs per-frame with no rate limit, must never be reachable by
+    /// an unprivileged caller: together with score redaction this closes the
+    /// similarity hill-climbing oracle by construction. The catch-all arm
+    /// makes any future method root-only until it is deliberately opened up.
+    fn scope(self) -> Scope {
+        match self {
+            Method::Authenticate => Scope::UserScoped,
+            _ => Scope::Root,
+        }
+    }
+}
+
+/// Who may call a D-Bus method. The bus policy admits root and the facelock
+/// group to the whole interface; this in-daemon check (keyed on the caller
+/// UID from `GetConnectionUnixUser`) is the per-method decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scope {
+    /// Root only.
+    Root,
+    /// Root, or a non-root caller acting on their own username.
+    UserScoped,
+}
+
+/// The single per-method authorization decision point. `target_user` is the
+/// username a user-scoped method acts on; root-scoped methods ignore it.
+/// Fails closed: a user-scoped call without a target user is denied.
+fn authorize_method(
+    caller: &CallerIdentity,
+    method: Method,
+    target_user: Option<&str>,
+) -> fdo::Result<()> {
+    match method.scope() {
+        Scope::Root => require_root(caller, method.name()),
+        Scope::UserScoped => {
+            let user = target_user.ok_or_else(|| {
+                fdo::Error::Failed(format!("{} requires a target user", method.name()))
+            })?;
+            require_user_authorized(caller, user, method.name())
+        }
+    }
 }
 
 fn require_root(caller: &CallerIdentity, operation: &str) -> fdo::Result<()> {
@@ -480,93 +574,11 @@ fn require_user_authorized(
     )))
 }
 
-fn require_camera_owner_or_root(
-    caller: &CallerIdentity,
-    owner_uid: Option<u32>,
-    operation: &str,
-) -> fdo::Result<()> {
-    if caller.uid == 0 {
-        return Ok(());
-    }
-
-    if owner_uid == Some(caller.uid) {
-        return Ok(());
-    }
-
-    let caller_name = caller.display_name();
-    warn!(
-        operation = operation,
-        caller_uid = caller.uid,
-        caller_name = %caller_name,
-        owner_uid,
-        "D-Bus caller does not own the active preview camera session"
-    );
-    Err(fdo::Error::AccessDenied(format!(
-        "{operation} not authorized: caller '{caller_name}' (UID {}) does not own the active preview camera session",
-        caller.uid
-    )))
-}
-
-fn require_facelock_access(caller: &CallerIdentity, operation: &str) -> fdo::Result<()> {
-    if caller.uid == 0 || caller.in_facelock_group {
-        return Ok(());
-    }
-
-    let caller_name = caller.display_name();
-    warn!(
-        operation = operation,
-        caller_uid = caller.uid,
-        caller_name = %caller_name,
-        "D-Bus caller is not in facelock group"
-    );
-    Err(fdo::Error::AccessDenied(format!(
-        "{operation} requires root or facelock group membership (caller: '{caller_name}', UID {})",
-        caller.uid
-    )))
-}
-
-async fn verify_caller_is_root(
-    hdr: &zbus::message::Header<'_>,
-    connection: &zbus::Connection,
-    operation: &str,
-) -> fdo::Result<()> {
-    let caller = resolve_caller_identity(hdr, connection).await?;
-    require_root(&caller, operation)
-}
-
-async fn verify_caller_authorized(
-    hdr: &zbus::message::Header<'_>,
-    connection: &zbus::Connection,
-    user: &str,
-    operation: &str,
-) -> fdo::Result<()> {
-    let caller = resolve_caller_identity(hdr, connection).await?;
-    require_user_authorized(&caller, user, operation)
-}
-
 fn uid_to_username(uid: u32) -> Option<String> {
     User::from_uid(Uid::from_raw(uid))
         .ok()
         .flatten()
         .map(|user| user.name)
-}
-
-fn is_facelock_group_member(uid: u32, username: Option<&str>) -> bool {
-    let Some(group) = Group::from_name("facelock").ok().flatten() else {
-        return false;
-    };
-
-    let in_primary_group = User::from_uid(Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .map(|user| user.gid == group.gid)
-        .unwrap_or(false);
-
-    let listed_in_group = username
-        .map(|name| group.mem.iter().any(|member| member == name))
-        .unwrap_or(false);
-
-    in_primary_group || listed_in_group
 }
 
 /// Current time as seconds since an arbitrary epoch (Instant-based).
@@ -622,10 +634,6 @@ impl FacelockService {
         if let Ok(mut owner) = self.camera_owner_uid.lock() {
             *owner = Some(uid);
         }
-    }
-
-    fn camera_owner_uid(&self) -> Option<u32> {
-        self.camera_owner_uid.lock().ok().and_then(|owner| *owner)
     }
 
     /// Check if the config file has been modified since the handler was built.
@@ -686,7 +694,9 @@ impl FacelockService {
     ) -> fdo::Result<AuthResult> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
-        verify_caller_authorized(&hdr, connection, user, "Authenticate").await?;
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        authorize_method(&caller, Method::Authenticate, Some(user))?;
+        let caller_is_root = caller.uid == 0;
         self.clear_camera_owner();
         let capture_guard = self.capture_slot.try_acquire("Authenticate")?;
         let handler = self.handler.clone();
@@ -745,6 +755,11 @@ impl FacelockService {
         .await
         .map_err(|e| fdo::Error::Failed(format!("task join error: {e}")))?;
 
+        // The similarity score is root-only (a hill-climbing oracle
+        // otherwise); the score has already reached the audit log unredacted
+        // inside the handler.
+        let result = result.map(|auth| auth.redact_similarity_unless_root(caller_is_root));
+
         // Emit auth_attempted signal (best-effort, don't fail auth if signal
         // fails). The payload deliberately carries no similarity score — the
         // raw biometric score is a spoof-tuning oracle for anyone able to
@@ -765,7 +780,8 @@ impl FacelockService {
     ) -> fdo::Result<(u32, u32)> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
-        verify_caller_is_root(&hdr, connection, "Enroll").await?;
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        authorize_method(&caller, Method::Enroll, None)?;
         self.clear_camera_owner();
         let capture_guard = self.capture_slot.try_acquire("Enroll")?;
         let handler = self.handler.clone();
@@ -798,7 +814,8 @@ impl FacelockService {
         user: &str,
     ) -> fdo::Result<Vec<ModelInfo>> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        verify_caller_authorized(&hdr, connection, user, "ListModels").await?;
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        authorize_method(&caller, Method::ListModels, None)?;
         let handler = self.handler.clone();
         let user = user.to_string();
         tokio::task::spawn_blocking(move || {
@@ -836,7 +853,8 @@ impl FacelockService {
         model_id: u32,
     ) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        verify_caller_is_root(&hdr, connection, "RemoveModel").await?;
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        authorize_method(&caller, Method::RemoveModel, None)?;
         let handler = self.handler.clone();
         let user = user.to_string();
         tokio::task::spawn_blocking(move || {
@@ -862,7 +880,8 @@ impl FacelockService {
         user: &str,
     ) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        verify_caller_is_root(&hdr, connection, "ClearModels").await?;
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        authorize_method(&caller, Method::ClearModels, None)?;
         let handler = self.handler.clone();
         let user = user.to_string();
         tokio::task::spawn_blocking(move || {
@@ -888,7 +907,7 @@ impl FacelockService {
     ) -> fdo::Result<Vec<u8>> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         let caller = resolve_caller_identity(&hdr, connection).await?;
-        require_root(&caller, "PreviewFrame")?;
+        authorize_method(&caller, Method::PreviewFrame, None)?;
         let capture_guard = self.capture_slot.try_acquire("PreviewFrame")?;
         let handler = self.handler.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -920,7 +939,10 @@ impl FacelockService {
     ) -> fdo::Result<(Vec<u8>, Vec<PreviewFaceInfo>)> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         let caller = resolve_caller_identity(&hdr, connection).await?;
-        require_user_authorized(&caller, user, "PreviewDetectFrame")?;
+        // Root-only: preview runs per-frame with neither pre_check nor the
+        // rate limiter, so for any weaker caller this method would be a
+        // continuous similarity feed at camera framerate.
+        authorize_method(&caller, Method::PreviewDetectFrame, None)?;
         let caller_is_root = caller.uid == 0;
 
         // Frame-byte authorization (root bypasses polkit). Resolved BEFORE
@@ -960,14 +982,20 @@ impl FacelockService {
                     let jpeg_data = sanitize_preview_jpeg(jpeg_data, allow_frames);
                     let face_infos: Vec<PreviewFaceInfo> = faces
                         .into_iter()
-                        .map(|f| PreviewFaceInfo {
-                            x: f.x as f64,
-                            y: f.y as f64,
-                            width: f.width as f64,
-                            height: f.height as f64,
-                            confidence: f.confidence as f64,
-                            similarity: f.similarity as f64,
-                            recognized: f.recognized,
+                        .map(|f| {
+                            PreviewFaceInfo {
+                                x: f.x as f64,
+                                y: f.y as f64,
+                                width: f.width as f64,
+                                height: f.height as f64,
+                                confidence: f.confidence as f64,
+                                similarity: f.similarity as f64,
+                                recognized: f.recognized,
+                            }
+                            // Defense in depth: authorization above already
+                            // restricts this method to root, but the score
+                            // must stay redacted even if that ever regresses.
+                            .redact_similarity_unless_root(caller_is_root)
                         })
                         .collect();
                     Ok((jpeg_data, face_infos))
@@ -993,7 +1021,7 @@ impl FacelockService {
     ) -> fdo::Result<Vec<DeviceInfo>> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         let caller = resolve_caller_identity(&hdr, connection).await?;
-        require_facelock_access(&caller, "ListDevices")?;
+        authorize_method(&caller, Method::ListDevices, None)?;
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -1026,7 +1054,7 @@ impl FacelockService {
     ) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         let caller = resolve_caller_identity(&hdr, connection).await?;
-        require_camera_owner_or_root(&caller, self.camera_owner_uid(), "ReleaseCamera")?;
+        authorize_method(&caller, Method::ReleaseCamera, None)?;
         let handler = self.handler.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -1054,7 +1082,8 @@ impl FacelockService {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> fdo::Result<String> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        let _ = resolve_caller_identity(&hdr, connection).await?;
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        authorize_method(&caller, Method::Ping, None)?;
         Ok("pong".to_string())
     }
 
@@ -1064,7 +1093,8 @@ impl FacelockService {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
-        verify_caller_is_root(&hdr, connection, "Shutdown").await?;
+        let caller = resolve_caller_identity(&hdr, connection).await?;
+        authorize_method(&caller, Method::Shutdown, None)?;
         self.clear_camera_owner();
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
@@ -1484,15 +1514,6 @@ mod tests {
     fn caller(uid: u32, username: Option<&str>) -> CallerIdentity {
         CallerIdentity {
             uid,
-            in_facelock_group: false,
-            username: username.map(str::to_string),
-        }
-    }
-
-    fn facelock_caller(uid: u32, username: Option<&str>) -> CallerIdentity {
-        CallerIdentity {
-            uid,
-            in_facelock_group: true,
             username: username.map(str::to_string),
         }
     }
@@ -1517,60 +1538,109 @@ mod tests {
         assert_eq!(result.similarity, 0.0);
     }
 
+    // --- Authorization matrix (N13) ---
+    //
+    // Authenticate is the only user-scoped method; everything else is
+    // root-only. These tests iterate Method::ALL so a new method cannot be
+    // added without landing in the matrix.
+
     #[test]
-    fn root_is_allowed_for_privileged_operations() {
-        assert!(require_root(&caller(0, Some("root")), "Shutdown").is_ok());
+    fn authz_matrix_root_is_allowed_everywhere() {
+        let root = caller(0, Some("root"));
+        for method in Method::ALL {
+            assert!(
+                authorize_method(&root, method, Some("alice")).is_ok(),
+                "root must be allowed to call {method:?}"
+            );
+        }
     }
 
     #[test]
-    fn same_user_is_allowed_for_user_scoped_methods() {
+    fn authz_matrix_every_method_is_root_only_except_authenticate() {
+        for method in Method::ALL {
+            let expected = if method == Method::Authenticate {
+                Scope::UserScoped
+            } else {
+                Scope::Root
+            };
+            assert_eq!(method.scope(), expected, "{method:?}");
+        }
+    }
+
+    #[test]
+    fn authz_matrix_non_root_is_denied_every_root_scoped_method() {
+        let alice = caller(1000, Some("alice"));
+        for method in Method::ALL {
+            if method == Method::Authenticate {
+                continue;
+            }
+            let err = authorize_method(&alice, method, Some("alice")).unwrap_err();
+            assert!(
+                matches!(err, fdo::Error::AccessDenied(_)),
+                "{method:?} must deny a non-root caller, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_and_metadata_methods_deny_non_root() {
+        // The methods N13 retargeted, pinned by name: PreviewDetectFrame is
+        // the continuous score feed (no pre_check, no rate limit); the rest
+        // were group- or user-reachable metadata surfaces.
+        let alice = caller(1000, Some("alice"));
+        for method in [
+            Method::PreviewDetectFrame,
+            Method::ListModels,
+            Method::ListDevices,
+            Method::Ping,
+            Method::ReleaseCamera,
+        ] {
+            let err = authorize_method(&alice, method, Some("alice")).unwrap_err();
+            assert!(
+                matches!(err, fdo::Error::AccessDenied(_)),
+                "{method:?} must deny a non-root caller"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticate_allows_non_root_caller_for_themselves() {
         assert!(
-            require_user_authorized(&caller(1000, Some("alice")), "alice", "Authenticate").is_ok()
+            authorize_method(
+                &caller(1000, Some("alice")),
+                Method::Authenticate,
+                Some("alice")
+            )
+            .is_ok()
         );
     }
 
     #[test]
-    fn different_user_is_denied_for_user_scoped_methods() {
-        let err = require_user_authorized(&caller(1000, Some("alice")), "bob", "Authenticate")
-            .unwrap_err();
+    fn authenticate_denies_non_root_caller_for_another_user() {
+        let err = authorize_method(
+            &caller(1000, Some("alice")),
+            Method::Authenticate,
+            Some("bob"),
+        )
+        .unwrap_err();
         assert!(matches!(err, fdo::Error::AccessDenied(_)));
     }
 
     #[test]
-    fn facelock_group_member_can_access_group_scoped_methods() {
+    fn authenticate_fails_closed_for_unresolvable_caller_username() {
+        // A non-root caller whose UID cannot be resolved to a username can
+        // never match the target user.
         assert!(
-            require_facelock_access(&facelock_caller(1000, Some("alice")), "ListDevices").is_ok()
+            authorize_method(&caller(1000, None), Method::Authenticate, Some("alice")).is_err()
         );
     }
 
     #[test]
-    fn non_member_cannot_access_group_scoped_methods() {
-        let err = require_facelock_access(&caller(1000, Some("alice")), "ListDevices").unwrap_err();
-        assert!(matches!(err, fdo::Error::AccessDenied(_)));
-    }
-
-    #[test]
-    fn preview_owner_can_release_camera() {
+    fn user_scoped_method_without_target_user_fails_closed() {
+        assert!(authorize_method(&caller(0, Some("root")), Method::Authenticate, None).is_err());
         assert!(
-            require_camera_owner_or_root(&caller(1000, Some("alice")), Some(1000), "ReleaseCamera")
-                .is_ok()
+            authorize_method(&caller(1000, Some("alice")), Method::Authenticate, None).is_err()
         );
-    }
-
-    #[test]
-    fn root_can_release_camera() {
-        assert!(
-            require_camera_owner_or_root(&caller(0, Some("root")), Some(1000), "ReleaseCamera")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn non_owner_cannot_release_camera() {
-        let err =
-            require_camera_owner_or_root(&caller(1001, Some("bob")), Some(1000), "ReleaseCamera")
-                .unwrap_err();
-        assert!(matches!(err, fdo::Error::AccessDenied(_)));
     }
 
     #[test]
