@@ -64,34 +64,43 @@ pub fn run(
 
     let user = ipc_client::resolve_user(user.as_deref());
 
-    let label = label.unwrap_or_else(|| {
-        let date = Local::now().format("%Y-%m-%d").to_string();
-        next_label(&date, &user, &config)
-    });
+    let label = match label {
+        Some(label) => label,
+        None => {
+            let date = Local::now().format("%Y-%m-%d").to_string();
+            next_label(&date, &user, &config)?
+        }
+    };
 
-    // Warn if existing models use a different embedder than currently configured
+    // Warn if existing models use a different embedder than currently
+    // configured. One failure policy (C4, issue #105): a store or daemon
+    // failure propagates instead of silently skipping the warning — the
+    // enrollment ahead needs the very store this check just failed to read.
     {
         let config_embedder = &config.recognition.embedder_model;
         let has_stale = if ipc_client::should_use_direct(&config) {
-            crate::direct::open_store(&config).ok().map(|s| {
-                let has_any = s.has_models(&user).ok().unwrap_or(false);
-                let has_matching = s
-                    .has_models_for_embedder(&user, config_embedder)
-                    .ok()
-                    .unwrap_or(false);
-                has_any && !has_matching
-            })
+            let store = crate::direct::open_store(&config)?;
+            let has_any = store
+                .has_models(&user)
+                .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
+            let has_matching = store
+                .has_models_for_embedder(&user, config_embedder)
+                .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
+            has_any && !has_matching
         } else {
             let request = DaemonRequest::ListModels { user: user.clone() };
-            match ipc_client::send_request(&request) {
-                Ok(DaemonResponse::Models(ref m)) if !m.is_empty() => Some(
-                    !m.iter()
-                        .any(|model| model.embedder_model == *config_embedder),
-                ),
-                _ => None,
+            match ipc_client::send_request(&request)? {
+                DaemonResponse::Models(m) => {
+                    !m.is_empty()
+                        && !m
+                            .iter()
+                            .any(|model| model.embedder_model == *config_embedder)
+                }
+                DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+                other => anyhow::bail!("unexpected response from daemon: {other:?}"),
             }
         };
-        if has_stale == Some(true) {
+        if has_stale {
             println!(
                 "Note: existing models don't use the configured embedder '{config_embedder}'."
             );
@@ -139,49 +148,108 @@ pub fn run(
 /// this never touches D-Bus in direct mode — an unconditional D-Bus call here
 /// would *activate* the system daemon and silently flip the subsequent
 /// enrollment from direct to daemon mode (issue #89 validation fallout).
-fn list_user_models(user: &str, config: &Config) -> Option<Vec<FaceModelInfo>> {
+///
+/// One failure policy (C4, issue #105): failures propagate; they must not
+/// read as "this user has no models".
+fn list_user_models(user: &str, config: &Config) -> anyhow::Result<Vec<FaceModelInfo>> {
     if ipc_client::should_use_direct(config) {
-        crate::direct::open_store(config)
-            .ok()?
+        let store = crate::direct::open_store(config)?;
+        store
             .list_models(user)
-            .ok()
+            .map_err(|e| anyhow::anyhow!("storage error: {e}"))
     } else {
         match ipc_client::send_request(&DaemonRequest::ListModels {
             user: user.to_string(),
-        }) {
-            Ok(DaemonResponse::Models(models)) => Some(models),
-            _ => None,
+        })? {
+            DaemonResponse::Models(models) => Ok(models),
+            DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+            other => anyhow::bail!("unexpected response from daemon: {other:?}"),
         }
     }
 }
 
 /// Generate the next available label like "2026-03-15-1", "2026-03-15-2", etc.
-fn next_label(date_prefix: &str, user: &str, config: &Config) -> String {
-    let max_suffix = list_user_models(user, config)
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|m| {
-                    m.label
-                        .strip_prefix(date_prefix)
-                        .and_then(|rest| rest.strip_prefix('-'))
-                        .and_then(|n| n.parse::<u32>().ok())
-                })
-                .max()
-                .unwrap_or(0)
+fn next_label(date_prefix: &str, user: &str, config: &Config) -> anyhow::Result<String> {
+    let max_suffix = list_user_models(user, config)?
+        .iter()
+        .filter_map(|m| {
+            m.label
+                .strip_prefix(date_prefix)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .and_then(|n| n.parse::<u32>().ok())
         })
+        .max()
         .unwrap_or(0);
 
-    format!("{date_prefix}-{}", max_suffix + 1)
+    Ok(format!("{date_prefix}-{}", max_suffix + 1))
 }
 
 fn check_model_count(user: &str, config: &Config) {
-    if let Some(models) = list_user_models(user, config) {
+    // Post-success advisory only: the enrollment already committed, so a
+    // failed count here must not turn a successful enrollment into a
+    // reported failure.
+    if let Ok(models) = list_user_models(user, config) {
         if models.len() > 5 {
             println!(
                 "\nWarning: user '{user}' has {} face models. Consider removing old ones with 'facelock remove'.",
                 models.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// `mode = "oneshot"` pins `should_use_direct` without touching D-Bus.
+    fn oneshot_config_with_db(db_path: &Path) -> Config {
+        let mut config = Config::parse("[daemon]\nmode = \"oneshot\"\n").expect("config parses");
+        config.storage.db_path = db_path.to_string_lossy().into_owned();
+        config
+    }
+
+    /// C4: a store failure while picking the next label propagates — it must
+    /// not silently fall back to a "-1" suffix.
+    #[test]
+    fn next_label_propagates_store_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let config = oneshot_config_with_db(&db_path);
+        assert!(next_label("2026-08-13", "alice", &config).is_err());
+    }
+
+    #[test]
+    fn next_label_counts_existing_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        {
+            let store = facelock_store::FaceStore::create(&db_path).unwrap();
+            let emb = [0.5f32; 512];
+            store
+                .add_model("alice", "2026-08-13-1", &emb, "embedder")
+                .unwrap();
+            store
+                .add_model("alice", "2026-08-13-2", &emb, "embedder")
+                .unwrap();
+        }
+
+        let config = oneshot_config_with_db(&db_path);
+        assert_eq!(
+            next_label("2026-08-13", "alice", &config).unwrap(),
+            "2026-08-13-3"
+        );
+        // A fresh prefix (or user) starts at -1.
+        assert_eq!(
+            next_label("2026-08-14", "alice", &config).unwrap(),
+            "2026-08-14-1"
+        );
+        assert_eq!(
+            next_label("2026-08-13", "bob", &config).unwrap(),
+            "2026-08-13-1"
+        );
     }
 }
