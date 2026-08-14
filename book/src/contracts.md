@@ -57,9 +57,13 @@ The CLI silently falls back to direct mode when the daemon is not available on D
 | Path | Owner | Mode | Purpose |
 |------|-------|------|---------|
 | `/etc/facelock/config.toml` | root:root | 644 | Configuration |
-| `/var/lib/facelock/facelock.db` | root:facelock | 640 | Face embeddings |
-| `/var/lib/facelock/models/` | root:root | 755 | ONNX models |
-| `/var/log/facelock/snapshots/` | root:facelock | 750 | Auth snapshots |
+| `/var/lib/facelock/` | root:facelock | 710 | State dir. Traverse-only for the `facelock` group; nothing for anyone else |
+| `/var/lib/facelock/facelock.db` | root:root | 600 | Face embeddings; read by the daemon (root) only |
+| `/var/lib/facelock/models/` | root:root | 755 | ONNX models — public, SHA256-verified; the 710 parent is the gate |
+| `/var/lib/facelock/enrolled/` | root:facelock | 710 | Enrollment markers for `is-enrolled`; group-traversable, not listable |
+| `/var/lib/facelock/enrolled/<user>` | \<user\>:\<user\> | 600 | A hint for `is-enrolled`, never authoritative |
+| `/var/log/facelock/` | root:root | 700 | Audit log and snapshots — root-only |
+| `/var/log/facelock/snapshots/` | root:root | 700 | Auth snapshots |
 | `/usr/bin/facelock` | root:root | 755 | CLI binary |
 | `/lib/security/pam_facelock.so` | root:root | 755 | PAM module |
 

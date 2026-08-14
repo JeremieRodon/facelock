@@ -22,7 +22,15 @@ sudo pacman -S onnxruntime-opt-openvino  # Intel
 
 ### 2. Set the execution provider
 
-Edit `/etc/facelock/config.toml`:
+Either let setup detect it:
+
+```bash
+sudo facelock setup --execution-provider=auto
+```
+
+`auto` asks the installed ONNX Runtime which providers it was built with and selects `cuda` > `rocm` > `openvino` > `cpu`, printing what it found either way. See [`--execution-provider=auto`](cli-reference.md#execution-provider-auto) in the CLI reference.
+
+Or set it yourself in `/etc/facelock/config.toml`:
 
 ```toml
 [recognition]
