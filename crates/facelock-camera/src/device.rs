@@ -136,11 +136,10 @@ fn has_mono_only_formats(device: &DeviceInfo) -> bool {
             .all(|f| is_ir_typical_fourcc(&f.fourcc))
 }
 
-/// Queryable IR-relevant evidence about a device — the facts a future
-/// `CameraCaps.is_ir` (gap D8) should be derived from. Populated strictly
-/// from queried V4L2 data (the capture formats the device actually
-/// enumerates), NEVER from the free-text device/card name, which is
-/// trivially attacker-controlled on virtual devices such as v4l2loopback (#98).
+/// An IR-ness verdict derived purely from queryable device evidence: the
+/// capture formats the device actually enumerates, NEVER the free-text
+/// device/card name, which is trivially attacker-controlled on virtual
+/// devices such as v4l2loopback (#98).
 ///
 /// Format evidence is stronger than the name, but it is NOT unforgeable:
 /// deriving IR-ness from the enumerated formats raises the attacker's cost from
@@ -150,26 +149,8 @@ fn has_mono_only_formats(device: &DeviceInfo) -> bool {
 /// backstops against a fabricated IR device are the liveness / frame-variance
 /// checks and the privilege required to create such a device — not this signal
 /// alone. See `docs/security.md` §A ("Honest residual").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct IrEvidence {
-    /// The device enumerates ONLY IR-typical mono capture formats — see
-    /// [`has_mono_only_formats`].
-    pub mono_only_formats: bool,
-}
-
-/// Query IR-relevant evidence for a device from its enumerated capture
-/// formats. Never looks at `device.name`.
-fn query_ir_evidence(device: &DeviceInfo) -> IrEvidence {
-    IrEvidence {
-        mono_only_formats: has_mono_only_formats(device),
-    }
-}
-
-/// Derive an IR-ness verdict purely from queried device evidence — never
-/// from the free-text device name. This is the function a future
-/// `CameraCaps.is_ir` (gap D8) can adopt directly.
-pub fn derive_ir_from_evidence(evidence: &IrEvidence) -> bool {
-    evidence.mono_only_formats
+fn has_queried_ir_evidence(device: &DeviceInfo) -> bool {
+    has_mono_only_formats(device)
 }
 
 /// The quirk-free heuristic classification, derived SOLELY from queried
@@ -177,7 +158,7 @@ pub fn derive_ir_from_evidence(evidence: &IrEvidence) -> bool {
 /// consulted here at all; it is used only as a tiebreak hint during
 /// auto-detection selection (see [`pick_auto_device`]).
 fn heuristic_ir_source(device: &DeviceInfo) -> IrSource {
-    if derive_ir_from_evidence(&query_ir_evidence(device)) {
+    if has_queried_ir_evidence(device) {
         IrSource::Format
     } else {
         IrSource::None
@@ -242,7 +223,7 @@ fn ir_source_with_quirks_and_ids(
                         // alone can no longer win force_ir through the
                         // quirks path (#98 Task 3).
                         crate::quirks::QuirkMatchKind::NameOnly => {
-                            usb_ids.is_some() || derive_ir_from_evidence(&query_ir_evidence(device))
+                            usb_ids.is_some() || has_queried_ir_evidence(device)
                         }
                     };
                     if corroborated {
@@ -394,9 +375,18 @@ pub fn is_ir_camera_resolved(
 /// NOTE (seam for Plan 02): device selection here is by capability/heuristic, not
 /// by stable device identity. Plan 02 will pin the enrolled camera by identity.
 pub fn auto_detect_device() -> Result<DeviceInfo> {
+    auto_detect_device_with(&crate::quirks::QuirksDb::load())
+}
+
+/// [`auto_detect_device`] against a caller-supplied quirks DB.
+///
+/// Callers that have already loaded a DB use this so selection and the
+/// classification recorded afterwards are decided by the SAME quirk set —
+/// loading a second copy would let the two disagree if the quirks files
+/// changed in between, and costs a directory walk either way.
+pub fn auto_detect_device_with(quirks: &crate::quirks::QuirksDb) -> Result<DeviceInfo> {
     let devices = list_devices()?;
-    let quirks = crate::quirks::QuirksDb::load();
-    let sources = classify_ir_sources(&devices, Some(&quirks));
+    let sources = classify_ir_sources(&devices, Some(quirks));
     pick_auto_device(&devices, &sources)
         .cloned()
         .ok_or_else(|| FacelockError::Camera("no video devices found".into()))
