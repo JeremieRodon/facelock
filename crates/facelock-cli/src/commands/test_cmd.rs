@@ -37,20 +37,22 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     let user = ipc_client::resolve_user(user.as_deref());
     let notif_config = &config.notification;
 
-    // Check if user has enrolled models before attempting auth
+    // Check if user has enrolled models before attempting auth. Three-way
+    // discrimination (C7, issue #105): a store that opens with zero models
+    // and a store that doesn't exist yet both mean "not enrolled" — but a
+    // store that is present and cannot be read is an error, and must never be
+    // reported as "no models enrolled".
     let has_models = if ipc_client::should_use_direct(&config) {
-        crate::direct::open_store(&config)
-            .ok()
-            .and_then(|s| s.has_models(&user).ok())
-            .unwrap_or(false)
+        direct_user_has_models(&config, &user)?
     } else {
         // Propagate a failed query instead of folding it into "no models
         // enrolled" — an AccessDenied here carries its own actionable hint.
         let request = DaemonRequest::ListModels { user: user.clone() };
-        matches!(
-            ipc_client::send_request(&request)?,
-            DaemonResponse::Models(ref m) if !m.is_empty()
-        )
+        match ipc_client::send_request(&request)? {
+            DaemonResponse::Models(m) => !m.is_empty(),
+            DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+            other => anyhow::bail!("unexpected response from daemon: {other:?}"),
+        }
     };
     if !has_models {
         println!("No face models enrolled for user '{user}'.");
@@ -58,21 +60,25 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Warn if no enrolled models match the current embedder
+    // Warn if no enrolled models match the current embedder. Same failure
+    // policy as above (C4): the store was readable one query ago, so a
+    // failure here is propagated rather than guessed either way (the two
+    // branches used to guess in opposite directions).
     {
         let config_embedder = &config.recognition.embedder_model;
         let has_matching = if ipc_client::should_use_direct(&config) {
-            crate::direct::open_store(&config)
-                .ok()
-                .and_then(|s| s.has_models_for_embedder(&user, config_embedder).ok())
-                .unwrap_or(false)
+            let store = crate::direct::open_store(&config)?;
+            store
+                .has_models_for_embedder(&user, config_embedder)
+                .map_err(|e| anyhow::anyhow!("storage error: {e}"))?
         } else {
             let request = DaemonRequest::ListModels { user: user.clone() };
-            match ipc_client::send_request(&request) {
-                Ok(DaemonResponse::Models(ref m)) => m
+            match ipc_client::send_request(&request)? {
+                DaemonResponse::Models(m) => m
                     .iter()
                     .any(|model| model.embedder_model == *config_embedder),
-                _ => true, // can't check, proceed anyway
+                DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+                other => anyhow::bail!("unexpected response from daemon: {other:?}"),
             }
         };
         if !has_matching {
@@ -220,4 +226,145 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Direct-transport "does this user have enrolled models?" with the C7
+/// three-way discrimination:
+///
+/// - store opens, zero models  → `Ok(false)` ("no models enrolled" is true)
+/// - store absent (fresh)      → `Ok(false)` (created empty; same message)
+/// - store present, unreadable → `Err`, never "no models"
+///
+/// For the error, the per-user enrollment marker is consulted **for the
+/// message only** — it is readable in exactly the cases the database is not,
+/// and lets the error say what the user actually wants to know ("you appear
+/// to be enrolled; the database is the problem"). The marker can be stale,
+/// hence "appear to"; it never influences the decision, only the wording.
+fn direct_user_has_models(config: &Config, user: &str) -> anyhow::Result<bool> {
+    let store = match crate::direct::open_store(config) {
+        Ok(store) => store,
+        Err(e) => return Err(unreadable_store_error(config, user, &e)),
+    };
+    match store.has_models(user) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(unreadable_store_error(
+            config,
+            user,
+            &anyhow::anyhow!("storage error: {e}"),
+        )),
+    }
+}
+
+/// Build the "store present but unreadable" error (C7). With a readable
+/// marker the message leads with the enrollment count; without one it still
+/// names the real problem — it must never claim "no models enrolled".
+fn unreadable_store_error(config: &Config, user: &str, cause: &anyhow::Error) -> anyhow::Error {
+    use super::enrollment_marker::{MarkerState, marker_dir, read_marker_in};
+    match read_marker_in(&marker_dir(config), user) {
+        MarkerState::Enrolled(marker) => anyhow::anyhow!(
+            "You appear to have {} enrolled model(s), but the face database at {} \
+             can't be read right now ({cause:#}).",
+            marker.models,
+            config.storage.db_path
+        ),
+        _ => anyhow::anyhow!(
+            "the face database at {} can't be read ({cause:#})",
+            config.storage.db_path
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn config_with_db(db_path: &Path) -> Config {
+        let mut config = Config::parse("").expect("defaults parse");
+        config.storage.db_path = db_path.to_string_lossy().into_owned();
+        config
+    }
+
+    /// C7 branch 1+2: a fresh (absent) store and an open store with zero
+    /// models both report "not enrolled".
+    #[test]
+    fn absent_store_and_zero_models_read_as_not_enrolled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        let config = config_with_db(&db_path);
+
+        // Absent (fresh): created empty on first touch.
+        assert!(!direct_user_has_models(&config, "alice").unwrap());
+
+        // Open store, models for someone else only.
+        {
+            let store = facelock_store::FaceStore::create(&db_path).unwrap();
+            store
+                .add_model("bob", "front", &[0.5f32; 512], "embedder")
+                .unwrap();
+        }
+        assert!(!direct_user_has_models(&config, "alice").unwrap());
+        assert!(direct_user_has_models(&config, "bob").unwrap());
+    }
+
+    /// C7 branch 3: a present-but-unreadable store is an error and must not
+    /// claim "no models". Without a marker the message still names the real
+    /// problem.
+    #[test]
+    fn unreadable_store_is_an_error_not_no_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let err = direct_user_has_models(&config_with_db(&db_path), "alice").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("can't be read"),
+            "error must name the real problem: {msg}"
+        );
+        assert!(
+            !msg.contains("appear to have"),
+            "no marker, so no enrollment claim: {msg}"
+        );
+    }
+
+    /// C7 branch 3 with a readable marker: the error leads with the (hedged)
+    /// enrollment count.
+    #[test]
+    fn unreadable_store_error_reports_marker_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let config = config_with_db(&db_path);
+        let marker_base = super::super::enrollment_marker::marker_dir(&config);
+        super::super::enrollment_marker::write_marker_in(&marker_base, "alice", 3, None).unwrap();
+
+        let err = direct_user_has_models(&config, "alice").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("appear to have 3 enrolled model(s)"),
+            "marker must enrich the message: {msg}"
+        );
+        assert!(msg.contains("can't be read"), "{msg}");
+    }
+
+    /// `--user other` degradation: no marker for that user, so the error
+    /// falls back to the plain accurate message — still an error, never
+    /// "no models enrolled".
+    #[test]
+    fn unreadable_store_for_other_user_degrades_to_plain_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let config = config_with_db(&db_path);
+        let marker_base = super::super::enrollment_marker::marker_dir(&config);
+        super::super::enrollment_marker::write_marker_in(&marker_base, "alice", 3, None).unwrap();
+
+        let err = direct_user_has_models(&config, "someone-else").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("appear to have"), "{msg}");
+        assert!(msg.contains("can't be read"), "{msg}");
+    }
 }
