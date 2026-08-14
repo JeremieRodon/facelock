@@ -230,7 +230,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(ref path) = config {
                 facelock_core::paths::set_process_config_override(PathBuf::from(path));
             }
-            commands::daemon::run(config)
+            commands::daemon::run(config, notifications::daemon_notifier_factory())
         }
         Commands::Auth { user, config } => {
             if let Some(ref path) = config {

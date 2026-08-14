@@ -3,8 +3,10 @@ use std::time::Instant;
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
+use facelock_core::notify::{NotifyEvent, notify_desktop_if_enabled};
+
 use crate::ipc_client;
-use crate::notifications::{NotifyEvent, notify_if_enabled};
+use crate::notifications::DesktopNotifier;
 
 pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     // N11 (issue #96): `facelock test` is root-only regardless of transport
@@ -39,6 +41,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
 
     let user = ipc_client::resolve_user(user.as_deref());
     let notif_config = &config.notification;
+    let notifier = DesktopNotifier::for_current_session();
 
     // Check if user has enrolled models before attempting auth. Three-way
     // discrimination (C7, issue #105): a store that opens with zero models
@@ -99,7 +102,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     println!("Testing face recognition for user '{user}'...");
     println!("Look at the camera.");
 
-    notify_if_enabled(notif_config, &NotifyEvent::Scanning);
+    notify_desktop_if_enabled(notif_config, &notifier, &NotifyEvent::Scanning);
 
     if ipc_client::should_use_direct(config) {
         let start = Instant::now();
@@ -111,8 +114,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                     result.similarity,
                     elapsed.as_secs_f64()
                 );
-                notify_if_enabled(
+                notify_desktop_if_enabled(
                     notif_config,
+                    &notifier,
                     &NotifyEvent::Success {
                         label: result.label.clone(),
                         similarity: result.similarity,
@@ -131,8 +135,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                         result.similarity,
                         elapsed.as_secs_f64()
                     );
-                    notify_if_enabled(
+                    notify_desktop_if_enabled(
                         notif_config,
+                        &notifier,
                         &NotifyEvent::Failure {
                             reason: "face matched but liveness variance not satisfied".to_string(),
                         },
@@ -143,8 +148,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                         result.similarity,
                         elapsed.as_secs_f64()
                     );
-                    notify_if_enabled(
+                    notify_desktop_if_enabled(
                         notif_config,
+                        &notifier,
                         &NotifyEvent::Failure {
                             reason: format!("no match (best similarity: {:.2})", result.similarity),
                         },
@@ -152,8 +158,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
-                notify_if_enabled(
+                notify_desktop_if_enabled(
                     notif_config,
+                    &notifier,
                     &NotifyEvent::Failure {
                         reason: e.to_string(),
                     },
@@ -180,8 +187,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                     result.similarity,
                     elapsed.as_secs_f64()
                 );
-                notify_if_enabled(
+                notify_desktop_if_enabled(
                     notif_config,
+                    &notifier,
                     &NotifyEvent::Success {
                         label: result.label.clone(),
                         similarity: result.similarity,
@@ -200,8 +208,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                     result.similarity,
                     elapsed.as_secs_f64()
                 );
-                notify_if_enabled(
+                notify_desktop_if_enabled(
                     notif_config,
+                    &notifier,
                     &NotifyEvent::Failure {
                         reason: "face matched but liveness variance not satisfied".to_string(),
                     },
@@ -212,8 +221,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                     result.similarity,
                     elapsed.as_secs_f64()
                 );
-                notify_if_enabled(
+                notify_desktop_if_enabled(
                     notif_config,
+                    &notifier,
                     &NotifyEvent::Failure {
                         reason: format!("no match (best similarity: {:.2})", result.similarity),
                     },
@@ -221,8 +231,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
             }
         }
         other => {
-            notify_if_enabled(
+            notify_desktop_if_enabled(
                 notif_config,
+                &notifier,
                 &NotifyEvent::Failure {
                     reason: "unexpected daemon response".to_string(),
                 },

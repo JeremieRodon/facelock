@@ -1,51 +1,42 @@
-use facelock_core::config::NotificationConfig;
+//! Desktop and terminal [`Notifier`] implementations (D9).
+//!
+//! The vocabulary ([`NotifyEvent`]) and the seam ([`Notifier`]) live in
+//! `facelock_core::notify`; this module owns rendering and delivery. The
+//! privilege-drop mechanics in [`send_as_user`] were hard-won against the
+//! daemon's systemd hardening — wrap them, don't rewrite them.
+
+use facelock_core::notify::{Notifier, NotifierFactory, NotifyEvent};
 use tracing::debug;
 
-/// Events that can trigger desktop notifications.
-#[derive(Debug, Clone, PartialEq)]
-pub enum NotifyEvent {
-    /// Face scanning has started.
-    Scanning,
-    /// Face recognition succeeded.
-    Success {
-        label: Option<String>,
-        similarity: f32,
-    },
-    /// Face recognition failed.
-    Failure { reason: String },
+/// Body text for the notification.
+fn body(event: &NotifyEvent) -> String {
+    match event {
+        NotifyEvent::Scanning => "Scanning face...".to_string(),
+        NotifyEvent::Success { label, similarity } => {
+            if let Some(label) = label {
+                format!("Welcome, {label}")
+            } else {
+                format!("Face recognized ({similarity:.2})")
+            }
+        }
+        NotifyEvent::Failure { reason } => format!("Face auth failed: {reason}"),
+    }
 }
 
-impl NotifyEvent {
-    /// Body text for the notification.
-    pub fn body(&self) -> String {
-        match self {
-            NotifyEvent::Scanning => "Scanning face...".to_string(),
-            NotifyEvent::Success { label, similarity } => {
-                if let Some(label) = label {
-                    format!("Welcome, {label}")
-                } else {
-                    format!("Face recognized ({similarity:.2})")
-                }
-            }
-            NotifyEvent::Failure { reason } => format!("Face auth failed: {reason}"),
-        }
+/// Freedesktop icon name for the notification.
+fn icon(event: &NotifyEvent) -> &'static str {
+    match event {
+        NotifyEvent::Scanning => "camera-web",
+        NotifyEvent::Success { .. } => "security-high",
+        NotifyEvent::Failure { .. } => "security-low",
     }
+}
 
-    /// Freedesktop icon name for the notification.
-    pub fn icon(&self) -> &str {
-        match self {
-            NotifyEvent::Scanning => "camera-web",
-            NotifyEvent::Success { .. } => "security-high",
-            NotifyEvent::Failure { .. } => "security-low",
-        }
-    }
-
-    /// Timeout in milliseconds for the notification.
-    pub fn timeout_ms(&self) -> i32 {
-        match self {
-            NotifyEvent::Scanning => 2000,
-            NotifyEvent::Success { .. } | NotifyEvent::Failure { .. } => 3000,
-        }
+/// Timeout in milliseconds for the notification.
+fn timeout_ms(event: &NotifyEvent) -> i32 {
+    match event {
+        NotifyEvent::Scanning => 2000,
+        NotifyEvent::Success { .. } | NotifyEvent::Failure { .. } => 3000,
     }
 }
 
@@ -75,12 +66,12 @@ fn send_notification_dbus(event: &NotifyEvent) -> anyhow::Result<()> {
         &(
             "Facelock",                                                        // app_name
             0u32,                                                              // replaces_id
-            event.icon(),                                                      // app_icon
+            icon(event),                                                       // app_icon
             "Facelock",                                                        // summary
-            event.body(),                                                      // body
+            body(event),                                                       // body
             Vec::<String>::new(),                                              // actions
             std::collections::HashMap::<String, zbus::zvariant::Value>::new(), // hints
-            event.timeout_ms(),                                                // expire_timeout
+            timeout_ms(event),                                                 // expire_timeout
         ),
     )?;
 
@@ -95,7 +86,7 @@ fn send_notification_dbus(event: &NotifyEvent) -> anyhow::Result<()> {
 /// When running as root (via sudo), D-Bus rejects connections from UID 0 to the
 /// user's session bus. We handle this by resolving the original user's session bus
 /// address and connecting directly, after dropping privileges with setpriv.
-pub fn send_notification(event: &NotifyEvent) {
+fn send_notification(event: &NotifyEvent) {
     debug!(?event, "sending desktop notification");
 
     if nix::unistd::Uid::current().is_root() {
@@ -141,15 +132,15 @@ fn send_as_user(user: &str, event: &NotifyEvent) {
     let uid = user_info.uid.as_raw();
     let gid = user_info.gid.as_raw();
     let bus_addr = format!("unix:path=/run/user/{uid}/bus");
-    let timeout = event.timeout_ms().to_string();
+    let timeout = timeout_ms(event).to_string();
 
     // Build the notify-send command string
     let notify_cmd = format!(
         "DBUS_SESSION_BUS_ADDRESS='{}' notify-send --app-name Facelock -i '{}' -t {} Facelock '{}'",
         bus_addr,
-        event.icon(),
+        icon(event),
         timeout,
-        event.body().replace('\'', "'\\''"),
+        body(event).replace('\'', "'\\''"),
     );
 
     // Try setpriv first: it switches real+effective uid/gid and supplementary
@@ -200,33 +191,59 @@ fn send_as_user(user: &str, event: &NotifyEvent) {
     }
 }
 
-/// Check whether a desktop notification should be sent for the given event.
-pub fn should_notify_desktop(config: &NotificationConfig, event: &NotifyEvent) -> bool {
-    if !config.desktop() {
-        return false;
+/// Desktop popup delivery. Pure delivery — config filtering happens at the
+/// decision site via [`facelock_core::notify::notify_desktop_if_enabled`].
+pub struct DesktopNotifier {
+    /// `None`: notify the invoking user's session ([`send_notification`] —
+    /// session bus directly, or setpriv via SUDO_USER/DOAS_USER when root).
+    /// `Some(user)`: notify that user's session ([`send_as_user`] — the
+    /// daemon path, which runs as root with no SUDO_USER).
+    target_user: Option<String>,
+}
+
+impl DesktopNotifier {
+    /// Notify the session of whoever invoked this process.
+    pub fn for_current_session() -> Self {
+        Self { target_user: None }
     }
-    match event {
-        NotifyEvent::Scanning => config.notify_prompt,
-        NotifyEvent::Success { .. } => config.notify_on_success,
-        NotifyEvent::Failure { .. } => config.notify_on_failure,
+
+    /// Notify a specific user's session. Used by the daemon.
+    pub fn for_user(user: impl Into<String>) -> Self {
+        Self {
+            target_user: Some(user.into()),
+        }
     }
 }
 
-/// Conditionally send a desktop notification based on config.
-pub fn notify_if_enabled(config: &NotificationConfig, event: &NotifyEvent) {
-    if should_notify_desktop(config, event) {
-        send_notification(event);
+impl Notifier for DesktopNotifier {
+    fn notify(&self, event: &NotifyEvent) {
+        match &self.target_user {
+            Some(user) => send_as_user(user, event),
+            None => send_notification(event),
+        }
     }
 }
 
-/// Conditionally send a desktop notification to a specific user's session.
-/// Used by the daemon, which runs as root without SUDO_USER/DOAS_USER.
-pub fn notify_if_enabled_for_user(config: &NotificationConfig, event: &NotifyEvent, user: &str) {
-    if !should_notify_desktop(config, event) {
-        debug!(?event, "notification filtered by config");
-        return;
+/// Renders events as plain lines on stdout.
+///
+/// Terminal text in the auth path is the PAM conversation, which pam_facelock
+/// owns; no CLI command routes through this yet — it exists so terminal
+/// delivery has a seam-shaped home when the daemon server moves out of this
+/// crate (H7) and for the i18n message-type work (D10).
+#[allow(dead_code)] // exercised by unit tests; production wiring arrives with H7/D10
+pub struct TerminalNotifier;
+
+impl Notifier for TerminalNotifier {
+    fn notify(&self, event: &NotifyEvent) {
+        println!("{}", body(event));
     }
-    send_as_user(user, event);
+}
+
+/// The production [`NotifierFactory`] for the daemon: per-request, per-user
+/// desktop delivery. Injected into `commands::daemon::run` from `main` so the
+/// server code never names this module.
+pub fn daemon_notifier_factory() -> NotifierFactory {
+    std::sync::Arc::new(|user: &str| Box::new(DesktopNotifier::for_user(user)))
 }
 
 #[cfg(test)]
@@ -234,11 +251,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scanning_event_fields() {
+    fn scanning_event_rendering() {
         let event = NotifyEvent::Scanning;
-        assert_eq!(event.body(), "Scanning face...");
-        assert_eq!(event.icon(), "camera-web");
-        assert_eq!(event.timeout_ms(), 2000);
+        assert_eq!(body(&event), "Scanning face...");
+        assert_eq!(icon(&event), "camera-web");
+        assert_eq!(timeout_ms(&event), 2000);
     }
 
     #[test]
@@ -247,9 +264,9 @@ mod tests {
             label: Some("Alice".to_string()),
             similarity: 0.87,
         };
-        assert_eq!(event.body(), "Welcome, Alice");
-        assert_eq!(event.icon(), "security-high");
-        assert_eq!(event.timeout_ms(), 3000);
+        assert_eq!(body(&event), "Welcome, Alice");
+        assert_eq!(icon(&event), "security-high");
+        assert_eq!(timeout_ms(&event), 3000);
     }
 
     #[test]
@@ -258,155 +275,25 @@ mod tests {
             label: None,
             similarity: 0.87,
         };
-        assert_eq!(event.body(), "Face recognized (0.87)");
+        assert_eq!(body(&event), "Face recognized (0.87)");
     }
 
     #[test]
-    fn failure_event_fields() {
+    fn failure_event_rendering() {
         let event = NotifyEvent::Failure {
             reason: "no match".to_string(),
         };
-        assert_eq!(event.body(), "Face auth failed: no match");
-        assert_eq!(event.icon(), "security-low");
-        assert_eq!(event.timeout_ms(), 3000);
+        assert_eq!(body(&event), "Face auth failed: no match");
+        assert_eq!(icon(&event), "security-low");
+        assert_eq!(timeout_ms(&event), 3000);
     }
 
-    use facelock_core::config::NotificationMode;
-
+    /// The factory hands out per-user desktop notifiers targeting the given
+    /// session — pin the plumbing without touching a real bus.
     #[test]
-    fn mode_off_blocks_all() {
-        let config = NotificationConfig {
-            mode: NotificationMode::Off,
-            ..Default::default()
-        };
-        assert!(!should_notify_desktop(&config, &NotifyEvent::Scanning));
-        assert!(!should_notify_desktop(
-            &config,
-            &NotifyEvent::Success {
-                label: None,
-                similarity: 0.9
-            }
-        ));
-    }
-
-    #[test]
-    fn mode_terminal_blocks_desktop() {
-        let config = NotificationConfig {
-            mode: NotificationMode::Terminal,
-            ..Default::default()
-        };
-        assert!(!should_notify_desktop(&config, &NotifyEvent::Scanning));
-        assert!(config.terminal());
-        assert!(!config.desktop());
-    }
-
-    #[test]
-    fn mode_desktop_enables_desktop() {
-        let config = NotificationConfig {
-            mode: NotificationMode::Desktop,
-            ..Default::default()
-        };
-        assert!(should_notify_desktop(&config, &NotifyEvent::Scanning));
-        assert!(!config.terminal());
-        assert!(config.desktop());
-    }
-
-    /// Helper: config with desktop notifications fully enabled
-    fn desktop_config() -> NotificationConfig {
-        NotificationConfig {
-            mode: NotificationMode::Both,
-            notify_prompt: true,
-            notify_on_success: true,
-            notify_on_failure: true,
-        }
-    }
-
-    #[test]
-    fn default_is_terminal_only() {
-        let config = NotificationConfig::default();
-        assert!(config.terminal());
-        assert!(!config.desktop());
-        assert!(!config.notify_on_failure);
-    }
-
-    #[test]
-    fn mode_both_enables_all() {
-        let config = desktop_config();
-        assert!(config.terminal());
-        assert!(config.desktop());
-        assert!(should_notify_desktop(&config, &NotifyEvent::Scanning));
-        assert!(should_notify_desktop(
-            &config,
-            &NotifyEvent::Success {
-                label: None,
-                similarity: 0.5
-            }
-        ));
-        assert!(should_notify_desktop(
-            &config,
-            &NotifyEvent::Failure {
-                reason: "err".into()
-            }
-        ));
-    }
-
-    #[test]
-    fn notify_prompt_controls_scanning() {
-        let config = NotificationConfig {
-            notify_prompt: false,
-            ..desktop_config()
-        };
-        assert!(!should_notify_desktop(&config, &NotifyEvent::Scanning));
-        // Success/failure still enabled
-        assert!(should_notify_desktop(
-            &config,
-            &NotifyEvent::Success {
-                label: None,
-                similarity: 0.9
-            }
-        ));
-    }
-
-    #[test]
-    fn notify_on_success_controls_success() {
-        let config = NotificationConfig {
-            notify_on_success: false,
-            ..desktop_config()
-        };
-        assert!(should_notify_desktop(&config, &NotifyEvent::Scanning));
-        assert!(!should_notify_desktop(
-            &config,
-            &NotifyEvent::Success {
-                label: None,
-                similarity: 0.9
-            }
-        ));
-        assert!(should_notify_desktop(
-            &config,
-            &NotifyEvent::Failure {
-                reason: "no match".into()
-            }
-        ));
-    }
-
-    #[test]
-    fn notify_on_failure_controls_failure() {
-        let config = NotificationConfig {
-            notify_on_failure: false,
-            ..desktop_config()
-        };
-        assert!(should_notify_desktop(
-            &config,
-            &NotifyEvent::Success {
-                label: Some("Bob".into()),
-                similarity: 0.8
-            }
-        ));
-        assert!(!should_notify_desktop(
-            &config,
-            &NotifyEvent::Failure {
-                reason: "timeout".into()
-            }
-        ));
+    fn factory_targets_the_requested_user() {
+        let notifier = DesktopNotifier::for_user("alice");
+        assert_eq!(notifier.target_user.as_deref(), Some("alice"));
+        assert!(DesktopNotifier::for_current_session().target_user.is_none());
     }
 }

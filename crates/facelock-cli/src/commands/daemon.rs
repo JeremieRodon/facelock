@@ -13,6 +13,7 @@ use facelock_core::dbus_interface::{
     AuthResult, BUS_NAME, DeviceInfo, ModelInfo, OBJECT_PATH, PreviewFaceInfo,
 };
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
+use facelock_core::notify::{Notifier, NotifierFactory, NotifyEvent, notify_desktop_if_enabled};
 use facelock_daemon::handler::Handler;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
@@ -623,6 +624,10 @@ struct FacelockService {
     capture_slot: Arc<CaptureSlot>,
     /// Per-connection polkit frame-authorization cache (PreviewDetectFrame).
     preview_authz: Arc<PreviewAuthzCache>,
+    /// Builds per-user notifiers for auth outcomes. Injected from `main` so
+    /// the server never names the delivery implementation (D9) — a
+    /// prerequisite for moving this server out of facelock-cli.
+    notifier_factory: NotifierFactory,
 }
 
 impl FacelockService {
@@ -702,6 +707,7 @@ impl FacelockService {
         self.clear_camera_owner();
         let capture_guard = self.capture_slot.try_acquire("Authenticate")?;
         let handler = self.handler.clone();
+        let notifier_factory = self.notifier_factory.clone();
         let user = user.to_string();
         let signal_user = user.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -723,17 +729,7 @@ impl FacelockService {
             match response {
                 DaemonResponse::AuthResult(result) => {
                     // Send desktop notification (fire-and-forget, runs as root → setpriv)
-                    let event = if result.matched {
-                        crate::notifications::NotifyEvent::Success {
-                            label: result.label.clone(),
-                            similarity: result.similarity,
-                        }
-                    } else {
-                        crate::notifications::NotifyEvent::Failure {
-                            reason: "no match".into(),
-                        }
-                    };
-                    crate::notifications::notify_if_enabled_for_user(&notify_config, &event, &user);
+                    notify_auth_outcome(&notify_config, notifier_factory(&user).as_ref(), &result);
 
                     Ok(AuthResult {
                         matched: result.matched,
@@ -1136,6 +1132,30 @@ type CameraFactory = Box<dyn Fn(&Config) -> Result<Camera<'static>, String> + Se
 
 /// Build a new handler from config. Used at startup and for live config reload.
 /// Returns the handler and idle_timeout_secs from the loaded config.
+/// Map an auth outcome to its desktop notification and deliver it through
+/// the injected notifier, honoring the notification config.
+///
+/// Pure decision + injected delivery: the tests below assert emit/no-emit
+/// with a recording notifier; production passes the per-user desktop
+/// notifier built by the injected [`NotifierFactory`].
+fn notify_auth_outcome(
+    config: &facelock_core::config::NotificationConfig,
+    notifier: &dyn Notifier,
+    result: &facelock_core::types::MatchResult,
+) {
+    let event = if result.matched {
+        NotifyEvent::Success {
+            label: result.label.clone(),
+            similarity: result.similarity,
+        }
+    } else {
+        NotifyEvent::Failure {
+            reason: "no match".into(),
+        }
+    };
+    notify_desktop_if_enabled(config, notifier, &event);
+}
+
 fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), String> {
     // Deliberate re-read (D7): this is the daemon's config lifecycle — one
     // parse at startup, one per mtime-triggered reload (maybe_reload_handler).
@@ -1285,7 +1305,7 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     Ok((handler, idle_timeout_secs))
 }
 
-pub fn run(config_path: Option<String>) -> anyhow::Result<()> {
+pub fn run(config_path: Option<String>, notifier_factory: NotifierFactory) -> anyhow::Result<()> {
     crate::ipc_client::require_root("sudo facelock daemon")?;
 
     // Init tracing (daemon uses its own tracing setup with target=true)
@@ -1318,7 +1338,12 @@ pub fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(run_dbus_server(handler, idle_timeout_secs, config_mtime))
+    rt.block_on(run_dbus_server(
+        handler,
+        idle_timeout_secs,
+        config_mtime,
+        notifier_factory,
+    ))
 }
 
 /// Bitmask (low 32-bit word, caps 0-31) of the capabilities the daemon keeps
@@ -1422,6 +1447,7 @@ async fn run_dbus_server(
     handler: Arc<Mutex<ProductionHandler>>,
     idle_timeout_secs: u64,
     startup_config_mtime: Option<std::time::SystemTime>,
+    notifier_factory: NotifierFactory,
 ) -> anyhow::Result<()> {
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
     let preview_authz = Arc::new(PreviewAuthzCache::default());
@@ -1432,6 +1458,7 @@ async fn run_dbus_server(
         camera_owner_uid: Arc::new(Mutex::new(None)),
         capture_slot: Arc::new(CaptureSlot::default()),
         preview_authz: preview_authz.clone(),
+        notifier_factory,
     };
 
     let _connection = zbus::connection::Builder::system()?
@@ -1606,6 +1633,70 @@ mod tests {
         assert_eq!(result.model_id, -2);
         assert_eq!(result.label, "rate limited");
         assert_eq!(result.similarity, 0.0);
+    }
+
+    use facelock_core::config::{NotificationConfig, NotificationMode};
+    use facelock_core::types::MatchResult;
+    use facelock_test_support::RecordingNotifier;
+
+    fn match_result(matched: bool) -> MatchResult {
+        MatchResult {
+            matched,
+            model_id: matched.then_some(1),
+            label: matched.then(|| "front".to_string()),
+            similarity: 0.42,
+            failure_reason: None,
+        }
+    }
+
+    fn desktop_config() -> NotificationConfig {
+        NotificationConfig {
+            mode: NotificationMode::Both,
+            notify_prompt: true,
+            notify_on_success: true,
+            notify_on_failure: true,
+        }
+    }
+
+    /// D9: a failed auth emits a Failure notification through the injected
+    /// notifier when the config enables desktop failure notifications.
+    #[test]
+    fn failed_auth_emits_failure_notification_when_enabled() {
+        let recorder = RecordingNotifier::new();
+        notify_auth_outcome(&desktop_config(), &recorder, &match_result(false));
+        assert_eq!(
+            recorder.events(),
+            vec![NotifyEvent::Failure {
+                reason: "no match".into()
+            }]
+        );
+    }
+
+    /// D9: under the default config (terminal-only mode, and
+    /// notify_on_failure = false) the same failed auth emits nothing.
+    #[test]
+    fn failed_auth_emits_nothing_under_default_config() {
+        let recorder = RecordingNotifier::new();
+        notify_auth_outcome(
+            &NotificationConfig::default(),
+            &recorder,
+            &match_result(false),
+        );
+        assert_eq!(recorder.events(), vec![]);
+    }
+
+    /// A successful auth carries the label and similarity into the event.
+    #[test]
+    fn successful_auth_emits_success_event_with_match_data() {
+        let recorder = RecordingNotifier::new();
+        notify_auth_outcome(&desktop_config(), &recorder, &match_result(true));
+        assert_eq!(
+            recorder.events(),
+            vec![NotifyEvent::Success {
+                label: Some("front".into()),
+                similarity: 0.42
+            }]
+        );
     }
 
     // --- Authorization matrix (N13) ---
