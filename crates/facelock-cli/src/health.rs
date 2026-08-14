@@ -27,9 +27,7 @@ use facelock_store::{FaceStore, StoreError};
 
 use crate::backend::{self, DaemonPing};
 use crate::commands::enrollment_marker::{self, MarkerState};
-use crate::resolved::{
-    CameraPresence, ConfigLoad, ExecutionProviderFact, Fact, ModelFiles, Resolved,
-};
+use crate::resolved::{CameraPresence, ConfigLoad, ExecutionProviderFact, Fact, ModelFiles};
 
 /// The oneshot auth binary the PAM module spawns when the daemon path fails.
 /// Mirrors `AUTH_BIN` in `pam-facelock` (hardcoded there by N9; a config key
@@ -96,24 +94,24 @@ impl Health {
             };
         };
 
-        let models: Fact<ModelFiles> = ModelFiles::probe(config).into();
+        let models = ModelFiles::probe(config);
         let fallback = probe_oneshot_fallback_at(
             Path::new(AUTH_BIN),
             Path::new(&config.storage.db_path),
-            models.known().is_some_and(|m| m.all_present()),
+            models.all_present(),
         );
         Health {
             config: config_health,
-            daemon: backend::probe_daemon(&config.daemon.mode).into(),
+            daemon: backend::probe_daemon(&config.daemon.mode),
             oneshot_fallback: Fact::probed(fallback),
-            camera: probe_camera(config).into(),
-            execution_provider: ExecutionProviderFact::probe(config).into(),
+            camera: probe_camera(config),
+            execution_provider: Fact::probed(ExecutionProviderFact::probe(config)),
             encryption: Fact::probed(probe_encryption(config)),
             enrolled: probe_enrolled(config, &user),
             security: Fact::claimed(SecurityHealth::from_config(config)),
             notifications: Fact::claimed(NotificationHealth::from_config(config)),
             pam: probe_pam(),
-            models,
+            models: Fact::probed(models),
             user,
         }
     }
@@ -243,10 +241,10 @@ impl From<&facelock_camera::ResolvedCamera> for InterrogatedCamera {
     }
 }
 
-fn probe_camera(config: &Config) -> Resolved<CameraHealth> {
+fn probe_camera(config: &Config) -> Fact<CameraHealth> {
     // Presence via the shared probe (D7); interrogation via the camera
     // domain's one implementation (D8) — never re-derived here.
-    match CameraPresence::probe(config).value {
+    match CameraPresence::probe(config) {
         CameraPresence::AutoDetect => {
             let resolved = crate::direct::resolve_camera_device(config)
                 .ok()
@@ -254,14 +252,8 @@ fn probe_camera(config: &Config) -> Resolved<CameraHealth> {
             match resolved {
                 // Nothing detected right now: the config's claim is all we
                 // have.
-                None => Resolved {
-                    value: CameraHealth::AutoDetect { resolved: None },
-                    provenance: crate::resolved::Provenance::Claimed,
-                },
-                some => Resolved {
-                    value: CameraHealth::AutoDetect { resolved: some },
-                    provenance: crate::resolved::Provenance::Probed,
-                },
+                None => Fact::claimed(CameraHealth::AutoDetect { resolved: None }),
+                some => Fact::probed(CameraHealth::AutoDetect { resolved: some }),
             }
         }
         CameraPresence::Configured { path, present } => {
@@ -272,14 +264,11 @@ fn probe_camera(config: &Config) -> Resolved<CameraHealth> {
             } else {
                 None
             };
-            Resolved {
-                value: CameraHealth::Configured {
-                    path,
-                    present,
-                    interrogated,
-                },
-                provenance: crate::resolved::Provenance::Probed,
-            }
+            Fact::probed(CameraHealth::Configured {
+                path,
+                present,
+                interrogated,
+            })
         }
     }
 }
@@ -541,7 +530,7 @@ mod tests {
             Fact::Unknown { why } => {
                 assert!(why.contains("database"), "{why}")
             }
-            Fact::Known(known) => panic!("must not claim a known answer: {:?}", known.value),
+            known => panic!("must not claim a known answer: {known:?}"),
         }
     }
 

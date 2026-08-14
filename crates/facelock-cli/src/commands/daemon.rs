@@ -89,9 +89,8 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     // missing model files, and ORT falls back to CPU silently when the
     // configured provider isn't compiled into the installed runtime.
     let models = crate::resolved::ModelFiles::probe(&config);
-    if !models.value.all_present() {
+    if !models.all_present() {
         let missing: Vec<String> = models
-            .value
             .missing()
             .iter()
             .map(|p| p.display().to_string())
@@ -102,13 +101,13 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
         ));
     }
     let ep = crate::resolved::ExecutionProviderFact::probe(&config);
-    match &ep.value.status {
+    match &ep.status {
         crate::resolved::EpStatus::Available => {
-            info!(provider = %ep.value.configured, "execution provider resolved");
+            info!(provider = %ep.configured, "execution provider resolved");
         }
         crate::resolved::EpStatus::NotBuiltIn => {
             warn!(
-                provider = %ep.value.configured,
+                provider = %ep.configured,
                 "configured execution provider is not built into the installed \
                  ONNX Runtime; inference will fall back to CPU"
             );

@@ -21,10 +21,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     ipc_client::require_root("sudo facelock test")?;
 
     // Check models exist — offer to run setup if missing
-    if !crate::resolved::ModelFiles::probe(config)
-        .value
-        .all_present()
-    {
+    if !crate::resolved::ModelFiles::probe(config).all_present() {
         Terminal.info(&UserMessage::ModelsNotFoundOfferSetup);
         if Terminal.confirm(&UserMessage::ConfirmDownloadModels)? {
             crate::commands::setup::run(false)?;
@@ -32,10 +29,7 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
             // still uses the Config this process parsed, as it always has —
             // setup may have rewritten the file, and picking that up would be
             // a mid-command re-read.
-            if !crate::resolved::ModelFiles::probe(config)
-                .value
-                .all_present()
-            {
+            if !crate::resolved::ModelFiles::probe(config).all_present() {
                 return Err(fail(UserMessage::ModelsStillMissingAfterSetup));
             }
         } else {

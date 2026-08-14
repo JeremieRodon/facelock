@@ -134,7 +134,7 @@ fn render_daemon(out: &mut String, daemon: &Fact<DaemonPing>) {
     );
     match daemon {
         Fact::Unknown { why } => unknown(out, why),
-        Fact::Known(ping) => match &ping.value {
+        Fact::Probed(ping) | Fact::Claimed(ping) => match ping {
             DaemonPing::NotConfigured => result(out, true, &UserMessage::StatusDaemonOneshot),
             DaemonPing::Responding => result(out, true, &UserMessage::StatusDaemonResponding),
             DaemonPing::NotResponding { error } => result(
@@ -154,8 +154,7 @@ fn render_fallback(out: &mut String, fallback: &Fact<OneshotFallback>) {
             item(out, &UserMessage::StatusLabelOneshotFallback, "");
             unknown(out, why);
         }
-        Fact::Known(resolved) => {
-            let fallback = &resolved.value;
+        Fact::Probed(fallback) | Fact::Claimed(fallback) => {
             item(
                 out,
                 &UserMessage::StatusLabelOneshotFallback,
@@ -186,7 +185,7 @@ fn render_camera(out: &mut String, camera: &Fact<CameraHealth>) {
             item(out, &UserMessage::StatusLabelCameraDevice, "");
             unknown(out, why);
         }
-        Fact::Known(resolved) => match &resolved.value {
+        Fact::Probed(camera) | Fact::Claimed(camera) => match camera {
             CameraHealth::Configured {
                 path,
                 present,
@@ -230,8 +229,7 @@ fn render_models(out: &mut String, models: &Fact<ModelFiles>) {
             item(out, &UserMessage::StatusLabelModelDirectory, "");
             unknown(out, why);
         }
-        Fact::Known(resolved) => {
-            let models = &resolved.value;
+        Fact::Probed(models) | Fact::Claimed(models) => {
             item(
                 out,
                 &UserMessage::StatusLabelModelDirectory,
@@ -272,8 +270,7 @@ fn render_execution_provider(out: &mut String, ep: &Fact<ExecutionProviderFact>)
             item(out, &UserMessage::StatusLabelExecutionProvider, "");
             unknown(out, why);
         }
-        Fact::Known(resolved) => {
-            let ep = &resolved.value;
+        Fact::Probed(ep) | Fact::Claimed(ep) => {
             let label = match ep.configured.as_str() {
                 "cpu" => "CPU",
                 "cuda" => "CUDA (NVIDIA GPU)",
@@ -304,9 +301,8 @@ fn render_encryption(out: &mut String, encryption: &Fact<EncryptionHealth>) {
             item(out, &UserMessage::StatusLabelEncryption, "");
             unknown(out, why);
         }
-        Fact::Known(resolved) => {
+        Fact::Probed(encryption) | Fact::Claimed(encryption) => {
             use facelock_core::config::EncryptionMethod;
-            let encryption = &resolved.value;
             let method = match encryption.method {
                 EncryptionMethod::Tpm => "AES-256-GCM (TPM-sealed key)",
                 EncryptionMethod::Keyfile => "AES-256-GCM (keyfile)",
@@ -385,8 +381,7 @@ fn render_enrolled(out: &mut String, user: &str, enrolled: &Fact<EnrollmentHealt
         // The money case. An unreadable store renders as *cannot determine*
         // — never as "no faces enrolled" (N4).
         Fact::Unknown { why } => unknown(out, why),
-        Fact::Known(resolved) => {
-            let enrolled = &resolved.value;
+        Fact::Probed(enrolled) | Fact::Claimed(enrolled) => {
             if enrolled.models.is_empty() {
                 result(out, false, &UserMessage::StatusNoFacesEnrolled);
             } else {
@@ -426,8 +421,7 @@ fn render_security(out: &mut String, security: &Fact<SecurityHealth>) {
     item(out, &UserMessage::StatusLabelSecurity, "");
     match security {
         Fact::Unknown { why } => unknown(out, why),
-        Fact::Known(resolved) => {
-            let security = &resolved.value;
+        Fact::Probed(security) | Fact::Claimed(security) => {
             if security.disabled {
                 result(out, false, &UserMessage::StatusSecurityDisabled);
                 return;
@@ -458,9 +452,8 @@ fn render_notifications(out: &mut String, notifications: &Fact<NotificationHealt
             item(out, &UserMessage::StatusLabelNotifications, "");
             unknown(out, why);
         }
-        Fact::Known(resolved) => {
+        Fact::Probed(notifications) | Fact::Claimed(notifications) => {
             use facelock_core::config::NotificationMode;
-            let notifications = &resolved.value;
             let mode = match notifications.mode {
                 NotificationMode::Off => UserMessage::StatusNotifyOff,
                 NotificationMode::Terminal => UserMessage::StatusNotifyTerminal,

@@ -40,7 +40,7 @@ use facelock_daemon::auth::AuthOutcome;
 use facelock_store::StoreError;
 
 use crate::message::{Terminal, UserMessage};
-use crate::resolved::{Provenance, Resolved};
+use crate::resolved::Fact;
 use crate::{direct, ipc_client};
 
 /// Which implementation answers this invocation's questions — and, for the
@@ -64,9 +64,9 @@ impl BackendKind {
     }
 }
 
-/// What the one probe observed, recorded beside the resolved-config facts
-/// (D7) with the same provenance discipline: `NotProbed` is a distinct value,
-/// never a guessed `Unreachable`. `status` reports the same discipline
+/// What the one probe observed, recorded as a [`Fact`] beside the config
+/// facts in `resolved` (D7) and with the same discipline: `NotProbed` is a
+/// distinct value, never a guessed `Unreachable`. `status` reports it
 /// through [`DaemonPing`], which additionally carries the failure detail a
 /// report wants and a human does not need at selection time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +339,7 @@ pub enum DaemonPing {
 
 /// `status`'s daemon probe. Lives in the seam so `ipc_client::ping` stays
 /// single-sited (D1) — the health model consumes the fact, not the transport.
-pub fn probe_daemon(mode: &DaemonMode) -> Resolved<DaemonPing> {
+pub fn probe_daemon(mode: &DaemonMode) -> Fact<DaemonPing> {
     probe_daemon_with(mode, ipc_client::ping)
 }
 
@@ -348,21 +348,15 @@ pub fn probe_daemon(mode: &DaemonMode) -> Resolved<DaemonPing> {
 fn probe_daemon_with(
     mode: &DaemonMode,
     ping: impl FnOnce() -> anyhow::Result<()>,
-) -> Resolved<DaemonPing> {
+) -> Fact<DaemonPing> {
     match mode {
-        DaemonMode::Oneshot => Resolved {
-            value: DaemonPing::NotConfigured,
-            provenance: Provenance::Claimed,
-        },
-        DaemonMode::Daemon => Resolved {
-            value: match ping() {
-                Ok(()) => DaemonPing::Responding,
-                Err(e) => DaemonPing::NotResponding {
-                    error: e.to_string(),
-                },
+        DaemonMode::Oneshot => Fact::claimed(DaemonPing::NotConfigured),
+        DaemonMode::Daemon => Fact::probed(match ping() {
+            Ok(()) => DaemonPing::Responding,
+            Err(e) => DaemonPing::NotResponding {
+                error: e.to_string(),
             },
-            provenance: Provenance::Probed,
-        },
+        }),
     }
 }
 
@@ -370,31 +364,22 @@ fn probe_daemon_with(
 fn classify(
     mode: &DaemonMode,
     probe: impl FnOnce() -> bool,
-) -> (BackendKind, Resolved<DaemonReachability>) {
+) -> (BackendKind, Fact<DaemonReachability>) {
     match mode {
         DaemonMode::Oneshot => (
             BackendKind::DirectByConfig,
-            Resolved {
-                value: DaemonReachability::NotProbed,
-                provenance: Provenance::Claimed,
-            },
+            Fact::claimed(DaemonReachability::NotProbed),
         ),
         DaemonMode::Daemon => {
             if probe() {
                 (
                     BackendKind::Daemon,
-                    Resolved {
-                        value: DaemonReachability::Reachable,
-                        provenance: Provenance::Probed,
-                    },
+                    Fact::probed(DaemonReachability::Reachable),
                 )
             } else {
                 (
                     BackendKind::DirectByFallback,
-                    Resolved {
-                        value: DaemonReachability::Unreachable,
-                        provenance: Provenance::Probed,
-                    },
+                    Fact::probed(DaemonReachability::Unreachable),
                 )
             }
         }
@@ -449,24 +434,21 @@ mod tests {
             panic!("oneshot must never probe the bus")
         });
         assert_eq!(kind, BackendKind::DirectByConfig);
-        assert_eq!(fact.value, DaemonReachability::NotProbed);
-        assert_eq!(fact.provenance, Provenance::Claimed);
+        assert_eq!(fact, Fact::claimed(DaemonReachability::NotProbed));
     }
 
     #[test]
     fn daemon_mode_with_owner_selects_daemon() {
         let (kind, fact) = classify(&DaemonMode::Daemon, || true);
         assert_eq!(kind, BackendKind::Daemon);
-        assert_eq!(fact.value, DaemonReachability::Reachable);
-        assert_eq!(fact.provenance, Provenance::Probed);
+        assert_eq!(fact, Fact::probed(DaemonReachability::Reachable));
     }
 
     #[test]
     fn daemon_mode_without_owner_is_fallback_not_config() {
         let (kind, fact) = classify(&DaemonMode::Daemon, || false);
         assert_eq!(kind, BackendKind::DirectByFallback);
-        assert_eq!(fact.value, DaemonReachability::Unreachable);
-        assert_eq!(fact.provenance, Provenance::Probed);
+        assert_eq!(fact, Fact::probed(DaemonReachability::Unreachable));
     }
 
     // -----------------------------------------------------------------------
@@ -478,15 +460,13 @@ mod tests {
         let fact = probe_daemon_with(&DaemonMode::Oneshot, || {
             panic!("oneshot must never ping the daemon")
         });
-        assert_eq!(fact.value, DaemonPing::NotConfigured);
-        assert_eq!(fact.provenance, Provenance::Claimed);
+        assert_eq!(fact, Fact::claimed(DaemonPing::NotConfigured));
     }
 
     #[test]
     fn daemon_probe_reports_a_completed_round_trip() {
         let fact = probe_daemon_with(&DaemonMode::Daemon, || Ok(()));
-        assert_eq!(fact.value, DaemonPing::Responding);
-        assert_eq!(fact.provenance, Provenance::Probed);
+        assert_eq!(fact, Fact::probed(DaemonPing::Responding));
     }
 
     #[test]
@@ -495,12 +475,11 @@ mod tests {
             Err(anyhow::anyhow!("D-Bus Ping call failed"))
         });
         assert_eq!(
-            fact.value,
-            DaemonPing::NotResponding {
+            fact,
+            Fact::probed(DaemonPing::NotResponding {
                 error: "D-Bus Ping call failed".into()
-            }
+            })
         );
-        assert_eq!(fact.provenance, Provenance::Probed);
     }
 
     /// Three kinds, three treatments: normal operation and an expected
