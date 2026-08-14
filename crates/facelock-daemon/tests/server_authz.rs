@@ -35,6 +35,12 @@ use zbus::fdo;
 
 type MockService = FacelockService<MockCamera, MockFaceEngine>;
 
+/// The camera factory `Handler::new` takes. Named because the spelled-out
+/// type trips `clippy::type_complexity`, which the `--all-targets` lint gate
+/// makes a hard failure. Each integration test file is its own crate, so this
+/// cannot be shared without exporting a test-only type from production code.
+type MockCameraFactory = Box<dyn Fn(&Config) -> Result<MockCamera, String> + Send + Sync>;
+
 /// Gates configured so the mock flow reaches the comparison loop: no IR
 /// requirement, no variance/liveness gates, environment aborts off,
 /// plaintext store (no sealer), audit off.
@@ -75,8 +81,7 @@ fn handler_with(
         config.security.rate_limit.max_attempts,
         config.security.rate_limit.window_secs,
     );
-    let factory: Box<dyn Fn(&Config) -> Result<MockCamera, String> + Send + Sync> =
-        Box::new(|_| Ok(MockCamera::bright(64, 64, 60)));
+    let factory: MockCameraFactory = Box::new(|_| Ok(MockCamera::bright(64, 64, 60)));
     Handler::new(
         config,
         engine,
