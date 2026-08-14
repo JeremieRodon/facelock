@@ -1038,7 +1038,6 @@ dependencies = [
  "libc",
  "nix",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -1083,7 +1082,6 @@ dependencies = [
  "image",
  "libc",
  "nix",
- "rusqlite",
  "serde",
  "serde_json",
  "signal-hook",
@@ -1138,6 +1136,7 @@ name = "facelock-test-support"
 version = "0.1.4"
 dependencies = [
  "facelock-core",
+ "rusqlite",
 ]
 
 [[package]]

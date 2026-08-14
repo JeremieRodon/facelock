@@ -104,16 +104,24 @@ mod tests {
     /// getpwuid-only version lacked.
     #[test]
     fn shared_resolver_honors_sudo_user() {
-        // SAFETY: process-global env mutation; no other test in this binary
-        // asserts on SUDO_USER (checked), and the one concurrent reader
-        // (`resolve_user_no_flag_falls_through`) only requires a non-empty
-        // result.
-        unsafe { std::env::set_var("SUDO_USER", "preview-c5-alice") };
-        let resolved = crate::ipc_client::resolve_user(None);
-        unsafe { std::env::remove_var("SUDO_USER") };
-        assert_eq!(resolved, "preview-c5-alice");
+        // The environment is injected rather than set: `set_var` is global to
+        // the test binary and cargo runs these threaded, so the real thing
+        // would be safe only by convention.
+        let env = |key: &str| match key {
+            "SUDO_USER" => Some("preview-c5-alice".to_string()),
+            "USER" => Some("root".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            crate::ipc_client::resolve_user_from_env(None, env),
+            "preview-c5-alice"
+        );
 
         // The explicit flag still wins over the environment.
-        assert_eq!(crate::ipc_client::resolve_user(Some("bob")), "bob");
+        assert_eq!(
+            crate::ipc_client::resolve_user_from_env(Some("bob"), env),
+            "bob"
+        );
     }
 }
