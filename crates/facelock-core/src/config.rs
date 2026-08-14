@@ -347,8 +347,13 @@ pub struct NotificationConfig {
     /// Show notification on successful face match
     #[serde(default = "default_true")]
     pub notify_on_success: bool,
-    /// Show notification on failed face match
-    #[serde(default = "default_true")]
+    /// Show notification on failed face match.
+    /// Default: false — a failed match is already visible (you get a password
+    /// prompt). Must agree with `Default for NotificationConfig` below, or the
+    /// effective value flips depending on whether `[notification]` appears in
+    /// the file (the shipped template has the section header active with every
+    /// key commented, which is exactly the shape that triggers the drift).
+    #[serde(default)]
     pub notify_on_failure: bool,
 }
 
@@ -789,6 +794,25 @@ path = "/dev/video0"
         assert_eq!(config.device.max_height, 480);
         assert_eq!(config.recognition.threshold, 0.80);
         assert!(config.security.require_ir);
+    }
+
+    /// D9 drift pin: a `[notification]` section present with every key
+    /// omitted must parse identically to no section at all. The two paths are
+    /// different code (serde field defaults vs `Default for
+    /// NotificationConfig`), and `notify_on_failure` had already drifted
+    /// between them (serde said `true`, `Default` and the shipped template
+    /// said `false`).
+    #[test]
+    fn notification_section_present_with_keys_omitted_equals_default() {
+        let present = Config::parse("[notification]\n").unwrap().notification;
+        let absent = Config::parse("").unwrap().notification;
+        let default = NotificationConfig::default();
+        for parsed in [&present, &absent] {
+            assert_eq!(parsed.mode, default.mode);
+            assert_eq!(parsed.notify_prompt, default.notify_prompt);
+            assert_eq!(parsed.notify_on_success, default.notify_on_success);
+            assert_eq!(parsed.notify_on_failure, default.notify_on_failure);
+        }
     }
 
     #[test]
