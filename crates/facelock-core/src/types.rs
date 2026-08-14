@@ -146,6 +146,41 @@ impl DeviceFingerprint {
     }
 }
 
+/// A supported capture pixel format with its available frame sizes, as
+/// enumerated by the device itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatInfo {
+    pub fourcc: String,
+    pub description: String,
+    pub sizes: Vec<(u32, u32)>,
+}
+
+/// Capabilities of a camera device, computed once at construction from device
+/// interrogation (format enumeration, quirks match, sysfs identity) and
+/// carried by the camera itself — so nothing downstream has to thread
+/// `device_is_ir` or a fingerprint as loose parameters (gap D8).
+#[derive(Debug, Clone, Default)]
+pub struct CameraCaps {
+    /// Whether this device is an IR camera, **derived** from queried device
+    /// evidence (mono-only format enumeration, corroborated quirks) — never
+    /// from the free-text device name, which is attacker-controlled on
+    /// virtual devices (#98). `security.require_ir` gates on this field.
+    pub is_ir: bool,
+    /// The quirks DB declares a controllable IR emitter (XU GUID + selector)
+    /// for this device. Declared, not probed: whether the ioctl actually
+    /// works is only known when the emitter is enabled at capture time.
+    pub has_emitter: bool,
+    /// The capture formats the device enumerates.
+    pub formats: Vec<FormatInfo>,
+    /// Hardware identity used for device coupling. All fields are `None`
+    /// when the device exposes no readable USB identity — "unknown" is a
+    /// value inside [`DeviceFingerprint`], not an `Option` around it.
+    pub fingerprint: DeviceFingerprint,
+    /// Human-readable identifiers of the quirks applied to this device, for
+    /// diagnostics ("why did this camera behave oddly").
+    pub applied_quirks: Vec<String>,
+}
+
 /// Granularity at which a live camera must match a template's enrolling camera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

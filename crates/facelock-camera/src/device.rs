@@ -14,13 +14,10 @@ pub struct DeviceInfo {
     pub formats: Vec<FormatInfo>,
 }
 
-/// A supported pixel format with its available sizes.
-#[derive(Debug, Clone)]
-pub struct FormatInfo {
-    pub fourcc: String,
-    pub description: String,
-    pub sizes: Vec<(u32, u32)>,
-}
+/// A supported pixel format with its available sizes. Defined in
+/// `facelock-core` so `CameraCaps` can carry it; re-exported here where the
+/// enumeration actually happens.
+pub use facelock_core::types::FormatInfo;
 
 /// List all V4L2 video capture devices.
 /// Returns an empty vec if no devices are found (does not error).
