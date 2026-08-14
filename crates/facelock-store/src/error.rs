@@ -69,7 +69,19 @@ impl StoreError {
             _ => None,
         };
         let path = path.to_path_buf();
-        let detail = e.to_string();
+        // rusqlite renders `SqliteFailure(_, Some(msg))` as the message alone,
+        // which drops the result code. That code is often the only thing that
+        // distinguishes the failure: ~30 `SQLITE_IOERR_*` extended codes all
+        // render as "disk I/O error", and which one it was decides whether an
+        // operator is looking at a full disk, a bad sector, or a broken lock.
+        // Keep both, so a log line stays actionable.
+        let detail = match &e {
+            rusqlite::Error::SqliteFailure(err, Some(msg)) => {
+                format!("{msg} (sqlite code {})", err.extended_code)
+            }
+            // Every other rendering already carries the code, or has none.
+            _ => e.to_string(),
+        };
         match code {
             Some(ErrorCode::NotADatabase) | Some(ErrorCode::DatabaseCorrupt) => {
                 Self::Corrupt { path, detail }
@@ -164,6 +176,22 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("/var/lib/facelock/facelock.db"), "{msg}");
         assert!(msg.contains("detail"), "{msg}");
+    }
+
+    /// The message alone is not enough to act on: `SQLITE_IOERR_WRITE` and
+    /// ~30 sibling `SQLITE_IOERR_*` codes all render as "disk I/O error", and
+    /// rusqlite drops the code entirely when a message is present. Pin that
+    /// classification keeps both halves.
+    #[test]
+    fn classify_keeps_the_result_code_beside_the_message() {
+        let path = Path::new("/var/lib/facelock/facelock.db");
+        let e = StoreError::classify(path, sqlite_error(rusqlite::ffi::SQLITE_IOERR_WRITE));
+        let msg = e.to_string();
+        assert!(msg.contains("detail"), "the message must survive: {msg}");
+        assert!(
+            msg.contains(&rusqlite::ffi::SQLITE_IOERR_WRITE.to_string()),
+            "the extended result code must survive: {msg}"
+        );
     }
 
     /// The compatibility conversion may erase the class, never the message.

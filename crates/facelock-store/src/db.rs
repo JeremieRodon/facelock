@@ -124,7 +124,7 @@ impl FaceStore {
     fn init(conn: rusqlite::Connection, db_path: &Path) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .map_err(|e| StoreError::classify(db_path, e))?;
-        run_migrations(&conn)?;
+        run_migrations(db_path, &conn)?;
         secure_database_files(db_path)?;
         Ok(Self {
             conn,
@@ -162,7 +162,7 @@ impl FaceStore {
             rusqlite::Connection::open_in_memory().map_err(|e| StoreError::classify(path, e))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| StoreError::classify(path, e))?;
-        run_migrations(&conn)?;
+        run_migrations(path, &conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
