@@ -10,14 +10,14 @@
 //!   `config` displays/edits the file itself, and `is-enrolled` tolerates a
 //!   missing config on its unprivileged path).
 //!
-//! - [`ResolvedConfig`] — **what is actually true.** A config value like
+//! - [`Fact`] — **what is actually true.** A config value like
 //!   `execution_provider = "cuda"` or `device.path = "/dev/video2"` is a
 //!   *claim*; whether CUDA exists in the installed ONNX Runtime or the device
-//!   node is present is discovered by an explicit probe, once, instead of
-//!   being re-derived ad hoc at each use site. Each fact carries a
-//!   [`Provenance`] tag. Resolution is for the heavyweight paths only
-//!   (daemon startup, status, enroll, test); lighter commands probe just the
-//!   fact they consume.
+//!   node is present is discovered by an explicit probe ([`ModelFiles`],
+//!   [`CameraPresence`], [`ExecutionProviderFact`]) instead of being
+//!   re-derived ad hoc at each use site. Each fact carries a [`Provenance`]
+//!   tag. Commands probe just the fact they consume; `status` gathers all of
+//!   them into `health::Health`.
 //!
 //! # `is-enrolled` never comes here
 //!
@@ -81,7 +81,7 @@ impl ConfigLoad {
 }
 
 // ---------------------------------------------------------------------------
-// ResolvedConfig — what is actually true
+// Facts — what is actually true
 // ---------------------------------------------------------------------------
 
 /// How a resolved fact was determined.
@@ -315,25 +315,6 @@ impl ExecutionProviderFact {
         ExecutionProviderFact {
             configured: configured.to_string(),
             status,
-        }
-    }
-}
-
-/// The full resolution pass, for the paths that consume every fact (daemon
-/// startup logging, `status`). Commands that need one fact probe it directly.
-#[derive(Debug, Clone)]
-pub struct ResolvedConfig {
-    pub models: Resolved<ModelFiles>,
-    pub camera: Resolved<CameraPresence>,
-    pub execution_provider: Resolved<ExecutionProviderFact>,
-}
-
-impl ResolvedConfig {
-    pub fn resolve(config: &Config) -> Self {
-        ResolvedConfig {
-            models: ModelFiles::probe(config),
-            camera: CameraPresence::probe(config),
-            execution_provider: ExecutionProviderFact::probe(config),
         }
     }
 }
@@ -592,7 +573,6 @@ mod tests {
     fn is_enrolled_module_stays_probe_free() {
         let forbidden = [
             "ConfigLoad",
-            "ResolvedConfig",
             "resolved::",
             "send_request(",
             "Backend::select(",
