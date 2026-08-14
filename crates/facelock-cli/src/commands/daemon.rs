@@ -27,15 +27,20 @@ type CameraFactory = Box<dyn Fn(&Config) -> Result<Camera<'static>, String> + Se
 
 /// Build a new handler from config. Used at startup and for live config reload.
 /// Returns the handler and idle_timeout_secs from the loaded config.
-fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), String> {
+///
+/// Which file that is comes from `Config::load()` — i.e. from the
+/// process-level config override `run` installs — and from nowhere else.
+/// This used to take an explicit path for the startup call while the reload
+/// recipe passed `None`; the two agreed only because `main` sets the
+/// override too. A caller that set one without the other would have started
+/// on one file and reloaded from another, silently. One source of truth
+/// makes that unrepresentable, and it is the same one `server`'s mtime watch
+/// stats (`paths::config_path()`).
+fn build_handler() -> Result<(ProductionHandler, u64), String> {
     // Deliberate re-read (D7): this is the daemon's config lifecycle — one
     // parse at startup, one per mtime-triggered reload (maybe_reload_handler).
     // Everything downstream consumes the Config held by the handler.
-    let config = match config_path {
-        Some(p) => Config::load_from(Path::new(p)),
-        None => Config::load(),
-    };
-    let mut config = config.map_err(|e| format!("failed to load config: {e}"))?;
+    let mut config = Config::load().map_err(|e| format!("failed to load config: {e}"))?;
 
     // Before anything opens the store: the daemon runs as root, so this is
     // where an upgraded install converges on the documented modes. A handful
@@ -175,7 +180,11 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
     Ok((handler, idle_timeout_secs))
 }
 
-pub fn run(config_path: Option<String>, notifier_factory: NotifierFactory) -> anyhow::Result<()> {
+/// `--config` is honored through the process-level override `main` installs
+/// before dispatch, which is what `Config::load()` and
+/// `paths::config_path()` both read — so startup, the live reload and the
+/// mtime watch cannot disagree about which file is the config.
+pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
     crate::ipc_client::require_root("sudo facelock daemon")?;
 
     // Init tracing (daemon uses its own tracing setup with target=true).
@@ -188,7 +197,7 @@ pub fn run(config_path: Option<String>, notifier_factory: NotifierFactory) -> an
 
     info!("facelock daemon starting");
 
-    let (handler, idle_timeout_secs) = match build_handler(config_path.as_deref()) {
+    let (handler, idle_timeout_secs) = match build_handler() {
         Ok(r) => r,
         Err(e) => {
             error!("{e}");
@@ -200,10 +209,8 @@ pub fn run(config_path: Option<String>, notifier_factory: NotifierFactory) -> an
         .and_then(|m| m.modified())
         .ok();
 
-    // The reload recipe: same builder, no explicit path — `Config::load()`
-    // honors the process-level config override `main` set for --config runs.
-    let rebuild: ProductionRebuild =
-        Box::new(|| build_handler(None).map(|(handler, _idle)| handler));
+    // The reload recipe: the same builder reading the same file.
+    let rebuild: ProductionRebuild = Box::new(|| build_handler().map(|(handler, _idle)| handler));
 
     facelock_daemon::server::run(
         handler,
