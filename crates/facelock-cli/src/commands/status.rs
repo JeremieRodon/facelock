@@ -7,6 +7,12 @@ use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use crate::ipc_client;
 
 pub fn run() -> anyhow::Result<()> {
+    // DEC-6/N4: every D-Bus method `status` calls (`Ping`, and `ListModels`
+    // via `check_enrolled`) is root-only now, and its direct-mode reads hit
+    // the same 0600 root:root database. Check before the first line of
+    // output (C6).
+    ipc_client::require_root("sudo facelock status")?;
+
     println!("facelock system status\n");
 
     // 1. Config

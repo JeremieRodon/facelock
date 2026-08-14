@@ -6,6 +6,9 @@ pub fn run(edit: bool) -> anyhow::Result<()> {
     let config_path = facelock_core::paths::config_path();
 
     if edit {
+        // DEC-6: display stays unprivileged (it reads a 0644 file), but
+        // editing is root — must run before the editor ever opens (C6).
+        crate::ipc_client::require_root("sudo facelock config --edit")?;
         open_in_editor(&config_path)?;
     } else {
         show_config(&config_path)?;

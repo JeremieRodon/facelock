@@ -5,6 +5,9 @@ use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use crate::ipc_client;
 
 pub fn run() -> anyhow::Result<()> {
+    // DEC-6/N13: `ListDevices` is root-only now (was facelock-group).
+    ipc_client::require_root("sudo facelock devices")?;
+
     let config = Config::load().context("failed to load config")?;
 
     if ipc_client::should_use_direct(&config) {

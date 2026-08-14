@@ -47,21 +47,10 @@ pub enum BenchCommand {
 }
 
 pub fn run(command: BenchCommand) -> Result<()> {
-    // Auth benchmarks need to decrypt embeddings, which may require root for TPM access
-    let needs_embeddings = matches!(
-        command,
-        BenchCommand::ColdAuth
-            | BenchCommand::WarmAuth
-            | BenchCommand::Calibrate
-            | BenchCommand::Report
-    );
-    if needs_embeddings {
-        if let Ok(config) = Config::load() {
-            if config.encryption.method == facelock_core::config::EncryptionMethod::Tpm {
-                crate::ipc_client::require_root("sudo facelock bench <subcommand>")?;
-            }
-        }
-    }
+    // DEC-6: `bench` is root by default (direct-mode access needs the 0600
+    // root:root database regardless of subcommand, and auth benchmarks may
+    // need TPM access besides). Supersedes the old TPM-only conditional check.
+    crate::ipc_client::require_root("sudo facelock bench <subcommand>")?;
 
     match command {
         BenchCommand::ColdAuth => cmd_cold_auth(),

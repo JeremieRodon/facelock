@@ -8,6 +8,13 @@ use facelock_core::types::FaceModelInfo;
 use crate::ipc_client;
 
 pub fn run(user: Option<String>, json: bool) -> anyhow::Result<()> {
+    // DEC-6/N4: `ListModels` is root-only now (was facelock-group). The
+    // direct-mode fallback in `fetch_models` already required root when the
+    // 0600 root:root database wasn't readable; checking up front here gives
+    // the same interactive escalation prompt on the D-Bus path too, instead
+    // of a bare AccessDenied.
+    ipc_client::require_root("sudo facelock list")?;
+
     let config = Config::load().context("failed to load config")?;
     let user = ipc_client::resolve_user(user.as_deref());
 
@@ -23,7 +30,7 @@ pub fn run(user: Option<String>, json: bool) -> anyhow::Result<()> {
 }
 
 fn fetch_models(config: &Config, user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
-    // Try D-Bus first (works without root)
+    // Try D-Bus first — `run` already required root above.
     if !ipc_client::should_use_direct(config) {
         let request = DaemonRequest::ListModels {
             user: user.to_string(),
@@ -35,16 +42,9 @@ fn fetch_models(config: &Config, user: &str) -> anyhow::Result<Vec<FaceModelInfo
         };
     }
 
-    // Direct mode: needs read access to DB (typically root or facelock group)
-    match crate::direct::open_store(config) {
-        Ok(store) => store.list_models(user).map_err(|e| anyhow::anyhow!("{e}")),
-        Err(_) => {
-            // DB not accessible — prompt for root
-            ipc_client::require_root("sudo facelock list")?;
-            let store = crate::direct::open_store(config)?;
-            store.list_models(user).map_err(|e| anyhow::anyhow!("{e}"))
-        }
-    }
+    // Direct mode: needs read access to the 0600 root:root database.
+    let store = crate::direct::open_store(config)?;
+    store.list_models(user).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn print_table(user: &str, models: &[FaceModelInfo]) {

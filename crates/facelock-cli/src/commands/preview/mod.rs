@@ -25,6 +25,11 @@ fn resolve_user(user: Option<String>) -> anyhow::Result<String> {
 }
 
 pub fn run(text_only: bool, user: Option<String>) -> anyhow::Result<()> {
+    // DEC-6/N13: `PreviewDetectFrame` is root-only now — it was the last
+    // unprivileged consumer of a per-frame similarity score (the
+    // hill-climbing oracle N12/N13 close by construction).
+    ipc_client::require_root("sudo facelock preview")?;
+
     let config = Config::load().context("failed to load config")?;
     let user = resolve_user(user)?;
 
