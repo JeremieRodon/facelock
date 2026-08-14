@@ -404,15 +404,49 @@ uninstall-files:
 pot:
     #!/usr/bin/env bash
     set -euo pipefail
-    if ! command -v xgettext >/dev/null; then
-        echo "error: xgettext not found — install the gettext package." >&2
-        echo "       (Translations are optional; building facelock does not need this.)" >&2
-        exit 1
-    fi
+    for tool in xgettext msgen msgfmt; do
+        if ! command -v "$tool" >/dev/null; then
+            echo "error: $tool not found — install the gettext package." >&2
+            echo "       (Translations are optional; building facelock does not need this.)" >&2
+            exit 1
+        fi
+    done
     mapfile -t seam < <(ls crates/facelock-cli/src/message/*.rs | LC_ALL=C sort)
     xgettext --language=C --keyword=translate --from-code=UTF-8 --no-wrap \
         --package-name=facelock --copyright-holder="Facelock Contributors" \
         -o po/facelock.pot "${seam[@]}"
+
+    # Mark the templates that carry `{placeholder}` tokens as brace-format, so
+    # `msgfmt --check` (see the `mo` recipe) rejects a translation that drops,
+    # renames or invents one. Without a format flag msgfmt validates nothing
+    # about the braces: "{pathh}" compiles clean and renders broken at runtime.
+    #
+    # This is done here rather than with `--flag=translate:1:python-brace-format`
+    # because xgettext honours format flags only for the format types its
+    # *scanner language* knows, and --language=C knows only c-format — the flag
+    # is accepted and silently dropped (verified against gettext 1.0). The seam
+    # uses exactly one placeholder syntax (`{lower_snake}`, see `fill` in
+    # message/mod.rs), so matching it here is precise, and the check below
+    # makes gettext itself confirm every flag we wrote is truthful.
+    awk '
+        { buf[NR] = $0 }
+        END {
+            for (i = 2; i <= NR; i++)
+                if (buf[i] ~ /^msgid "/ && buf[i] ~ /\{[a-z_][a-z0-9_]*\}/) {
+                    if (buf[i-1] ~ /^#,/) sub(/$/, ", python-brace-format", buf[i-1])
+                    else buf[i-1] = buf[i-1] "\n#, python-brace-format"
+                }
+            for (i = 1; i <= NR; i++) print buf[i]
+        }
+    ' po/facelock.pot > po/facelock.pot.tmp
+    mv po/facelock.pot.tmp po/facelock.pot
+
+    # Every flagged msgid must itself parse as a brace-format string: fill the
+    # template with English and run the same check translators will hit. A msgid
+    # with an unbalanced brace in prose would fail here rather than in a
+    # translator's catalog.
+    msgen po/facelock.pot | msgfmt --check-format -o /dev/null -
+
     xgettext --language=C --keyword=gettext --from-code=UTF-8 --no-wrap \
         --package-name=pam_facelock --copyright-holder="Facelock Contributors" \
         -o po/pam_facelock.pot crates/pam-facelock/src/lib.rs
@@ -424,6 +458,11 @@ pot:
 # translation: mkdir -p po/de && msginit -i po/facelock.pot -o po/de/facelock.po -l de
 # To verify a translation manually without installing system-wide:
 #   FACELOCK_LOCALEDIR=$PWD/target/locale LANGUAGE=de facelock list
+#
+# `msgfmt --check` is what enforces the `{placeholder}` contract: paired with the
+# python-brace-format flags `just pot` writes, it rejects a translation that
+# typos, drops or invents a placeholder. Dropping --check would silently turn
+# that back off.
 mo:
     #!/usr/bin/env bash
     set -euo pipefail
