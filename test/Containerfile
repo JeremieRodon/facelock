@@ -48,7 +48,8 @@ COPY test/fake-facelock-daemon.py /fake-facelock-daemon.py
 COPY test/run-container-tests.sh /run-tests.sh
 COPY test/run-integration-tests.sh /run-integration-tests.sh
 COPY test/run-oneshot-tests.sh /run-oneshot-tests.sh
-RUN chmod +x /run-tests.sh /run-integration-tests.sh /run-oneshot-tests.sh
+COPY test/run-layout-tests.sh /run-layout-tests.sh
+RUN chmod +x /run-tests.sh /run-integration-tests.sh /run-oneshot-tests.sh /run-layout-tests.sh
 
 # Clean up build dir to save image size
 RUN rm -rf /build

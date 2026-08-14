@@ -22,8 +22,19 @@ dark_threshold = 1.0
 threshold = 0.80
 timeout_secs = 10
 
+# The [daemon] header below is deliberately present and deliberately empty.
+#
+# `model_dir` is NOT set: the built-in default (/var/lib/facelock/models) is
+# already where test/Containerfile puts the ONNX files, so a pin would buy
+# nothing.
+#
+# The HEADER itself must stay. run-container-tests.sh injects the oneshot
+# env_clear fixture with `sed '/^\[daemon\]/a mode = ...\nauth_bin = ...'`, so
+# deleting the header silently stops that fixture being applied: the capture
+# stub never runs, /tmp/oneshot-child-env is never written, and three env_clear
+# assertions fail with grep exit 2 rather than anything resembling the real
+# cause.
 [daemon]
-model_dir = "/var/lib/facelock/models"
 
 [security]
 disabled = false

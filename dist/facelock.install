@@ -1,14 +1,34 @@
+# Modes for the current layout, mirroring dist/facelock.tmpfiles for hosts
+# where a bare `systemd-tmpfiles --create` did not run. Nothing here moves,
+# creates, or deletes data: directories are created, existing files are
+# re-chmod/chowned, and that is all. Every line is idempotent.
+_facelock_secure_paths() {
+    # State dir: traverse-only for the facelock group, nothing for others.
+    chown root:facelock /var/lib/facelock 2>/dev/null || true
+    chmod 710 /var/lib/facelock 2>/dev/null || true
+    # Models are public, SHA256-verified downloads; the 0710 parent is the gate.
+    chown root:root /var/lib/facelock/models 2>/dev/null || true
+    chmod 755 /var/lib/facelock/models 2>/dev/null || true
+    # `facelock is-enrolled` marker dir: group-traversable, not listable.
+    install -d -o root -g facelock -m 0710 /var/lib/facelock/enrolled 2>/dev/null || true
+    # Database and sidecars: root-only. Tighten if present, never create.
+    for f in /var/lib/facelock/facelock.db /var/lib/facelock/facelock.db-wal /var/lib/facelock/facelock.db-shm; do
+        [ -f "$f" ] && chown root:root "$f" 2>/dev/null && chmod 600 "$f" 2>/dev/null
+    done
+    # Audit log (per-user auth history) and snapshots (raw face images):
+    # root-only.
+    chown root:root /var/log/facelock 2>/dev/null || true
+    chmod 700 /var/log/facelock 2>/dev/null || true
+    chown root:root /var/log/facelock/snapshots 2>/dev/null || true
+    chmod 700 /var/log/facelock/snapshots 2>/dev/null || true
+    [ -f /var/log/facelock/audit.jsonl ] && chown root:root /var/log/facelock/audit.jsonl 2>/dev/null && chmod 600 /var/log/facelock/audit.jsonl 2>/dev/null
+    return 0
+}
+
 post_install() {
     systemd-sysusers
     systemd-tmpfiles --create
-    chown root:facelock /var/lib/facelock 2>/dev/null || true
-    chmod 750 /var/lib/facelock 2>/dev/null || true
-    chown root:root /var/lib/facelock/models 2>/dev/null || true
-    chmod 755 /var/lib/facelock/models 2>/dev/null || true
-    chown root:facelock /var/log/facelock 2>/dev/null || true
-    chmod 750 /var/log/facelock 2>/dev/null || true
-    chown root:facelock /var/log/facelock/snapshots 2>/dev/null || true
-    chmod 750 /var/log/facelock/snapshots 2>/dev/null || true
+    _facelock_secure_paths
 
     # Reload systemd for D-Bus activation
     systemctl daemon-reload 2>/dev/null || true
@@ -21,14 +41,7 @@ post_install() {
 post_upgrade() {
     systemd-sysusers
     systemd-tmpfiles --create
-    chown root:facelock /var/lib/facelock 2>/dev/null || true
-    chmod 750 /var/lib/facelock 2>/dev/null || true
-    chown root:root /var/lib/facelock/models 2>/dev/null || true
-    chmod 755 /var/lib/facelock/models 2>/dev/null || true
-    chown root:facelock /var/log/facelock 2>/dev/null || true
-    chmod 750 /var/log/facelock 2>/dev/null || true
-    chown root:facelock /var/log/facelock/snapshots 2>/dev/null || true
-    chmod 750 /var/log/facelock/snapshots 2>/dev/null || true
+    _facelock_secure_paths
 
     # Restart daemon if running
     if systemctl is-active --quiet facelock-daemon; then

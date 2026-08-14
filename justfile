@@ -49,6 +49,15 @@ _build-test-container: build-release
 test-arch-pam: _build-test-container
     podman run --rm facelock-pam-test
 
+# Automated state-layout test (Arch container, camera-free).
+# Asserts the exact modes and ownership of everything under /var/lib/facelock
+# and /var/log/facelock, including that enrolled/ is traversable but not
+# listable for a facelock group member. This is the only test that exercises
+# the packaging wiring (install-files modes + the built-in defaults) end to
+# end — unit tests cannot.
+test-arch-layout: _build-test-container
+    podman run --rm facelock-pam-test /run-layout-tests.sh
+
 # Guard for the camera tiers: the Containerfile bakes models/ into the image
 # with a tolerant `|| true`, so building from a checkout without the ONNX
 # models (fresh clone/worktree — they are downloaded, not tracked) produces an
@@ -69,7 +78,7 @@ _require-models:
         for m in "${missing[@]}"; do echo "         $m" >&2; done
         echo "       They are downloaded, not tracked. Copy them from the install tree" >&2
         echo "       ('sudo facelock setup' downloads them to /var/lib/facelock/models):" >&2
-        echo "         cp /var/lib/facelock/models/*.onnx models/" >&2
+        echo "         sudo cp /var/lib/facelock/models/*.onnx models/" >&2
         echo "       (models/*.onnx is gitignored, so this cannot be committed by accident.)" >&2
         exit 1
     fi
@@ -191,11 +200,18 @@ install-files:
     # and will steal polkit auth from the DE's agent, causing all privilege prompts to hang)
     [ -f target/release/facelock-polkit-agent ] && install -Dm755 target/release/facelock-polkit-agent /usr/bin/facelock-polkit-agent || true
 
-    # Directories
-    install -dm750 -o root -g facelock /var/lib/facelock
+    # Directories. Must match dist/facelock.tmpfiles.
+    # State dir 0710 root:facelock: traverse-only for the group, nothing for
+    # anyone else. Models are public, SHA256-verified downloads — the 0710
+    # parent is the gate. enrolled/ 0710 root:facelock: a group member can
+    # open its own 0600 marker by name but cannot list who else is enrolled.
+    # Audit log and snapshots are root-only (per-user auth history and raw
+    # face images).
+    install -dm710 -o root -g facelock /var/lib/facelock
     install -dm755 -o root -g root /var/lib/facelock/models
-    install -dm750 -o root -g facelock /var/log/facelock
-    install -dm750 -o root -g facelock /var/log/facelock/snapshots
+    install -dm710 -o root -g facelock /var/lib/facelock/enrolled
+    install -dm700 -o root -g root /var/log/facelock
+    install -dm700 -o root -g root /var/log/facelock/snapshots
 
     # Enable D-Bus activation (if systemd present)
     if [ -d /run/systemd/system ]; then
@@ -210,14 +226,18 @@ install-files:
     [ -d /etc/facelock ] && chown root:root /etc/facelock && chmod 755 /etc/facelock || true
     [ -f /etc/facelock/config.toml ] && chown root:root /etc/facelock/config.toml && chmod 644 /etc/facelock/config.toml || true
     [ -f /etc/facelock/config.toml.default ] && chown root:root /etc/facelock/config.toml.default && chmod 644 /etc/facelock/config.toml.default || true
-    [ -d /var/lib/facelock ] && chown root:facelock /var/lib/facelock && chmod 750 /var/lib/facelock || true
+    [ -d /var/lib/facelock ] && chown root:facelock /var/lib/facelock && chmod 710 /var/lib/facelock || true
     [ -d /var/lib/facelock/models ] && chown root:root /var/lib/facelock/models && chmod 755 /var/lib/facelock/models || true
-    [ -d /var/log/facelock ] && chown root:facelock /var/log/facelock && chmod 750 /var/log/facelock || true
-    [ -d /var/log/facelock/snapshots ] && chown root:facelock /var/log/facelock/snapshots && chmod 750 /var/log/facelock/snapshots || true
+    [ -d /var/lib/facelock/enrolled ] && chown root:facelock /var/lib/facelock/enrolled && chmod 710 /var/lib/facelock/enrolled || true
+    [ -d /var/log/facelock ] && chown root:root /var/log/facelock && chmod 700 /var/log/facelock || true
+    [ -d /var/log/facelock/snapshots ] && chown root:root /var/log/facelock/snapshots && chmod 700 /var/log/facelock/snapshots || true
+    [ -f /var/log/facelock/audit.jsonl ] && chown root:root /var/log/facelock/audit.jsonl && chmod 600 /var/log/facelock/audit.jsonl || true
     [ -d /var/lib/facelock/models ] && chmod 644 /var/lib/facelock/models/*.onnx 2>/dev/null || true
-    [ -f /var/lib/facelock/facelock.db ] && chown root:facelock /var/lib/facelock/facelock.db && chmod 640 /var/lib/facelock/facelock.db || true
-    [ -f /var/lib/facelock/facelock.db-wal ] && chown root:facelock /var/lib/facelock/facelock.db-wal && chmod 640 /var/lib/facelock/facelock.db-wal || true
-    [ -f /var/lib/facelock/facelock.db-shm ] && chown root:facelock /var/lib/facelock/facelock.db-shm && chmod 640 /var/lib/facelock/facelock.db-shm || true
+    # The database and sidecars are root-only: encrypted biometric templates,
+    # read by the daemon. Tighten if present, never create.
+    [ -f /var/lib/facelock/facelock.db ] && chown root:root /var/lib/facelock/facelock.db && chmod 600 /var/lib/facelock/facelock.db || true
+    [ -f /var/lib/facelock/facelock.db-wal ] && chown root:root /var/lib/facelock/facelock.db-wal && chmod 600 /var/lib/facelock/facelock.db-wal || true
+    [ -f /var/lib/facelock/facelock.db-shm ] && chown root:root /var/lib/facelock/facelock.db-shm && chmod 600 /var/lib/facelock/facelock.db-shm || true
 
     echo ""
     echo ""

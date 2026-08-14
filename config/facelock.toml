@@ -138,7 +138,7 @@
 [storage]
 
 # SQLite database for face embeddings. Contains biometric data —
-# file permissions should be 640 owned by root:facelock.
+# file permissions should be 600 owned by root:root.
 # Default: "/var/lib/facelock/facelock.db"
 # db_path = "/var/lib/facelock/facelock.db"
 
