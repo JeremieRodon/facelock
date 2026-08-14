@@ -79,7 +79,7 @@ Supported providers: `cpu` (default), `cuda` (NVIDIA), `rocm` (AMD), `openvino` 
 | facelock-core | serde, toml, thiserror, tracing, subtle, zeroize, zvariant |
 | facelock-camera | facelock-core, v4l, image, tracing |
 | facelock-face | facelock-core, ort, ndarray, image, sha2 |
-| facelock-store | facelock-core, rusqlite (bundled), bytemuck |
+| facelock-store | facelock-core, rusqlite (bundled), bytemuck, thiserror |
 | facelock-daemon | facelock-core, facelock-camera, facelock-face, facelock-store, facelock-tpm, signal-hook, nix |
 | facelock-cli | facelock-core + all above, clap, reqwest, zbus, tokio, dialoguer |
 | facelock-bench | facelock-core, facelock-camera, facelock-face, facelock-store, clap, anyhow, tracing |

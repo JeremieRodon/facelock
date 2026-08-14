@@ -4,6 +4,7 @@ use chrono::Local;
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_core::types::FaceModelInfo;
+use facelock_store::StoreError;
 
 use crate::ipc_client;
 
@@ -79,14 +80,7 @@ pub fn run(
     {
         let config_embedder = &config.recognition.embedder_model;
         let has_stale = if ipc_client::should_use_direct(&config) {
-            let store = crate::direct::open_store(&config)?;
-            let has_any = store
-                .has_models(&user)
-                .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
-            let has_matching = store
-                .has_models_for_embedder(&user, config_embedder)
-                .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
-            has_any && !has_matching
+            direct_has_stale_embedder(&config, &user, config_embedder)?
         } else {
             let request = DaemonRequest::ListModels { user: user.clone() };
             match ipc_client::send_request(&request)? {
@@ -153,7 +147,13 @@ pub fn run(
 /// read as "this user has no models".
 fn list_user_models(user: &str, config: &Config) -> anyhow::Result<Vec<FaceModelInfo>> {
     if ipc_client::should_use_direct(config) {
-        let store = crate::direct::open_store(config)?;
+        let store = match crate::direct::open_store_existing(config) {
+            Ok(store) => store,
+            // Fresh install: no models yet. Picking the first free label must
+            // not create the database enrollment itself is about to create.
+            Err(StoreError::Absent { .. }) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
         store
             .list_models(user)
             .map_err(|e| anyhow::anyhow!("storage error: {e}"))
@@ -166,6 +166,25 @@ fn list_user_models(user: &str, config: &Config) -> anyhow::Result<Vec<FaceModel
             other => anyhow::bail!("unexpected response from daemon: {other:?}"),
         }
     }
+}
+
+/// Direct-transport half of the stale-embedder warning. [`StoreError::Absent`]
+/// reads as "no models, nothing stale" without creating the database; any
+/// other failure class propagates (C4) — the enrollment ahead needs the very
+/// store this check just failed to read.
+fn direct_has_stale_embedder(config: &Config, user: &str, embedder: &str) -> anyhow::Result<bool> {
+    let store = match crate::direct::open_store_existing(config) {
+        Ok(store) => store,
+        Err(StoreError::Absent { .. }) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let has_any = store
+        .has_models(user)
+        .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
+    let has_matching = store
+        .has_models_for_embedder(user, embedder)
+        .map_err(|e| anyhow::anyhow!("storage error: {e}"))?;
+    Ok(has_any && !has_matching)
 }
 
 /// Generate the next available label like "2026-03-15-1", "2026-03-15-2", etc.
@@ -208,6 +227,38 @@ mod tests {
         let mut config = Config::parse("[daemon]\nmode = \"oneshot\"\n").expect("config parses");
         config.storage.db_path = db_path.to_string_lossy().into_owned();
         config
+    }
+
+    /// `Absent` vs everything else at the pre-enrollment reads: a fresh
+    /// install reads as "no models, nothing stale" and the probes create
+    /// nothing — enrollment proper is what brings the database into being.
+    #[test]
+    fn absent_store_reads_as_no_models_without_creating() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        let config = oneshot_config_with_db(&db_path);
+
+        assert!(!direct_has_stale_embedder(&config, "alice", "embedder").unwrap());
+        assert_eq!(
+            next_label("2026-08-13", "alice", &config).unwrap(),
+            "2026-08-13-1"
+        );
+        assert!(
+            !db_path.exists(),
+            "pre-enrollment reads must not create the database"
+        );
+    }
+
+    /// The counterpart: an unreadable (present) store is NOT `Absent` — the
+    /// stale-embedder check propagates it instead of skipping the warning.
+    #[test]
+    fn stale_embedder_check_propagates_unreadable_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let config = oneshot_config_with_db(&db_path);
+        assert!(direct_has_stale_embedder(&config, "alice", "embedder").is_err());
     }
 
     /// C4: a store failure while picking the next label propagates — it must

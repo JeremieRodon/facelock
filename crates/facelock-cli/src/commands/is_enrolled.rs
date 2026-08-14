@@ -46,7 +46,7 @@
 //! first, which *activates* the system daemon. Nothing in this module may call
 //! [`crate::ipc_client::send_request`],
 //! [`crate::ipc_client::should_use_direct`] (it probes the system bus), or
-//! [`crate::direct::open_store`].
+//! [`crate::direct::open_store`] or [`crate::direct::open_store_existing`].
 //!
 //! The only syscalls on the hot path are: read `/etc/facelock/config.toml` (for
 //! the state directory), and read one marker file.

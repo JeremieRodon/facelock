@@ -67,7 +67,10 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
     {
         let config_embedder = &config.recognition.embedder_model;
         let has_matching = if ipc_client::should_use_direct(&config) {
-            let store = crate::direct::open_store(&config)?;
+            // `open_store_existing`: the store answered has_models one query
+            // ago, so it exists; if it vanished since, that is an error, not
+            // a cue to create an empty one and warn about a stale embedder.
+            let store = crate::direct::open_store_existing(&config)?;
             store
                 .has_models_for_embedder(&user, config_embedder)
                 .map_err(|e| anyhow::anyhow!("storage error: {e}"))?
@@ -229,11 +232,11 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Direct-transport "does this user have enrolled models?" with the C7
-/// three-way discrimination:
+/// three-way discrimination, now carried by [`StoreError`]'s variants:
 ///
-/// - store opens, zero models  → `Ok(false)` ("no models enrolled" is true)
-/// - store absent (fresh)      → `Ok(false)` (created empty; same message)
-/// - store present, unreadable → `Err`, never "no models"
+/// - store opens, zero models      → `Ok(false)` ("no models enrolled" is true)
+/// - `StoreError::Absent` (fresh)  → `Ok(false)` (no database created; same message)
+/// - any other failure class       → `Err`, never "no models"
 ///
 /// For the error, the per-user enrollment marker is consulted **for the
 /// message only** — it is readable in exactly the cases the database is not,
@@ -241,9 +244,10 @@ pub fn run(user: Option<String>) -> anyhow::Result<()> {
 /// to be enrolled; the database is the problem"). The marker can be stale,
 /// hence "appear to"; it never influences the decision, only the wording.
 fn direct_user_has_models(config: &Config, user: &str) -> anyhow::Result<bool> {
-    let store = match crate::direct::open_store(config) {
+    let store = match crate::direct::open_store_existing(config) {
         Ok(store) => store,
-        Err(e) => return Err(unreadable_store_error(config, user, &e)),
+        Err(facelock_store::StoreError::Absent { .. }) => return Ok(false),
+        Err(e) => return Err(unreadable_store_error(config, user, &anyhow::Error::new(e))),
     };
     match store.has_models(user) {
         Ok(v) => Ok(v),
@@ -293,7 +297,8 @@ mod tests {
         let db_path = dir.path().join("facelock.db");
         let config = config_with_db(&db_path);
 
-        // Absent (fresh): created empty on first touch.
+        // Absent (fresh): the StoreError::Absent variant, read as "not
+        // enrolled" without creating anything.
         assert!(!direct_user_has_models(&config, "alice").unwrap());
 
         // Open store, models for someone else only.
@@ -305,6 +310,21 @@ mod tests {
         }
         assert!(!direct_user_has_models(&config, "alice").unwrap());
         assert!(direct_user_has_models(&config, "bob").unwrap());
+    }
+
+    /// The `Absent` arm answers "not enrolled" as a *value*: the probe must
+    /// not manufacture the empty database the create-based `open_store` used
+    /// to leave behind.
+    #[test]
+    fn absent_store_probe_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+
+        assert!(!direct_user_has_models(&config_with_db(&db_path), "alice").unwrap());
+        assert!(
+            !db_path.exists(),
+            "probing enrollment must not create the database it reports absent"
+        );
     }
 
     /// C7 branch 3: a present-but-unreadable store is an error and must not

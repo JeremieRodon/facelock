@@ -2,6 +2,7 @@ use anyhow::Context;
 
 use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
+use facelock_store::StoreError;
 
 use crate::ipc_client;
 
@@ -37,7 +38,10 @@ pub fn run(user: Option<String>, yes: bool) -> anyhow::Result<()> {
     }
 
     if ipc_client::should_use_direct(&config) {
-        let store = crate::direct::open_store(&config)?;
+        // `open_store_existing`: has_models above just proved the database is
+        // there. If it vanished since, deleting has nothing to do — erroring
+        // beats re-creating an empty database in its place.
+        let store = crate::direct::open_store_existing(&config)?;
         let count = store
             .clear_user(&user)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -66,9 +70,15 @@ pub fn run(user: Option<String>, yes: bool) -> anyhow::Result<()> {
 
 /// Direct-transport half of the pre-prompt check: a store that cannot be
 /// opened or queried is an error, never "no models" and never "assume yes and
-/// prompt anyway".
+/// prompt anyway". [`StoreError::Absent`] alone reads as "no models" — a
+/// fresh install has provably nothing to delete, and the probe must not
+/// create the database it is about to report empty.
 fn direct_user_has_models(config: &Config, user: &str) -> anyhow::Result<bool> {
-    let store = crate::direct::open_store(config)?;
+    let store = match crate::direct::open_store_existing(config) {
+        Ok(store) => store,
+        Err(StoreError::Absent { .. }) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
     store
         .has_models(user)
         .map_err(|e| anyhow::anyhow!("storage error: {e}"))
@@ -144,6 +154,21 @@ mod tests {
         std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
         assert!(direct_user_has_models(&config_with_db(&db_path), "alice").is_err());
+    }
+
+    /// The `Absent` variant reads as "no models" without creating anything:
+    /// before the typed error, this probe ran as root and left an empty
+    /// database at the path as a side effect of finding nothing to delete.
+    #[test]
+    fn direct_absent_store_reads_as_no_models_without_creating() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+
+        assert!(!direct_user_has_models(&config_with_db(&db_path), "alice").unwrap());
+        assert!(
+            !db_path.exists(),
+            "the pre-prompt probe must not create the database it reports empty"
+        );
     }
 
     #[test]

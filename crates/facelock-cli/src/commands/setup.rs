@@ -1163,13 +1163,16 @@ fn handle_orphan_models_before_keygen(
     // Fail closed on both reads (C2, issue #105): a database that cannot be
     // opened, or a query that fails on an open one, does NOT mean "nothing to
     // protect" — it means facelock cannot tell, and minting a key on "cannot
-    // tell" is what orphans real templates.
-    let store = match crate::direct::open_store(config) {
+    // tell" is what orphans real templates. `Absent` is the one failure class
+    // that authorizes proceeding: no database file means there are no
+    // templates to orphan, and the probe must not create one to prove it.
+    let store = match crate::direct::open_store_existing(config) {
         Ok(s) => s,
+        Err(facelock_store::StoreError::Absent { .. }) => return Ok(()),
         Err(e) => bail!(
             "refusing to generate a new encryption key: the face database could \
              not be read, so facelock cannot tell whether existing templates \
-             would be orphaned ({e:#}). Fix access to {} and re-run, or clear \
+             would be orphaned ({e}). Fix access to {} and re-run, or clear \
              models first with: sudo facelock clear",
             config.storage.db_path
         ),
@@ -1303,6 +1306,24 @@ mod orphan_guard_tests {
 
         handle_orphan_models_before_keygen(&config_with_db(&db_path), None)
             .expect("a fresh store with zero models must not block keygen");
+    }
+
+    /// (c′) The `Absent` variant is what encodes case (c): the guard proceeds
+    /// on a missing database *because there is provably nothing to orphan* —
+    /// and, unlike the create-based probe it replaces, leaves no empty
+    /// database behind. Together with (a) this pins Absent ≠ Denied/Corrupt:
+    /// one authorizes keygen, the other refuses it.
+    #[test]
+    fn absent_database_proceeds_without_creating_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+
+        handle_orphan_models_before_keygen(&config_with_db(&db_path), None)
+            .expect("an absent database means nothing to orphan");
+        assert!(
+            !db_path.exists(),
+            "the orphan probe must not create the database it reports absent"
+        );
     }
 
     /// (d) Models present, non-interactive: the existing orphaned-models bail

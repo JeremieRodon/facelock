@@ -19,7 +19,7 @@ use facelock_daemon::audit::AuditSource;
 use facelock_daemon::auth::{PreCheckContext, pre_check_audited_with_context};
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
-use facelock_store::FaceStore;
+use facelock_store::{FaceStore, StoreError};
 use tracing::debug;
 
 /// Open the face database, applying the state-directory layout first.
@@ -40,6 +40,19 @@ pub fn open_store(config: &Config) -> anyhow::Result<FaceStore> {
     // `create`: first-time `enroll` legitimately brings the database into
     // being here.
     FaceStore::create(Path::new(&config.storage.db_path)).context("failed to open database")
+}
+
+/// Like [`open_store`], but never creates: [`StoreError::Absent`] comes back
+/// as a value instead of an empty database materializing at the path.
+///
+/// This is the constructor for guards and reporters — the call shapes that
+/// need "fresh install" and "cannot read" to be different answers. The typed
+/// error is the point: callers match `Absent` to proceed on "nothing
+/// enrolled" and treat every other class as "cannot tell", without sniffing
+/// message strings.
+pub fn open_store_existing(config: &Config) -> Result<FaceStore, StoreError> {
+    crate::state_layout::ensure_state_layout_best_effort(config);
+    FaceStore::open_existing(Path::new(&config.storage.db_path))
 }
 
 #[derive(Clone)]
