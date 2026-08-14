@@ -32,6 +32,13 @@ pub enum StatusMessage {
     StatusUnknown {
         why: String,
     },
+    /// The one `why` facelock authors itself, rather than quoting from a
+    /// probe: every config-dependent fact is undeterminable when the config
+    /// did not parse. It is a catalog entry because it is prose that reaches
+    /// a user, and it is composed into [`StatusMessage::StatusUnknown`]'s
+    /// sentence — so leaving it as a bare Rust literal would embed English
+    /// inside an otherwise localized line.
+    StatusWhyConfigNotAvailable,
     StatusConfigValid,
     StatusConfigNotFound,
     StatusConfigInvalid {
@@ -121,6 +128,7 @@ impl Message for StatusMessage {
                 translate("cannot determine: {why}"),
                 &[("why", why.clone())],
             ),
+            StatusWhyConfigNotAvailable => translate("config not available"),
             StatusConfigValid => translate("valid"),
             StatusConfigNotFound => translate("not found"),
             StatusConfigInvalid { error } => {
@@ -133,10 +141,10 @@ impl Message for StatusMessage {
                 &[("error", error.clone())],
             ),
             StatusFallbackUsable => translate(
-                "usable (root-invoked PAM can authenticate via 'facelock auth' without the daemon)",
+                "prerequisites present (binary, models and database in place for daemon-less auth)",
             ),
             StatusFallbackNotUsable => translate(
-                "not usable (PAM would fall through to the next auth method if the daemon is unreachable)",
+                "prerequisites missing (PAM would fall through to the next auth method if the daemon is unreachable)",
             ),
             StatusCameraDeviceExists => translate("device exists"),
             StatusCameraDeviceNotFound => translate("device not found"),
@@ -150,6 +158,10 @@ impl Message for StatusMessage {
             StatusEpNotBuiltIn => translate(
                 "not built into the installed ONNX Runtime — inference will fall back to CPU",
             ),
+            // The provider names are spelled out rather than joined from
+            // `ProviderKind::all_names()` because this string is translated:
+            // an assembled sentence cannot be localized. The literal is held
+            // to the enum by `unknown_provider_hint_lists_every_provider`.
             StatusEpUnknownName => {
                 translate("unknown execution provider (valid: cpu, cuda, rocm, openvino)")
             }
@@ -237,7 +249,8 @@ impl super::Samples for StatusMessage {
             StatusLabelSecurity => StatusLabelNotifications,
             StatusLabelNotifications => StatusLabelPamModule,
             StatusLabelPamModule => StatusUnknown { why: s("w") },
-            StatusUnknown { .. } => StatusConfigValid,
+            StatusUnknown { .. } => StatusWhyConfigNotAvailable,
+            StatusWhyConfigNotAvailable => StatusConfigValid,
             StatusConfigValid => StatusConfigNotFound,
             StatusConfigNotFound => StatusConfigInvalid { error: s("e") },
             StatusConfigInvalid { .. } => StatusDaemonOneshot,
@@ -284,5 +297,26 @@ impl super::Samples for StatusMessage {
             StatusPamSudoConfigured => StatusPamSudoNotConfigured,
             StatusPamSudoNotConfigured => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drift pin for the one place a provider list is written out by hand.
+    /// `facelock-face` derives every other list from `ProviderKind::ALL`;
+    /// this hint cannot, because it is a translated sentence. So instead of
+    /// assembling it, hold it to the enum: adding a provider without
+    /// mentioning it here (and in the translations) fails this test.
+    #[test]
+    fn unknown_provider_hint_lists_every_provider() {
+        let hint = StatusMessage::StatusEpUnknownName.localized();
+        for name in facelock_face::ProviderKind::all_names() {
+            assert!(
+                hint.contains(name),
+                "execution-provider hint omits {name:?}: {hint}"
+            );
+        }
     }
 }

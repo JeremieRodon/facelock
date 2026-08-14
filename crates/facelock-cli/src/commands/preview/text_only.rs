@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::ipc_client;
+use crate::message::{FaceMessage, Terminal};
 
 /// Run the text-only preview mode.
 ///
@@ -88,8 +89,22 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
 
     let mut camera = crate::direct::open_camera(config)?;
     let mut engine = crate::direct::load_engine(config)?;
-    let store = crate::direct::open_store(config)?;
-    let stored = crate::direct::load_user_embeddings(&store, config, user)?;
+    // Preview only reads: it shows live similarity against whatever is
+    // enrolled and never writes a row. The create-based `open_store` would
+    // materialise an empty database on a fresh install — the silent lie about
+    // a store of biometric templates that `open_existing` exists to prevent.
+    // An absent database is simply "nothing enrolled yet", which preview can
+    // still render: every face just comes back unrecognized.
+    let stored = match crate::direct::open_store_existing(config) {
+        Ok(store) => crate::direct::load_user_embeddings(&store, config, user)?,
+        Err(facelock_store::StoreError::Absent { .. }) => {
+            Terminal.info(&FaceMessage::NoModelsEnrolled {
+                user: user.to_string(),
+            });
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
+    };
     let threshold = config.recognition.threshold;
 
     let mut frame_count: u64 = 0;

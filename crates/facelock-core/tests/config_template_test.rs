@@ -5,13 +5,10 @@
 //! as `/etc/facelock/config.toml` on every fresh install, so drift here is a
 //! drift in what a real installation actually does.
 //!
-//! `Config` derives neither `PartialEq` nor `Default` (and adding either is
-//! outside this crate's test-only edit scope for this change), so this test
-//! gets its "default" reference from `Config::parse("")` instead — every one
-//! of `Config`'s 11 fields is `#[serde(default)]`, so an empty TOML document
-//! parses to exactly what a `Config::default()` would produce if one
-//! existed — and compares via `Debug` formatting, which is derived
-//! everywhere `Config` nests.
+//! `Config` derives `PartialEq` and `Default`, so these comparisons are real
+//! structural equality. They used to go through `Debug` strings, which was
+//! sound only as long as no field ever gained redaction or unordered
+//! iteration — a property nothing enforced.
 
 use facelock_core::config::Config;
 
@@ -20,18 +17,12 @@ const TEMPLATE: &str = include_str!(concat!(
     "/../../config/facelock.toml"
 ));
 
-fn debug_eq(a: &Config, b: &Config) -> bool {
-    format!("{a:?}") == format!("{b:?}")
-}
-
-fn debug_diff(a: &Config, b: &Config) -> String {
+fn config_diff(a: &Config, b: &Config) -> String {
     format!("parsed:\n{a:#?}\n\ndefault:\n{b:#?}")
 }
 
-/// What `Config::default()` would produce, obtained without one: every field
-/// is `#[serde(default)]`, so an empty document is equivalent by construction.
 fn expected_default() -> Config {
-    Config::parse("").expect("an empty config document must always parse")
+    Config::default()
 }
 
 /// Three example lines in the template are deliberately **not** defaults:
@@ -55,21 +46,24 @@ const NOT_DEFAULT_EXAMPLES: &[(&str, &str)] = &[
 /// "pcr_binding = true is ENFORCED: ..." (bad value: trailing prose after
 /// `true`) — the value check is what rejects those.
 fn assignment_key(rest: &str) -> Option<&str> {
-    let (key, value) = rest.split_once('=')?;
+    let key = assignment_shaped_key(rest)?;
+    let (_, value) = rest.split_once('=')?;
+    looks_like_toml_value(value).then_some(key)
+}
+
+/// The left-hand half of [`assignment_key`]: a bare, whitespace-free,
+/// key-shaped token before an `=`. Says nothing about the value, which is
+/// what makes it the right test for "was this line *meant* to be an
+/// assignment" — see [`Expansion::skipped`].
+fn assignment_shaped_key(rest: &str) -> Option<&str> {
+    let (key, _) = rest.split_once('=')?;
     let key = key.trim();
-    if key.is_empty() || key.split_whitespace().count() != 1 {
-        return None;
-    }
-    if !key
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-    {
-        return None;
-    }
-    if !looks_like_toml_value(value) {
-        return None;
-    }
-    Some(key)
+    let plausible = !key.is_empty()
+        && key.split_whitespace().count() == 1
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    plausible.then_some(key)
 }
 
 /// Best-effort check that `value` is *just* a TOML scalar or array, with at
@@ -97,13 +91,30 @@ fn looks_like_toml_value(raw_value: &str) -> bool {
         || value.parse::<f64>().is_ok()
 }
 
+/// The result of expanding the template, including what the expander could
+/// *not* classify — see [`Expansion::skipped`].
+struct Expansion {
+    toml: String,
+    /// Commented lines with a key-shaped left-hand side whose right-hand side
+    /// did not look like a TOML value, so they were left commented and
+    /// contribute no coverage.
+    ///
+    /// Every one of these is prose today. The reason to surface them is that
+    /// a *multi-line* example — a value continued onto following comment
+    /// lines — lands here too, and would otherwise be dropped in silence:
+    /// the test would still pass, having quietly stopped checking the example
+    /// it looks like it checks.
+    skipped: Vec<String>,
+}
+
 /// Uncomment every commented-out example in the template except the
 /// deliberately-non-default placeholders in [`NOT_DEFAULT_EXAMPLES`],
 /// tracking the current `[section]` so keys reused across sections (e.g.
 /// `path` under both `[device]` and `[audit]`) are only skipped where
 /// documented as non-default.
-fn uncomment_all_examples(template: &str) -> String {
+fn uncomment_all_examples(template: &str) -> Expansion {
     let mut current_section = String::new();
+    let mut skipped = Vec::new();
     let mut out = String::with_capacity(template.len());
     for line in template.lines() {
         let trimmed = line.trim_start();
@@ -138,10 +149,15 @@ fn uncomment_all_examples(template: &str) -> String {
             continue;
         }
 
+        // Left commented. Record it if it was *shaped* like an assignment,
+        // since that is where an example the classifier cannot handle hides.
+        if assignment_shaped_key(rest).is_some() {
+            skipped.push(rest.to_string());
+        }
         out.push_str(line);
         out.push('\n');
     }
-    out
+    Expansion { toml: out, skipped }
 }
 
 #[test]
@@ -150,27 +166,55 @@ fn shipped_template_parses_to_config_default() {
     let parsed = Config::parse(TEMPLATE).expect("shipped template must parse");
     let default = expected_default();
     assert!(
-        debug_eq(&parsed, &default),
+        parsed == default,
         "shipped config/facelock.toml drifted from Config::default():\n{}",
-        debug_diff(&parsed, &default)
+        config_diff(&parsed, &default)
     );
 }
 
 #[test]
 fn every_documented_example_default_round_trips() {
-    let expanded = uncomment_all_examples(TEMPLATE);
-    let parsed = Config::parse(&expanded).unwrap_or_else(|e| {
+    let expansion = uncomment_all_examples(TEMPLATE);
+    let parsed = Config::parse(&expansion.toml).unwrap_or_else(|e| {
         panic!(
             "uncommenting every documented example must still parse: {e}\n\n\
-             --- expanded template ---\n{expanded}"
+             --- expanded template ---\n{}",
+            expansion.toml
         )
     });
     let default = expected_default();
     assert!(
-        debug_eq(&parsed, &default),
+        parsed == default,
         "a commented-out example in config/facelock.toml documents a value \
          that is not actually Config::default() once uncommented:\n{}",
-        debug_diff(&parsed, &default)
+        config_diff(&parsed, &default)
+    );
+}
+
+/// How many commented lines in the template look like assignments but are
+/// prose. Two today, both doc text that happens to open with a key-shaped
+/// token: `encryption.method = "none". Default FALSE: ...` and
+/// `pcr_binding = true is ENFORCED: ...`. Pinned so the number cannot grow
+/// unnoticed — see [`Expansion::skipped`] for why growth matters.
+const EXPECTED_SKIPPED_PROSE_LINES: usize = 2;
+
+/// The silent half of `every_documented_example_default_round_trips`: that
+/// test only asserts on lines the classifier *did* uncomment, so a line it
+/// declines contributes nothing and says nothing. Pin the count, so adding a
+/// multi-line example — or any example the classifier cannot read — fails
+/// here instead of silently shrinking coverage.
+#[test]
+fn no_example_line_is_skipped_without_being_accounted_for() {
+    let skipped = uncomment_all_examples(TEMPLATE).skipped;
+    assert_eq!(
+        skipped.len(),
+        EXPECTED_SKIPPED_PROSE_LINES,
+        "the expander left {} assignment-shaped comment line(s) uncovered. \
+         If these are prose, update EXPECTED_SKIPPED_PROSE_LINES. If any is a \
+         real example, it is NOT being checked against Config::default() — \
+         teach assignment_key to read it:\n{}",
+        skipped.len(),
+        skipped.join("\n")
     );
 }
 
@@ -191,7 +235,7 @@ denied_services = ["sshd"]
 "#;
     let parsed =
         Config::parse(with_pam_policy).expect("unknown keys must be ignored, not rejected");
-    assert!(debug_eq(&parsed, &expected_default()));
+    assert_eq!(parsed, expected_default());
 }
 
 #[test]

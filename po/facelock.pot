@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: facelock\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-14 14:26-0700\n"
+"POT-Creation-Date: 2026-08-14 14:51-0700\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -717,236 +717,240 @@ msgid ""
 "Setup complete. Run `facelock enroll` to register your face."
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:108
+#: crates/facelock-cli/src/message/status.rs:115
 msgid "facelock system status"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:109
+#: crates/facelock-cli/src/message/status.rs:116
 msgid "Config file"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:110
+#: crates/facelock-cli/src/message/status.rs:117
 msgid "Daemon"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:111
+#: crates/facelock-cli/src/message/status.rs:118
 msgid "Oneshot fallback"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:112
+#: crates/facelock-cli/src/message/status.rs:119
 msgid "Camera device"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:113
+#: crates/facelock-cli/src/message/status.rs:120
 msgid "Model directory"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:114
+#: crates/facelock-cli/src/message/status.rs:121
 msgid "Execution provider"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:115
+#: crates/facelock-cli/src/message/status.rs:122
 msgid "Encryption"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:116
+#: crates/facelock-cli/src/message/status.rs:123
 msgid "Enrolled faces"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:117
+#: crates/facelock-cli/src/message/status.rs:124
 msgid "Security"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:118
+#: crates/facelock-cli/src/message/status.rs:125
 msgid "Notifications"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:119
+#: crates/facelock-cli/src/message/status.rs:126
 msgid "PAM module"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:121
+#: crates/facelock-cli/src/message/status.rs:128
 #, python-brace-format
 msgid "cannot determine: {why}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:124
+#: crates/facelock-cli/src/message/status.rs:131
+msgid "config not available"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:132
 msgid "valid"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:125
+#: crates/facelock-cli/src/message/status.rs:133
 msgid "not found"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:127
+#: crates/facelock-cli/src/message/status.rs:135
 #, python-brace-format
 msgid "invalid: {error}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:129
+#: crates/facelock-cli/src/message/status.rs:137
 msgid "oneshot mode (no daemon)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:130
+#: crates/facelock-cli/src/message/status.rs:138
 msgid "responding"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:132
+#: crates/facelock-cli/src/message/status.rs:140
 #, python-brace-format
 msgid "not responding: {error}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:136
-msgid "usable (root-invoked PAM can authenticate via 'facelock auth' without the daemon)"
-msgstr ""
-
-#: crates/facelock-cli/src/message/status.rs:139
-msgid "not usable (PAM would fall through to the next auth method if the daemon is unreachable)"
-msgstr ""
-
-#: crates/facelock-cli/src/message/status.rs:141
-msgid "device exists"
-msgstr ""
-
-#: crates/facelock-cli/src/message/status.rs:142
-msgid "device not found"
-msgstr ""
-
-#: crates/facelock-cli/src/message/status.rs:143
-msgid "auto-detect enabled"
-msgstr ""
-
 #: crates/facelock-cli/src/message/status.rs:144
-msgid "directory not found"
-msgstr ""
-
-#: crates/facelock-cli/src/message/status.rs:145
-msgid "all configured models present"
-msgstr ""
-
-#: crates/facelock-cli/src/message/status.rs:146
-msgid "some models missing (run 'facelock setup')"
+msgid "prerequisites present (binary, models and database in place for daemon-less auth)"
 msgstr ""
 
 #: crates/facelock-cli/src/message/status.rs:147
-msgid "present"
-msgstr ""
-
-#: crates/facelock-cli/src/message/status.rs:148
-msgid "MISSING"
+msgid "prerequisites missing (PAM would fall through to the next auth method if the daemon is unreachable)"
 msgstr ""
 
 #: crates/facelock-cli/src/message/status.rs:149
-msgid "supported by the installed ONNX Runtime"
+msgid "device exists"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:150
+msgid "device not found"
 msgstr ""
 
 #: crates/facelock-cli/src/message/status.rs:151
-msgid "not built into the installed ONNX Runtime — inference will fall back to CPU"
+msgid "auto-detect enabled"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:152
+msgid "directory not found"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:153
+msgid "all configured models present"
 msgstr ""
 
 #: crates/facelock-cli/src/message/status.rs:154
-msgid "unknown execution provider (valid: cpu, cuda, rocm, openvino)"
+msgid "some models missing (run 'facelock setup')"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:155
+msgid "present"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:156
+msgid "MISSING"
 msgstr ""
 
 #: crates/facelock-cli/src/message/status.rs:157
+msgid "supported by the installed ONNX Runtime"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:159
+msgid "not built into the installed ONNX Runtime — inference will fall back to CPU"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:166
+msgid "unknown execution provider (valid: cpu, cuda, rocm, openvino)"
+msgstr ""
+
+#: crates/facelock-cli/src/message/status.rs:169
 #, python-brace-format
 msgid "ONNX Runtime not loadable: {error}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:161
+#: crates/facelock-cli/src/message/status.rs:173
 #, python-brace-format
 msgid "sealed key: {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:164
+#: crates/facelock-cli/src/message/status.rs:176
 #, python-brace-format
 msgid "sealed key missing: {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:168
+#: crates/facelock-cli/src/message/status.rs:180
 #, python-brace-format
 msgid "TPM device missing: {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:172
+#: crates/facelock-cli/src/message/status.rs:184
 #, python-brace-format
 msgid "key file: {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:175
+#: crates/facelock-cli/src/message/status.rs:187
 #, python-brace-format
 msgid "key file missing: {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:179
+#: crates/facelock-cli/src/message/status.rs:191
 msgid "embeddings stored as plaintext (run 'facelock setup' to enable encryption)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:181
+#: crates/facelock-cli/src/message/status.rs:193
 msgid "no faces enrolled (run 'facelock enroll')"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:183
+#: crates/facelock-cli/src/message/status.rs:195
 #, python-brace-format
 msgid "{count} model(s)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:188
+#: crates/facelock-cli/src/message/status.rs:200
 #, python-brace-format
 msgid "out of date (marker says {marker}, database has {store}) — run 'sudo facelock setup' to reconcile"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:193
+#: crates/facelock-cli/src/message/status.rs:205
 #, python-brace-format
 msgid "unreadable: {why}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:195
+#: crates/facelock-cli/src/message/status.rs:207
 msgid "ALL SECURITY CHECKS DISABLED"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:196
+#: crates/facelock-cli/src/message/status.rs:208
 msgid "yes"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:197
+#: crates/facelock-cli/src/message/status.rs:209
 msgid "no"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:198
+#: crates/facelock-cli/src/message/status.rs:210
 msgid "off"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:199
+#: crates/facelock-cli/src/message/status.rs:211
 msgid "terminal"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:200
+#: crates/facelock-cli/src/message/status.rs:212
 msgid "desktop"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:201
+#: crates/facelock-cli/src/message/status.rs:213
 msgid "terminal + desktop"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:202
+#: crates/facelock-cli/src/message/status.rs:214
 msgid "installed"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:204
+#: crates/facelock-cli/src/message/status.rs:216
 #, python-brace-format
 msgid "installed at {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:206
+#: crates/facelock-cli/src/message/status.rs:218
 msgid "not installed"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:207
+#: crates/facelock-cli/src/message/status.rs:219
 msgid "configured"
 msgstr ""
 
-#: crates/facelock-cli/src/message/status.rs:208
+#: crates/facelock-cli/src/message/status.rs:220
 msgid "not configured for facelock"
 msgstr ""
 

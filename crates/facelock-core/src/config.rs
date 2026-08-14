@@ -13,7 +13,11 @@ pub enum ConfigError {
     Validation(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` is derived and composes each section's own `Default`, so
+/// `Config::default()` and `Config::parse("")` are the same value by
+/// construction rather than by coincidence — a property
+/// `empty_document_parses_to_default` pins directly.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub device: DeviceConfig,
@@ -39,7 +43,7 @@ pub struct Config {
     pub polkit: PolkitConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -85,7 +89,7 @@ impl Default for DeviceConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecognitionConfig {
     #[serde(default = "default_threshold")]
     pub threshold: f32,
@@ -143,7 +147,7 @@ pub enum DaemonMode {
     Oneshot,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_model_dir")]
     pub model_dir: String,
@@ -163,7 +167,7 @@ impl Default for DaemonConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StorageConfig {
     #[serde(default = "default_db_path")]
     pub db_path: String,
@@ -177,7 +181,7 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub disabled: bool,
@@ -279,7 +283,7 @@ impl SecurityConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RateLimitConfig {
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
@@ -337,23 +341,31 @@ pub enum NotificationMode {
     Both,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The container-level `#[serde(default)]` is the fix for a shipped bug, not
+/// a style choice. With per-field defaults, an omitted key and an absent
+/// `[notification]` section are filled by two different mechanisms — serde's
+/// field defaults and `Default for NotificationConfig` — which must agree by
+/// hand. They did not: `notify_on_failure` once read `true` from serde and
+/// `false` from `Default`, so the effective value flipped depending on
+/// whether the section header was present. The shipped template has exactly
+/// the triggering shape: an active `[notification]` header with every key
+/// commented out.
+///
+/// Filling the whole struct from `Default` instead leaves one source of
+/// truth, and "section present, key omitted" is then identical to "section
+/// absent" by construction. Do not reintroduce `#[serde(default = "...")]` on
+/// these fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NotificationConfig {
-    #[serde(default)]
     pub mode: NotificationMode,
     /// Show prompt text/notification when scanning starts ("Identifying face...")
-    #[serde(default = "default_true")]
     pub notify_prompt: bool,
     /// Show notification on successful face match
-    #[serde(default = "default_true")]
     pub notify_on_success: bool,
     /// Show notification on failed face match.
     /// Default: false — a failed match is already visible (you get a password
-    /// prompt). Must agree with `Default for NotificationConfig` below, or the
-    /// effective value flips depending on whether `[notification]` appears in
-    /// the file (the shipped template has the section header active with every
-    /// key commented, which is exactly the shape that triggers the drift).
-    #[serde(default)]
+    /// prompt).
     pub notify_on_failure: bool,
 }
 
@@ -402,7 +414,7 @@ pub enum SnapshotMode {
     Success,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotConfig {
     #[serde(default)]
     pub mode: SnapshotMode,
@@ -431,7 +443,7 @@ impl SnapshotConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TpmConfig {
     #[serde(default)]
     pub seal_database: bool,
@@ -470,7 +482,7 @@ pub enum EncryptionMethod {
     Tpm,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EncryptionConfig {
     #[serde(default)]
     pub method: EncryptionMethod,
@@ -561,7 +573,7 @@ fn default_pcr_indices() -> Vec<u32> {
 fn default_tcti() -> String {
     "device:/dev/tpmrm0".to_string()
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditConfig {
     /// Enable structured audit logging to JSONL file.
     #[serde(default)]
@@ -585,7 +597,7 @@ impl Default for AuditConfig {
 }
 
 /// Configuration for the polkit authentication agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolkitConfig {
     /// polkit `action_id`s for which face authentication may be offered.
     ///
@@ -797,11 +809,12 @@ path = "/dev/video0"
     }
 
     /// D9 drift pin: a `[notification]` section present with every key
-    /// omitted must parse identically to no section at all. The two paths are
-    /// different code (serde field defaults vs `Default for
-    /// NotificationConfig`), and `notify_on_failure` had already drifted
+    /// omitted must parse identically to no section at all. This was two
+    /// different code paths (serde field defaults vs `Default for
+    /// NotificationConfig`) and `notify_on_failure` had already drifted
     /// between them (serde said `true`, `Default` and the shipped template
-    /// said `false`).
+    /// said `false`). The container-level `#[serde(default)]` now makes them
+    /// the same path; this stays as the regression guard for that.
     #[test]
     fn notification_section_present_with_keys_omitted_equals_default() {
         let present = Config::parse("[notification]\n").unwrap().notification;
@@ -813,6 +826,39 @@ path = "/dev/video0"
             assert_eq!(parsed.notify_on_success, default.notify_on_success);
             assert_eq!(parsed.notify_on_failure, default.notify_on_failure);
         }
+    }
+
+    /// `NotificationMode`'s own `Default` went unused when the container-level
+    /// `#[serde(default)]` above removed the field-level default that called
+    /// it — `NotificationConfig::default()` names the mode explicitly. It is
+    /// kept rather than deleted, because its two sibling enums in this file
+    /// (`SnapshotMode`, `EncryptionMethod`) still have live `Default`s via
+    /// their own field-level defaults, and one enum silently lacking a
+    /// `Default` reads as an oversight rather than a decision.
+    ///
+    /// Keeping it means two answers to "what is the default mode" exist, and
+    /// that impl is the one that drifted to `Both` in a shipped release — so
+    /// pin them equal. This also covers the case a deletion could not: if
+    /// `#[serde(default)]` is ever re-added to the `mode` field, the enum's
+    /// answer becomes authoritative again, and this catches it disagreeing.
+    #[test]
+    fn notification_mode_default_agrees_with_the_section_default() {
+        assert_eq!(
+            NotificationMode::default(),
+            NotificationConfig::default().mode
+        );
+    }
+
+    /// The same drift class, generalized past one section: every `Config`
+    /// field is `#[serde(default)]`, so an empty document must produce
+    /// exactly `Config::default()`. Any section that grows a field default
+    /// disagreeing with its `Default` impl fails here, not in production.
+    #[test]
+    fn empty_document_parses_to_default() {
+        assert_eq!(
+            Config::parse("").expect("an empty config document must always parse"),
+            Config::default()
+        );
     }
 
     #[test]

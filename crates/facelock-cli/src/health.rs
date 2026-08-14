@@ -43,7 +43,13 @@ pub const PAM_MODULE_PATHS: [&str; 2] = [
 
 /// The `why` shared by every fact that cannot be probed without a parsed
 /// config.
-const CONFIG_NOT_AVAILABLE: &str = "config not available";
+///
+/// Sourced from the message catalog rather than written here: it is composed
+/// into the localized "cannot determine: {why}" line, so an English literal
+/// would leave half that sentence untranslatable.
+fn config_not_available() -> String {
+    crate::message::Message::localized(&crate::message::StatusMessage::StatusWhyConfigNotAvailable)
+}
 
 /// Everything `status` reports, as data. Constructed by [`Health::probe`] on
 /// the real system (root), or literally in tests.
@@ -80,16 +86,16 @@ impl Health {
         let Some(config) = loaded.config() else {
             return Health {
                 config: config_health,
-                daemon: Fact::unknown(CONFIG_NOT_AVAILABLE),
-                oneshot_fallback: Fact::unknown(CONFIG_NOT_AVAILABLE),
-                camera: Fact::unknown(CONFIG_NOT_AVAILABLE),
-                models: Fact::unknown(CONFIG_NOT_AVAILABLE),
-                execution_provider: Fact::unknown(CONFIG_NOT_AVAILABLE),
-                encryption: Fact::unknown(CONFIG_NOT_AVAILABLE),
+                daemon: Fact::unknown(config_not_available()),
+                oneshot_fallback: Fact::unknown(config_not_available()),
+                camera: Fact::unknown(config_not_available()),
+                models: Fact::unknown(config_not_available()),
+                execution_provider: Fact::unknown(config_not_available()),
+                encryption: Fact::unknown(config_not_available()),
                 user,
-                enrolled: Fact::unknown(CONFIG_NOT_AVAILABLE),
-                security: Fact::unknown(CONFIG_NOT_AVAILABLE),
-                notifications: Fact::unknown(CONFIG_NOT_AVAILABLE),
+                enrolled: Fact::unknown(config_not_available()),
+                security: Fact::unknown(config_not_available()),
+                notifications: Fact::unknown(config_not_available()),
                 pam: probe_pam(),
             };
         };
@@ -167,15 +173,25 @@ impl ConfigHealth {
 // Oneshot fallback (F7)
 // ---------------------------------------------------------------------------
 
-/// F7: whether PAM's oneshot fallback would work if the daemon were
-/// unreachable at auth time.
+/// F7: whether the three things PAM's oneshot fallback needs from *this*
+/// section are on disk, if the daemon were unreachable at auth time.
 ///
-/// "Usable" means precisely: `pam_facelock`, root-invoked (DEC-2), could
-/// spawn [`AUTH_BIN`] and complete an authentication locally — which needs
-/// the binary at its hardcoded path, both configured model files, and the
-/// database. Whether *this user* would then match is the Enrolled section's
-/// answer, not this one; a missing enrollment fails one user, a missing
-/// binary fails the mechanism.
+/// The claim is deliberately narrower than "auth would succeed", because the
+/// evidence is narrower. What is checked is presence: [`AUTH_BIN`] at its
+/// hardcoded path, both configured model files, and the database. Whether
+/// *this user* would then match is the Enrolled section's answer — a missing
+/// enrollment fails one user, a missing binary fails the mechanism.
+///
+/// Two gaps keep this from being a verdict on authentication, and both are
+/// reported elsewhere rather than folded in here:
+///
+/// - A camera and (under encryption) key material are equally required, and
+///   equally fail the mechanism. They have their own sections, with their own
+///   probes; duplicating their conclusions into this line would mean two
+///   places to keep true.
+/// - Presence is not loadability. A model file whose SHA256 does not match
+///   is present and still refuses to load, so even all three checks passing
+///   does not prove `facelock auth` would run.
 #[derive(Debug, Clone)]
 pub struct OneshotFallback {
     pub auth_bin: String,
@@ -185,7 +201,10 @@ pub struct OneshotFallback {
 }
 
 impl OneshotFallback {
-    pub fn usable(&self) -> bool {
+    /// All three files this section checks are present. Named for what it
+    /// tests: it is not a prediction that authentication would succeed — see
+    /// the type's docs for what it deliberately does not cover.
+    pub fn prerequisites_present(&self) -> bool {
         self.auth_bin_present && self.models_present && self.database_present
     }
 }
@@ -727,21 +746,21 @@ mod tests {
         assert!(fallback.auth_bin_present);
         assert!(fallback.database_present);
         assert!(fallback.models_present);
-        assert!(fallback.usable());
+        assert!(fallback.prerequisites_present());
 
         let no_models = probe_oneshot_fallback_at(&bin, &db, &model_files(false));
         assert!(!no_models.models_present);
-        assert!(!no_models.usable());
+        assert!(!no_models.prerequisites_present());
 
         let no_bin =
             probe_oneshot_fallback_at(&dir.path().join("missing"), &db, &model_files(true));
         assert!(!no_bin.auth_bin_present);
-        assert!(!no_bin.usable());
+        assert!(!no_bin.prerequisites_present());
 
         let no_db =
             probe_oneshot_fallback_at(&bin, &dir.path().join("missing.db"), &model_files(true));
         assert!(!no_db.database_present);
-        assert!(!no_db.usable());
+        assert!(!no_db.prerequisites_present());
     }
 
     /// N4 at the derivation site. `models_present` must be read off the
@@ -755,6 +774,36 @@ mod tests {
     /// the types. `probe_oneshot_fallback_at` now takes `&ModelFiles`, so the
     /// old expression does not type-check; this pin fails if a `Fact` is ever
     /// routed back through `known()` inside the constructor.
+    /// `AUTH_BIN` is duplicated, not shared: `pam-facelock` may not depend on
+    /// this crate (or any facelock crate), so the path PAM actually executes
+    /// is declared there and mirrored here. A comment was the only thing
+    /// coupling the two — and the failure mode is silent, since a diverged
+    /// copy makes `status` report on a binary PAM never spawns. Read PAM's
+    /// declaration and compare.
+    #[test]
+    fn auth_bin_matches_the_path_pam_actually_spawns() {
+        let pam_src = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../pam-facelock/src/lib.rs"),
+        )
+        .expect("pam-facelock source must be readable from the workspace");
+
+        // Assembled so this test's own prose is not what it matches on.
+        let decl = format!("const AUTH_BIN: &str = {}", '"');
+        let pam_value = pam_src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(&decl)?.split_once('"'))
+            .map(|(value, _)| value.to_string())
+            .expect("pam-facelock must declare AUTH_BIN as a string literal");
+
+        assert_eq!(
+            pam_value, AUTH_BIN,
+            "health::AUTH_BIN ({AUTH_BIN}) and pam-facelock's AUTH_BIN \
+             ({pam_value}) have diverged. `status` would then report on a \
+             binary the PAM module never spawns. They are separate constants \
+             because pam-facelock takes no facelock dependency; keep them equal."
+        );
+    }
+
     #[test]
     fn probe_derives_the_fallback_from_the_model_value_not_a_fact() {
         let source =

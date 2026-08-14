@@ -18,9 +18,17 @@ test:
 test-all:
     cargo test --workspace -- --include-ignored
 
-# Run clippy with warnings as errors
+# Run clippy with warnings as errors.
+#
+# `--all-targets` is load-bearing, not tidiness: without it clippy skips test,
+# bench and example targets entirely, so a deny-by-default lint in test code
+# never reaches this gate. That matters disproportionately here because file
+# modes ARE a security contract in this project (0600 database, 0710 state
+# dir), and `non_octal_unix_permissions` is exactly the lint that catches a
+# `from_mode(600)` — which means 0o1130, not 0o600 — before it ships.
+# Keep in sync with .github/workflows/ci.yml.
 lint:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Format check
 fmt-check:

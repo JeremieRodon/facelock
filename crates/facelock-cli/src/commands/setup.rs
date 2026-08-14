@@ -1277,41 +1277,16 @@ mod orphan_guard_tests {
         );
     }
 
-    /// (b) The store opens, but the models query fails. Injection: allocate
-    /// donor pages of the *opposite* btree type (an index page for the table,
-    /// table pages for its indexes), orphan them, and point `face_models` and
-    /// its indexes at them via `writable_schema`. Every rootpage stays unique
-    /// and within the file, so a fresh connection opens and migrates cleanly —
-    /// but the page-type mismatch makes any query that walks `face_models`
-    /// (or its indexes) report corruption.
+    /// (b) The store opens, but the models query fails. The injection — and
+    /// the schema coupling it carries — lives in `facelock_test_support::
+    /// schema_faults`, shared with the daemon's storage-failure test.
     #[test]
     fn failing_models_query_on_open_store_aborts_before_keygen() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("facelock.db");
         drop(facelock_store::FaceStore::create(&db_path).unwrap());
 
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("CREATE TABLE d1(x); CREATE INDEX di1 ON d1(x); CREATE TABLE d2(x);")
-            .unwrap();
-        let page = |name: &str| -> i64 {
-            conn.query_row(
-                "SELECT rootpage FROM sqlite_master WHERE name = ?1",
-                [name],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        let (p_d1, p_di1, p_d2) = (page("d1"), page("di1"), page("d2"));
-        conn.execute_batch(&format!(
-            "PRAGMA writable_schema=ON;
-             UPDATE sqlite_master SET rootpage={p_di1} WHERE name='face_models';
-             UPDATE sqlite_master SET rootpage={p_d1} WHERE name='idx_face_models_user';
-             UPDATE sqlite_master SET rootpage={p_d2} WHERE name='sqlite_autoindex_face_models_1';
-             DELETE FROM sqlite_master WHERE name IN ('d1','di1','d2');
-             PRAGMA writable_schema=OFF;",
-        ))
-        .unwrap();
-        drop(conn);
+        facelock_test_support::schema_faults::break_face_models_table(&db_path);
 
         let err = handle_orphan_models_before_keygen(&config_with_db(&db_path), None).unwrap_err();
         let chain = format!("{err:#}");
@@ -1321,16 +1296,23 @@ mod orphan_guard_tests {
         );
     }
 
-    /// (c) Fresh install: no database yet, zero models once created. The
-    /// guard must let keygen proceed — this is the case the old fail-open
-    /// behavior was (correctly) serving.
+    /// (c) A real database that holds zero models — the state after `facelock
+    /// clear`, or after an enrollment that was rolled back. The guard opens
+    /// it, gets `has_any_models() == Ok(false)`, and must let keygen proceed.
+    ///
+    /// The store is created and dropped deliberately: without it this test
+    /// lands on the `Absent` early return instead, which is case (c′) below,
+    /// and this arm — the only one that actually runs the query — would go
+    /// uncovered.
     #[test]
     fn zero_models_proceeds() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("facelock.db");
+        drop(facelock_store::FaceStore::create(&db_path).unwrap());
+        assert!(db_path.exists(), "the store under test must exist on disk");
 
         handle_orphan_models_before_keygen(&config_with_db(&db_path), None)
-            .expect("a fresh store with zero models must not block keygen");
+            .expect("a real store with zero models must not block keygen");
     }
 
     /// (c′) The `Absent` variant is what encodes case (c): the guard proceeds
@@ -3571,17 +3553,17 @@ account include   system-login
     fn pam_idempotent_detection() {
         // Exact match
         let content = format!("#%PAM-1.0\n{PAM_LINE}\nauth    include   system-login\n");
-        assert!(content.lines().any(|line| is_facelock_pam_line(line)));
+        assert!(content.lines().any(is_facelock_pam_line));
 
         // Different spacing should still match
         let content2 =
             "#%PAM-1.0\nauth  sufficient  pam_facelock.so\nauth    include   system-login\n";
-        assert!(content2.lines().any(|line| is_facelock_pam_line(line)));
+        assert!(content2.lines().any(is_facelock_pam_line));
 
         // Commented-out line should not match
         let content3 =
             "#%PAM-1.0\n#auth sufficient pam_facelock.so\nauth    include   system-login\n";
-        assert!(!content3.lines().any(|line| is_facelock_pam_line(line)));
+        assert!(!content3.lines().any(is_facelock_pam_line));
     }
 
     #[test]

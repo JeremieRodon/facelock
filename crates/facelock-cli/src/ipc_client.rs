@@ -375,11 +375,25 @@ pub fn ping() -> anyhow::Result<()> {
 ///
 /// Priority: explicit --user flag > SUDO_USER > DOAS_USER > current user.
 pub fn resolve_user(flag: Option<&str>) -> String {
+    resolve_user_from_env(flag, |key| std::env::var(key).ok())
+}
+
+/// The resolution order itself, with the environment supplied by the caller.
+///
+/// Split out so the precedence can be tested without `set_var`: mutating the
+/// process environment is global to the whole test binary, which cargo runs
+/// multi-threaded, so a test that does it can only be kept safe by a promise
+/// that no concurrent test reads the same variable — a promise nothing
+/// enforces and any later test may quietly break.
+pub(crate) fn resolve_user_from_env(
+    flag: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> String {
     flag.map(String::from)
-        .or_else(|| std::env::var("SUDO_USER").ok())
-        .or_else(|| std::env::var("DOAS_USER").ok())
+        .or_else(|| env("SUDO_USER"))
+        .or_else(|| env("DOAS_USER"))
         .unwrap_or_else(|| {
-            std::env::var("USER").ok().unwrap_or_else(|| {
+            env("USER").unwrap_or_else(|| {
                 // Fall back to getpwuid if $USER is not set (e.g. in containers)
                 let uid = unsafe { libc::getuid() };
                 let pw = unsafe { libc::getpwuid(uid) };

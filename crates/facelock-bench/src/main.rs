@@ -921,12 +921,8 @@ mod tests {
         let mut emb_a = [0.0f32; 512];
         let mut emb_b = [0.0f32; 512];
         // Orthogonal embeddings
-        for i in 0..256 {
-            emb_a[i] = 1.0 / (256.0f32).sqrt();
-        }
-        for i in 256..512 {
-            emb_b[i] = 1.0 / (256.0f32).sqrt();
-        }
+        emb_a[..256].fill(1.0 / (256.0f32).sqrt());
+        emb_b[256..].fill(1.0 / (256.0f32).sqrt());
         let faces = vec![(
             facelock_core::types::Detection {
                 bbox: facelock_core::types::BoundingBox {
