@@ -24,71 +24,58 @@ const BUNDLED_ORT_PATHS: &[&str] = &[
 /// 2. System paths (may have GPU support)
 /// 3. Bundled CPU-only fallback
 fn load_ort() -> std::result::Result<(), String> {
-    use std::sync::Once;
+    use std::sync::OnceLock;
 
-    static INIT: Once = Once::new();
-    let mut init_err: Option<String> = None;
+    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(initialize_ort).clone()
+}
 
-    INIT.call_once(|| {
-        // Check ORT_DYLIB_PATH env var first
-        if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
-            if std::path::Path::new(&path).exists() {
-                if let Err(e) = ort::init_from(std::path::Path::new(&path)) {
-                    init_err = Some(format!(
-                        "Failed to load ORT from ORT_DYLIB_PATH={path}: {e}"
-                    ));
-                }
-                return;
-            }
+fn initialize_ort() -> std::result::Result<(), String> {
+    // Check ORT_DYLIB_PATH env var first
+    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
+        if std::path::Path::new(&path).exists() {
+            return ort::init_from(std::path::Path::new(&path))
+                .map(|_| ())
+                .map_err(|e| format!("Failed to load ORT from ORT_DYLIB_PATH={path}: {e}"));
         }
+    }
 
-        // Search system paths (may have GPU support)
-        for path_str in SYSTEM_ORT_PATHS {
-            let path = std::path::Path::new(path_str);
-            if path.exists() {
-                match ort::init_from(path) {
-                    Ok(_) => {
-                        tracing::info!("Loaded system ONNX Runtime from {path_str}");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Found {path_str} but failed to load: {e}");
-                    }
+    // Search system paths (may have GPU support)
+    for path_str in SYSTEM_ORT_PATHS {
+        let path = std::path::Path::new(path_str);
+        if path.exists() {
+            match ort::init_from(path) {
+                Ok(_) => {
+                    tracing::info!("Loaded system ONNX Runtime from {path_str}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("Found {path_str} but failed to load: {e}");
                 }
             }
         }
+    }
 
-        // Fall back to bundled CPU-only ORT
-        for bundled_path in BUNDLED_ORT_PATHS {
-            let bundled = std::path::Path::new(bundled_path);
-            if bundled.exists() {
-                match ort::init_from(bundled) {
-                    Ok(_) => {
-                        tracing::info!("Loaded bundled CPU ONNX Runtime from {bundled_path}");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Found bundled ORT at {bundled_path} but failed to load: {e}"
-                        );
-                    }
+    // Fall back to bundled CPU-only ORT
+    for bundled_path in BUNDLED_ORT_PATHS {
+        let bundled = std::path::Path::new(bundled_path);
+        if bundled.exists() {
+            match ort::init_from(bundled) {
+                Ok(_) => {
+                    tracing::info!("Loaded bundled CPU ONNX Runtime from {bundled_path}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("Found bundled ORT at {bundled_path} but failed to load: {e}");
                 }
             }
         }
+    }
 
-        init_err = Some(
-            "Could not find libonnxruntime.so. \
+    Err("Could not find libonnxruntime.so. \
              Ensure the facelock package is installed correctly, \
              or set ORT_DYLIB_PATH to point to a compatible libonnxruntime.so"
-                .into(),
-        );
-    });
-
-    if let Some(e) = init_err {
-        Err(e)
-    } else {
-        Ok(())
-    }
+        .into())
 }
 
 /// Ensure the ONNX Runtime shared library is loaded before any session builders

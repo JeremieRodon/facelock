@@ -524,7 +524,9 @@ mod tests {
         } else {
             unsafe { CStr::from_ptr(original) }.to_owned()
         };
-        let usable = [c"en_US.UTF-8", c"en_US.utf8", c"C.UTF-8", c"C.utf8"]
+        // C.UTF-8 is still a C-family locale for gettext purposes: glibc
+        // deliberately ignores LANGUAGE there even though setlocale accepts it.
+        let usable = [c"en_US.UTF-8", c"en_US.utf8"]
             .into_iter()
             .find(|l| !unsafe { setlocale(libc::LC_MESSAGES, l.as_ptr()) }.is_null());
         if usable.is_none() {
