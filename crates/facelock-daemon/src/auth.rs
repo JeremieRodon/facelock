@@ -20,7 +20,41 @@ use crate::audit::{self, AuditEntry, AuditSource};
 use crate::liveness::LandmarkTracker;
 use crate::rate_limit::RateLimiter;
 
-/// Run pre-flight checks that don't need the camera.
+/// Which of [`pre_check`]'s environment gates a caller may skip.
+///
+/// The only intended consumer is `facelock test` (N11, issue #96): it is
+/// root-only, and an admin legitimately runs it over SSH or with the lid
+/// closed on a docked laptop while diagnosing recognition, which is exactly
+/// what `abort_if_ssh`/`abort_if_lid_closed` exist to stop an *attacker* from
+/// doing. Every other gate in `pre_check` (disabled, enrollment,
+/// rate-limiting, `require_ir`) still applies to `test` unchanged — this
+/// struct exists so that carve-out is explicit at every call site instead of
+/// a parallel copy of the gate logic (see #95, which this whole `pre_check`
+/// unification closes).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreCheckContext {
+    pub skip_ssh_gate: bool,
+    pub skip_lid_gate: bool,
+}
+
+impl PreCheckContext {
+    /// The default, fully-enforced context every real authentication path
+    /// (daemon `Authenticate`, oneshot `facelock auth`) uses.
+    pub fn enforced() -> Self {
+        Self::default()
+    }
+
+    /// `facelock test`'s context (N11): skip the SSH/lid gates, keep
+    /// everything else enforced.
+    pub fn test() -> Self {
+        Self {
+            skip_ssh_gate: true,
+            skip_lid_gate: true,
+        }
+    }
+}
+
+/// Run pre-flight checks that don't need the camera, fully enforced.
 /// Returns Some(response) to short-circuit, or None to proceed with auth.
 pub fn pre_check(
     config: &Config,
@@ -29,6 +63,26 @@ pub fn pre_check(
     rate_limiter: &RateLimiter,
     device_is_ir: bool,
 ) -> Option<DaemonResponse> {
+    pre_check_with_context(
+        config,
+        store,
+        user,
+        rate_limiter,
+        device_is_ir,
+        PreCheckContext::enforced(),
+    )
+}
+
+/// Run pre-flight checks that don't need the camera, honoring `ctx`'s gate
+/// overrides. See [`PreCheckContext`].
+pub fn pre_check_with_context(
+    config: &Config,
+    store: &FaceStore,
+    user: &str,
+    rate_limiter: &RateLimiter,
+    device_is_ir: bool,
+    ctx: PreCheckContext,
+) -> Option<DaemonResponse> {
     if config.security.disabled {
         warn!(user, "facelock is disabled");
         return Some(DaemonResponse::Error {
@@ -36,14 +90,14 @@ pub fn pre_check(
         });
     }
 
-    if config.security.abort_if_ssh && is_ssh_session() {
+    if !ctx.skip_ssh_gate && config.security.abort_if_ssh && is_ssh_session() {
         info!(user, "SSH session detected, aborting");
         return Some(DaemonResponse::Error {
             message: "SSH session detected".into(),
         });
     }
 
-    if config.security.abort_if_lid_closed && is_lid_closed() {
+    if !ctx.skip_lid_gate && config.security.abort_if_lid_closed && is_lid_closed() {
         info!(user, "lid closed, aborting");
         return Some(DaemonResponse::Error {
             message: "lid closed".into(),
@@ -114,7 +168,28 @@ pub fn pre_check_audited(
     device_is_ir: bool,
     source: AuditSource,
 ) -> Option<DaemonResponse> {
-    let resp = pre_check(config, store, user, rate_limiter, device_is_ir)?;
+    pre_check_audited_with_context(
+        config,
+        store,
+        user,
+        rate_limiter,
+        device_is_ir,
+        source,
+        PreCheckContext::enforced(),
+    )
+}
+
+/// [`pre_check_audited`], honoring `ctx`'s gate overrides. See [`PreCheckContext`].
+pub fn pre_check_audited_with_context(
+    config: &Config,
+    store: &FaceStore,
+    user: &str,
+    rate_limiter: &RateLimiter,
+    device_is_ir: bool,
+    source: AuditSource,
+    ctx: PreCheckContext,
+) -> Option<DaemonResponse> {
+    let resp = pre_check_with_context(config, store, user, rate_limiter, device_is_ir, ctx)?;
     let (result, error) = match &resp {
         DaemonResponse::Error { message } if message.contains("rate limited") => {
             ("rate_limited".to_string(), Some(message.clone()))
@@ -622,8 +697,18 @@ fn is_lid_closed() -> bool {
 mod tests {
     use super::*;
 
+    /// `SSH_CONNECTION` is process-global state; `cargo test` runs this
+    /// file's tests on multiple threads, and four of them now mutate it
+    /// (previously just one). Serialize access so they can't interleave.
+    static SSH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_ssh_env() -> std::sync::MutexGuard<'static, ()> {
+        SSH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn ssh_detection_with_env_vars() {
+        let _guard = lock_ssh_env();
         let old_conn = std::env::var("SSH_CONNECTION").ok();
         let old_tty = std::env::var("SSH_TTY").ok();
         unsafe {
@@ -652,5 +737,141 @@ mod tests {
     #[test]
     fn lid_closed_returns_false_on_missing_file() {
         let _result = is_lid_closed();
+    }
+
+    fn test_pre_check_config() -> Config {
+        let toml =
+            facelock_test_support::fixtures::test_config_toml("/tmp/facelock-precheck-test.db");
+        let mut config = Config::parse(&toml).unwrap();
+        config.security.abort_if_ssh = true;
+        config
+    }
+
+    fn store_with_enrolled_user(user: &str) -> FaceStore {
+        let store = FaceStore::open_memory().unwrap();
+        store
+            .add_model(
+                user,
+                "front",
+                &facelock_test_support::fixtures::known_embedding(0),
+                "",
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn pre_check_context_test_skips_both_environment_gates() {
+        let ctx = PreCheckContext::test();
+        assert!(ctx.skip_ssh_gate);
+        assert!(ctx.skip_lid_gate);
+    }
+
+    #[test]
+    fn pre_check_context_enforced_skips_neither_gate() {
+        let ctx = PreCheckContext::enforced();
+        assert!(!ctx.skip_ssh_gate);
+        assert!(!ctx.skip_lid_gate);
+        // `Default` must agree with `enforced()` — `pre_check`/`pre_check_audited`
+        // rely on this to stay fully enforced without threading a context.
+        let default_ctx = PreCheckContext::default();
+        assert!(!default_ctx.skip_ssh_gate);
+        assert!(!default_ctx.skip_lid_gate);
+    }
+
+    #[test]
+    fn pre_check_test_context_skips_ssh_gate() {
+        let _guard = lock_ssh_env();
+        let config = test_pre_check_config();
+        let store = store_with_enrolled_user("alice");
+        let rate_limiter = RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        );
+
+        let old_conn = std::env::var("SSH_CONNECTION").ok();
+        unsafe { std::env::set_var("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22") };
+        let resp = pre_check_with_context(
+            &config,
+            &store,
+            "alice",
+            &rate_limiter,
+            true,
+            PreCheckContext::test(),
+        );
+        unsafe {
+            match old_conn {
+                Some(v) => std::env::set_var("SSH_CONNECTION", v),
+                None => std::env::remove_var("SSH_CONNECTION"),
+            }
+        }
+
+        assert!(
+            resp.is_none(),
+            "PreCheckContext::test() must proceed past the SSH gate, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn pre_check_enforced_context_still_blocks_ssh() {
+        let _guard = lock_ssh_env();
+        let config = test_pre_check_config();
+        let store = store_with_enrolled_user("alice");
+        let rate_limiter = RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        );
+
+        let old_conn = std::env::var("SSH_CONNECTION").ok();
+        unsafe { std::env::set_var("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22") };
+        let resp = pre_check_with_context(
+            &config,
+            &store,
+            "alice",
+            &rate_limiter,
+            true,
+            PreCheckContext::enforced(),
+        );
+        unsafe {
+            match old_conn {
+                Some(v) => std::env::set_var("SSH_CONNECTION", v),
+                None => std::env::remove_var("SSH_CONNECTION"),
+            }
+        }
+
+        assert!(
+            matches!(resp, Some(DaemonResponse::Error { ref message }) if message.contains("SSH")),
+            "the default/enforced context must still reject an SSH session, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn pre_check_without_context_matches_enforced() {
+        // `pre_check` (no context param) is a thin wrapper — pin that it stays
+        // equivalent to `pre_check_with_context(.., PreCheckContext::enforced())`
+        // so real auth paths (daemon `Authenticate`, oneshot `facelock auth`)
+        // never silently pick up a relaxed gate.
+        let _guard = lock_ssh_env();
+        let config = test_pre_check_config();
+        let store = store_with_enrolled_user("alice");
+        let rate_limiter = RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        );
+
+        let old_conn = std::env::var("SSH_CONNECTION").ok();
+        unsafe { std::env::set_var("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22") };
+        let resp = pre_check(&config, &store, "alice", &rate_limiter, true);
+        unsafe {
+            match old_conn {
+                Some(v) => std::env::set_var("SSH_CONNECTION", v),
+                None => std::env::remove_var("SSH_CONNECTION"),
+            }
+        }
+
+        assert!(
+            matches!(resp, Some(DaemonResponse::Error { ref message }) if message.contains("SSH")),
+            "pre_check() must stay fully enforced, got: {resp:?}"
+        );
     }
 }
