@@ -11,7 +11,7 @@
 //! retyped on any of these structs, this file must be touched deliberately.
 
 use facelock_core::dbus_interface::*;
-use zvariant::DynamicType;
+use zvariant::{DynamicType, Type};
 
 #[test]
 fn auth_result_signature_is_pinned() {
@@ -23,6 +23,34 @@ fn auth_result_signature_is_pinned() {
     };
     // bool, i32, String, f64 -> b, i, s, d
     assert_eq!(val.signature().to_string(), "(bisd)");
+}
+
+/// `AuthResult` is the reply of **two** methods now: `Authenticate` (real
+/// authentication, always charges the rate limit) and the root-only
+/// `TestAuthenticate` (the diagnostic entry point behind `facelock test`,
+/// which charges nothing). They deliberately share one wire shape — a single
+/// `s` username in, one `AuthResult` out, with the same `-1`/`-2`/`-3`
+/// sentinels — so the in-band encoding cannot drift between them, and so the
+/// upgrade-window concern above applies once rather than twice.
+///
+/// The method *names* cannot be pinned from this crate: zbus derives them
+/// from the `#[interface]` function names in facelock-daemon, which pins the
+/// wire method set against its authorization matrix in
+/// `server::tests::interface_methods_and_the_authz_matrix_are_the_same_set`.
+/// What is pinned here is the shape a client must be able to encode and
+/// decode for either method.
+#[test]
+fn both_authentication_methods_share_the_pinned_wire_shape() {
+    // The argument list: one username, for both methods.
+    assert_eq!(<(String,) as Type>::SIGNATURE.to_string(), "(s)");
+
+    let reply = AuthResult {
+        matched: false,
+        model_id: -2,
+        label: "rate limited".into(),
+        similarity: 0.0,
+    };
+    assert_eq!(reply.signature().to_string(), "(bisd)");
 }
 
 #[test]
