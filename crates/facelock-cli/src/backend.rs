@@ -244,18 +244,19 @@ impl<'a> Backend<'a> {
     }
 
     /// Recognition only — backs `facelock test` (root-only, N11). NEVER the
-    /// PAM/auth path.
+    /// PAM/auth path: the daemon transport calls the root-only
+    /// `TestAuthenticate` method, not `Authenticate`.
     ///
-    /// Both transports run the same `pre_check` gates. The surviving posture
-    /// difference: the direct path skips the SSH/lid physical-presence aborts
+    /// The two transports now have the same posture: both run every
+    /// `pre_check` gate except the SSH/lid physical-presence aborts
     /// (`PreCheckContext::test` — they exist to stop an attacker's shortcuts,
-    /// not a root operator testing over SSH) and audits as `Test`, while the
-    /// daemon path enforces them and audits as `Daemon`. Neither path charges
-    /// the rate limit for a failed test: direct never records failures, and
-    /// the daemon exempts root callers.
+    /// not a root operator diagnosing over SSH), both audit as `Test`, and
+    /// neither charges the rate limit for a failed test — the direct path
+    /// because it never records failures, the daemon path because
+    /// `TestAuthenticate` is the entry point that does not.
     pub fn recognize(&self, user: &str) -> anyhow::Result<MatchResult> {
         match self.kind {
-            BackendKind::Daemon => match ipc_client::authenticate(user)? {
+            BackendKind::Daemon => match ipc_client::test_authenticate(user)? {
                 AuthOutcome::AuthResult(result) => Ok(result),
                 // `suppress_unknown` short-circuit: same "no result"
                 // shape the direct path reports.
@@ -698,7 +699,7 @@ mod tests {
             "commands/preview/wayland_preview.rs", // daemon frame loop
         ];
         let pins: &[(&str, &[&str])] = &[
-            ("authenticate", backend_only),
+            ("test_authenticate", backend_only),
             ("list_models", backend_only),
             ("remove_model", backend_only),
             ("clear_models", backend_only),
@@ -729,6 +730,28 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The CLI must never call the daemon's `Authenticate` method. That
+    /// method is real authentication: it always charges the shared
+    /// rate-limit budget, and its only legitimate callers are the
+    /// authenticators (PAM, the polkit agent). `facelock test` is a
+    /// diagnostic and goes to the root-only `TestAuthenticate` instead —
+    /// keeping the two apart on the wire is what lets the daemon stop
+    /// guessing an attempt's purpose from the caller's UID, which is how a
+    /// failed face auth at a `sudo` prompt used to escape the limiter.
+    #[test]
+    fn the_cli_never_calls_the_real_authenticate_method() {
+        // Assembled at runtime so this test's own literal doesn't count.
+        let needle = format!("ipc_client::{}(", "authenticate");
+        for (path, content) in source_files() {
+            assert!(
+                !code_contains(&content, &needle),
+                "{}: `{needle}` is the always-charging real-auth method — \
+                 `facelock test` must call ipc_client::test_authenticate",
+                path.display()
+            );
         }
     }
 

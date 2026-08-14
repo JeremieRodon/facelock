@@ -12,9 +12,12 @@ use crate::notifications::DesktopNotifier;
 pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     // N11 (issue #96): `facelock test` is root-only regardless of transport
     // (direct or daemon-mediated) — keeps similarity scores and full detail,
-    // and lets both the daemon and direct paths safely exempt failed test
-    // runs from rate-limit consumption (root already has unrestricted access
-    // to the rate-limit table). Must run before any prompt or output (C6).
+    // and is what makes it safe for both paths to exempt failed test runs
+    // from rate-limit consumption (root already has unrestricted access to
+    // the rate-limit table). On the daemon transport that exemption is the
+    // root-only `TestAuthenticate` method, asked for explicitly, rather than
+    // something the daemon infers from this process being root. Must run
+    // before any prompt or output (C6).
     ipc_client::require_root("sudo facelock test")?;
 
     // Check models exist — offer to run setup if missing

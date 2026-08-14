@@ -211,43 +211,58 @@ fn hinted<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
     result.map_err(add_access_denied_hint)
 }
 
-/// Call `Authenticate` and decode the in-band sentinels (see
-/// docs/contracts.md "Authenticate error encoding"): `model_id == -2` is a
-/// recoverable daemon error travelling as data (label carries the message,
-/// byte-identical — PAM string-matches "rate limited"), `-3` is the
-/// `suppress_unknown` short-circuit.
-pub fn authenticate(user: &str) -> anyhow::Result<AuthOutcome> {
+/// Call the daemon's root-only `TestAuthenticate` and decode the reply.
+///
+/// This is deliberately the CLI's *only* authentication transport. The
+/// always-charging `Authenticate` method belongs to the real authenticators
+/// — PAM, the polkit agent — and has no CLI caller: `facelock test` is a
+/// diagnostic, and routing it through `Authenticate` is what once let a
+/// failed face auth at a `sudo` prompt (setuid-root, UID 0 at the daemon)
+/// escape the rate limiter, because the daemon had to guess from the
+/// caller's privilege which of the two it was serving.
+pub fn test_authenticate(user: &str) -> anyhow::Result<AuthOutcome> {
     hinted((|| {
         let proxy = create_proxy()?;
         let result: AuthResult = proxy
-            .call("Authenticate", &(user,))
-            .context("D-Bus Authenticate call failed")?;
-        if !result.matched && result.model_id == -2 {
-            return Ok(AuthOutcome::Error {
-                message: result.label,
-            });
-        }
-        if !result.matched && result.model_id == -3 {
-            return Ok(AuthOutcome::Suppressed);
-        }
-        Ok(AuthOutcome::AuthResult(MatchResult {
-            matched: result.matched,
-            model_id: if result.model_id >= 0 {
-                Some(result.model_id as u32)
-            } else {
-                None
-            },
-            label: if result.label.is_empty() {
-                None
-            } else {
-                Some(result.label)
-            },
-            similarity: result.similarity as f32,
-            // Not part of the D-Bus AuthResult contract; derived client-side
-            // where needed (see test_cmd).
-            failure_reason: None,
-        }))
+            .call("TestAuthenticate", &(user,))
+            .context("D-Bus TestAuthenticate call failed")?;
+        Ok(decode_auth_result(result))
     })())
+}
+
+/// Decode the in-band sentinels of an `AuthResult` (see docs/contracts.md
+/// "Authenticate error encoding"): `model_id == -2` is a recoverable daemon
+/// error travelling as data (label carries the message, byte-identical —
+/// PAM string-matches "rate limited"), `-3` is the `suppress_unknown`
+/// short-circuit. Split from the transport so the sentinel decoding is
+/// testable without a bus, and so any future method replying with an
+/// `AuthResult` decodes it identically.
+fn decode_auth_result(result: AuthResult) -> AuthOutcome {
+    if !result.matched && result.model_id == -2 {
+        return AuthOutcome::Error {
+            message: result.label,
+        };
+    }
+    if !result.matched && result.model_id == -3 {
+        return AuthOutcome::Suppressed;
+    }
+    AuthOutcome::AuthResult(MatchResult {
+        matched: result.matched,
+        model_id: if result.model_id >= 0 {
+            Some(result.model_id as u32)
+        } else {
+            None
+        },
+        label: if result.label.is_empty() {
+            None
+        } else {
+            Some(result.label)
+        },
+        similarity: result.similarity as f32,
+        // Not part of the D-Bus AuthResult contract; derived client-side
+        // where needed (see test_cmd).
+        failure_reason: None,
+    })
 }
 
 pub fn list_models(user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
@@ -462,6 +477,58 @@ mod tests {
         if !Uid::current().is_root() {
             let err = require_root_scripted("sudo facelock audit").unwrap_err();
             assert!(format!("{err:#}").contains("Root required"));
+        }
+    }
+
+    fn reply(matched: bool, model_id: i32, label: &str) -> AuthResult {
+        AuthResult {
+            matched,
+            model_id,
+            label: label.to_string(),
+            similarity: 0.9,
+        }
+    }
+
+    /// The `-2` sentinel is a recoverable daemon decision carried as data,
+    /// and the message must survive byte-identical: PAM substring-matches
+    /// "rate limited" and "IR camera required" on the same encoding.
+    #[test]
+    fn recoverable_error_sentinel_decodes_with_the_message_intact() {
+        match decode_auth_result(reply(false, -2, "rate limited")) {
+            AuthOutcome::Error { message } => assert_eq!(message, "rate limited"),
+            other => panic!("expected a recoverable error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suppressed_sentinel_decodes_to_suppressed() {
+        assert!(matches!(
+            decode_auth_result(reply(false, -3, "")),
+            AuthOutcome::Suppressed
+        ));
+    }
+
+    #[test]
+    fn no_match_decodes_without_a_model() {
+        match decode_auth_result(reply(false, -1, "")) {
+            AuthOutcome::AuthResult(result) => {
+                assert!(!result.matched);
+                assert_eq!(result.model_id, None);
+                assert_eq!(result.label, None);
+            }
+            other => panic!("expected an ordinary non-match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_decodes_with_its_model_and_label() {
+        match decode_auth_result(reply(true, 4, "front")) {
+            AuthOutcome::AuthResult(result) => {
+                assert!(result.matched);
+                assert_eq!(result.model_id, Some(4));
+                assert_eq!(result.label.as_deref(), Some("front"));
+            }
+            other => panic!("expected a match, got {other:?}"),
         }
     }
 
