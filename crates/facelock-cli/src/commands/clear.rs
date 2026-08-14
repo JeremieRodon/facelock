@@ -3,6 +3,7 @@ use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_store::StoreError;
 
 use crate::ipc_client;
+use crate::message::{Terminal, UserMessage};
 
 pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<()> {
     // ClearModels is root-only on the daemon side too, so demand root up front.
@@ -22,14 +23,14 @@ pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<(
         daemon_user_has_models(ipc_client::send_request(&request))?
     };
     if !has_models {
-        println!("No face models enrolled for user '{user}'.");
+        Terminal.info(&UserMessage::NoModelsEnrolled { user: user.clone() });
         return Ok(());
     }
 
     if !yes {
-        let confirmed = ipc_client::confirm(&format!("Remove ALL face models for user '{user}'?"))?;
+        let confirmed = Terminal.confirm(&UserMessage::ConfirmClearAll { user: user.clone() })?;
         if !confirmed {
-            println!("Cancelled.");
+            Terminal.info(&UserMessage::Cancelled);
             return Ok(());
         }
     }
@@ -42,7 +43,10 @@ pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<(
         let count = store
             .clear_user(&user)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!("Removed {count} face model(s) for user '{user}'.");
+        Terminal.info(&UserMessage::ClearedModels {
+            count: count as usize,
+            user: user.clone(),
+        });
         // The user has no models by construction, so drop the marker outright.
         super::enrollment_marker::forget(config, &user);
         return Ok(());
@@ -54,7 +58,7 @@ pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<(
 
     match response {
         DaemonResponse::Removed => {
-            println!("All face models removed for user '{user}'.");
+            Terminal.info(&UserMessage::AllModelsRemoved { user: user.clone() });
             super::enrollment_marker::forget(config, &user);
         }
         other => {

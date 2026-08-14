@@ -13,6 +13,8 @@ use facelock_core::types::{FaceModelInfo, MatchResult};
 /// If stdin is a TTY, prompts the user and re-execs. Otherwise bails
 /// with an actionable error message.
 pub fn require_root(hint: &str) -> anyhow::Result<()> {
+    use crate::message::{Terminal, UserMessage, fail};
+
     if Uid::current().is_root() {
         return Ok(());
     }
@@ -21,18 +23,22 @@ pub fn require_root(hint: &str) -> anyhow::Result<()> {
 
     // Non-interactive: just bail with instructions
     if !is_tty {
-        bail!("Root required.\n  Run: {hint}");
+        return Err(fail(UserMessage::RootRequired {
+            hint: hint.to_string(),
+        }));
     }
 
     // Interactive: offer to re-exec with sudo
-    eprint!("Root required. Re-run with sudo? [Y/n] ");
+    Terminal.prompt(&UserMessage::SudoReexecPrompt);
     let mut input = String::new();
     std::io::stdin()
         .read_line(&mut input)
         .context("failed to read input")?;
     let answer = input.trim().to_lowercase();
     if answer == "n" || answer == "no" {
-        bail!("Root required.\n  Run: {hint}");
+        return Err(fail(UserMessage::RootRequired {
+            hint: hint.to_string(),
+        }));
     }
 
     // Re-exec with sudo, preserving all arguments
@@ -56,7 +62,11 @@ pub fn require_root_scripted(hint: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    bail!("Root required.\n  Run: {hint}");
+    Err(crate::message::fail(
+        crate::message::UserMessage::RootRequired {
+            hint: hint.to_string(),
+        },
+    ))
 }
 
 /// Check whether we should use direct (daemonless) mode.
@@ -144,10 +154,8 @@ pub fn send_enroll(
     // into a duplicate label.
     let result: (u32, u32) = proxy.call("Enroll", &(user, label)).map_err(|e| {
         if is_timeout_error(&e) {
-            anyhow::Error::new(e).context(
-                "enrollment timed out client-side; the daemon may have completed it — \
-                 run `facelock list` before retrying",
-            )
+            anyhow::Error::new(e)
+                .context(crate::message::UserMessage::EnrollTimedOutClientSide.localized())
         } else {
             anyhow::Error::new(e).context("D-Bus Enroll call failed")
         }
@@ -213,15 +221,11 @@ fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
     if !is_access_denied(&err) {
         return err;
     }
+    // Context strings render on stderr for a human, so they localize (D10).
     if is_root_required_denial(&err) {
-        err.context("Access denied: this operation requires root.\n  Re-run with sudo, or as root.")
+        err.context(crate::message::UserMessage::AccessDeniedRootHint.localized())
     } else {
-        err.context(
-            "Access denied. If you are not in the 'facelock' group, add yourself:\n  \
-             sudo usermod -aG facelock $USER\nthen log out and back in (or re-run: \
-             sudo facelock setup). Note: some operations require root regardless of \
-             group membership.",
-        )
+        err.context(crate::message::UserMessage::AccessDeniedGroupHint.localized())
     }
 }
 

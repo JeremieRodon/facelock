@@ -6,6 +6,7 @@ use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_core::notify::{NotifyEvent, notify_desktop_if_enabled};
 
 use crate::ipc_client;
+use crate::message::{Terminal, UserMessage, fail};
 use crate::notifications::DesktopNotifier;
 
 pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
@@ -21,8 +22,8 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
         .value
         .all_present()
     {
-        println!("Face recognition models not found.");
-        if crate::ipc_client::confirm("Download models now?")? {
+        Terminal.info(&UserMessage::ModelsNotFoundOfferSetup);
+        if Terminal.confirm(&UserMessage::ConfirmDownloadModels)? {
             crate::commands::setup::run(false)?;
             // Deliberate re-probe: setup just changed the disk. The judgment
             // still uses the Config this process parsed, as it always has —
@@ -32,10 +33,10 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                 .value
                 .all_present()
             {
-                anyhow::bail!("Models still not found after setup.");
+                return Err(fail(UserMessage::ModelsStillMissingAfterSetup));
             }
         } else {
-            anyhow::bail!("Models required. Run `facelock setup` to download them.");
+            return Err(fail(UserMessage::ModelsRequired));
         }
     }
 
@@ -61,8 +62,8 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
         }
     };
     if !has_models {
-        println!("No face models enrolled for user '{user}'.");
-        println!("Run 'facelock enroll' to enroll a face first.");
+        Terminal.info(&UserMessage::NoModelsEnrolled { user: user.clone() });
+        Terminal.info(&UserMessage::RunEnrollFirst);
         return Ok(());
     }
 
@@ -91,16 +92,16 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
             }
         };
         if !has_matching {
-            println!(
-                "Warning: no enrolled models use the configured embedder '{config_embedder}'."
-            );
-            println!("Re-enroll with 'facelock enroll' to use the current model.");
+            Terminal.info(&UserMessage::NoMatchingEmbedder {
+                embedder: config_embedder.clone(),
+            });
+            Terminal.info(&UserMessage::ReenrollHint);
             return Ok(());
         }
     }
 
-    println!("Testing face recognition for user '{user}'...");
-    println!("Look at the camera.");
+    Terminal.info(&UserMessage::TestingUser { user: user.clone() });
+    Terminal.info(&UserMessage::TestLookAtCamera);
 
     notify_desktop_if_enabled(notif_config, &notifier, &NotifyEvent::Scanning);
 
@@ -109,11 +110,10 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
         match crate::direct::authenticate(config, &user) {
             Ok(result) if result.matched => {
                 let elapsed = start.elapsed();
-                println!(
-                    "Matched (similarity: {:.2}) in {:.2}s",
-                    result.similarity,
-                    elapsed.as_secs_f64()
-                );
+                Terminal.info(&UserMessage::TestMatched {
+                    similarity: result.similarity,
+                    seconds: elapsed.as_secs_f64(),
+                });
                 notify_desktop_if_enabled(
                     notif_config,
                     &notifier,
@@ -128,13 +128,10 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                 if result.failure_reason
                     == Some(facelock_core::types::AuthFailureReason::VarianceNotSatisfied)
                 {
-                    println!(
-                        "Face matched (best: {:.2}) but the liveness variance check was not \
-                         satisfied after {:.1}s — try moving slightly, or tune \
-                         security.frame_variance_max_similarity",
-                        result.similarity,
-                        elapsed.as_secs_f64()
-                    );
+                    Terminal.info(&UserMessage::TestVarianceBlocked {
+                        similarity: result.similarity,
+                        seconds: elapsed.as_secs_f64(),
+                    });
                     notify_desktop_if_enabled(
                         notif_config,
                         &notifier,
@@ -143,11 +140,10 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                         },
                     );
                 } else {
-                    println!(
-                        "No match (best: {:.2}) after {:.1}s",
-                        result.similarity,
-                        elapsed.as_secs_f64()
-                    );
+                    Terminal.info(&UserMessage::TestNoMatch {
+                        similarity: result.similarity,
+                        seconds: elapsed.as_secs_f64(),
+                    });
                     notify_desktop_if_enabled(
                         notif_config,
                         &notifier,
@@ -182,11 +178,12 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
             if result.matched {
                 let model_id = result.model_id.unwrap_or(0);
                 let label = result.label.as_deref().unwrap_or("unknown");
-                println!(
-                    "Matched model #{model_id} '{label}' (similarity: {:.2}) in {:.2}s",
-                    result.similarity,
-                    elapsed.as_secs_f64()
-                );
+                Terminal.info(&UserMessage::TestMatchedModel {
+                    model_id,
+                    label: label.to_string(),
+                    similarity: result.similarity,
+                    seconds: elapsed.as_secs_f64(),
+                });
                 notify_desktop_if_enabled(
                     notif_config,
                     &notifier,
@@ -201,13 +198,10 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                 // The D-Bus AuthResult contract carries no failure reason, but
                 // matched=false with similarity above the recognition threshold
                 // means a liveness gate (frame variance) blocked the attempt.
-                println!(
-                    "Face matched (best: {:.2}) but the liveness variance check was not \
-                     satisfied after {:.1}s — try moving slightly, or tune \
-                     security.frame_variance_max_similarity",
-                    result.similarity,
-                    elapsed.as_secs_f64()
-                );
+                Terminal.info(&UserMessage::TestVarianceBlocked {
+                    similarity: result.similarity,
+                    seconds: elapsed.as_secs_f64(),
+                });
                 notify_desktop_if_enabled(
                     notif_config,
                     &notifier,
@@ -216,11 +210,10 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
                     },
                 );
             } else {
-                println!(
-                    "No match (best: {:.2}) after {:.1}s",
-                    result.similarity,
-                    elapsed.as_secs_f64()
-                );
+                Terminal.info(&UserMessage::TestNoMatch {
+                    similarity: result.similarity,
+                    seconds: elapsed.as_secs_f64(),
+                });
                 notify_desktop_if_enabled(
                     notif_config,
                     &notifier,

@@ -57,15 +57,19 @@ impl ConfigLoad {
     /// The parsed config, or the unified load error (D7 item 4): missing file
     /// points at `facelock setup`; a broken file names the path and the parse
     /// error. Every command that needs a config fails through here, so the
-    /// wording cannot drift per command.
+    /// wording cannot drift per command. The error's Display terminates on
+    /// stderr, so it renders through the message seam (D10).
     pub fn require(self) -> anyhow::Result<Config> {
+        use crate::message::{UserMessage, fail};
         match self.result {
             Ok(config) => Ok(config),
-            Err(ConfigError::NotFound(_)) => anyhow::bail!(
-                "no config file at {} — run 'sudo facelock setup' to create one",
-                self.path.display()
-            ),
-            Err(e) => anyhow::bail!("invalid config at {}: {e}", self.path.display()),
+            Err(ConfigError::NotFound(_)) => Err(fail(UserMessage::NoConfigFile {
+                path: self.path.display().to_string(),
+            })),
+            Err(e) => Err(fail(UserMessage::InvalidConfig {
+                path: self.path.display().to_string(),
+                error: e.to_string(),
+            })),
         }
     }
 

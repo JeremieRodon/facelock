@@ -2,6 +2,7 @@ use facelock_core::Config;
 use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
 use crate::ipc_client;
+use crate::message::{Terminal, UserMessage};
 
 pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()> {
     // C6: root check must run before the confirmation prompt below — a group
@@ -13,10 +14,12 @@ pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> a
     let user = ipc_client::resolve_user(user.as_deref());
 
     if !yes {
-        let confirmed =
-            ipc_client::confirm(&format!("Remove face model #{model_id} for user '{user}'?"))?;
+        let confirmed = Terminal.confirm(&UserMessage::ConfirmRemoveModel {
+            model_id,
+            user: user.clone(),
+        })?;
         if !confirmed {
-            println!("Cancelled.");
+            Terminal.info(&UserMessage::Cancelled);
             return Ok(());
         }
     }
@@ -27,9 +30,15 @@ pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> a
             .remove_model(&user, model_id)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if removed {
-            println!("Removed face model #{model_id} for user '{user}'.");
+            Terminal.info(&UserMessage::RemovedModel {
+                model_id,
+                user: user.clone(),
+            });
         } else {
-            println!("Model #{model_id} not found for user '{user}'.");
+            Terminal.info(&UserMessage::ModelNotFound {
+                model_id,
+                user: user.clone(),
+            });
         }
         // Recompute from the list we already have open rather than decrementing:
         // same cost, and it cannot drift from the database.
@@ -50,7 +59,10 @@ pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> a
 
     match response {
         DaemonResponse::Removed => {
-            println!("Removed face model #{model_id} for user '{user}'.");
+            Terminal.info(&UserMessage::RemovedModel {
+                model_id,
+                user: user.clone(),
+            });
             super::enrollment_marker::refresh(config, &user);
         }
         other => {

@@ -6,6 +6,7 @@ use facelock_core::types::FaceModelInfo;
 use facelock_store::StoreError;
 
 use crate::ipc_client;
+use crate::message::{Terminal, UserMessage, fail};
 
 pub fn run(
     config: &Config,
@@ -20,16 +21,16 @@ pub fn run(
         let marker = std::path::Path::new(super::setup::SETUP_COMPLETE_MARKER);
         if !marker.exists() {
             ipc_client::require_root("sudo facelock setup")?;
-            println!("Setup has not been completed.");
-            if ipc_client::confirm("Run setup now?")? {
+            Terminal.info(&UserMessage::SetupNotCompleted);
+            if Terminal.confirm(&UserMessage::ConfirmRunSetupNow)? {
                 super::setup::run(false)?;
                 if !marker.exists() {
-                    anyhow::bail!("Setup did not complete successfully.");
+                    return Err(fail(UserMessage::SetupDidNotComplete));
                 }
                 // Setup includes face enrollment (Step 4), so we're done
                 return Ok(());
             } else {
-                println!("Run 'sudo facelock setup' when ready.");
+                Terminal.info(&UserMessage::RunSetupWhenReady);
                 return Ok(());
             }
         }
@@ -41,10 +42,7 @@ pub fn run(
     // warn prominently when the opt-in is active.
     if config.encryption.method == facelock_core::config::EncryptionMethod::None {
         if config.security.allow_plaintext {
-            eprintln!(
-                "WARNING: encryption.method = \"none\" and security.allow_plaintext = true.\n\
-                 Your face template will be stored UNENCRYPTED (plaintext biometric data at rest)."
-            );
+            Terminal.error(&UserMessage::PlaintextEnrollWarning);
         } else if let Err(message) = config.ensure_enroll_encryption_allowed() {
             anyhow::bail!(message);
         }
@@ -56,10 +54,9 @@ pub fn run(
         .value
         .all_present()
     {
-        anyhow::bail!(
-            "Face recognition models not found in {}.\nRun `sudo facelock setup` to download them.",
-            config.daemon.model_dir
-        );
+        return Err(fail(UserMessage::ModelsMissing {
+            dir: config.daemon.model_dir.clone(),
+        }));
     }
 
     let user = ipc_client::resolve_user(user.as_deref());
@@ -94,24 +91,26 @@ pub fn run(
             }
         };
         if has_stale {
-            println!(
-                "Note: existing models don't use the configured embedder '{config_embedder}'."
-            );
-            println!(
-                "Old enrollments will not work with the new embedder. Consider removing them with 'facelock remove'.\n"
-            );
+            Terminal.info(&UserMessage::StaleEmbedderNote {
+                embedder: config_embedder.clone(),
+            });
         }
     }
 
-    println!("Enrolling face for user '{user}' with label '{label}'...");
-    println!("Look at the camera. Slowly turn your head left and right.");
+    Terminal.info(&UserMessage::Enrolling {
+        user: user.clone(),
+        label: label.clone(),
+    });
+    Terminal.info(&UserMessage::EnrollLookAtCamera);
 
     if ipc_client::should_use_direct(config) {
         ipc_client::require_root("sudo facelock enroll")?;
         let (model_id, embedding_count) = crate::direct::enroll(config, &user, &label)?;
-        println!(
-            "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
-        );
+        Terminal.info(&UserMessage::EnrollComplete {
+            model_id,
+            count: embedding_count,
+            label: label.clone(),
+        });
         super::enrollment_marker::refresh(config, &user);
         check_model_count(&user, config);
         return Ok(());
@@ -127,9 +126,11 @@ pub fn run(
         embedding_count,
     } = response
     {
-        println!(
-            "\nFace enrolled successfully!\n  Model ID: {model_id}\n  Embeddings: {embedding_count}\n  Label: {label}"
-        );
+        Terminal.info(&UserMessage::EnrollComplete {
+            model_id,
+            count: embedding_count,
+            label: label.clone(),
+        });
         super::enrollment_marker::refresh(config, &user);
         check_model_count(&user, config);
     }
@@ -208,10 +209,10 @@ fn check_model_count(user: &str, config: &Config) {
     // reported failure.
     if let Ok(models) = list_user_models(user, config) {
         if models.len() > 5 {
-            println!(
-                "\nWarning: user '{user}' has {} face models. Consider removing old ones with 'facelock remove'.",
-                models.len()
-            );
+            Terminal.info(&UserMessage::TooManyModels {
+                user: user.to_string(),
+                count: models.len(),
+            });
         }
     }
 }

@@ -13,6 +13,8 @@ use facelock_core::fs_security::{
     create_truncate_file, ensure_mode, ensure_private_dir, write_file,
 };
 
+use crate::message::{Terminal, UserMessage, fail};
+
 /// Embedded systemd unit file.
 const SERVICE_UNIT: &str = include_str!("../../../../systemd/facelock-daemon.service");
 
@@ -358,18 +360,9 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     let theme = ColorfulTheme::default();
 
     // -- Welcome --
-    println!();
-    println!("  Facelock v{}", env!("CARGO_PKG_VERSION"));
-    println!("  Linux face authentication");
-    println!();
-    println!("  This wizard will walk you through initial setup:");
-    println!("    - Camera detection");
-    println!("    - Model quality and inference device");
-    println!("    - Model downloads");
-    println!("    - Embedding encryption (TPM or software)");
-    println!("    - Face enrollment");
-    println!("    - Daemon and PAM configuration");
-    println!();
+    Terminal.info(&UserMessage::SetupIntro {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    });
 
     // -- Load or create config --
     // Deliberate load (D7): setup bootstraps the config file — it may not
@@ -391,75 +384,76 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     // `--camera` answers the question and therefore replaces the prompt (plan
     // §1 rule 1). An explicit value that cannot be honoured is fatal: the user
     // asked for a specific device, so falling back would be silently wrong.
-    println!("\n--- Step 1: Camera Selection ---\n");
+    Terminal.info(&UserMessage::SetupStepCamera);
     match plan.camera.as_ref() {
         Some(choice) => apply_camera_choice(&mut config, choice)?,
         None => match wizard_camera_selection(&theme, &mut config) {
             Ok(()) => {}
             Err(e) => {
-                println!("  Camera detection failed: {e}");
-                println!("  You can configure the camera later in the config file.");
-                println!(
-                    "  Continuing with current setting: {}",
-                    config.device.path.as_deref().unwrap_or("/dev/video0")
-                );
+                Terminal.info(&UserMessage::CameraStepFailed {
+                    error: e.to_string(),
+                    current: config
+                        .device
+                        .path
+                        .as_deref()
+                        .unwrap_or("/dev/video0")
+                        .to_string(),
+                });
             }
         },
     }
 
     // -- Step 2: Model quality --
-    println!("\n--- Step 2: Model Quality ---\n");
+    Terminal.info(&UserMessage::SetupStepModelQuality);
     match plan.models {
         Some(preset) => apply_model_preset(&mut config, preset)?,
         None => match wizard_model_quality(&theme, &mut config) {
             Ok(()) => {}
             Err(e) => {
-                println!("  Model quality selection failed: {e}");
-                println!(
-                    "  Continuing with current setting: {}",
-                    config.recognition.detector_model
-                );
+                Terminal.info(&UserMessage::ModelQualityStepFailed {
+                    error: e.to_string(),
+                    current: config.recognition.detector_model.clone(),
+                });
             }
         },
     }
 
     // -- Step 3: Execution provider --
-    println!("\n--- Step 3: Inference Device ---\n");
+    Terminal.info(&UserMessage::SetupStepInferenceDevice);
     match plan.execution_provider {
         Some(choice) => apply_execution_provider(&mut config, choice)?,
         None => match wizard_execution_provider(&theme, &mut config) {
             Ok(()) => {}
             Err(e) => {
-                println!("  Inference device selection failed: {e}");
-                println!(
-                    "  Continuing with current setting: {}",
-                    config.recognition.execution_provider
-                );
+                Terminal.info(&UserMessage::InferenceStepFailed {
+                    error: e.to_string(),
+                    current: config.recognition.execution_provider.clone(),
+                });
             }
         },
     }
 
     // -- Step 4: Model download --
-    println!("\n--- Step 4: Model Download ---\n");
+    Terminal.info(&UserMessage::SetupStepModelDownload);
     match wizard_model_download(&theme, &config) {
         Ok(()) => {}
         Err(e) => {
-            println!("  Model download failed: {e}");
-            println!("  You can retry later with: sudo facelock setup --non-interactive");
+            Terminal.info(&UserMessage::ModelDownloadStepFailed {
+                error: e.to_string(),
+            });
         }
     }
 
     // -- Step 5: Encryption setup --
-    println!("\n--- Step 5: Embedding Encryption ---\n");
+    Terminal.info(&UserMessage::SetupStepEncryption);
     match plan.encryption {
         Some(choice) => apply_encryption_choice(&mut config, choice, Some(&theme))?,
         None => match wizard_encryption_setup(&theme, &mut config) {
             Ok(()) => {}
             Err(e) => {
-                println!("  Encryption setup failed: {e}");
-                println!(
-                    "  You can configure encryption later with: sudo facelock encrypt --generate-key"
-                );
+                Terminal.info(&UserMessage::EncryptionStepFailed {
+                    error: e.to_string(),
+                });
             }
         },
     }
@@ -467,52 +461,54 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     // -- Step 6: Face enrollment --
     let enroll_steps = enroll_steps_for(plan);
     let enrolled = if enroll_steps.enroll {
-        println!("\n--- Step 6: Face Enrollment ---\n");
+        Terminal.info(&UserMessage::SetupStepEnrollment);
         match wizard_face_enroll(&config, &theme, enroll_steps.assume_yes) {
             Ok(did_enroll) => did_enroll,
             Err(e) => {
-                println!("  Enrollment failed: {e}");
-                println!("  You can enroll later with: facelock enroll");
+                Terminal.info(&UserMessage::EnrollStepFailed {
+                    error: e.to_string(),
+                });
                 false
             }
         }
     } else {
-        println!("\n--- Step 6: Face Enrollment (skipped, --no-enroll) ---\n");
+        Terminal.info(&UserMessage::SetupStepEnrollmentSkipped);
         false
     };
 
     // -- Step 7: Test recognition --
     if test_recognition_runs(enroll_steps, enrolled) {
-        println!("\n--- Step 7: Test Recognition ---\n");
+        Terminal.info(&UserMessage::SetupStepTest);
         match wizard_test_recognition(&config, &theme, plan.yes) {
             Ok(()) => {}
             Err(e) => {
-                println!("  Test failed: {e}");
-                println!("  You can test later with: facelock test");
+                Terminal.info(&UserMessage::TestStepFailed {
+                    error: e.to_string(),
+                });
             }
         }
     } else {
-        println!("\n--- Step 7: Test Recognition (skipped, no face enrolled) ---\n");
+        Terminal.info(&UserMessage::SetupStepTestSkipped);
     }
 
     // -- Step 8: Systemd setup --
-    println!("\n--- Step 8: Daemon Configuration ---\n");
+    Terminal.info(&UserMessage::SetupStepDaemon);
     let systemd_step = systemd_step_for(plan);
     let systemd_enabled = if systemd_step.wizard_may_install() {
         match wizard_systemd_setup(&theme, plan.yes) {
             Ok(enabled) => enabled,
             Err(e) => {
-                println!("  Systemd setup failed: {e}");
-                println!("  You can enable it later with: sudo facelock setup --systemd");
+                Terminal.info(&UserMessage::SystemdStepFailed {
+                    error: e.to_string(),
+                });
                 false
             }
         }
     } else {
         if systemd_step == SystemdStep::Skip {
-            println!("  Skipping daemon configuration (--no-systemd).");
-            println!("  No unit files are written and systemctl is not invoked.");
+            Terminal.info(&UserMessage::SystemdSkippedFlag);
         } else {
-            println!("  Answered on the command line; applied once setup finishes.");
+            Terminal.info(&UserMessage::SystemdDeferred);
         }
         false
     };
@@ -520,12 +516,13 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     // Group membership: without it, the first daemon command a normal user
     // runs after setup fails with a bare D-Bus AccessDenied (issue #89).
     if let Err(e) = setup_group_membership(Some(&theme)) {
-        println!("  Group setup failed: {e}");
-        println!("  Add manually: sudo usermod -aG facelock <user>");
+        Terminal.info(&UserMessage::GroupStepFailed {
+            error: e.to_string(),
+        });
     }
 
     // -- Step 9: PAM configuration --
-    println!("\n--- Step 9: PAM Configuration ---\n");
+    Terminal.info(&UserMessage::SetupStepPam);
     let pam_services = match pam_step_in(
         Path::new(PAM_DIR),
         plan,
@@ -534,8 +531,9 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     ) {
         Ok(services) => services,
         Err(e) => {
-            println!("  PAM setup failed: {e}");
-            println!("  You can configure PAM later with: sudo facelock setup --pam");
+            Terminal.info(&UserMessage::PamStepFailed {
+                error: e.to_string(),
+            });
             Vec::new()
         }
     };
@@ -547,7 +545,7 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     print_pam_extension_hint();
 
     // -- Summary --
-    println!("\n--- Setup Complete ---\n");
+    Terminal.info(&UserMessage::SetupCompleteHeader);
     let encryption_label = match config.encryption.method {
         facelock_core::config::EncryptionMethod::Tpm => "AES-256-GCM (TPM-sealed key)",
         facelock_core::config::EncryptionMethod::Keyfile => "AES-256-GCM (keyfile)",
@@ -561,42 +559,51 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         ("scrfd_2.5g_bnkps.onnx", "glintr100.onnx") => "balanced (SCRFD 2.5G + ArcFace R100)",
         _ => "standard (SCRFD 2.5G + ArcFace R50)",
     };
-    println!(
-        "  Camera:     {}",
-        config.device.path.as_deref().unwrap_or("/dev/video0")
-    );
-    println!(
-        "  Models:     {} ({})",
-        config.daemon.model_dir, model_quality_label
-    );
-    println!(
-        "  Inference:  {}",
-        config.recognition.execution_provider.to_uppercase()
-    );
-    println!("  Database:   {}", config.storage.db_path);
-    println!("  Encryption: {}", encryption_label);
-    println!(
-        "  Daemon:   {}",
-        match systemd_step {
-            SystemdStep::Skip => "not configured (--no-systemd)",
-            SystemdStep::Deferred => "configured from the command line",
-            SystemdStep::Ask if systemd_enabled => "enabled (D-Bus activation)",
-            SystemdStep::Ask => "not configured",
+    Terminal.info(&UserMessage::SummaryCamera {
+        value: config
+            .device
+            .path
+            .as_deref()
+            .unwrap_or("/dev/video0")
+            .to_string(),
+    });
+    Terminal.info(&UserMessage::SummaryModels {
+        dir: config.daemon.model_dir.clone(),
+        quality: model_quality_label.to_string(),
+    });
+    Terminal.info(&UserMessage::SummaryInference {
+        value: config.recognition.execution_provider.to_uppercase(),
+    });
+    Terminal.info(&UserMessage::SummaryDatabase {
+        value: config.storage.db_path.clone(),
+    });
+    Terminal.info(&UserMessage::SummaryEncryption {
+        value: encryption_label.to_string(),
+    });
+    Terminal.info(&UserMessage::SummaryDaemon {
+        status: match systemd_step {
+            SystemdStep::Skip => UserMessage::DaemonStatusNotConfiguredNoSystemd,
+            SystemdStep::Deferred => UserMessage::DaemonStatusDeferred,
+            SystemdStep::Ask if systemd_enabled => UserMessage::DaemonStatusEnabled,
+            SystemdStep::Ask => UserMessage::DaemonStatusNotConfigured,
         }
-    );
+        .localized(),
+    });
     if !pam_services.is_empty() {
-        println!("  PAM:      {}", pam_services.join(", "));
+        Terminal.info(&UserMessage::SummaryPam {
+            services: pam_services.join(", "),
+        });
     } else if pam_step_for(plan) == PamStep::Skip {
-        println!("  PAM:      not configured (--no-pam)");
+        Terminal.info(&UserMessage::SummaryPamSkipped);
     } else {
-        println!("  PAM:      not configured");
+        Terminal.info(&UserMessage::SummaryPamNone);
     }
     if enrolled {
-        println!("  Face:     enrolled");
+        Terminal.info(&UserMessage::SummaryFaceEnrolled);
     } else if !enroll_steps.enroll {
-        println!("  Face:     not enrolled (--no-enroll; run `facelock enroll`)");
+        Terminal.info(&UserMessage::SummaryFaceNotEnrolledNoEnroll);
     } else {
-        println!("  Face:     not enrolled (run `facelock enroll`)");
+        Terminal.info(&UserMessage::SummaryFaceNotEnrolled);
     }
     println!();
 
@@ -625,8 +632,7 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
     let devices = facelock_camera::list_devices().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if devices.is_empty() {
-        println!("  No video devices found.");
-        println!("  Check that your camera is connected and the v4l2 module is loaded.");
+        Terminal.info(&UserMessage::NoVideoDevices);
         return Ok(());
     }
 
@@ -654,7 +660,10 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
     // If exactly one IR camera, auto-select it
     if ir_devices.len() == 1 {
         let dev = ir_devices[0];
-        println!("  Auto-selected IR camera: {} ({})", dev.path, dev.name);
+        Terminal.info(&UserMessage::AutoSelectedIrCamera {
+            path: dev.path.clone(),
+            name: dev.name.clone(),
+        });
         config.device.path = Some(dev.path.clone());
         return Ok(());
     }
@@ -680,14 +689,17 @@ fn wizard_camera_selection(theme: &ColorfulTheme, config: &mut Config) -> anyhow
         .unwrap_or(0);
 
     let selection = Select::with_theme(theme)
-        .with_prompt("Select camera device")
+        .with_prompt(UserMessage::PromptSelectCameraDevice.localized())
         .items(&display_items)
         .default(default_idx)
         .interact()?;
 
     let selected = &devices[selection];
     config.device.path = Some(selected.path.clone());
-    println!("  Selected: {} ({})", selected.path, selected.name);
+    Terminal.info(&UserMessage::SelectedCamera {
+        path: selected.path.clone(),
+        name: selected.name.clone(),
+    });
 
     Ok(())
 }
@@ -713,21 +725,17 @@ fn select_ir_camera(candidates: &[CameraCandidate]) -> anyhow::Result<String> {
 
     match ir.len() {
         1 => Ok(ir[0].path.clone()),
-        0 if candidates.is_empty() => bail!(
-            "--camera=auto found no video devices; check that the camera is connected \
-             and the v4l2 module is loaded"
-        ),
+        0 if candidates.is_empty() => Err(fail(UserMessage::AutoCameraNoDevices)),
         0 => {
             let listed = candidates
                 .iter()
                 .map(|c| format!("    {} - {}", c.path, c.name))
                 .collect::<Vec<_>>()
                 .join("\n");
-            bail!(
-                "--camera=auto found no IR-capable camera among the detected devices:\n{listed}\n  \
-                 Pass an explicit device path, e.g. --camera={}",
-                candidates[0].path
-            )
+            Err(fail(UserMessage::AutoCameraNoIr {
+                listed,
+                example: candidates[0].path.clone(),
+            }))
         }
         _ => {
             let listed = ir
@@ -735,11 +743,10 @@ fn select_ir_camera(candidates: &[CameraCandidate]) -> anyhow::Result<String> {
                 .map(|c| format!("    {} - {}", c.path, c.name))
                 .collect::<Vec<_>>()
                 .join("\n");
-            bail!(
-                "--camera=auto found {} IR-capable cameras:\n{listed}\n  \
-                 Pass an explicit device path to choose one.",
-                ir.len()
-            )
+            Err(fail(UserMessage::AutoCameraManyIr {
+                count: ir.len(),
+                listed,
+            }))
         }
     }
 }
@@ -772,17 +779,18 @@ fn apply_camera_choice(config: &mut Config, choice: &CameraChoice) -> anyhow::Re
     let path = match choice {
         CameraChoice::Auto => {
             let path = select_ir_camera(&enumerate_camera_candidates()?)?;
-            println!("  Auto-selected IR camera: {path}");
+            Terminal.info(&UserMessage::AutoSelectedIrCameraPath { path: path.clone() });
             path
         }
         CameraChoice::Path(path) => {
             if !Path::new(path).exists() {
-                bail!(
-                    "camera device {path} does not exist; \
-                     pass a valid /dev/video* path or --camera=auto"
-                );
+                return Err(fail(UserMessage::CameraDeviceMissing {
+                    path: path.clone(),
+                }));
             }
-            println!("  Selected: {path}");
+            Terminal.info(&UserMessage::SelectedValue {
+                value: path.clone(),
+            });
             path.clone()
         }
     };
@@ -883,7 +891,7 @@ fn wizard_model_quality(theme: &ColorfulTheme, config: &mut Config) -> anyhow::R
     .unwrap_or(0);
 
     let selection = Select::with_theme(theme)
-        .with_prompt("Select model quality")
+        .with_prompt(UserMessage::PromptSelectModelQuality.localized())
         .items(&MODEL_PRESET_OPTIONS[..])
         .default(default_idx)
         .interact()?;
@@ -908,7 +916,7 @@ fn wizard_execution_provider(theme: &ColorfulTheme, config: &mut Config) -> anyh
     ];
 
     let selection = Select::with_theme(theme)
-        .with_prompt("Select inference device")
+        .with_prompt(UserMessage::PromptSelectInferenceDevice.localized())
         .items(&options[..])
         .default(default_idx)
         .interact()?;
@@ -919,7 +927,9 @@ fn wizard_execution_provider(theme: &ColorfulTheme, config: &mut Config) -> anyh
     };
 
     config.recognition.execution_provider = provider.to_string();
-    println!("  Selected: {}", provider);
+    Terminal.info(&UserMessage::SelectedValue {
+        value: provider.to_string(),
+    });
     warn_provider_preflight(provider);
 
     update_config_provider(config)?;
@@ -993,7 +1003,9 @@ fn apply_execution_provider(
 ) -> anyhow::Result<()> {
     let provider = provider_name(choice)?;
     config.recognition.execution_provider = provider.clone();
-    println!("  Selected: {provider}");
+    Terminal.info(&UserMessage::SelectedValue {
+        value: provider.clone(),
+    });
     warn_provider_preflight(&provider);
 
     update_config_provider(config)?;
@@ -1112,40 +1124,48 @@ fn wizard_model_download(theme: &ColorfulTheme, config: &Config) -> anyhow::Resu
     }
 
     for entry in &already_present {
-        println!("  [ok] {} ({})", entry.name, entry.purpose);
+        Terminal.info(&UserMessage::ModelPresentOk {
+            name: entry.name.clone(),
+            purpose: entry.purpose.clone(),
+        });
     }
 
     if to_download.is_empty() {
-        println!("  All models are already present and verified.");
+        Terminal.info(&UserMessage::AllModelsPresent);
         return Ok(());
     }
 
     let total_mb: u64 = to_download.iter().map(|e| e.size_mb).sum();
-    println!("  Models to download:");
+    Terminal.info(&UserMessage::ModelsToDownloadHeader);
     for entry in &to_download {
-        println!(
-            "    - {} (~{}MB) - {}",
-            entry.name, entry.size_mb, entry.purpose
-        );
+        Terminal.info(&UserMessage::ModelToDownloadEntry {
+            name: entry.name.clone(),
+            size_mb: entry.size_mb,
+            purpose: entry.purpose.clone(),
+        });
     }
-    println!("  Total download size: ~{}MB", total_mb);
+    Terminal.info(&UserMessage::TotalDownloadSize { mb: total_mb });
 
     let proceed = Confirm::with_theme(theme)
-        .with_prompt("Download required models?")
+        .with_prompt(UserMessage::ConfirmDownloadRequiredModels.localized())
         .default(true)
         .interact()?;
 
     if !proceed {
-        println!("  Skipping model download.");
+        Terminal.info(&UserMessage::SkippingModelDownload);
         return Ok(());
     }
 
     for entry in &to_download {
         let model_path = model_dir.join(&entry.filename);
-        println!("  Downloading {}...", entry.name);
+        Terminal.info(&UserMessage::DownloadingModel {
+            name: entry.name.clone(),
+        });
         download_model(entry, &model_path)?;
         verify_after_download(&model_path, &entry.sha256, &entry.name)?;
-        println!("  [ok] {} downloaded and verified", entry.name);
+        Terminal.info(&UserMessage::ModelDownloaded {
+            name: entry.name.clone(),
+        });
     }
 
     Ok(())
@@ -1866,10 +1886,14 @@ fn wizard_face_enroll(
     theme: &ColorfulTheme,
     assume_yes: bool,
 ) -> anyhow::Result<bool> {
-    let proceed = confirm_step(theme, "Would you like to enroll a face now?", assume_yes)?;
+    let proceed = confirm_step(
+        theme,
+        &UserMessage::ConfirmEnrollNow.localized(),
+        assume_yes,
+    )?;
 
     if !proceed {
-        println!("  Skipping face enrollment.");
+        Terminal.info(&UserMessage::EnrollSkipped);
         return Ok(false);
     }
 
@@ -1882,10 +1906,14 @@ fn wizard_test_recognition(
     theme: &ColorfulTheme,
     assume_yes: bool,
 ) -> anyhow::Result<()> {
-    let proceed = confirm_step(theme, "Would you like to test recognition?", assume_yes)?;
+    let proceed = confirm_step(
+        theme,
+        &UserMessage::ConfirmTestRecognition.localized(),
+        assume_yes,
+    )?;
 
     if !proceed {
-        println!("  Skipping recognition test.");
+        Terminal.info(&UserMessage::TestSkipped);
         return Ok(());
     }
 
@@ -1895,19 +1923,18 @@ fn wizard_test_recognition(
 
 fn wizard_systemd_setup(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Result<bool> {
     if !Path::new("/run/systemd/system").exists() {
-        println!("  systemd not detected. Skipping daemon configuration.");
-        println!("  Facelock will use oneshot mode for authentication.");
+        Terminal.info(&UserMessage::SystemdNotDetected);
         return Ok(false);
     }
 
     let proceed = confirm_step(
         theme,
-        "Enable daemon mode with D-Bus activation?",
+        &UserMessage::ConfirmDaemonMode.localized(),
         assume_yes,
     )?;
 
     if !proceed {
-        println!("  Skipping systemd setup. Facelock will use oneshot mode.");
+        Terminal.info(&UserMessage::SystemdDeclined);
         return Ok(false);
     }
 
@@ -1932,21 +1959,25 @@ fn pam_step_in(
 
     if !step.touches_pam_d() {
         if step == PamStep::Skip {
-            println!("  Skipping PAM configuration (--no-pam).");
-            println!("  No file under {} is read or modified.", base.display());
+            Terminal.info(&UserMessage::PamSkippedFlag {
+                dir: base.display().to_string(),
+            });
         }
         return Ok(Vec::new());
     }
 
     if !module_present {
-        println!("  PAM module not found at {PAM_MODULE_PATH}.");
-        println!("  Install it first, then run: sudo facelock setup --pam");
+        Terminal.info(&UserMessage::PamModuleMissing {
+            path: PAM_MODULE_PATH.to_string(),
+        });
         return Ok(Vec::new());
     }
 
     match step {
         PamStep::Install(service) => {
-            println!("  Configuring PAM for {service}...");
+            Terminal.info(&UserMessage::ConfiguringPamFor {
+                service: service.clone(),
+            });
             pam_install_in(base, &service, plan.yes, false)?;
             Ok(vec![service])
         }
@@ -1960,23 +1991,15 @@ fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec
     let candidates = candidates_in(base);
 
     if candidates.is_empty() {
-        println!(
-            "  No supported PAM service files found in {}/.",
-            base.display()
-        );
+        Terminal.info(&UserMessage::NoPamCandidates {
+            dir: base.display().to_string(),
+        });
         return Ok(Vec::new());
     }
 
-    println!("  The following line will be added to each selected /etc/pam.d/<service>:");
-    println!();
-    println!("      {PAM_LINE}");
-    println!();
-    println!(
-        "  It is inserted above the first existing 'auth' line. A backup\n  \
-         (.facelock-backup) is saved before any change, and you'll be asked\n  \
-         to confirm each file individually."
-    );
-    println!();
+    Terminal.info(&UserMessage::PamLinePreview {
+        line: PAM_LINE.to_string(),
+    });
 
     let labels: Vec<&str> = candidates.iter().map(|c| c.description).collect();
     let defaults: Vec<bool> = candidates.iter().map(|c| c.default_enabled).collect();
@@ -1991,7 +2014,7 @@ fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec
             .collect()
     } else {
         let selections = MultiSelect::with_theme(theme)
-            .with_prompt("Select services to enable face authentication for")
+            .with_prompt(UserMessage::PromptSelectPamServices.localized())
             .items(&labels)
             .defaults(&defaults)
             .interact()?;
@@ -2003,19 +2026,24 @@ fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec
 
     let mut configured = Vec::new();
     for service in selected_services {
-        println!("  Configuring PAM for {service}...");
+        Terminal.info(&UserMessage::ConfiguringPamFor {
+            service: service.clone(),
+        });
         // `yes = true`: the multi-select above *is* the per-service consent, and
         // no candidate is in SENSITIVE_SERVICES.
         match pam_install_in(base, &service, true, false) {
             Ok(()) => configured.push(service),
             Err(e) => {
-                println!("  Failed to configure {service}: {e}");
+                Terminal.info(&UserMessage::PamConfigureFailed {
+                    service: service.clone(),
+                    error: e.to_string(),
+                });
             }
         }
     }
 
     if configured.is_empty() {
-        println!("  No PAM services selected.");
+        Terminal.info(&UserMessage::NoPamServicesSelected);
     }
 
     Ok(configured)
@@ -2089,7 +2117,7 @@ fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
 // ---------------------------------------------------------------------------
 
 fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
-    println!("facelock setup: preparing system...\n");
+    Terminal.info(&UserMessage::NonInteractivePreparing);
 
     // Load config (or use defaults for paths). Deliberate load (D7): setup
     // bootstraps the config file, which may not exist yet.
@@ -2139,7 +2167,9 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
         .filter(|m| m.filename == *configured_detector || m.filename == *configured_embedder)
         .collect();
 
-    println!("Checking {} model(s)...\n", needed.len());
+    Terminal.info(&UserMessage::CheckingModels {
+        count: needed.len(),
+    });
 
     for entry in &needed {
         let model_path = model_dir.join(&entry.filename);
@@ -2207,9 +2237,9 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
     }
 
     if enrolled {
-        println!("\nSetup complete.");
+        Terminal.info(&UserMessage::SetupCompleteShort);
     } else {
-        println!("\nSetup complete. Run `facelock enroll` to register your face.");
+        Terminal.info(&UserMessage::SetupCompleteEnroll);
     }
     Ok(())
 }
@@ -2331,7 +2361,7 @@ fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
         .context("failed to look up facelock group")?
         .is_none()
     {
-        println!("  Creating 'facelock' system group...");
+        Terminal.info(&UserMessage::CreatingFacelockGroup);
         run_cmd("groupadd", &["-r", "facelock"])?;
     }
     let group = nix::unistd::Group::from_name("facelock")
@@ -2339,15 +2369,12 @@ fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
         .context("facelock group missing after creation")?;
 
     let Some(user) = invoking_user() else {
-        println!(
-            "  Note: running daemon commands (preview/test) as a normal user requires\n  \
-             membership in the 'facelock' group: sudo usermod -aG facelock <user>"
-        );
+        Terminal.info(&UserMessage::GroupMembershipNote);
         return Ok(());
     };
 
     if user_in_group(&user, &group) {
-        println!("  User '{user}' is already in the 'facelock' group.");
+        Terminal.info(&UserMessage::AlreadyInGroup { user: user.clone() });
         return Ok(());
     }
 
@@ -2356,22 +2383,18 @@ fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
         // the wizard's caller prints the error plus the manual usermod command,
         // so a broken stdin surfaces rather than silently skipping the add.
         let proceed = Confirm::with_theme(theme)
-            .with_prompt(format!(
-                "Add user '{user}' to the 'facelock' group? (required to run \
-                 facelock preview/test without sudo)"
-            ))
+            .with_prompt(UserMessage::ConfirmAddToGroup { user: user.clone() }.localized())
             .default(true)
             .interact()
             .context("group membership prompt failed")?;
         if !proceed {
-            println!("  Skipped. Add later with: sudo usermod -aG facelock {user}");
+            Terminal.info(&UserMessage::GroupAddSkipped { user: user.clone() });
             return Ok(());
         }
     }
 
     run_cmd("usermod", &["-aG", "facelock", &user])?;
-    println!("  Added '{user}' to the 'facelock' group.");
-    println!("  NOTE: log out and back in for the new group membership to take effect.");
+    Terminal.info(&UserMessage::AddedToGroup { user: user.clone() });
     Ok(())
 }
 
@@ -2830,7 +2853,9 @@ fn pam_install_in(base: &Path, service: &str, yes: bool, no_prompt: bool) -> any
 
     // Check idempotency — match on the module name, not exact spacing
     if content.lines().any(is_facelock_pam_line) {
-        println!("PAM line already present in {pam_path}. Nothing to do.");
+        Terminal.info(&UserMessage::PamLineAlreadyPresent {
+            path: pam_path.clone(),
+        });
         return Ok(());
     }
 
@@ -2839,37 +2864,42 @@ fn pam_install_in(base: &Path, service: &str, yes: bool, no_prompt: bool) -> any
 
     // Decide where the line will go BEFORE prompting, so the preview is accurate.
     let insertion_hint = if content.lines().any(|l| l.trim_start().starts_with("auth")) {
-        "inserted before the first 'auth' line"
+        UserMessage::PamInsertBeforeAuthHint
     } else {
-        "no 'auth' line found — inserted at the top of the file"
+        UserMessage::PamInsertAtTopHint
     };
 
-    println!();
-    println!("About to modify {pam_path}:");
-    println!("  + {PAM_LINE}    ({insertion_hint})");
-    println!("  Backup will be saved to: {backup_path}");
-    println!();
-    println!("(To configure manually instead, add the line above to each service yourself.)");
+    Terminal.info(&UserMessage::PamModifyPreview {
+        path: pam_path.clone(),
+        line: PAM_LINE.to_string(),
+        hint: insertion_hint.localized(),
+        backup: backup_path.clone(),
+    });
 
     let proceed = if yes || no_prompt || !std::io::stdin().is_terminal() {
         true
     } else {
         Confirm::new()
-            .with_prompt("Proceed?")
+            .with_prompt(UserMessage::ConfirmProceed.localized())
             .default(true)
             .interact()
             .context("failed to read confirmation")?
     };
 
     if !proceed {
-        println!("Skipped {pam_path}.");
+        Terminal.info(&UserMessage::PamSkippedFile {
+            path: pam_path.clone(),
+        });
         return Ok(());
     }
 
     // 4b. Create backup (always, before any modification)
     fs::copy(pam_file, &backup_path)
         .with_context(|| format!("failed to back up {pam_path} to {backup_path}"))?;
-    println!("Backed up {pam_path} -> {backup_path}");
+    Terminal.info(&UserMessage::PamBackedUp {
+        path: pam_path.clone(),
+        backup: backup_path.clone(),
+    });
 
     // 5. Prepend PAM line before first auth line
     let mut new_lines: Vec<String> = Vec::new();
@@ -2896,10 +2926,11 @@ fn pam_install_in(base: &Path, service: &str, yes: bool, no_prompt: bool) -> any
 
     fs::write(pam_file, &output).with_context(|| format!("failed to write {pam_path}"))?;
 
-    println!("Installed facelock PAM line into {pam_path}");
-    println!("\nTo rollback:");
-    println!("  sudo cp {backup_path} {pam_path}");
-    println!("  # or: sudo facelock setup --pam --remove --service {service}");
+    Terminal.info(&UserMessage::PamInstalled {
+        path: pam_path.clone(),
+        backup: backup_path.clone(),
+        service: service.to_string(),
+    });
 
     Ok(())
 }
@@ -2922,7 +2953,9 @@ fn pam_remove(service: &str) -> anyhow::Result<()> {
         .collect();
 
     if new_lines.len() == original_count {
-        println!("No facelock PAM line found in {pam_path}. Nothing to remove.");
+        Terminal.info(&UserMessage::PamNoLineFound {
+            path: pam_path.clone(),
+        });
     } else {
         let mut output = new_lines.join("\n");
         if content.ends_with('\n') {
@@ -2930,14 +2963,18 @@ fn pam_remove(service: &str) -> anyhow::Result<()> {
         }
 
         fs::write(pam_file, &output).with_context(|| format!("failed to write {pam_path}"))?;
-        println!("Removed facelock PAM line from {pam_path}");
+        Terminal.info(&UserMessage::PamRemoved {
+            path: pam_path.clone(),
+        });
     }
 
     // Offer backup restore
     let backup_path = format!("{pam_path}.facelock-backup");
     if Path::new(&backup_path).exists() {
-        println!("Backup exists at {backup_path}");
-        println!("To restore: sudo cp {backup_path} {pam_path}");
+        Terminal.info(&UserMessage::PamBackupExists {
+            path: pam_path.clone(),
+            backup: backup_path.clone(),
+        });
     }
 
     Ok(())
