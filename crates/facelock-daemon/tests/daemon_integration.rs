@@ -855,15 +855,10 @@ fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
     }
 
     // Corrupt the schema so only `list_models` fails (see doc comment). The
-    // migrations' unconditional `CREATE TABLE IF NOT EXISTS` no-ops on the
-    // still-present table, and the V5 migration that would re-add the column
-    // is gated behind a schema version this database is already past, so the
-    // handler's own connection opens cleanly.
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("ALTER TABLE face_models DROP COLUMN embedder_model;")
-            .unwrap();
-    }
+    // injection — and the migration gating that keeps the handler's own
+    // re-open from healing it — lives in `facelock_test_support::
+    // schema_faults`, shared with facelock-cli's keygen-guard test.
+    facelock_test_support::schema_faults::drop_embedder_model_column(&db_path);
 
     let factory: MockCameraFactory = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
 

@@ -1082,7 +1082,6 @@ dependencies = [
  "image",
  "libc",
  "nix",
- "rusqlite",
  "serde",
  "serde_json",
  "signal-hook",
