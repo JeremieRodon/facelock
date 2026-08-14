@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use facelock_core::config::{Config, EncryptionMethod};
 use facelock_core::ipc::{DaemonRequest, DaemonResponse, PreviewFace};
 use facelock_core::traits::{CameraSource, FaceProcessor};
-use facelock_core::types::best_match;
+use facelock_core::types::{best_match, zeroize_stored_embeddings};
 use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
@@ -377,7 +377,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
 
                 // Pre-load and decrypt embeddings (handles TPM + software encryption)
-                let stored = match self.load_user_embeddings(&user) {
+                let mut stored = match self.load_user_embeddings(&user) {
                     Ok(s) => s,
                     Err(resp) => return resp,
                 };
@@ -396,6 +396,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     &self.device_fingerprint,
                     AuditSource::Daemon,
                 );
+                // `authenticate_with_embeddings` works on an internal copy;
+                // wipe the caller-side plaintext set too (#100).
+                zeroize_stored_embeddings(&mut stored);
                 self.camera = Some(camera);
                 self.camera_last_used = Instant::now();
                 // Only failed auths count against the rate limit

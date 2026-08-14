@@ -1141,6 +1141,7 @@ dependencies = [
  "facelock-daemon",
  "facelock-face",
  "facelock-store",
+ "facelock-test-support",
  "facelock-tpm",
  "futures-util",
  "image",
