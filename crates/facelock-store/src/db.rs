@@ -19,9 +19,89 @@ fn map_err(e: rusqlite::Error) -> FacelockError {
 }
 
 impl FaceStore {
-    /// Open database at the given path, enable WAL mode and foreign keys, run migrations.
-    pub fn open(db_path: &Path) -> Result<Self> {
+    /// Open an **existing** database read-write; never creates one.
+    ///
+    /// This is the constructor almost every caller wants. `SQLITE_OPEN_CREATE`
+    /// is deliberately absent, because creating on open is not a harmless
+    /// convenience here: a command that merely *reads* (list, remove, clear,
+    /// status) pointed at a typo'd or wrong path would materialise an empty
+    /// database there and then report "nothing enrolled" — a silent lie about
+    /// a store of biometric templates. A missing database must be an error the
+    /// caller sees.
+    ///
+    /// Errors when the file is missing, unreadable, or not a SQLite database.
+    /// The error type does not yet distinguish those cases — use
+    /// [`FaceStore::database_exists`] first when the caller needs to tell
+    /// "fresh install" apart from "cannot read".
+    ///
+    /// **Migrations do run.** Not creating and not migrating are separate
+    /// concerns: a database that is *present* but on an older schema still has
+    /// to be brought forward, or every query touching a newer column fails.
+    /// The connection is read-write, so migrating is exactly as safe as it is
+    /// under [`FaceStore::create`].
+    pub fn open_existing(db_path: &Path) -> Result<Self> {
+        // The flags below are what actually guarantee no file is created; this
+        // check only exists so the common case reports "no database" instead of
+        // SQLite's undifferentiated "unable to open database file".
+        if !Self::database_exists(db_path) {
+            return Err(FacelockError::Storage(format!(
+                "no database at {}",
+                db_path.display()
+            )));
+        }
+
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            // No CREATE, and no URI handling either: a path is a path, never a
+            // `file:` URI with query parameters.
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
+            FacelockError::Storage(format!("failed to open {}: {e}", db_path.display()))
+        })?;
+
+        Self::init(conn, db_path)
+    }
+
+    /// Create the database if absent, then open it read-write.
+    ///
+    /// Only enrollment and setup legitimately need this: they are the flows
+    /// that are *supposed* to bring a database into existence. Everything else
+    /// should use [`FaceStore::open_existing`] — see its docs for why creating
+    /// as a side effect of reading strands a user's templates.
+    pub fn create(db_path: &Path) -> Result<Self> {
+        // `Connection::open` implies SQLITE_OPEN_CREATE.
         let conn = rusqlite::Connection::open(db_path).map_err(map_err)?;
+        Self::init(conn, db_path)
+    }
+
+    /// Create-or-open, as this constructor has always behaved.
+    ///
+    /// Kept working for callers that have not yet been split, but every use is
+    /// a decision that was never made: pick [`FaceStore::open_existing`] if the
+    /// database is expected to be there, [`FaceStore::create`] if this flow is
+    /// the one that brings it into being.
+    #[deprecated(
+        note = "ambiguous: use FaceStore::open_existing to read an existing database, or FaceStore::create when this flow is meant to create one"
+    )]
+    pub fn open(db_path: &Path) -> Result<Self> {
+        Self::create(db_path)
+    }
+
+    /// Whether a database file is present at this path.
+    ///
+    /// A cheap `stat`, no connection opened and no schema inspected — enough to
+    /// tell "fresh install" from "cannot read" before calling
+    /// [`FaceStore::open_existing`], which cannot express that difference in
+    /// its error type today.
+    pub fn database_exists(db_path: &Path) -> bool {
+        db_path.is_file()
+    }
+
+    /// Shared tail of [`FaceStore::open_existing`] and [`FaceStore::create`]:
+    /// WAL, foreign keys, migrations, restrictive file modes. Only the flags
+    /// used to obtain `conn` differ between them.
+    fn init(conn: rusqlite::Connection, db_path: &Path) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .map_err(map_err)?;
         run_migrations(&conn)?;
@@ -31,6 +111,10 @@ impl FaceStore {
 
     /// Open database in read-only mode for authentication queries.
     /// Does not enable WAL or run migrations (avoids needing write access).
+    ///
+    /// Like [`FaceStore::open_existing`], this omits `SQLITE_OPEN_CREATE` and
+    /// so never brings a database into existence; it differs in giving up write
+    /// access entirely, which is why it also cannot migrate.
     pub fn open_readonly(db_path: &Path) -> Result<Self> {
         let conn = rusqlite::Connection::open_with_flags(
             db_path,
@@ -201,6 +285,27 @@ impl FaceStore {
                     device_id: row.get::<_, Option<String>>(5)?,
                 })
             })
+            .map_err(map_err)?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(map_err)?);
+        }
+        Ok(results)
+    }
+
+    /// List every distinct user that has at least one stored model.
+    ///
+    /// Used to rebuild per-user enrollment markers from the authoritative
+    /// database (`facelock setup` reconcile).
+    pub fn list_users(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT user FROM face_models ORDER BY user")
+            .map_err(map_err)?;
+
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(map_err)?;
 
         let mut results = Vec::new();
@@ -558,7 +663,7 @@ fn secure_database_files(db_path: &Path) -> Result<()> {
         sqlite_sidecar_path(db_path, "-wal"),
         sqlite_sidecar_path(db_path, "-shm"),
     ] {
-        ensure_mode(&path, 0o640).map_err(|e| {
+        ensure_mode(&path, 0o600).map_err(|e| {
             FacelockError::Storage(format!(
                 "failed to secure database file {}: {e}",
                 path.display()
@@ -664,6 +769,23 @@ mod tests {
         store.clear_user("alice").unwrap();
         assert!(!store.has_models("alice").unwrap());
         assert!(store.has_models("bob").unwrap());
+    }
+
+    #[test]
+    fn test_list_users() {
+        let store = FaceStore::open_memory().unwrap();
+        assert!(store.list_users().unwrap().is_empty());
+
+        let emb = test_embedding();
+        store.add_model("bob", "front", &emb, "").unwrap();
+        store.add_model("alice", "front", &emb, "").unwrap();
+        store.add_model("alice", "side", &emb, "").unwrap();
+
+        // Distinct and sorted — alice appears once despite two models.
+        assert_eq!(store.list_users().unwrap(), vec!["alice", "bob"]);
+
+        store.clear_user("alice").unwrap();
+        assert_eq!(store.list_users().unwrap(), vec!["bob"]);
     }
 
     #[test]
@@ -947,11 +1069,11 @@ mod tests {
                 .as_nanos()
         ));
 
-        let store = FaceStore::open(&db_path).unwrap();
+        let store = FaceStore::create(&db_path).unwrap();
         store.record_auth_attempt("alice").unwrap();
         drop(store);
 
-        let reopened = FaceStore::open(&db_path).unwrap();
+        let reopened = FaceStore::open_existing(&db_path).unwrap();
         assert!(!reopened.check_rate_limit("alice", 1, 60).unwrap());
 
         let _ = std::fs::remove_file(&db_path);
@@ -993,7 +1115,7 @@ mod tests {
 
         for path in [&db_path, &wal_path, &shm_path] {
             let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o640, "unexpected mode for {}", path.display());
+            assert_eq!(mode, 0o600, "unexpected mode for {}", path.display());
         }
 
         let _ = std::fs::remove_file(&db_path);
@@ -1094,8 +1216,10 @@ mod tests {
             .unwrap();
         }
 
-        // Reopen: migrations run, adding device_id.
-        let store = FaceStore::open(&db_path).unwrap();
+        // Reopen: migrations run, adding device_id. Via `open_existing`
+        // specifically — a present-but-old database is exactly the case that
+        // constructor must still migrate.
+        let store = FaceStore::open_existing(&db_path).unwrap();
         let models = store.list_models("legacy").unwrap();
         assert_eq!(models.len(), 1, "legacy model must survive migration");
         assert_eq!(models[0].label, "old-face");
@@ -1114,6 +1238,95 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(sqlite_sidecar_path(&db_path, "-wal"));
         let _ = std::fs::remove_file(sqlite_sidecar_path(&db_path, "-shm"));
+    }
+
+    /// The whole point of the constructor split: a read path run against an
+    /// install that has no database yet must leave the path empty and report
+    /// the absence, never manufacture an empty database there.
+    #[test]
+    fn open_existing_on_a_missing_path_errors_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("facelock.db");
+
+        assert!(FaceStore::open_existing(&missing).is_err());
+        assert!(
+            !missing.exists(),
+            "open_existing must not create the database it failed to find"
+        );
+    }
+
+    /// A failed `open_existing` must not leave WAL/SHM sidecars behind either —
+    /// their presence is enough to make a path look occupied.
+    #[test]
+    fn open_existing_on_a_missing_path_creates_no_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("facelock.db");
+
+        assert!(FaceStore::open_existing(&missing).is_err());
+
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(&missing, suffix);
+            assert!(
+                !sidecar.exists(),
+                "{} must not exist after a failed open",
+                sidecar.display()
+            );
+        }
+        // And nothing else appeared in the directory under another name.
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn open_existing_reads_a_real_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("facelock.db");
+
+        let created = FaceStore::create(&db).unwrap();
+        created
+            .add_model("alice", "front", &test_embedding(), "w600k_r50.onnx")
+            .unwrap();
+        drop(created);
+
+        let store = FaceStore::open_existing(&db).unwrap();
+        let models = store.list_models("alice").unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].label, "front");
+        assert_eq!(store.get_user_embeddings("alice").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_makes_a_database_at_a_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("facelock.db");
+        assert!(!db.exists());
+
+        let store = FaceStore::create(&db).unwrap();
+        assert!(
+            db.is_file(),
+            "create must bring the database into existence"
+        );
+        // Usable, not just present.
+        store
+            .add_model("alice", "front", &test_embedding(), "")
+            .unwrap();
+        assert!(store.has_models("alice").unwrap());
+    }
+
+    #[test]
+    fn database_exists_reports_presence_without_creating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("facelock.db");
+
+        assert!(!FaceStore::database_exists(&db));
+        assert!(!db.exists(), "the probe itself must not create anything");
+
+        drop(FaceStore::create(&db).unwrap());
+        assert!(FaceStore::database_exists(&db));
+
+        // A directory at the path is not a database.
+        let dir = tmp.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!FaceStore::database_exists(&dir));
     }
 
     #[test]

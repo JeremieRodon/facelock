@@ -118,8 +118,8 @@ fn cmd_cold_auth() -> Result<()> {
     let mut camera = open_camera(&config)?;
 
     // Open store
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
 
     let embeddings = direct::load_user_embeddings(&store, &config, &user)?;
     if embeddings.is_empty() {
@@ -181,8 +181,8 @@ fn cmd_warm_auth() -> Result<()> {
     // Pre-load everything
     let mut engine = load_engine(&config)?;
     let mut camera = open_camera(&config)?;
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
 
     let embeddings = direct::load_user_embeddings(&store, &config, &user)?;
     if embeddings.is_empty() {
@@ -373,8 +373,8 @@ fn cmd_calibrate() -> Result<()> {
 
     let mut engine = load_engine(&config)?;
     let mut camera = open_camera(&config)?;
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
 
     let enrolled = direct::load_user_embeddings(&store, &config, &user)?;
     if enrolled.is_empty() {
@@ -553,8 +553,8 @@ fn cmd_report() -> Result<()> {
     };
 
     // Warm auth benchmark
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
     let embeddings = direct::load_user_embeddings(&store, &config, &user)?;
     let has_enrolled = !embeddings.is_empty();
 

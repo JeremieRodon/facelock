@@ -58,6 +58,8 @@ That's it. Open a new terminal and run `sudo echo "ok"` to confirm face auth fir
 
 To re-run individual steps later: `sudo facelock enroll`, `sudo facelock test`, `sudo facelock setup --systemd`, `sudo facelock setup --pam`.
 
+Every wizard step can also be answered or declined from the command line — `--camera`, `--models`, `--execution-provider`, `--encryption` to supply a value, and `--no-pam` / `--no-systemd` / `--no-enroll` to decline an action outright. See the [CLI reference](book/src/cli-reference.md#facelock-setup) for the full flag surface.
+
 ### GPU Acceleration (Optional)
 
 GPU support is runtime-only -- no special build flags needed. Install a GPU-enabled ONNX Runtime package for your hardware and set `execution_provider` in `/etc/facelock/config.toml`:
@@ -92,6 +94,7 @@ The CLI works in all modes — it connects to the daemon if available, otherwise
 
 ```
 facelock setup          Download models, install systemd/PAM
+facelock is-enrolled    Is this user enrolled? (exit 0/1/2)
 facelock enroll         Capture and store a face
 facelock test           Test recognition
 facelock list           List enrolled models
@@ -110,6 +113,18 @@ facelock decrypt        Decrypt stored embeddings
 facelock restart        Restart daemon
 facelock audit          View structured audit log
 ```
+
+### For integrators
+
+`facelock is-enrolled` answers "does this user have a usable enrollment?" as an exit code — `0` yes, `1` no, `2` error, the same convention as `grep` — so a lock screen can decide whether to offer a face-auth affordance without parsing anything:
+
+```bash
+facelock is-enrolled --quiet && show_face_indicator
+```
+
+It is named after systemd's `is-*` family (`systemctl is-active --quiet`), and like those it prints the state word — `enrolled` or `not-enrolled` — when not quiet.
+
+It is cheap and safe to call repeatedly: no daemon activation, no camera, no database access. It answers "enrolled" only when face auth is actually operational for the caller — which includes `facelock` group membership; a caller outside the group reports `not-enrolled` rather than erroring. The marker it reads is a hint for the UI — PAM at auth time remains authoritative. See the [CLI reference](book/src/cli-reference.md#facelock-is-enrolled).
 
 ## Architecture
 

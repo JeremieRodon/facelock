@@ -1,10 +1,34 @@
 # Runtime directory for facelock daemon
 d /run/facelock 0755 root facelock -
 
-# Data directory (biometric data - restricted)
-d /var/lib/facelock 0750 root facelock -
+# State directory (biometric data - restricted).
+# 0710 root:facelock = traverse-only for the facelock group, nothing for
+# anyone else. A group member can open a path it knows by name — its own
+# enrolled/<user> marker, a model file — but cannot list the directory, and
+# users outside the group cannot reach anything below this point at all.
+# Parent must come before its children.
+d /var/lib/facelock 0710 root facelock -
+
+# ONNX models. Public downloads, SHA256-verified at load; the 0710 parent is
+# what keeps non-group users out.
 d /var/lib/facelock/models 0755 root root -
 
-# Log directory (auth snapshots - restricted)
-d /var/log/facelock 0750 root facelock -
-d /var/log/facelock/snapshots 0750 root facelock -
+# Enrollment markers for `facelock is-enrolled`, and nothing else.
+# 0710 root:facelock: a group member can open its own 0600 marker by name but
+# cannot enumerate who else is enrolled.
+d /var/lib/facelock/enrolled 0710 root facelock -
+
+# The database and its WAL sidecars hold encrypted biometric templates and are
+# read by the daemon (root) only. `z` adjusts an existing file and never
+# creates one, so these are no-ops on a fresh install and tighten an upgraded
+# one (pre-0710 layouts shipped the database group-readable at 0640).
+z /var/lib/facelock/facelock.db 0600 root root -
+z /var/lib/facelock/facelock.db-wal 0600 root root -
+z /var/lib/facelock/facelock.db-shm 0600 root root -
+
+# Log directory. The audit log holds per-user auth history and snapshots hold
+# raw face images — both root-only, strictly more sensitive than the encrypted
+# templates.
+d /var/log/facelock 0700 root root -
+d /var/log/facelock/snapshots 0700 root root -
+z /var/log/facelock/audit.jsonl 0600 root root -

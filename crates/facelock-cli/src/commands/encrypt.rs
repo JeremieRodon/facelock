@@ -98,7 +98,10 @@ pub fn run_encrypt(generate_key: bool) -> Result<()> {
 
     let sealer = obtain_sealer(&config).context("failed to obtain encryption sealer")?;
 
-    let store = FaceStore::open(Path::new(&config.storage.db_path))
+    // `open_existing`, never `create`: nothing to encrypt or decrypt means a
+    // missing database is an error to report, not a file to bring into being
+    // at whatever path a typo'd config names.
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("failed to open face database")?;
 
     let all = store
@@ -145,7 +148,10 @@ pub fn run_decrypt() -> Result<()> {
     crate::ipc_client::require_root("sudo facelock decrypt")?;
     let config = Config::load()?;
 
-    let store = FaceStore::open(Path::new(&config.storage.db_path))
+    // `open_existing`, never `create`: nothing to encrypt or decrypt means a
+    // missing database is an error to report, not a file to bring into being
+    // at whatever path a typo'd config names.
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("failed to open face database")?;
 
     let all = store

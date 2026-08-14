@@ -183,10 +183,13 @@ sudo usermod -aG facelock $USER
 
 The SQLite database requires specific permissions:
 ```bash
-sudo chown root:facelock /var/lib/facelock/facelock.db
-sudo chmod 640 /var/lib/facelock/facelock.db
-# The directory needs group write for SQLite WAL files:
-sudo chmod 770 /var/lib/facelock
+sudo chown root:root /var/lib/facelock/facelock.db
+sudo chmod 600 /var/lib/facelock/facelock.db
+# The daemon (root) writes the -wal/-shm sidecars next to the database; the
+# state directory itself ships at 710 root:facelock (traverse-only for the
+# group, nothing for anyone else):
+sudo chown root:facelock /var/lib/facelock
+sudo chmod 710 /var/lib/facelock
 ```
 
 ### PAM module cannot reach daemon

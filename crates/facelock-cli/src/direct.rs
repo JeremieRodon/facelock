@@ -19,8 +19,24 @@ use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
 use tracing::debug;
 
+/// Open the face database, applying the state-directory layout first.
+///
+/// This is the single choke point for every direct-mode store access —
+/// `enroll`, `list`, `remove`, `clear`, `test`, `preview` and the marker
+/// refresh all arrive here — which is why the layout hook lives at this layer
+/// rather than being repeated at each command. `daemon`, `auth` and `setup`
+/// keep their own explicit calls: they are cheap, and they document that those
+/// three must not depend on some later store access to fix the modes for them.
+///
+/// A layout failure only means modes could not be set — it cannot change what
+/// is read — so it is logged rather than blocking the caller; unprivileged
+/// callers hit it constantly.
 pub fn open_store(config: &Config) -> anyhow::Result<FaceStore> {
-    FaceStore::open(Path::new(&config.storage.db_path)).context("failed to open database")
+    crate::state_layout::ensure_state_layout_best_effort(config);
+
+    // `create`: first-time `enroll` legitimately brings the database into
+    // being here.
+    FaceStore::create(Path::new(&config.storage.db_path)).context("failed to open database")
 }
 
 #[derive(Clone)]

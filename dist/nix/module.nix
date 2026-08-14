@@ -101,12 +101,25 @@ in
     };
 
     # tmpfiles rules
+    # Must match dist/facelock.tmpfiles.
     systemd.tmpfiles.rules = [
       "d /run/facelock 0755 root facelock -"
-      "d /var/lib/facelock 0750 root facelock -"
+      # 0710 root:facelock = traverse-only for the facelock group, nothing
+      # for anyone else. Parent must come before its children.
+      "d /var/lib/facelock 0710 root facelock -"
+      # Public, SHA256-verified downloads; the 0710 parent is the gate.
       "d /var/lib/facelock/models 0755 root root -"
-      "d /var/log/facelock 0750 root facelock -"
-      "d /var/log/facelock/snapshots 0750 root facelock -"
+      # Markers only: a group member can open its own 0600 marker by name but
+      # cannot enumerate who else is enrolled.
+      "d /var/lib/facelock/enrolled 0710 root facelock -"
+      # Encrypted biometric templates: root-only. `z` never creates.
+      "z /var/lib/facelock/facelock.db 0600 root root -"
+      "z /var/lib/facelock/facelock.db-wal 0600 root root -"
+      "z /var/lib/facelock/facelock.db-shm 0600 root root -"
+      # Per-user auth history and raw face snapshots: root-only.
+      "d /var/log/facelock 0700 root root -"
+      "d /var/log/facelock/snapshots 0700 root root -"
+      "z /var/log/facelock/audit.jsonl 0600 root root -"
     ];
   };
 }

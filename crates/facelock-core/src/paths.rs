@@ -90,6 +90,7 @@ pub fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
 
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -143,6 +144,16 @@ mod tests {
         assert!(is_privileged_effective_uid(None));
         assert!(is_privileged_effective_uid(Some(0)));
         assert!(!is_privileged_effective_uid(Some(1000)));
+    }
+
+    /// The database and models sit directly in the state directory. Pinned
+    /// because the enrollment-marker directory is derived by walking *up* from
+    /// `db_path`, and a change here silently moves the markers.
+    #[test]
+    fn state_paths_sit_directly_in_the_state_directory() {
+        let state_dir = Path::new("/var/lib/facelock");
+        assert_eq!(PathBuf::from(DEFAULT_DB_PATH).parent(), Some(state_dir));
+        assert_eq!(PathBuf::from(DEFAULT_MODEL_DIR).parent(), Some(state_dir));
     }
 
     #[test]
