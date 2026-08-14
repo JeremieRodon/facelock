@@ -9,11 +9,12 @@ use anyhow::{Context, bail};
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{Camera, ResolvedCamera, auto_detect_device, list_devices, validate_device};
 use facelock_core::config::{Config, EncryptionMethod};
-use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{MatchResult, zeroize_stored_embeddings};
 use facelock_daemon::audit::AuditSource;
+use facelock_daemon::auth::AuthOutcome;
 use facelock_daemon::auth::{PreCheckContext, pre_check_audited_with_context};
+use facelock_daemon::enroll::EnrollOutcome;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::{FaceStore, StoreError};
@@ -139,18 +140,17 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         PreCheckContext::test(),
     ) {
         return match resp {
-            DaemonResponse::AuthResult(mr) => Ok(mr),
+            AuthOutcome::AuthResult(mr) => Ok(mr),
             // `suppress_unknown` short-circuit: no result to report, same as
             // the plain not-enrolled case below from `test`'s point of view.
-            DaemonResponse::Suppressed => Ok(MatchResult {
+            AuthOutcome::Suppressed => Ok(MatchResult {
                 matched: false,
                 model_id: None,
                 label: None,
                 similarity: 0.0,
                 failure_reason: None,
             }),
-            DaemonResponse::Error { message } => bail!("{message}"),
-            _ => bail!("unexpected pre-check response"),
+            AuthOutcome::Error { message } => bail!("{message}"),
         };
     }
 
@@ -179,9 +179,9 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
     );
 
     match response {
-        DaemonResponse::AuthResult(result) => Ok(result),
-        DaemonResponse::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected auth response"),
+        AuthOutcome::AuthResult(result) => Ok(result),
+        AuthOutcome::Error { message } => bail!("{message}"),
+        AuthOutcome::Suppressed => bail!("unexpected auth response"),
     }
 }
 
@@ -197,7 +197,7 @@ pub fn authenticate_and_wipe<C: CameraSource, E: FaceProcessor>(
     config: &Config,
     user: &str,
     source: AuditSource,
-) -> DaemonResponse {
+) -> AuthOutcome {
     let response = facelock_daemon::auth::authenticate_with_embeddings(
         camera, engine, stored, models, config, user, source,
     );
@@ -318,12 +318,11 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
     );
 
     match response {
-        DaemonResponse::Enrolled {
+        EnrollOutcome::Enrolled {
             model_id,
             embedding_count,
         } => Ok((model_id, embedding_count)),
-        DaemonResponse::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected enroll response"),
+        EnrollOutcome::Error { message } => bail!("{message}"),
     }
 }
 
@@ -559,7 +558,7 @@ abort_if_lid_closed = false
         assert!(
             matches!(
                 response,
-                DaemonResponse::AuthResult(MatchResult { matched: true, .. })
+                AuthOutcome::AuthResult(MatchResult { matched: true, .. })
             ),
             "auth loop must run to completion: {response:?}"
         );

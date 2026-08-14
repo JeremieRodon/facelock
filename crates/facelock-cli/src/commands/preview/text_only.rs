@@ -3,8 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
-
 use crate::ipc_client;
 
 /// Run the text-only preview mode.
@@ -26,95 +24,55 @@ pub fn run(user: &str) -> anyhow::Result<()> {
     let stdout = std::io::stdout();
 
     while !stop.load(Ordering::Relaxed) {
-        let response = match ipc_client::send_request(&DaemonRequest::PreviewDetectFrame {
-            user: user.to_string(),
-        }) {
-            Ok(r) => r,
+        // A daemon-side failure arrives as a transport error (the server
+        // replies with a D-Bus error, never an in-band error for previews).
+        let (jpeg_data, faces) = match ipc_client::preview_detect_frame(user) {
+            Ok(frame) => frame,
             Err(e) => {
                 eprintln!("{e:#}");
                 break;
             }
         };
 
-        match response {
-            DaemonResponse::DetectFrame { jpeg_data, faces } => {
-                frame_count += 1;
-                fps_frame_count += 1;
+        frame_count += 1;
+        fps_frame_count += 1;
 
-                let now = Instant::now();
-                let elapsed = now.duration_since(last_fps_time).as_secs_f32();
-                if elapsed >= 1.0 {
-                    current_fps = fps_frame_count as f32 / elapsed;
-                    fps_frame_count = 0;
-                    last_fps_time = now;
-                }
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_fps_time).as_secs_f32();
+        if elapsed >= 1.0 {
+            current_fps = fps_frame_count as f32 / elapsed;
+            fps_frame_count = 0;
+            last_fps_time = now;
+        }
 
-                let (width, height) = jpeg_dimensions(&jpeg_data);
-                let recognized = faces.iter().filter(|f| f.recognized).count();
-                let unrecognized = faces.len() - recognized;
+        let (width, height) = jpeg_dimensions(&jpeg_data);
+        let recognized = faces.iter().filter(|f| f.recognized).count();
+        let unrecognized = faces.len() - recognized;
 
-                let output = serde_json::json!({
-                    "frame": frame_count,
-                    "fps": (current_fps * 10.0).round() / 10.0,
-                    "jpeg_size": jpeg_data.len(),
-                    "width": width,
-                    "height": height,
-                    "recognized": recognized,
-                    "unrecognized": unrecognized,
-                    "faces": faces.iter().map(|f| serde_json::json!({
-                        "x": f.x, "y": f.y,
-                        "width": f.width, "height": f.height,
-                        "confidence": (f.confidence * 1000.0).round() / 1000.0,
-                        "similarity": (f.similarity * 1000.0).round() / 1000.0,
-                        "recognized": f.recognized,
-                    })).collect::<Vec<_>>(),
-                });
+        let output = serde_json::json!({
+            "frame": frame_count,
+            "fps": (current_fps * 10.0).round() / 10.0,
+            "jpeg_size": jpeg_data.len(),
+            "width": width,
+            "height": height,
+            "recognized": recognized,
+            "unrecognized": unrecognized,
+            "faces": faces.iter().map(|f| serde_json::json!({
+                "x": f.x, "y": f.y,
+                "width": f.width, "height": f.height,
+                "confidence": (f.confidence * 1000.0).round() / 1000.0,
+                "similarity": (f.similarity * 1000.0).round() / 1000.0,
+                "recognized": f.recognized,
+            })).collect::<Vec<_>>(),
+        });
 
-                let mut handle = stdout.lock();
-                if writeln!(handle, "{output}").is_err() {
-                    break;
-                }
-            }
-            DaemonResponse::Frame { jpeg_data } => {
-                frame_count += 1;
-                fps_frame_count += 1;
-
-                let now = Instant::now();
-                let elapsed = now.duration_since(last_fps_time).as_secs_f32();
-                if elapsed >= 1.0 {
-                    current_fps = fps_frame_count as f32 / elapsed;
-                    fps_frame_count = 0;
-                    last_fps_time = now;
-                }
-
-                let (width, height) = jpeg_dimensions(&jpeg_data);
-                let output = serde_json::json!({
-                    "frame": frame_count,
-                    "fps": (current_fps * 10.0).round() / 10.0,
-                    "jpeg_size": jpeg_data.len(),
-                    "width": width,
-                    "height": height,
-                    "recognized": 0,
-                    "unrecognized": 0,
-                    "faces": [],
-                });
-
-                let mut handle = stdout.lock();
-                if writeln!(handle, "{output}").is_err() {
-                    break;
-                }
-            }
-            DaemonResponse::Error { message } => {
-                let _ = ipc_client::send_request(&DaemonRequest::ReleaseCamera);
-                anyhow::bail!("daemon error: {message}");
-            }
-            other => {
-                tracing::warn!("unexpected response from daemon: {other:?}");
-            }
+        let mut handle = stdout.lock();
+        if writeln!(handle, "{output}").is_err() {
+            break;
         }
     }
 
-    let _ = ipc_client::send_request(&DaemonRequest::ReleaseCamera);
+    let _ = ipc_client::release_camera();
     let _ = start;
     Ok(())
 }

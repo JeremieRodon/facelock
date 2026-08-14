@@ -7,11 +7,11 @@ use std::path::Path;
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{Camera, ResolvedCamera, auto_detect_device, validate_device};
 use facelock_core::config::Config;
-use facelock_core::ipc::DaemonResponse;
 use facelock_core::types::CameraCaps;
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::{self, AuditEntry, AuditSource};
 use facelock_daemon::auth;
+use facelock_daemon::auth::AuthOutcome;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
@@ -189,7 +189,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
 
     if matches!(
         response,
-        DaemonResponse::AuthResult(MatchResult { matched: false, .. })
+        AuthOutcome::AuthResult(MatchResult { matched: false, .. })
     ) {
         if let Err(e) = rate_limiter.record_failure(&store, &user) {
             error!("rate limit record: {e}");
@@ -197,7 +197,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     }
 
     match response {
-        DaemonResponse::AuthResult(MatchResult {
+        AuthOutcome::AuthResult(MatchResult {
             matched: true,
             similarity,
             ..
@@ -205,7 +205,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             info!(user = %user, similarity = format!("{similarity:.4}"), "authenticated");
             0
         }
-        DaemonResponse::AuthResult(MatchResult {
+        AuthOutcome::AuthResult(MatchResult {
             matched: false,
             similarity,
             failure_reason,
@@ -221,11 +221,11 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             );
             1
         }
-        DaemonResponse::Error { message } if message.contains("all frames dark") => {
+        AuthOutcome::Error { message } if message.contains("all frames dark") => {
             info!(user = %user, "all frames dark");
             1
         }
-        DaemonResponse::Error { message } => {
+        AuthOutcome::Error { message } => {
             // Errors from authenticate() that aren't "all frames dark" are storage errors
             // which happen before the auth loop — audit those here.
             audit::write_audit_entry(
@@ -256,9 +256,9 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use facelock_core::config::Config;
-    use facelock_core::ipc::DaemonResponse;
     use facelock_core::types::MatchResult;
     use facelock_daemon::audit::AuditSource;
+    use facelock_daemon::auth::AuthOutcome;
     use facelock_daemon::auth::pre_check_audited;
     use facelock_daemon::rate_limit::RateLimiter;
     use facelock_store::FaceStore;
@@ -337,7 +337,7 @@ path = "{audit_path}"
         )
         .expect("rate-limited user must short-circuit");
         assert!(
-            matches!(resp, DaemonResponse::Error { ref message } if message.contains("rate limited")),
+            matches!(resp, AuthOutcome::Error { ref message } if message.contains("rate limited")),
             "expected rate-limited error, got {resp:?}"
         );
 
@@ -367,7 +367,7 @@ path = "{audit_path}"
             AuditSource::Oneshot,
         )
         .expect("un-enrolled user must short-circuit");
-        assert!(matches!(resp, DaemonResponse::Suppressed));
+        assert!(matches!(resp, AuthOutcome::Suppressed));
 
         let lines = audit_lines(&audit_path);
         assert_eq!(lines.len(), 1);
@@ -396,7 +396,7 @@ path = "{audit_path}"
         .expect("un-enrolled user must short-circuit");
         assert!(matches!(
             resp,
-            DaemonResponse::AuthResult(MatchResult { matched: false, .. })
+            AuthOutcome::AuthResult(MatchResult { matched: false, .. })
         ));
 
         let lines = audit_lines(&audit_path);

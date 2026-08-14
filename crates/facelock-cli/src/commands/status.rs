@@ -2,7 +2,6 @@ use std::path::Path;
 
 use facelock_core::Config;
 use facelock_core::config::EncryptionMethod;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
 use crate::ipc_client;
 
@@ -86,13 +85,9 @@ fn check_daemon(config: Option<&Config>) {
 
     // Try to ping — this may trigger D-Bus activation if the daemon
     // isn't running yet but activation is configured.
-    let request = DaemonRequest::Ping;
-    match ipc_client::send_request(&request) {
-        Ok(DaemonResponse::Ok) => {
+    match ipc_client::ping() {
+        Ok(()) => {
             print_result(true, "responding");
-        }
-        Ok(_) => {
-            print_result(true, "connected (unexpected response)");
         }
         Err(e) => {
             print_result(false, &format!("not responding: {e}"));

@@ -5,7 +5,6 @@ use facelock_camera::capture::is_dark_with_config;
 use facelock_camera::preprocess::check_ir_texture;
 use facelock_core::config::{Config, SnapshotConfig};
 use facelock_core::fs_security::{ensure_dir, ensure_private_dir, write_file};
-use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{
     AuthFailureReason, CameraCaps, FaceEmbedding, Frame, FrameVarianceWindow, MatchResult,
@@ -19,6 +18,24 @@ use tracing::{debug, info, warn};
 use crate::audit::{self, AuditEntry, AuditSource};
 use crate::liveness::LandmarkTracker;
 use crate::rate_limit::RateLimiter;
+
+/// The outcome of an authentication attempt or its pre-flight gates — the
+/// vocabulary every transport shares. The daemon handler maps it onto its
+/// wire response; the direct path (`facelock test`, oneshot `facelock auth`)
+/// and the D-Bus client consume it as-is, so the CLI never needs the
+/// handler's own request/response enums (D5). The `Error` messages are
+/// protocol-bearing: PAM string-matches "rate limited" and "IR camera
+/// required", so they must flow through every mapping byte-identical.
+#[derive(Debug, Clone)]
+pub enum AuthOutcome {
+    /// The comparison loop ran (or a gate produced a definitive non-match).
+    AuthResult(MatchResult),
+    /// No enrolled models and `suppress_unknown` is enabled.
+    Suppressed,
+    /// A recoverable error (rate limited, IR required, storage/camera
+    /// failure) that must not read as "no match".
+    Error { message: String },
+}
 
 /// Which of [`pre_check`]'s environment gates a caller may skip.
 ///
@@ -67,7 +84,7 @@ pub fn pre_check(
     user: &str,
     rate_limiter: &RateLimiter,
     caps: &CameraCaps,
-) -> Option<DaemonResponse> {
+) -> Option<AuthOutcome> {
     pre_check_with_context(
         config,
         store,
@@ -87,24 +104,24 @@ pub fn pre_check_with_context(
     rate_limiter: &RateLimiter,
     caps: &CameraCaps,
     ctx: PreCheckContext,
-) -> Option<DaemonResponse> {
+) -> Option<AuthOutcome> {
     if config.security.disabled {
         warn!(user, "facelock is disabled");
-        return Some(DaemonResponse::Error {
+        return Some(AuthOutcome::Error {
             message: "facelock is disabled".into(),
         });
     }
 
     if !ctx.skip_ssh_gate && config.security.abort_if_ssh && is_ssh_session() {
         info!(user, "SSH session detected, aborting");
-        return Some(DaemonResponse::Error {
+        return Some(AuthOutcome::Error {
             message: "SSH session detected".into(),
         });
     }
 
     if !ctx.skip_lid_gate && config.security.abort_if_lid_closed && is_lid_closed() {
         info!(user, "lid closed, aborting");
-        return Some(DaemonResponse::Error {
+        return Some(AuthOutcome::Error {
             message: "lid closed".into(),
         });
     }
@@ -112,7 +129,7 @@ pub fn pre_check_with_context(
     let has_models = match store.has_models(user) {
         Ok(v) => v,
         Err(e) => {
-            return Some(DaemonResponse::Error {
+            return Some(AuthOutcome::Error {
                 message: format!("storage error: {e}"),
             });
         }
@@ -123,9 +140,9 @@ pub fn pre_check_with_context(
                 user,
                 "no enrolled models, suppressing (suppress_unknown=true)"
             );
-            return Some(DaemonResponse::Suppressed);
+            return Some(AuthOutcome::Suppressed);
         }
-        return Some(DaemonResponse::AuthResult(MatchResult {
+        return Some(AuthOutcome::AuthResult(MatchResult {
             matched: false,
             model_id: None,
             label: None,
@@ -138,13 +155,13 @@ pub fn pre_check_with_context(
         Ok(true) => {}
         Ok(false) => {
             warn!(user, "rate limited");
-            return Some(DaemonResponse::Error {
+            return Some(AuthOutcome::Error {
                 message: "rate limited".into(),
             });
         }
         Err(e) => {
             warn!(user, error = %e, "rate limit check failed");
-            return Some(DaemonResponse::Error {
+            return Some(AuthOutcome::Error {
                 message: format!("rate limit check failed: {e}"),
             });
         }
@@ -152,7 +169,7 @@ pub fn pre_check_with_context(
 
     if config.security.require_ir && !caps.is_ir {
         warn!(user, "IR camera required but device is not IR");
-        return Some(DaemonResponse::Error {
+        return Some(AuthOutcome::Error {
             message: "IR camera required for authentication. Set security.require_ir = false to override (NOT RECOMMENDED).".into(),
         });
     }
@@ -172,7 +189,7 @@ pub fn pre_check_audited(
     rate_limiter: &RateLimiter,
     caps: &CameraCaps,
     source: AuditSource,
-) -> Option<DaemonResponse> {
+) -> Option<AuthOutcome> {
     pre_check_audited_with_context(
         config,
         store,
@@ -193,15 +210,15 @@ pub fn pre_check_audited_with_context(
     caps: &CameraCaps,
     source: AuditSource,
     ctx: PreCheckContext,
-) -> Option<DaemonResponse> {
+) -> Option<AuthOutcome> {
     let resp = pre_check_with_context(config, store, user, rate_limiter, caps, ctx)?;
     let (result, error) = match &resp {
-        DaemonResponse::Error { message } if message.contains("rate limited") => {
+        AuthOutcome::Error { message } if message.contains("rate limited") => {
             ("rate_limited".to_string(), Some(message.clone()))
         }
-        DaemonResponse::Error { message } => ("error".to_string(), Some(message.clone())),
-        DaemonResponse::AuthResult(mr) if !mr.matched => ("failure".to_string(), None),
-        DaemonResponse::Suppressed => ("suppressed".to_string(), None),
+        AuthOutcome::Error { message } => ("error".to_string(), Some(message.clone())),
+        AuthOutcome::AuthResult(mr) if !mr.matched => ("failure".to_string(), None),
+        AuthOutcome::Suppressed => ("suppressed".to_string(), None),
         _ => ("error".to_string(), None),
     };
     audit::write_audit_entry(
@@ -249,7 +266,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     config: &Config,
     user: &str,
     source: AuditSource,
-) -> DaemonResponse {
+) -> AuthOutcome {
     let mut stored = stored.to_vec();
     let models = models.to_vec();
     authenticate_inner(camera, engine, &mut stored, &models, config, user, source)
@@ -304,7 +321,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     config: &Config,
     user: &str,
     source: AuditSource,
-) -> DaemonResponse {
+) -> AuthOutcome {
     let device_is_ir = camera.capabilities().is_ir;
     let live_fingerprint = camera.capabilities().fingerprint.clone();
     let start = Instant::now();
@@ -529,7 +546,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                     best_model_id.is_none_or(|id| allowed.contains(&id)),
                     "device coupling invariant violated: skipped template reached success"
                 );
-                let response = DaemonResponse::AuthResult(MatchResult {
+                let response = AuthOutcome::AuthResult(MatchResult {
                     matched: true,
                     model_id: best_model_id,
                     label: best_model_id.and_then(&label_for),
@@ -580,7 +597,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
                     save_snapshot(&config.snapshots, user, best_similarity, snap_frame);
                 }
             }
-            let response = DaemonResponse::AuthResult(MatchResult {
+            let response = AuthOutcome::AuthResult(MatchResult {
                 matched: true,
                 model_id: best_model_id,
                 label: best_model_id.and_then(&label_for),
@@ -633,7 +650,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
             },
         );
         // No snapshot for all-dark: last_frame is None since dark frames are skipped
-        return DaemonResponse::Error {
+        return AuthOutcome::Error {
             message: "all frames dark".into(),
         };
     }
@@ -670,7 +687,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
         }
     }
 
-    DaemonResponse::AuthResult(MatchResult {
+    AuthOutcome::AuthResult(MatchResult {
         matched: false,
         model_id: None,
         label: None,
@@ -845,7 +862,7 @@ mod tests {
         }
 
         assert!(
-            matches!(resp, Some(DaemonResponse::Error { ref message }) if message.contains("SSH")),
+            matches!(resp, Some(AuthOutcome::Error { ref message }) if message.contains("SSH")),
             "the default/enforced context must still reject an SSH session, got: {resp:?}"
         );
     }
@@ -875,7 +892,7 @@ mod tests {
         }
 
         assert!(
-            matches!(resp, Some(DaemonResponse::Error { ref message }) if message.contains("SSH")),
+            matches!(resp, Some(AuthOutcome::Error { ref message }) if message.contains("SSH")),
             "pre_check() must stay fully enforced, got: {resp:?}"
         );
     }

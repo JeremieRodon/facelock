@@ -1,10 +1,11 @@
-use anyhow::{Context, bail};
+use anyhow::Context;
 use nix::unistd::Uid;
 use zbus::blocking::Proxy;
 
 use facelock_core::dbus_interface::*;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse, IpcDeviceInfo, PreviewFace};
+use facelock_core::ipc::{IpcDeviceInfo, PreviewFace};
 use facelock_core::types::{FaceModelInfo, MatchResult};
+use facelock_daemon::auth::AuthOutcome;
 
 /// Check if running as root; if not, offer to re-exec via sudo.
 ///
@@ -114,7 +115,7 @@ pub fn send_enroll(
     user: &str,
     label: &str,
     config: &facelock_core::Config,
-) -> anyhow::Result<DaemonResponse> {
+) -> anyhow::Result<(u32, u32)> {
     let timeout =
         std::time::Duration::from_secs(config.enroll_timeout_secs()) + ENROLL_TIMEOUT_MARGIN;
     let connection = zbus::blocking::connection::Builder::system()
@@ -136,10 +137,7 @@ pub fn send_enroll(
             anyhow::Error::new(e).context("D-Bus Enroll call failed")
         }
     })?;
-    Ok(DaemonResponse::Enrolled {
-        model_id: result.0,
-        embedding_count: result.1,
-    })
+    Ok(result)
 }
 
 /// True for the client-side method-timeout shape: `method_timeout` expiring
@@ -172,7 +170,7 @@ pub fn is_access_denied(err: &anyhow::Error) -> bool {
 }
 
 /// True if the D-Bus error chain carries the daemon's own "requires root"
-/// denial (`require_root` in `commands/daemon.rs`'s `authorize_method`), as
+/// denial (`require_root` in `facelock_daemon::server`'s `authorize_method`), as
 /// opposed to a bus-policy rejection for a caller outside the `facelock`
 /// group. Matched on the rendered message rather than the `zbus::Error`
 /// shape, since the daemon's denial text is the only thing the wire
@@ -205,144 +203,150 @@ fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Send a request to the daemon via D-Bus, translating to/from the old
-/// DaemonRequest/DaemonResponse types used by the command layer.
-pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    send_request_inner(request).map_err(add_access_denied_hint)
+/// The typed daemon transport (D5): one function per D-Bus method, returning
+/// domain values. The handler's own request/response enums are internal to
+/// `facelock-daemon`; nothing here (or in any caller) names them. Every call
+/// gets the AccessDenied hint treatment via [`hinted`].
+fn hinted<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    result.map_err(add_access_denied_hint)
 }
 
-fn send_request_inner(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    let proxy = create_proxy()?;
+/// Call `Authenticate` and decode the in-band sentinels (see
+/// docs/contracts.md "Authenticate error encoding"): `model_id == -2` is a
+/// recoverable daemon error travelling as data (label carries the message,
+/// byte-identical — PAM string-matches "rate limited"), `-3` is the
+/// `suppress_unknown` short-circuit.
+pub fn authenticate(user: &str) -> anyhow::Result<AuthOutcome> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let result: AuthResult = proxy
+            .call("Authenticate", &(user,))
+            .context("D-Bus Authenticate call failed")?;
+        if !result.matched && result.model_id == -2 {
+            return Ok(AuthOutcome::Error {
+                message: result.label,
+            });
+        }
+        if !result.matched && result.model_id == -3 {
+            return Ok(AuthOutcome::Suppressed);
+        }
+        Ok(AuthOutcome::AuthResult(MatchResult {
+            matched: result.matched,
+            model_id: if result.model_id >= 0 {
+                Some(result.model_id as u32)
+            } else {
+                None
+            },
+            label: if result.label.is_empty() {
+                None
+            } else {
+                Some(result.label)
+            },
+            similarity: result.similarity as f32,
+            // Not part of the D-Bus AuthResult contract; derived client-side
+            // where needed (see test_cmd).
+            failure_reason: None,
+        }))
+    })())
+}
 
-    match request {
-        DaemonRequest::Authenticate { user } => {
-            let result: AuthResult = proxy
-                .call("Authenticate", &(user.as_str(),))
-                .context("D-Bus Authenticate call failed")?;
-            // Sentinel model_id values (see docs/contracts.md):
-            // -2 = recoverable daemon error (label carries the message),
-            // -3 = suppressed (no enrolled models + suppress_unknown).
-            if !result.matched && result.model_id == -2 {
-                return Ok(DaemonResponse::Error {
-                    message: result.label,
-                });
-            }
-            if !result.matched && result.model_id == -3 {
-                return Ok(DaemonResponse::Suppressed);
-            }
-            Ok(DaemonResponse::AuthResult(MatchResult {
-                matched: result.matched,
-                model_id: if result.model_id >= 0 {
-                    Some(result.model_id as u32)
-                } else {
-                    None
-                },
-                label: if result.label.is_empty() {
-                    None
-                } else {
-                    Some(result.label)
-                },
-                similarity: result.similarity as f32,
-                // Not part of the D-Bus AuthResult contract; derived client-side
-                // where needed (see test_cmd).
-                failure_reason: None,
-            }))
-        }
-        // Enrollment needs a method timeout derived from the daemon's
-        // config-dependent deadline, which this shared proxy cannot provide.
-        DaemonRequest::Enroll { .. } => {
-            bail!("Enroll must use send_enroll (needs a config-derived timeout)")
-        }
-        DaemonRequest::ListModels { user } => {
-            let models: Vec<ModelInfo> = proxy
-                .call("ListModels", &(user.as_str(),))
-                .context("D-Bus ListModels call failed")?;
-            Ok(DaemonResponse::Models(
-                models
-                    .into_iter()
-                    .map(|m| FaceModelInfo {
-                        id: m.id,
-                        user: m.user,
-                        label: m.label,
-                        created_at: m.created_at,
-                        embedder_model: m.embedder_model,
-                        // Empty string sentinel (D-Bus) maps back to NULL.
-                        device_id: Some(m.device_id).filter(|s| !s.is_empty()),
-                    })
-                    .collect(),
-            ))
-        }
-        DaemonRequest::RemoveModel { user, model_id } => {
-            let _: () = proxy
-                .call("RemoveModel", &(user.as_str(), *model_id))
-                .context("D-Bus RemoveModel call failed")?;
-            Ok(DaemonResponse::Removed)
-        }
-        DaemonRequest::ClearModels { user } => {
-            let _: () = proxy
-                .call("ClearModels", &(user.as_str(),))
-                .context("D-Bus ClearModels call failed")?;
-            Ok(DaemonResponse::Removed)
-        }
-        DaemonRequest::PreviewFrame => {
-            let jpeg_data: Vec<u8> = proxy
-                .call("PreviewFrame", &())
-                .context("D-Bus PreviewFrame call failed")?;
-            Ok(DaemonResponse::Frame { jpeg_data })
-        }
-        DaemonRequest::PreviewDetectFrame { user } => {
-            let result: (Vec<u8>, Vec<PreviewFaceInfo>) = proxy
-                .call("PreviewDetectFrame", &(user.as_str(),))
-                .context("D-Bus PreviewDetectFrame call failed")?;
-            let (jpeg_data, face_infos) = result;
-            let faces = face_infos
-                .into_iter()
-                .map(|f| PreviewFace {
-                    x: f.x as f32,
-                    y: f.y as f32,
-                    width: f.width as f32,
-                    height: f.height as f32,
-                    confidence: f.confidence as f32,
-                    similarity: f.similarity as f32,
-                    recognized: f.recognized,
-                })
-                .collect();
-            Ok(DaemonResponse::DetectFrame { jpeg_data, faces })
-        }
-        DaemonRequest::ListDevices => {
-            let devices: Vec<DeviceInfo> = proxy
-                .call("ListDevices", &())
-                .context("D-Bus ListDevices call failed")?;
-            Ok(DaemonResponse::Devices(
-                devices
-                    .into_iter()
-                    .map(|d| IpcDeviceInfo {
-                        path: d.path,
-                        name: d.name,
-                        driver: d.driver,
-                        is_ir: d.is_ir,
-                        formats: vec![],
-                    })
-                    .collect(),
-            ))
-        }
-        DaemonRequest::ReleaseCamera => {
-            let _: () = proxy
-                .call("ReleaseCamera", &())
-                .context("D-Bus ReleaseCamera call failed")?;
-            Ok(DaemonResponse::Ok)
-        }
-        DaemonRequest::Ping => {
-            let _: String = proxy.call("Ping", &()).context("D-Bus Ping call failed")?;
-            Ok(DaemonResponse::Ok)
-        }
-        DaemonRequest::Shutdown => {
-            let _: () = proxy
-                .call("Shutdown", &())
-                .context("D-Bus Shutdown call failed")?;
-            Ok(DaemonResponse::Ok)
-        }
-    }
+pub fn list_models(user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let models: Vec<ModelInfo> = proxy
+            .call("ListModels", &(user,))
+            .context("D-Bus ListModels call failed")?;
+        Ok(models
+            .into_iter()
+            .map(|m| FaceModelInfo {
+                id: m.id,
+                user: m.user,
+                label: m.label,
+                created_at: m.created_at,
+                embedder_model: m.embedder_model,
+                // Empty string sentinel (D-Bus) maps back to NULL.
+                device_id: Some(m.device_id).filter(|s| !s.is_empty()),
+            })
+            .collect())
+    })())
+}
+
+pub fn remove_model(user: &str, model_id: u32) -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        proxy
+            .call("RemoveModel", &(user, model_id))
+            .context("D-Bus RemoveModel call failed")
+    })())
+}
+
+pub fn clear_models(user: &str) -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        proxy
+            .call("ClearModels", &(user,))
+            .context("D-Bus ClearModels call failed")
+    })())
+}
+
+pub fn preview_detect_frame(user: &str) -> anyhow::Result<(Vec<u8>, Vec<PreviewFace>)> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let (jpeg_data, face_infos): (Vec<u8>, Vec<PreviewFaceInfo>) = proxy
+            .call("PreviewDetectFrame", &(user,))
+            .context("D-Bus PreviewDetectFrame call failed")?;
+        let faces = face_infos
+            .into_iter()
+            .map(|f| PreviewFace {
+                x: f.x as f32,
+                y: f.y as f32,
+                width: f.width as f32,
+                height: f.height as f32,
+                confidence: f.confidence as f32,
+                similarity: f.similarity as f32,
+                recognized: f.recognized,
+            })
+            .collect();
+        Ok((jpeg_data, faces))
+    })())
+}
+
+pub fn list_devices() -> anyhow::Result<Vec<IpcDeviceInfo>> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let devices: Vec<DeviceInfo> = proxy
+            .call("ListDevices", &())
+            .context("D-Bus ListDevices call failed")?;
+        Ok(devices
+            .into_iter()
+            .map(|d| IpcDeviceInfo {
+                path: d.path,
+                name: d.name,
+                driver: d.driver,
+                is_ir: d.is_ir,
+                // The D-Bus DeviceInfo type carries no formats (C9, Phase E);
+                // `BackendCaps::device_formats` states this up front.
+                formats: vec![],
+            })
+            .collect())
+    })())
+}
+
+pub fn release_camera() -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        proxy
+            .call("ReleaseCamera", &())
+            .context("D-Bus ReleaseCamera call failed")
+    })())
+}
+
+pub fn ping() -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let _: String = proxy.call("Ping", &()).context("D-Bus Ping call failed")?;
+        Ok(())
+    })())
 }
 
 /// Resolve the target user for commands.

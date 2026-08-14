@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use facelock_core::config::{Config, EncryptionMethod};
-use facelock_core::ipc::{DaemonRequest, DaemonResponse, PreviewFace};
+use facelock_core::ipc::PreviewFace;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{best_match, zeroize_stored_embeddings};
 use facelock_store::FaceStore;
@@ -9,9 +9,99 @@ use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
 
 use crate::audit::AuditSource;
-use crate::auth;
-use crate::enroll;
+use crate::auth::{self, AuthOutcome};
+use crate::enroll::{self, EnrollOutcome};
 use crate::rate_limit::RateLimiter;
+
+/// The handler's input vocabulary — one variant per operation the daemon can
+/// perform. Internal to this crate (D5): the D-Bus server (`crate::server`)
+/// builds these from decoded method calls, and the CLI talks through typed
+/// clients and the [`AuthOutcome`]/[`EnrollOutcome`] vocabulary instead. The
+/// request/wire double translation is deliberate — it is what keeps this
+/// handler transport-agnostic and mock-testable.
+#[derive(Debug, Clone)]
+pub enum DaemonRequest {
+    Authenticate {
+        user: String,
+    },
+    Enroll {
+        user: String,
+        label: String,
+    },
+    ListModels {
+        user: String,
+    },
+    RemoveModel {
+        user: String,
+        model_id: u32,
+    },
+    ClearModels {
+        user: String,
+    },
+    PreviewFrame,
+    /// Preview with face detection + recognition against the given user's models.
+    PreviewDetectFrame {
+        user: String,
+    },
+    ListDevices,
+    ReleaseCamera,
+    Ping,
+    Shutdown,
+}
+
+/// The handler's output vocabulary, mirroring [`DaemonRequest`]. Internal to
+/// this crate (D5); `crate::server` maps it onto the D-Bus reply types.
+#[derive(Debug, Clone)]
+pub enum DaemonResponse {
+    AuthResult(facelock_core::types::MatchResult),
+    Enrolled {
+        model_id: u32,
+        embedding_count: u32,
+    },
+    Models(Vec<facelock_core::types::FaceModelInfo>),
+    Removed,
+    Frame {
+        jpeg_data: Vec<u8>,
+    },
+    /// Preview frame with face detection results.
+    DetectFrame {
+        jpeg_data: Vec<u8>,
+        faces: Vec<PreviewFace>,
+    },
+    Devices(Vec<facelock_core::ipc::IpcDeviceInfo>),
+    Ok,
+    /// User has no enrolled models and `suppress_unknown` is enabled.
+    /// PAM should map this to `PAM_AUTHINFO_UNAVAIL` to let the stack fall through.
+    Suppressed,
+    Error {
+        message: String,
+    },
+}
+
+impl From<AuthOutcome> for DaemonResponse {
+    fn from(outcome: AuthOutcome) -> Self {
+        match outcome {
+            AuthOutcome::AuthResult(result) => DaemonResponse::AuthResult(result),
+            AuthOutcome::Suppressed => DaemonResponse::Suppressed,
+            AuthOutcome::Error { message } => DaemonResponse::Error { message },
+        }
+    }
+}
+
+impl From<EnrollOutcome> for DaemonResponse {
+    fn from(outcome: EnrollOutcome) -> Self {
+        match outcome {
+            EnrollOutcome::Enrolled {
+                model_id,
+                embedding_count,
+            } => DaemonResponse::Enrolled {
+                model_id,
+                embedding_count,
+            },
+            EnrollOutcome::Error { message } => DaemonResponse::Error { message },
+        }
+    }
+}
 
 /// Type alias for the camera factory closure.
 type CameraFactory<C> = Box<dyn Fn(&Config) -> Result<C, String> + Send + Sync>;
@@ -322,7 +412,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 );
                 self.camera = Some(camera);
                 self.camera_last_used = Instant::now();
-                result
+                result.into()
             }
 
             DaemonRequest::ListModels { user } => match self.store.list_models(&user) {
@@ -464,7 +554,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             &self.device_caps,
             AuditSource::Daemon,
         ) {
-            return resp;
+            return resp.into();
         }
 
         // A storage failure here must surface as an error, never fold into an
@@ -510,14 +600,14 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         self.camera_last_used = Instant::now();
         // Only failed auths count against the rate limit, and only when the
         // caller hasn't been exempted (see doc comment above).
-        if let DaemonResponse::AuthResult(ref mr) = result {
+        if let AuthOutcome::AuthResult(ref mr) = result {
             if !mr.matched && charge_failed_attempt {
                 if let Err(e) = self.rate_limiter.record_failure(&self.store, &user) {
                     warn!(user, error = %e, "failed to record auth failure");
                 }
             }
         }
-        result
+        result.into()
     }
 
     fn encode_frame_response(&mut self, rgb: &[u8], width: u32, height: u32) -> DaemonResponse {

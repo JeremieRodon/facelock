@@ -17,7 +17,6 @@ use facelock_camera::Camera;
 use facelock_core::dbus_interface::{
     AuthResult, BUS_NAME, DeviceInfo, ModelInfo, OBJECT_PATH, PreviewFaceInfo,
 };
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_core::notify::{Notifier, NotifierFactory, NotifyEvent, notify_desktop_if_enabled};
 use facelock_face::FaceEngine;
 use futures_util::StreamExt;
@@ -25,7 +24,7 @@ use nix::unistd::{Uid, User};
 use tracing::{error, info, warn};
 use zbus::{fdo, interface, object_server::SignalEmitter};
 
-use crate::handler::Handler;
+use crate::handler::{DaemonRequest, DaemonResponse, Handler};
 
 /// Production type alias for the handler with real Camera and FaceEngine.
 pub type ProductionHandler = Handler<Camera<'static>, FaceEngine>;

@@ -33,8 +33,9 @@ use zbus::blocking::Connection;
 use facelock_core::Config;
 use facelock_core::config::DaemonMode;
 use facelock_core::dbus_interface::BUS_NAME;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse, IpcDeviceInfo};
+use facelock_core::ipc::IpcDeviceInfo;
 use facelock_core::types::{FaceModelInfo, MatchResult};
+use facelock_daemon::auth::AuthOutcome;
 use facelock_store::StoreError;
 
 use crate::message::{Terminal, UserMessage};
@@ -195,10 +196,7 @@ impl<'a> Backend<'a> {
     pub fn remove_model(&self, user: &str, model_id: u32) -> anyhow::Result<Option<bool>> {
         match self.kind {
             BackendKind::Daemon => {
-                removed_reply(ipc_client::send_request(&DaemonRequest::RemoveModel {
-                    user: user.to_string(),
-                    model_id,
-                }))?;
+                ipc_client::remove_model(user, model_id)?;
                 Ok(None)
             }
             // An absent store provably holds nothing to remove: report "not
@@ -219,9 +217,7 @@ impl<'a> Backend<'a> {
     pub fn clear_models(&self, user: &str) -> anyhow::Result<Option<usize>> {
         match self.kind {
             BackendKind::Daemon => {
-                removed_reply(ipc_client::send_request(&DaemonRequest::ClearModels {
-                    user: user.to_string(),
-                }))?;
+                ipc_client::clear_models(user)?;
                 Ok(None)
             }
             _ => {
@@ -240,13 +236,7 @@ impl<'a> Backend<'a> {
     /// derived from the daemon's own enrollment deadline (issue #89).
     pub fn enroll(&self, user: &str, label: &str) -> anyhow::Result<(u32, u32)> {
         match self.kind {
-            BackendKind::Daemon => match ipc_client::send_enroll(user, label, self.config)? {
-                DaemonResponse::Enrolled {
-                    model_id,
-                    embedding_count,
-                } => Ok((model_id, embedding_count)),
-                other => bail!("unexpected response from daemon: {other:?}"),
-            },
+            BackendKind::Daemon => ipc_client::send_enroll(user, label, self.config),
             _ => direct::enroll(self.config, user, label),
         }
     }
@@ -263,24 +253,19 @@ impl<'a> Backend<'a> {
     /// the daemon exempts root callers.
     pub fn recognize(&self, user: &str) -> anyhow::Result<MatchResult> {
         match self.kind {
-            BackendKind::Daemon => {
-                match ipc_client::send_request(&DaemonRequest::Authenticate {
-                    user: user.to_string(),
-                })? {
-                    DaemonResponse::AuthResult(result) => Ok(result),
-                    // `suppress_unknown` short-circuit: same "no result"
-                    // shape the direct path reports.
-                    DaemonResponse::Suppressed => Ok(MatchResult {
-                        matched: false,
-                        model_id: None,
-                        label: None,
-                        similarity: 0.0,
-                        failure_reason: None,
-                    }),
-                    DaemonResponse::Error { message } => bail!("daemon error: {message}"),
-                    other => bail!("unexpected response from daemon: {other:?}"),
-                }
-            }
+            BackendKind::Daemon => match ipc_client::authenticate(user)? {
+                AuthOutcome::AuthResult(result) => Ok(result),
+                // `suppress_unknown` short-circuit: same "no result"
+                // shape the direct path reports.
+                AuthOutcome::Suppressed => Ok(MatchResult {
+                    matched: false,
+                    model_id: None,
+                    label: None,
+                    similarity: 0.0,
+                    failure_reason: None,
+                }),
+                AuthOutcome::Error { message } => bail!("daemon error: {message}"),
+            },
             _ => direct::authenticate(self.config, user),
         }
     }
@@ -293,31 +278,23 @@ impl<'a> Backend<'a> {
                 // Only blame a missing daemon when the request wasn't
                 // refused: an AccessDenied already carries its own hint as
                 // the headline.
-                let response =
-                    ipc_client::send_request(&DaemonRequest::ListDevices).map_err(|e| {
-                        if ipc_client::is_access_denied(&e) {
-                            e
-                        } else {
-                            e.context("failed to query daemon — is facelock-daemon running?")
-                        }
-                    })?;
-                match response {
-                    DaemonResponse::Devices(devices) => Ok(devices),
-                    DaemonResponse::Error { message } => bail!("daemon error: {message}"),
-                    _ => bail!("unexpected response from daemon"),
-                }
+                ipc_client::list_devices().map_err(|e| {
+                    if ipc_client::is_access_denied(&e) {
+                        e
+                    } else {
+                        e.context("failed to query daemon — is facelock-daemon running?")
+                    }
+                })
             }
             _ => direct::list_devices_info(),
         }
     }
 
-    /// Interpret the daemon's `ListModels` reply. One failure policy (C4):
-    /// transport failures and error replies propagate — they must never read
-    /// as "no models enrolled".
+    /// The daemon's `ListModels`, typed. One failure policy (C4): transport
+    /// failures — including the daemon's own error reply, which arrives as a
+    /// D-Bus error — propagate; they must never read as "no models enrolled".
     fn daemon_list_models(&self, user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
-        models_reply(ipc_client::send_request(&DaemonRequest::ListModels {
-            user: user.to_string(),
-        }))
+        ipc_client::list_models(user)
     }
 
     /// Direct-transport read with the C7 discrimination carried by
@@ -405,24 +382,6 @@ fn daemon_bus_reachable() -> bool {
     proxy.name_has_owner(name).unwrap_or(false)
 }
 
-/// Interpret a daemon reply that should be `Models`. Failure policy: C4.
-fn models_reply(response: anyhow::Result<DaemonResponse>) -> anyhow::Result<Vec<FaceModelInfo>> {
-    match response? {
-        DaemonResponse::Models(models) => Ok(models),
-        DaemonResponse::Error { message } => bail!("daemon error: {message}"),
-        other => bail!("unexpected response from daemon: {other:?}"),
-    }
-}
-
-/// Interpret a daemon reply that should be `Removed`.
-fn removed_reply(response: anyhow::Result<DaemonResponse>) -> anyhow::Result<()> {
-    match response? {
-        DaemonResponse::Removed => Ok(()),
-        DaemonResponse::Error { message } => bail!("daemon error: {message}"),
-        other => bail!("unexpected response from daemon: {other:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,58 +455,6 @@ mod tests {
         let caps = daemon.caps();
         assert!(caps.graphical_preview);
         assert!(!caps.device_formats);
-    }
-
-    // -----------------------------------------------------------------------
-    // Daemon reply interpretation (C4 pins, moved here with the fork: these
-    // lived in clear.rs as daemon_user_has_models tests).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn daemon_transport_failure_propagates() {
-        let err = models_reply(Err(anyhow::anyhow!("D-Bus timeout"))).unwrap_err();
-        assert!(format!("{err:#}").contains("D-Bus timeout"));
-    }
-
-    #[test]
-    fn daemon_error_reply_propagates() {
-        let err = models_reply(Ok(DaemonResponse::Error {
-            message: "storage error: disk I/O error".into(),
-        }))
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("storage error"));
-    }
-
-    #[test]
-    fn daemon_unexpected_reply_propagates() {
-        let err = models_reply(Ok(DaemonResponse::Ok)).unwrap_err();
-        assert!(format!("{err:#}").contains("unexpected response"));
-
-        let err = removed_reply(Ok(DaemonResponse::Ok)).unwrap_err();
-        assert!(format!("{err:#}").contains("unexpected response"));
-    }
-
-    #[test]
-    fn daemon_model_lists_map_to_bool() {
-        assert!(
-            models_reply(Ok(DaemonResponse::Models(vec![])))
-                .unwrap()
-                .is_empty()
-        );
-        let model = FaceModelInfo {
-            id: 1,
-            user: "alice".into(),
-            label: "front".into(),
-            created_at: 0,
-            embedder_model: String::new(),
-            device_id: None,
-        };
-        assert_eq!(
-            models_reply(Ok(DaemonResponse::Models(vec![model])))
-                .unwrap()
-                .len(),
-            1
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -692,19 +599,31 @@ mod tests {
     }
 
     /// Daemon transport entry points appear only at the allowed sites. A new
-    /// `send_request` call site outside the seam is a per-site fork trying to
-    /// come back.
+    /// transport call site outside the seam is a per-site fork trying to
+    /// come back (D1). The needles are the typed `ipc_client` transport
+    /// functions (D5) — `require_root`/`resolve_user`/`confirm` are not
+    /// transport and stay unrestricted.
     #[test]
     fn daemon_transport_entry_points_are_single_sited() {
-        let allowed_send_request = [
-            "ipc_client.rs",                       // the definition
-            "backend.rs",                          // the seam (this module)
-            "commands/status.rs",                  // its own Ping probe until H8
+        // (function, allowed files). Needles are assembled at runtime so this
+        // test's own table doesn't match itself; ipc_client.rs (the
+        // definitions) is always allowed.
+        let backend_only: &[&str] = &["backend.rs"];
+        let preview: &[&str] = &[
             "commands/preview/text_only.rs",       // daemon frame loop
             "commands/preview/wayland_preview.rs", // daemon frame loop
-            "resolved.rs",                         // token literal in its own pin test
         ];
-        let allowed_send_enroll = ["ipc_client.rs", "backend.rs"];
+        let pins: &[(&str, &[&str])] = &[
+            ("authenticate", backend_only),
+            ("list_models", backend_only),
+            ("remove_model", backend_only),
+            ("clear_models", backend_only),
+            ("send_enroll", backend_only),
+            ("list_devices", backend_only),
+            ("ping", &["commands/status.rs"]), // its own probe until H8
+            ("preview_detect_frame", preview),
+            ("release_camera", preview),
+        ];
 
         for (path, content) in source_files() {
             let rel = path
@@ -713,18 +632,39 @@ mod tests {
                 .last()
                 .unwrap()
                 .to_string();
-            if code_contains(&content, "send_request(") {
-                assert!(
-                    allowed_send_request.iter().any(|a| rel == *a),
-                    "{rel}: send_request( outside the backend seam — route the \
-                     operation through backend::Backend (D1)"
-                );
+            if rel == "ipc_client.rs" {
+                continue;
             }
-            if code_contains(&content, "send_enroll(") {
+            for (function, allowed) in pins {
+                let needle = format!("ipc_client::{function}(");
+                if code_contains(&content, &needle) {
+                    assert!(
+                        allowed.iter().any(|a| rel == *a),
+                        "{rel}: {needle} outside the backend seam — route the \
+                         operation through backend::Backend (D1)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// D5: the handler's request/response enums are internal to
+    /// facelock-daemon. The CLI talks through the typed `ipc_client`
+    /// transport and the AuthOutcome/EnrollOutcome vocabulary; these type
+    /// names reappearing here means the double translation is leaking back
+    /// out of the daemon crate.
+    #[test]
+    fn handler_enums_never_appear_in_the_cli() {
+        // Assembled at runtime so this test's own literals don't count.
+        let request = format!("Daemon{}", "Request");
+        let response = format!("Daemon{}", "Response");
+        for (path, content) in source_files() {
+            for needle in [&request, &response] {
                 assert!(
-                    allowed_send_enroll.iter().any(|a| rel == *a),
-                    "{rel}: send_enroll( outside the backend seam — route \
-                     enrollment through backend::Backend::enroll (D1)"
+                    !code_contains(&content, needle),
+                    "{}: `{needle}` is facelock-daemon-internal (D5) — use the \
+                     typed ipc_client transport or the outcome vocabulary",
+                    path.display()
                 );
             }
         }

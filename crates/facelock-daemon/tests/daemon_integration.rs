@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use facelock_core::config::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
+use facelock_daemon::auth::AuthOutcome;
+use facelock_daemon::handler::{DaemonRequest, DaemonResponse};
 use facelock_store::FaceStore;
 use facelock_test_support::fixtures;
 use facelock_test_support::{MockCamera, MockFaceEngine};
@@ -220,7 +221,7 @@ fn device_mismatch_never_reaches_success() {
         AuditSource::Daemon,
     );
     match resp {
-        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+        AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
             assert!(
                 !matched,
                 "device mismatch must not authenticate a perfect embedding match"
@@ -251,7 +252,7 @@ fn device_mismatch_never_reaches_success() {
         AuditSource::Daemon,
     );
     match resp2 {
-        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+        AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
             assert!(matched, "matching device must authenticate");
         }
         other => panic!("unexpected response: {other:?}"),
@@ -303,7 +304,7 @@ fn legacy_null_device_id_still_authenticates() {
         AuditSource::Daemon,
     );
     match resp {
-        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+        AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
             assert!(
                 matched,
                 "legacy NULL device_id must authenticate (allow-with-warn)"
@@ -449,7 +450,7 @@ fn static_matching_frames_report_variance_reason() {
     );
 
     match resp {
-        DaemonResponse::AuthResult(r) => {
+        AuthOutcome::AuthResult(r) => {
             assert!(!r.matched, "static input must not authenticate");
             assert!(
                 r.similarity >= config.recognition.threshold,
@@ -500,7 +501,7 @@ fn still_then_moving_frames_recover_and_authenticate() {
     );
 
     match resp {
-        DaemonResponse::AuthResult(r) => {
+        AuthOutcome::AuthResult(r) => {
             assert!(
                 r.matched,
                 "still-then-moving user must authenticate once the window fills \
@@ -548,7 +549,7 @@ fn failed_auth_writes_audit_entry() {
         AuditSource::Daemon,
     );
     assert!(
-        matches!(resp, DaemonResponse::AuthResult(ref r) if !r.matched),
+        matches!(resp, AuthOutcome::AuthResult(ref r) if !r.matched),
         "sanity: attempt with no enrolled templates must fail, got {resp:?}"
     );
 

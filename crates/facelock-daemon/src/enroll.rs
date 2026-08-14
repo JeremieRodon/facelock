@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use facelock_camera::capture::is_dark_with_config;
 use facelock_core::config::Config;
-use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::FaceEmbedding;
 use facelock_store::FaceStore;
@@ -10,6 +9,15 @@ use facelock_tpm::SoftwareSealer;
 use tracing::{debug, info, warn};
 
 use crate::quality;
+
+/// The outcome of an enrollment attempt — shared by the daemon handler
+/// (which maps it onto its wire response) and the CLI's direct path, so the
+/// CLI never needs the handler's own request/response enums (D5).
+#[derive(Debug, Clone)]
+pub enum EnrollOutcome {
+    Enrolled { model_id: u32, embedding_count: u32 },
+    Error { message: String },
+}
 
 const MIN_CAPTURES: usize = 3;
 const MAX_CAPTURES: usize = 10;
@@ -147,14 +155,14 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
     label: &str,
     sealer: Option<&SoftwareSealer>,
     device_id: Option<&str>,
-) -> DaemonResponse {
+) -> EnrollOutcome {
     // Clear any previous model with the same label (re-enrollment)
     match store.remove_model_by_label(user, label) {
         Ok(true) => info!(user, label, "removed existing model for re-enrollment"),
         Ok(false) => {}
         Err(e) => {
             warn!(user, label, "failed to remove existing model: {e}");
-            return DaemonResponse::Error {
+            return EnrollOutcome::Error {
                 message: format!("storage error clearing old model: {e}"),
             };
         }
@@ -271,7 +279,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
                 },
                 Err(e) => {
                     warn!("failed to encrypt embedding: {e}");
-                    return DaemonResponse::Error {
+                    return EnrollOutcome::Error {
                         message: format!("encryption error: {e}"),
                     };
                 }
@@ -318,7 +326,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
             Err(e) => {
                 if model_id.is_none() {
                     warn!("failed to create model: {e}");
-                    return DaemonResponse::Error {
+                    return EnrollOutcome::Error {
                         message: format!("storage error: {e}"),
                     };
                 } else {
@@ -340,7 +348,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
             "insufficient angle diversity during enrollment"
         );
         discard_partial_model(store, user, label, model_id);
-        return DaemonResponse::Error {
+        return EnrollOutcome::Error {
             message: "insufficient angle diversity: please move your head to different angles during enrollment".into(),
         };
     }
@@ -360,7 +368,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
             "insufficient face captures during enrollment"
         );
         discard_partial_model(store, user, label, model_id);
-        return DaemonResponse::Error {
+        return EnrollOutcome::Error {
             message: format!(
                 "only captured {stored_count} frames, need at least {MIN_CAPTURES}{}",
                 rejections.summary()
@@ -376,7 +384,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
         "enrollment complete"
     );
 
-    DaemonResponse::Enrolled {
+    EnrollOutcome::Enrolled {
         model_id: model_id.unwrap_or(0),
         embedding_count: stored_count,
     }
@@ -537,7 +545,7 @@ mod tests {
         );
 
         match &response {
-            DaemonResponse::Error { message } => {
+            EnrollOutcome::Error { message } => {
                 assert!(message.contains("angle diversity"), "got: {message}")
             }
             other => panic!("expected an angle-diversity error, got: {other:?}"),
