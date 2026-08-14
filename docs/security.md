@@ -454,10 +454,12 @@ enabling it is a deliberate operator choice that commits to the reseal workflow.
 Access to the daemon is restricted by the D-Bus system bus policy defined in `dbus/org.facelock.Daemon.conf`. Only root and members of the `facelock` group are allowed to send messages to the daemon interface. The policy file is installed to `/usr/share/dbus-1/system.d/` and enforced by the bus daemon itself. Setup and package install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present, but `/usr/share/...` is the canonical install path.
 
 The daemon must also verify the caller UID via `GetConnectionUnixUser` on every method call and apply method-level authorization:
-- `Authenticate`, `ListModels`, `PreviewDetectFrame`: root or the matching Unix user
-- `Enroll`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `Shutdown`: root only
-- `ReleaseCamera`: root or the Unix user that owns the active preview camera session
-- `ListDevices`: root or a caller in the `facelock` group
+- `Authenticate`: root, or a non-root caller acting on their own username. This is the **only** user-scoped method, and it is architecture rather than policy: screen lockers run their PAM stack as the user, so a user must be able to request authentication for themselves.
+- Everything else is **root only**: `TestAuthenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`.
+
+The scope table's catch-all arm is root-only, so a method added later is closed until it is deliberately opened up. Two entries are spelled out explicitly rather than left to that catch-all, because their root-only scope is load-bearing rather than incidental:
+- `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter. For any weaker caller it would be a continuous similarity feed at camera framerate; together with score redaction, denying non-root callers closes the hill-climbing oracle by construction (see A5 below).
+- `TestAuthenticate` is the entry point that does *not* charge the rate limit, which is exactly why it is only safe to offer to root.
 
 The policy also self-contains two explicit defaults rather than relying on system-wide bus defaults:
 - `<deny own="org.facelock.Daemon"/>` in the default context (name-squatting protection; only root may own the name).
