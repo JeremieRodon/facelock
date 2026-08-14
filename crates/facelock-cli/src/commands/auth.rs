@@ -5,9 +5,10 @@
 use std::path::Path;
 
 use facelock_camera::quirks::QuirksDb;
-use facelock_camera::{Camera, auto_detect_device, is_ir_camera_resolved, validate_device};
+use facelock_camera::{Camera, ResolvedCamera, auto_detect_device, validate_device};
 use facelock_core::config::Config;
 use facelock_core::ipc::DaemonResponse;
+use facelock_core::types::CameraCaps;
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::{self, AuditEntry, AuditSource};
 use facelock_daemon::auth;
@@ -58,25 +59,24 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         }
     }
 
-    // Resolve the live device before the pre-flight gates so `pre_check` sees
-    // the real IR classification, exactly like the daemon does at startup.
+    // Resolve and interrogate the live device before the pre-flight gates so
+    // `pre_check` sees the real caps (IR classification, fingerprint),
+    // exactly like the daemon does at startup. Tolerant of a device that
+    // cannot be queried: non-IR caps with whatever identity sysfs still
+    // offers, so `require_ir` rejects rather than a hard error here.
     let device_path = config.device.path.clone().unwrap();
     let quirks = QuirksDb::load();
-    let device_info = validate_device(&device_path);
-    // Sibling-aware classification: on multi-node USB cameras (e.g. BRIO) only
-    // the actual IR sensor node counts as IR, not every node of the device.
-    let device_is_ir = device_info
+    let resolved = match validate_device(&device_path) {
+        Ok(info) => Some(ResolvedCamera::interrogate(info, &quirks)),
+        Err(_) => None,
+    };
+    let caps = resolved
         .as_ref()
-        .map(|dev| is_ir_camera_resolved(dev, Some(&quirks)))
-        .unwrap_or(false);
-
-    // Device coupling (Plan 02): fingerprint the live camera so the compare loop
-    // can skip templates enrolled on a different camera.
-    let live_fingerprint = facelock_camera::device_fingerprint(&device_path);
-
-    let device_quirk = device_info
-        .ok()
-        .and_then(|info| quirks.find_match(&info).cloned());
+        .map(|r| r.caps.clone())
+        .unwrap_or_else(|| CameraCaps {
+            fingerprint: facelock_camera::device_fingerprint(&device_path),
+            ..Default::default()
+        });
 
     // Best-effort mode fixing before the store is opened: this is the PAM
     // path, the one entry point guaranteed to run on an oneshot-mode install
@@ -110,7 +110,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         &store,
         &user,
         &rate_limiter,
-        device_is_ir,
+        &caps,
         AuditSource::Oneshot,
     ) {
         // Every pre-flight rejection exits 2 ("error"), which the PAM module
@@ -123,7 +123,20 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         return 2;
     }
 
-    let mut camera = match Camera::open(&config.device, device_quirk.as_ref()) {
+    // Quirk override takes precedence over the config's warmup value.
+    let warmup = resolved
+        .as_ref()
+        .and_then(|r| r.quirk.as_ref())
+        .and_then(|q| q.warmup_frames)
+        .unwrap_or(config.device.warmup_frames);
+    let camera = match resolved {
+        // The camera carries the caps the pre-flight gates just checked.
+        Some(resolved) => resolved.open(&config.device),
+        // Unqueryable at resolution time: attempt a fresh resolve-and-open so
+        // the failure surfaces as the camera error it is.
+        None => Camera::open(&config.device, &quirks),
+    };
+    let mut camera = match camera {
         Ok(c) => c,
         Err(e) => {
             error!("camera: {e}");
@@ -132,9 +145,6 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     };
 
     // Discard warmup frames for AGC/AE stabilization.
-    let warmup = device_quirk
-        .and_then(|q| q.warmup_frames)
-        .unwrap_or(config.device.warmup_frames);
     for _ in 0..warmup {
         let _ = camera.capture();
     }
@@ -169,8 +179,6 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         &models,
         &config,
         &user,
-        device_is_ir,
-        &live_fingerprint,
         AuditSource::Oneshot,
     );
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -292,6 +300,15 @@ path = "{audit_path}"
         RateLimiter::new(rl.max_attempts, rl.window_secs)
     }
 
+    /// Caps of an IR-classified device (what these tests used to express as a
+    /// bare `device_is_ir: true`).
+    fn ir_caps() -> facelock_core::types::CameraCaps {
+        facelock_core::types::CameraCaps {
+            is_ir: true,
+            ..Default::default()
+        }
+    }
+
     /// #95 symptom (a): a rate-limited oneshot attempt used to be rejected
     /// with no audit record. Unified on `pre_check_audited`, the rejection
     /// must produce the same `rate_limited` entry the daemon path writes,
@@ -315,7 +332,7 @@ path = "{audit_path}"
             &store,
             "alice",
             &limiter,
-            true,
+            &ir_caps(),
             AuditSource::Oneshot,
         )
         .expect("rate-limited user must short-circuit");
@@ -346,7 +363,7 @@ path = "{audit_path}"
             &store,
             "nobody",
             &rate_limiter(&config),
-            true,
+            &ir_caps(),
             AuditSource::Oneshot,
         )
         .expect("un-enrolled user must short-circuit");
@@ -373,7 +390,7 @@ path = "{audit_path}"
             &store,
             "nobody",
             &rate_limiter(&config),
-            true,
+            &ir_caps(),
             AuditSource::Oneshot,
         )
         .expect("un-enrolled user must short-circuit");
@@ -405,7 +422,7 @@ path = "{audit_path}"
             &store,
             "alice",
             &rate_limiter(&config),
-            true,
+            &ir_caps(),
             AuditSource::Oneshot,
         );
         assert!(resp.is_none(), "gates must pass, got {resp:?}");

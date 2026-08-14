@@ -7,10 +7,7 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use facelock_camera::quirks::QuirksDb;
-use facelock_camera::{
-    Camera, DeviceInfo, auto_detect_device, is_ir_camera_resolved, list_devices, validate_device,
-};
-use facelock_core::config::DeviceConfig;
+use facelock_camera::{Camera, ResolvedCamera, auto_detect_device, list_devices, validate_device};
 use facelock_core::config::{Config, EncryptionMethod};
 use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
@@ -55,39 +52,12 @@ pub fn open_store_existing(config: &Config) -> Result<FaceStore, StoreError> {
     FaceStore::open_existing(Path::new(&config.storage.db_path))
 }
 
-#[derive(Clone)]
-struct ResolvedCameraDevice {
-    device: DeviceConfig,
-    device_quirk: Option<facelock_camera::quirks::Quirk>,
-    device_is_ir: bool,
-    device_fingerprint: facelock_core::types::DeviceFingerprint,
-}
-
-struct OpenedCamera {
-    camera: Camera<'static>,
-    device_is_ir: bool,
-    device_fingerprint: facelock_core::types::DeviceFingerprint,
-}
-
-fn build_resolved_camera_device(
-    config: &Config,
-    device_info: DeviceInfo,
-    quirks: &QuirksDb,
-) -> ResolvedCameraDevice {
-    let mut device = config.device.clone();
-    device.path = Some(device_info.path.clone());
-
-    ResolvedCameraDevice {
-        device_fingerprint: facelock_camera::device_fingerprint(&device_info.path),
-        device_quirk: quirks.find_match(&device_info).cloned(),
-        // Sibling-aware: on multi-node USB cameras only the IR sensor node
-        // counts as IR, not every node sharing the quirk's VID:PID.
-        device_is_ir: is_ir_camera_resolved(&device_info, Some(quirks)),
-        device,
-    }
-}
-
-fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCameraDevice> {
+/// Resolve and interrogate the configured (or auto-detected) camera device
+/// without opening it. The returned [`ResolvedCamera`] carries the caps
+/// (`is_ir`, fingerprint, formats, applied quirks) that used to be threaded
+/// around as loose values — pre-flight gates read `resolved.caps`, and the
+/// camera opened from it carries the very same caps.
+fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCamera> {
     let quirks = QuirksDb::load();
     let device_info = match config.device.path.as_deref() {
         Some(path) => validate_device(path)
@@ -97,20 +67,24 @@ fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCameraDevice
         }
     };
 
-    Ok(build_resolved_camera_device(config, device_info, &quirks))
+    Ok(ResolvedCamera::interrogate(device_info, &quirks))
 }
 
-fn open_camera_context(config: &Config) -> anyhow::Result<OpenedCamera> {
-    let resolved = resolve_camera_device(config)?;
-    let mut camera = Camera::open(&resolved.device, resolved.device_quirk.as_ref())
-        .context("failed to open camera")?;
-
+/// Open an already-resolved camera and discard warmup frames.
+fn open_resolved_camera(
+    config: &Config,
+    resolved: ResolvedCamera,
+) -> anyhow::Result<Camera<'static>> {
     // Discard warmup frames for AGC/AE stabilization.
     // Quirk override takes precedence over config value.
     let warmup = resolved
-        .device_quirk
+        .quirk
+        .as_ref()
         .and_then(|q| q.warmup_frames)
-        .unwrap_or(resolved.device.warmup_frames);
+        .unwrap_or(config.device.warmup_frames);
+    let mut camera = resolved
+        .open(&config.device)
+        .context("failed to open camera")?;
     if warmup > 0 {
         debug!(warmup, "discarding warmup frames");
         for _ in 0..warmup {
@@ -118,16 +92,12 @@ fn open_camera_context(config: &Config) -> anyhow::Result<OpenedCamera> {
         }
     }
 
-    Ok(OpenedCamera {
-        camera,
-        device_is_ir: resolved.device_is_ir,
-        device_fingerprint: resolved.device_fingerprint,
-    })
+    Ok(camera)
 }
 
 /// Open camera with quirks support and warmup frame discarding.
 pub fn open_camera(config: &Config) -> anyhow::Result<Camera<'static>> {
-    Ok(open_camera_context(config)?.camera)
+    open_resolved_camera(config, resolve_camera_device(config)?)
 }
 
 pub fn load_engine(config: &Config) -> anyhow::Result<FaceEngine> {
@@ -150,12 +120,11 @@ pub fn load_engine(config: &Config) -> anyhow::Result<FaceEngine> {
 pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> {
     let store = open_store(config)?;
 
-    // Cheap device classification only (no camera I/O), so a pre-check
-    // rejection never touches the camera. `open_camera_context` below
-    // re-resolves the same device once opening actually proceeds.
-    let device_is_ir = resolve_camera_device(config)
-        .context("failed to resolve camera device")?
-        .device_is_ir;
+    // Cheap device resolution only (no camera I/O), so a pre-check rejection
+    // never touches the camera. The same resolution is opened below once auth
+    // actually proceeds, so the caps the gates saw are the caps the camera
+    // carries.
+    let resolved = resolve_camera_device(config).context("failed to resolve camera device")?;
 
     let rl = &config.security.rate_limit;
     let rate_limiter = RateLimiter::new(rl.max_attempts, rl.window_secs);
@@ -165,7 +134,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         &store,
         user,
         &rate_limiter,
-        device_is_ir,
+        &resolved.caps,
         AuditSource::Test,
         PreCheckContext::test(),
     ) {
@@ -185,11 +154,7 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         };
     }
 
-    let OpenedCamera {
-        mut camera,
-        device_is_ir,
-        device_fingerprint,
-    } = open_camera_context(config)?;
+    let mut camera = open_resolved_camera(config, resolved)?;
     let mut engine = load_engine(config)?;
 
     // Load embeddings with encryption support, matching the daemon handler path.
@@ -210,8 +175,6 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         &models,
         config,
         user,
-        device_is_ir,
-        &device_fingerprint,
         AuditSource::Test,
     );
 
@@ -226,7 +189,6 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
 /// embeddings (#100). `authenticate_with_embeddings` copies the compare set
 /// and zeroizes only its own copies, so without this the plaintext templates
 /// passed in would outlive authentication in the caller's memory.
-#[allow(clippy::too_many_arguments)]
 pub fn authenticate_and_wipe<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
@@ -234,20 +196,10 @@ pub fn authenticate_and_wipe<C: CameraSource, E: FaceProcessor>(
     models: &[facelock_core::types::FaceModelInfo],
     config: &Config,
     user: &str,
-    device_is_ir: bool,
-    live_fingerprint: &facelock_core::types::DeviceFingerprint,
     source: AuditSource,
 ) -> DaemonResponse {
     let response = facelock_daemon::auth::authenticate_with_embeddings(
-        camera,
-        engine,
-        stored,
-        models,
-        config,
-        user,
-        device_is_ir,
-        live_fingerprint,
-        source,
+        camera, engine, stored, models, config, user, source,
     );
     zeroize_stored_embeddings(stored);
     response
@@ -375,9 +327,10 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
         .map_err(|m| anyhow::anyhow!(m))?;
 
     let store = open_store(config)?;
-    let opened = open_camera_context(config)?;
-    let device_id = opened.device_fingerprint.canonical_for_storage();
-    let mut camera = opened.camera;
+    let mut camera = open_camera(config)?;
+    // The enrolling camera's own identity — asked of the camera that records
+    // the template.
+    let device_id = camera.capabilities().fingerprint.canonical_for_storage();
     let mut engine = load_engine(config)?;
 
     // Initialize sealer if encryption is configured
@@ -459,20 +412,10 @@ pub fn list_devices_direct() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use facelock_camera::FormatInfo;
+    use facelock_camera::{DeviceInfo, FormatInfo};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_config() -> Config {
-        Config::parse(
-            r#"
-[device]
-warmup_frames = 2
-"#,
-        )
-        .unwrap()
-    }
 
     fn make_device(path: &str, name: &str, fourcc: &str) -> DeviceInfo {
         DeviceInfo {
@@ -501,7 +444,6 @@ warmup_frames = 2
 
     #[test]
     fn auto_detected_device_inherits_quirk_state() {
-        let config = test_config();
         let device = make_device("/dev/video2", "BRIO IR", "GREY");
         let dir = write_quirks_dir(
             r#"
@@ -514,12 +456,13 @@ warmup_frames = 9
         let mut quirks = QuirksDb::default();
         quirks.load_dir(&dir);
 
-        let resolved = build_resolved_camera_device(&config, device, &quirks);
+        let resolved = ResolvedCamera::interrogate(device, &quirks);
 
-        assert_eq!(resolved.device.path.as_deref(), Some("/dev/video2"));
-        assert!(resolved.device_is_ir);
+        assert_eq!(resolved.info.path, "/dev/video2");
+        assert!(resolved.caps.is_ir);
+        assert_eq!(resolved.caps.applied_quirks.len(), 1);
         assert_eq!(
-            resolved.device_quirk.as_ref().and_then(|q| q.warmup_frames),
+            resolved.quirk.as_ref().and_then(|q| q.warmup_frames),
             Some(9)
         );
 
@@ -528,16 +471,17 @@ warmup_frames = 9
 
     #[test]
     fn unmatched_device_keeps_default_warmup_and_non_ir_state() {
-        let config = test_config();
         let device = make_device("/dev/video3", "USB Camera", "MJPG");
         let quirks = QuirksDb::default();
 
-        let resolved = build_resolved_camera_device(&config, device, &quirks);
+        let resolved = ResolvedCamera::interrogate(device, &quirks);
 
-        assert_eq!(resolved.device.path.as_deref(), Some("/dev/video3"));
-        assert_eq!(resolved.device.warmup_frames, 2);
-        assert!(!resolved.device_is_ir);
-        assert!(resolved.device_quirk.is_none());
+        assert_eq!(resolved.info.path, "/dev/video3");
+        assert!(!resolved.caps.is_ir);
+        // No quirk match: `open_resolved_camera` falls back to the config's
+        // own warmup_frames.
+        assert!(resolved.quirk.is_none());
+        assert!(resolved.caps.applied_quirks.is_empty());
     }
 
     // --- N8: encrypted-store loading in the direct path ---
@@ -648,13 +592,9 @@ abort_if_lid_closed = false
             embedder_model: String::new(),
             device_id: None,
         }];
-        let fingerprint = facelock_core::types::DeviceFingerprint {
-            vid: None,
-            pid: None,
-            serial: None,
-            by_path: None,
-        };
 
+        // The mock's default caps are non-IR with an all-None fingerprint —
+        // the same facts the removed loose parameters used to carry.
         let response = authenticate_and_wipe(
             &mut camera,
             &mut engine,
@@ -662,8 +602,6 @@ abort_if_lid_closed = false
             &models,
             &config,
             "alice",
-            false,
-            &fingerprint,
             AuditSource::Test,
         );
 

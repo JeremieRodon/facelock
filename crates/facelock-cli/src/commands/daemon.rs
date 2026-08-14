@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use facelock_camera::quirks::QuirksDb;
-use facelock_camera::{Camera, auto_detect_device, is_ir_camera_resolved, validate_device};
+use facelock_camera::{
+    Camera, ResolvedCamera, auto_detect_device, is_ir_camera_resolved, validate_device,
+};
 use facelock_core::config::Config;
 use facelock_core::dbus_interface::{
     AuthResult, BUS_NAME, DeviceInfo, ModelInfo, OBJECT_PATH, PreviewFaceInfo,
@@ -1161,19 +1163,35 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
 
     let device_path = config.device.path.clone().unwrap();
 
-    let device_is_ir = match validate_device(&device_path) {
+    // Resolve and interrogate the device once, up front. The resulting caps
+    // gate `pre_check` before any camera is opened, and every camera the
+    // factory opens carries the same interrogation. Tolerant of a device
+    // that cannot be queried: the daemon still starts (auth keeps falling
+    // through to password), with non-IR caps and whatever identity sysfs
+    // still offers.
+    let resolved = match validate_device(&device_path) {
         Ok(info) => {
-            // Sibling-aware: on multi-node USB cameras only the IR sensor
-            // node counts as IR, not every node sharing the quirk's VID:PID.
-            let is_ir = is_ir_camera_resolved(&info, Some(&quirks));
-            info!(device = %device_path, ir = is_ir, name = %info.name, "camera device");
-            is_ir
+            let resolved = ResolvedCamera::interrogate(info, &quirks);
+            info!(
+                device = %device_path,
+                ir = resolved.caps.is_ir,
+                name = %resolved.info.name,
+                "camera device"
+            );
+            Some(resolved)
         }
         Err(e) => {
             warn!("failed to query device {device_path}: {e}");
-            false
+            None
         }
     };
+    let device_caps = resolved
+        .as_ref()
+        .map(|r| r.caps.clone())
+        .unwrap_or_else(|| facelock_core::types::CameraCaps {
+            fingerprint: facelock_camera::device_fingerprint(&device_path),
+            ..Default::default()
+        });
 
     // Explicit resolution before construction (D7): name what is missing or
     // misconfigured up front — the engine's load error is opaque about
@@ -1225,34 +1243,41 @@ fn build_handler(config_path: Option<&str>) -> Result<(ProductionHandler, u64), 
         config.security.rate_limit.window_secs,
     );
 
-    let device_quirk = validate_device(&device_path)
-        .ok()
-        .and_then(|info| quirks.find_match(&info).cloned());
-
-    let quirk_for_factory = device_quirk.clone();
-    let camera_factory: CameraFactory = Box::new(move |config: &Config| {
-        Camera::open(&config.device, quirk_for_factory.as_ref()).map_err(|e| e.to_string())
-    });
-
-    // Device coupling (Plan 02): fingerprint the resolved camera once so enroll
-    // can record it and auth can require it. Advisory only (model-granularity,
-    // spoofable) — see facelock_core::types::DeviceFingerprint.
-    let device_fingerprint = facelock_camera::device_fingerprint(&device_path);
+    // Device coupling (Plan 02): the interrogated fingerprint rides on the
+    // caps, so enroll can record it and auth can require it. Advisory only
+    // (model-granularity, spoofable) — see facelock_core::types::DeviceFingerprint.
     info!(
         device = %device_path,
-        device_id = %device_fingerprint.canonical(),
+        device_id = %device_caps.fingerprint.canonical(),
         "camera device fingerprint"
     );
 
     let idle_timeout_secs = config.daemon.idle_timeout_secs;
-    let warmup_override = device_quirk.and_then(|q| q.warmup_frames);
+    let warmup_override = resolved
+        .as_ref()
+        .and_then(|r| r.quirk.as_ref())
+        .and_then(|q| q.warmup_frames);
+    let camera_factory: CameraFactory = match resolved {
+        // Reuse the startup interrogation for every (re)open, exactly as the
+        // startup-captured quirk used to be reused.
+        Some(resolved) => Box::new(move |config: &Config| {
+            resolved
+                .clone()
+                .open(&config.device)
+                .map_err(|e| e.to_string())
+        }),
+        // Unqueryable at startup: retry a fresh resolve-and-open per request
+        // so a later-appearing device surfaces its own open error (or works).
+        None => Box::new(move |config: &Config| {
+            Camera::open(&config.device, &QuirksDb::load()).map_err(|e| e.to_string())
+        }),
+    };
     let handler = Handler::new(
         config,
         engine,
         store,
         rate_limiter,
-        device_is_ir,
-        device_fingerprint,
+        device_caps,
         Some(camera_factory),
         warmup_override,
     )?;

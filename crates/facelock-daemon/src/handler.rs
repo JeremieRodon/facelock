@@ -25,10 +25,11 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
     pub engine: E,
     pub store: FaceStore,
     pub rate_limiter: RateLimiter,
-    pub device_is_ir: bool,
-    /// Live camera fingerprint used to couple templates to their enrolling
-    /// camera (Plan 02). Computed once at handler build from the resolved device.
-    pub device_fingerprint: facelock_core::types::DeviceFingerprint,
+    /// Capabilities of the resolved (not necessarily open) camera device,
+    /// computed once at handler build. `pre_check` gates `require_ir` on
+    /// `device_caps.is_ir` *before* any camera is opened; once a camera is
+    /// open, its own `capabilities()` are authoritative.
+    pub device_caps: facelock_core::types::CameraCaps,
     pub shutdown_requested: bool,
     camera: Option<C>,
     camera_factory: Option<CameraFactory<C>>,
@@ -52,8 +53,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         engine: E,
         store: FaceStore,
         rate_limiter: RateLimiter,
-        device_is_ir: bool,
-        device_fingerprint: facelock_core::types::DeviceFingerprint,
+        device_caps: facelock_core::types::CameraCaps,
         camera_factory: Option<CameraFactory<C>>,
         warmup_frames_override: Option<u32>,
     ) -> Result<Self, String> {
@@ -157,8 +157,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             engine,
             store,
             rate_limiter,
-            device_is_ir,
-            device_fingerprint,
+            device_caps,
             shutdown_requested: false,
             camera: None,
             camera_factory,
@@ -368,7 +367,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
 
                 let mut camera = self.camera.take().unwrap();
-                let device_id = self.device_fingerprint.canonical_for_storage();
+                // The enrolling camera's own identity — asked of the camera
+                // actually recording the template, not a handler-level copy.
+                let device_id = camera.capabilities().fingerprint.canonical_for_storage();
                 let result = enroll::enroll(
                     &mut camera,
                     &mut self.engine,
@@ -520,7 +521,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             &self.store,
             &user,
             &self.rate_limiter,
-            self.device_is_ir,
+            &self.device_caps,
             AuditSource::Daemon,
         ) {
             return resp;
@@ -560,8 +561,6 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             &models,
             &self.config,
             &user,
-            self.device_is_ir,
-            &self.device_fingerprint,
             AuditSource::Daemon,
         );
         // `authenticate_with_embeddings` works on an internal copy;

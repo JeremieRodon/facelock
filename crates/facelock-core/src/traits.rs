@@ -1,18 +1,21 @@
 use crate::error::Result;
-use crate::types::{Detection, FaceEmbedding, Frame};
+use crate::types::{CameraCaps, Detection, FaceEmbedding, Frame};
 
 /// Abstraction over camera frame capture.
+///
+/// Object-safe: capabilities are computed once at construction and asked of
+/// the camera, never threaded alongside it as loose parameters (gap D8).
+/// Frame darkness is a property of a frame, not a camera — see the free
+/// function `facelock_camera::is_dark`.
 pub trait CameraSource {
+    /// Capabilities of the underlying device, computed at construction.
+    fn capabilities(&self) -> &CameraCaps;
+
     /// Capture a frame with full preprocessing (RGB + grayscale + CLAHE).
     fn capture(&mut self) -> Result<Frame>;
 
     /// Capture a frame with RGB only (no grayscale/CLAHE).
     fn capture_rgb_only(&mut self) -> Result<Frame>;
-
-    /// Check if a frame is too dark.
-    fn is_dark(frame: &Frame) -> bool
-    where
-        Self: Sized;
 }
 
 /// Abstraction over face detection + embedding extraction.

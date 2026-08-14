@@ -1,6 +1,6 @@
 use facelock_core::error::Result;
 use facelock_core::traits::CameraSource;
-use facelock_core::types::Frame;
+use facelock_core::types::{CameraCaps, Frame};
 
 use crate::fixtures;
 
@@ -10,6 +10,7 @@ pub struct MockCamera {
     index: usize,
     #[allow(dead_code)]
     dark_threshold: f32,
+    caps: CameraCaps,
 }
 
 impl MockCamera {
@@ -22,6 +23,7 @@ impl MockCamera {
             frames,
             index: 0,
             dark_threshold: 0.4,
+            caps: CameraCaps::default(),
         }
     }
 
@@ -34,6 +36,7 @@ impl MockCamera {
             frames,
             index: 0,
             dark_threshold: 0.4,
+            caps: CameraCaps::default(),
         }
     }
 
@@ -43,16 +46,39 @@ impl MockCamera {
             frames,
             index: 0,
             dark_threshold: 0.4,
+            caps: CameraCaps::default(),
         }
+    }
+
+    /// Attach capabilities (defaults to `CameraCaps::default()`: non-IR, no
+    /// identity) — for IR-gating and device-coupling tests.
+    pub fn with_caps(mut self, caps: CameraCaps) -> Self {
+        self.caps = caps;
+        self
     }
 
     /// How many frames have been captured.
     pub fn captures(&self) -> usize {
         self.index
     }
+
+    /// Mock darkness check (fixed thresholds), kept as an inherent method now
+    /// that `is_dark` is no longer part of `CameraSource`.
+    pub fn is_dark(frame: &Frame) -> bool {
+        if frame.gray.is_empty() {
+            return true;
+        }
+        let dark_count = frame.gray.iter().filter(|&&p| p < 10).count();
+        let ratio = dark_count as f32 / frame.gray.len() as f32;
+        ratio > 0.4
+    }
 }
 
 impl CameraSource for MockCamera {
+    fn capabilities(&self) -> &CameraCaps {
+        &self.caps
+    }
+
     fn capture(&mut self) -> Result<Frame> {
         if self.index >= self.frames.len() {
             // Wrap around to allow repeated captures
@@ -67,14 +93,5 @@ impl CameraSource for MockCamera {
         let mut frame = self.capture()?;
         frame.gray = Vec::new();
         Ok(frame)
-    }
-
-    fn is_dark(frame: &Frame) -> bool {
-        if frame.gray.is_empty() {
-            return true;
-        }
-        let dark_count = frame.gray.iter().filter(|&&p| p < 10).count();
-        let ratio = dark_count as f32 / frame.gray.len() as f32;
-        ratio > 0.4
     }
 }

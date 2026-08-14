@@ -18,7 +18,8 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 use crate::ir_emitter;
 use crate::ir_emitter::EmitterXuInfo;
 use crate::preprocess;
-use crate::quirks::Quirk;
+use crate::quirks::{Quirk, QuirksDb};
+use facelock_core::types::CameraCaps;
 
 /// A V4L2 camera for frame capture.
 pub struct Camera<'a> {
@@ -33,17 +34,34 @@ pub struct Camera<'a> {
     ir_emitter_active: bool,
     /// Emitter XU info, stored for disable on drop when the quirk ref is gone.
     emitter_xu_info: Option<EmitterXuInfo>,
+    /// Capabilities computed at construction — see `crate::caps` (gap D8).
+    caps: CameraCaps,
 }
 
 impl<'a> Camera<'a> {
-    /// Open a camera device with the given configuration.
-    /// If `config.path` is `None`, auto-detects the best available camera.
+    /// Resolve, interrogate and open a camera in one step. If `config.path`
+    /// is `None`, auto-detects the best available camera. The matched quirk
+    /// and the capabilities both come from the resolution — callers that need
+    /// the caps *before* opening (pre-flight gates) use
+    /// [`crate::caps::ResolvedCamera`] directly and open from that.
+    pub fn open(config: &DeviceConfig, quirks: &QuirksDb) -> Result<Camera<'static>> {
+        crate::caps::ResolvedCamera::resolve(config, quirks)?.open(config)
+    }
+
+    /// Open a camera device with the given configuration and pre-computed
+    /// capabilities (from [`crate::caps::ResolvedCamera`] — the one place
+    /// caps are derived, so an arbitrary caller cannot assert caps a device
+    /// never demonstrated).
     ///
     /// When a `quirk` is provided, its overrides take precedence:
     /// - `format_preference` is prepended to the format priority list.
     /// - `warmup_frames` replaces `config.warmup_frames`.
     /// - `rotation` replaces `config.rotation`.
-    pub fn open(config: &DeviceConfig, quirk: Option<&Quirk>) -> Result<Camera<'static>> {
+    pub(crate) fn open_resolved(
+        config: &DeviceConfig,
+        quirk: Option<&Quirk>,
+        caps: CameraCaps,
+    ) -> Result<Camera<'static>> {
         let device_path = match config.path {
             Some(ref p) => p.clone(),
             None => {
@@ -56,10 +74,10 @@ impl<'a> Camera<'a> {
             .map_err(|e| FacelockError::Camera(format!("failed to open {device_path}: {e}")))?;
 
         // Verify VIDEO_CAPTURE capability
-        let caps = dev.query_caps().map_err(|e| {
+        let v4l_caps = dev.query_caps().map_err(|e| {
             FacelockError::Camera(format!("failed to query caps for {device_path}: {e}"))
         })?;
-        if !caps
+        if !v4l_caps
             .capabilities
             .contains(v4l::capability::Flags::VIDEO_CAPTURE)
         {
@@ -171,7 +189,13 @@ impl<'a> Camera<'a> {
             device_path,
             ir_emitter_active,
             emitter_xu_info,
+            caps,
         })
+    }
+
+    /// Capabilities computed at construction. See [`CameraCaps`].
+    pub fn capabilities(&self) -> &CameraCaps {
+        &self.caps
     }
 
     /// Return the negotiated pixel format string (e.g. "MJPG", "YUYV", "GREY").
@@ -284,8 +308,17 @@ impl<'a> Camera<'a> {
 
     /// Check if a frame is too dark using default thresholds.
     pub fn is_dark(frame: &Frame) -> bool {
-        is_dark_with_config(frame, 0.6, 10)
+        is_dark(frame)
     }
+}
+
+/// Check if a frame is too dark using default thresholds.
+///
+/// A free function, not a `CameraSource` method: darkness is a property of a
+/// frame, and hanging it off the trait was what made the trait non-object-safe
+/// (`where Self: Sized`).
+pub fn is_dark(frame: &Frame) -> bool {
+    is_dark_with_config(frame, 0.6, 10)
 }
 
 /// Check if a frame is too dark to process.
@@ -325,16 +358,16 @@ impl Drop for Camera<'_> {
 }
 
 impl CameraSource for Camera<'_> {
+    fn capabilities(&self) -> &CameraCaps {
+        Camera::capabilities(self)
+    }
+
     fn capture(&mut self) -> Result<Frame> {
         Camera::capture(self)
     }
 
     fn capture_rgb_only(&mut self) -> Result<Frame> {
         Camera::capture_rgb_only(self)
-    }
-
-    fn is_dark(frame: &Frame) -> bool {
-        Camera::is_dark(frame)
     }
 }
 
@@ -455,7 +488,7 @@ mod tests {
             ir_emitter: false,
             camera_release_secs: 5,
         };
-        let mut cam = Camera::open(&config, None).expect("failed to open camera");
+        let mut cam = Camera::open(&config, &QuirksDb::load()).expect("failed to open camera");
         let frame = cam.capture().expect("failed to capture frame");
         assert!(frame.width > 0);
         assert!(frame.height > 0);

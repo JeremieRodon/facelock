@@ -83,6 +83,19 @@ fn mock_camera_wraps_around() {
     assert_eq!(frame.width, 64);
 }
 
+/// D8 compile-time pin: `CameraSource` is object-safe. The old trait carried
+/// `fn is_dark(..) where Self: Sized`, which made `dyn CameraSource`
+/// unusable; darkness is a free function now and capabilities live on the
+/// camera, so a boxed camera works.
+#[test]
+fn camera_source_is_object_safe() {
+    use facelock_core::traits::CameraSource;
+    let mut cam: Box<dyn CameraSource> = Box::new(MockCamera::bright(64, 64, 1));
+    let frame = cam.capture().unwrap();
+    assert_eq!(frame.width, 64);
+    assert!(!cam.capabilities().is_ir);
+}
+
 #[test]
 fn mock_face_engine_one_face() {
     use facelock_core::traits::FaceProcessor;
@@ -184,6 +197,8 @@ fn device_mismatch_never_reaches_success() {
         device_id: Some("aaaa:bbbb:".into()),
     }];
 
+    // The live camera's identity now rides on its caps — the auth loop asks
+    // the camera rather than taking a fingerprint parameter (D8).
     let mismatch = DeviceFingerprint {
         vid: Some("cccc".into()),
         pid: Some("dddd".into()),
@@ -191,7 +206,10 @@ fn device_mismatch_never_reaches_success() {
         by_path: None,
     };
     let mut engine = MockFaceEngine::one_face(emb);
-    let mut cam = MockCamera::bright(64, 64, 10);
+    let mut cam = MockCamera::bright(64, 64, 10).with_caps(facelock_core::types::CameraCaps {
+        fingerprint: mismatch,
+        ..Default::default()
+    });
     let resp = authenticate_with_embeddings(
         &mut cam,
         &mut engine,
@@ -199,8 +217,6 @@ fn device_mismatch_never_reaches_success() {
         &models,
         &config,
         "u",
-        false,
-        &mismatch,
         AuditSource::Daemon,
     );
     match resp {
@@ -221,7 +237,10 @@ fn device_mismatch_never_reaches_success() {
         by_path: None,
     };
     let mut engine2 = MockFaceEngine::one_face(emb);
-    let mut cam2 = MockCamera::bright(64, 64, 10);
+    let mut cam2 = MockCamera::bright(64, 64, 10).with_caps(facelock_core::types::CameraCaps {
+        fingerprint: matching,
+        ..Default::default()
+    });
     let resp2 = authenticate_with_embeddings(
         &mut cam2,
         &mut engine2,
@@ -229,8 +248,6 @@ fn device_mismatch_never_reaches_success() {
         &models,
         &config,
         "u",
-        false,
-        &matching,
         AuditSource::Daemon,
     );
     match resp2 {
@@ -272,7 +289,10 @@ fn legacy_null_device_id_still_authenticates() {
         by_path: None,
     };
     let mut engine = MockFaceEngine::one_face(emb);
-    let mut cam = MockCamera::bright(64, 64, 10);
+    let mut cam = MockCamera::bright(64, 64, 10).with_caps(facelock_core::types::CameraCaps {
+        fingerprint: live,
+        ..Default::default()
+    });
     let resp = authenticate_with_embeddings(
         &mut cam,
         &mut engine,
@@ -280,8 +300,6 @@ fn legacy_null_device_id_still_authenticates() {
         &models,
         &config,
         "u",
-        false,
-        &live,
         AuditSource::Daemon,
     );
     match resp {
@@ -326,8 +344,7 @@ fn warmup_frames_discarded_on_camera_open() {
         engine,
         store,
         rate_limiter,
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )
@@ -370,8 +387,7 @@ fn warmup_frames_zero_skips_discard() {
         engine,
         store,
         rate_limiter,
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )
@@ -429,8 +445,6 @@ fn static_matching_frames_report_variance_reason() {
         &models,
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Daemon,
     );
 
@@ -482,8 +496,6 @@ fn still_then_moving_frames_recover_and_authenticate() {
         &models,
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Daemon,
     );
 
@@ -533,8 +545,6 @@ fn failed_auth_writes_audit_entry() {
         &[],
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Daemon,
     );
     assert!(
@@ -554,8 +564,6 @@ fn failed_auth_writes_audit_entry() {
         &[],
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Test,
     );
 
@@ -629,8 +637,7 @@ fn keyfile_sealer_init_failure_fails_enroll_closed_no_plaintext() {
         engine,
         store,
         rate_limiter,
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )
@@ -700,8 +707,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,
         ),
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory1),
         None,
     )
@@ -727,8 +733,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,
         ),
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory2),
         None,
     )
@@ -785,8 +790,7 @@ fn exempted_authenticate_does_not_consume_rate_limit_budget() {
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,
         ),
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )
@@ -875,8 +879,7 @@ fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,
         ),
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )

@@ -8,7 +8,7 @@ use facelock_core::fs_security::{ensure_dir, ensure_private_dir, write_file};
 use facelock_core::ipc::DaemonResponse;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{
-    AuthFailureReason, DeviceFingerprint, FaceEmbedding, Frame, FrameVarianceWindow, MatchResult,
+    AuthFailureReason, CameraCaps, FaceEmbedding, Frame, FrameVarianceWindow, MatchResult,
     best_match, device_allowed_model_ids, zeroize_stored_embeddings,
 };
 use facelock_store::FaceStore;
@@ -56,19 +56,24 @@ impl PreCheckContext {
 
 /// Run pre-flight checks that don't need the camera, fully enforced.
 /// Returns Some(response) to short-circuit, or None to proceed with auth.
+///
+/// `caps` are the *resolved* device's capabilities ([`CameraCaps`]), computed
+/// without opening a camera stream — the `require_ir` gate must run before
+/// any camera (and its indicator LED) is touched, so this is the one boundary
+/// where caps arrive as a parameter instead of being asked of an open camera.
 pub fn pre_check(
     config: &Config,
     store: &FaceStore,
     user: &str,
     rate_limiter: &RateLimiter,
-    device_is_ir: bool,
+    caps: &CameraCaps,
 ) -> Option<DaemonResponse> {
     pre_check_with_context(
         config,
         store,
         user,
         rate_limiter,
-        device_is_ir,
+        caps,
         PreCheckContext::enforced(),
     )
 }
@@ -80,7 +85,7 @@ pub fn pre_check_with_context(
     store: &FaceStore,
     user: &str,
     rate_limiter: &RateLimiter,
-    device_is_ir: bool,
+    caps: &CameraCaps,
     ctx: PreCheckContext,
 ) -> Option<DaemonResponse> {
     if config.security.disabled {
@@ -145,7 +150,7 @@ pub fn pre_check_with_context(
         }
     }
 
-    if config.security.require_ir && !device_is_ir {
+    if config.security.require_ir && !caps.is_ir {
         warn!(user, "IR camera required but device is not IR");
         return Some(DaemonResponse::Error {
             message: "IR camera required for authentication. Set security.require_ir = false to override (NOT RECOMMENDED).".into(),
@@ -165,7 +170,7 @@ pub fn pre_check_audited(
     store: &FaceStore,
     user: &str,
     rate_limiter: &RateLimiter,
-    device_is_ir: bool,
+    caps: &CameraCaps,
     source: AuditSource,
 ) -> Option<DaemonResponse> {
     pre_check_audited_with_context(
@@ -173,7 +178,7 @@ pub fn pre_check_audited(
         store,
         user,
         rate_limiter,
-        device_is_ir,
+        caps,
         source,
         PreCheckContext::enforced(),
     )
@@ -185,11 +190,11 @@ pub fn pre_check_audited_with_context(
     store: &FaceStore,
     user: &str,
     rate_limiter: &RateLimiter,
-    device_is_ir: bool,
+    caps: &CameraCaps,
     source: AuditSource,
     ctx: PreCheckContext,
 ) -> Option<DaemonResponse> {
-    let resp = pre_check_with_context(config, store, user, rate_limiter, device_is_ir, ctx)?;
+    let resp = pre_check_with_context(config, store, user, rate_limiter, caps, ctx)?;
     let (result, error) = match &resp {
         DaemonResponse::Error { message } if message.contains("rate limited") => {
             ("rate_limited".to_string(), Some(message.clone()))
@@ -231,7 +236,11 @@ pub fn pre_check_audited_with_context(
 /// only `Test` (direct-mode `facelock test`) skips `pre_check`, so a `success`
 /// stamped `test` is a recognition result rather than an approved
 /// authentication.
-#[allow(clippy::too_many_arguments)]
+///
+/// The device's IR-ness (gating the IR texture liveness check) and its
+/// fingerprint (restricting the compare set to templates enrolled on this
+/// camera) are asked of `camera.capabilities()` — the camera in use, not a
+/// parameter a caller could get out of sync with it (gap D8).
 pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
@@ -239,23 +248,11 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     models: &[facelock_core::types::FaceModelInfo],
     config: &Config,
     user: &str,
-    device_is_ir: bool,
-    live_fingerprint: &DeviceFingerprint,
     source: AuditSource,
 ) -> DaemonResponse {
     let mut stored = stored.to_vec();
     let models = models.to_vec();
-    authenticate_inner(
-        camera,
-        engine,
-        &mut stored,
-        &models,
-        config,
-        user,
-        device_is_ir,
-        live_fingerprint,
-        source,
-    )
+    authenticate_inner(camera, engine, &mut stored, &models, config, user, source)
 }
 
 /// Save a snapshot of the last captured frame to disk.
@@ -299,7 +296,6 @@ fn save_snapshot(snapshot_config: &SnapshotConfig, user: &str, similarity: f32, 
     debug!(path = %path.display(), "saved auth snapshot");
 }
 
-#[allow(clippy::too_many_arguments)]
 fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
@@ -307,10 +303,10 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     models: &[facelock_core::types::FaceModelInfo],
     config: &Config,
     user: &str,
-    device_is_ir: bool,
-    live_fingerprint: &DeviceFingerprint,
     source: AuditSource,
 ) -> DaemonResponse {
+    let device_is_ir = camera.capabilities().is_ir;
+    let live_fingerprint = camera.capabilities().fingerprint.clone();
     let start = Instant::now();
     let save_snapshots = config.snapshots.mode != facelock_core::config::SnapshotMode::Off;
     let label_for =
@@ -322,7 +318,7 @@ fn authenticate_inner<C: CameraSource, E: FaceProcessor>(
     // — the outcome degrades to "no match" → password, never a success and never
     // a lockout. Fail SOFT by construction.
     let policy = config.security.device_binding_policy();
-    let allowed = device_allowed_model_ids(models, live_fingerprint, &policy);
+    let allowed = device_allowed_model_ids(models, &live_fingerprint, &policy);
     let mut compare_set: Vec<(u32, FaceEmbedding)> = stored
         .iter()
         .filter(|(id, _)| allowed.contains(id))
@@ -747,6 +743,15 @@ mod tests {
         config
     }
 
+    /// Caps of an IR-classified device (what these tests used to express as a
+    /// bare `device_is_ir: true`).
+    fn ir_caps() -> CameraCaps {
+        CameraCaps {
+            is_ir: true,
+            ..Default::default()
+        }
+    }
+
     fn store_with_enrolled_user(user: &str) -> FaceStore {
         let store = FaceStore::open_memory().unwrap();
         store
@@ -796,7 +801,7 @@ mod tests {
             &store,
             "alice",
             &rate_limiter,
-            true,
+            &ir_caps(),
             PreCheckContext::test(),
         );
         unsafe {
@@ -829,7 +834,7 @@ mod tests {
             &store,
             "alice",
             &rate_limiter,
-            true,
+            &ir_caps(),
             PreCheckContext::enforced(),
         );
         unsafe {
@@ -861,7 +866,7 @@ mod tests {
 
         let old_conn = std::env::var("SSH_CONNECTION").ok();
         unsafe { std::env::set_var("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22") };
-        let resp = pre_check(&config, &store, "alice", &rate_limiter, true);
+        let resp = pre_check(&config, &store, "alice", &rate_limiter, &ir_caps());
         unsafe {
             match old_conn {
                 Some(v) => std::env::set_var("SSH_CONNECTION", v),
