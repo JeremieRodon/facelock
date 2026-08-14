@@ -14,11 +14,14 @@ fn facelock_bin() -> Command {
 /// would otherwise hang waiting for input that never arrives.
 ///
 /// Skips (rather than failing) under an actual root test runner: these
-/// commands legitimately succeed as root, and this contract has nothing to
-/// assert in that case. Every dev/CI invocation of `cargo test` observed for
-/// this crate runs non-root, so the skip is the exceptional path, not the
-/// common one.
+/// commands may proceed past the root check and then fail for unrelated
+/// reasons, and this contract has nothing to assert in that case.
 fn assert_refuses_before_output(args: &[&str], forbidden_substrings: &[&str]) {
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!("skipping {args:?}: non-root refusal cannot be tested as root");
+        return;
+    }
+
     let output = facelock_bin()
         .args(args)
         .stdin(Stdio::null())
@@ -27,12 +30,6 @@ fn assert_refuses_before_output(args: &[&str], forbidden_substrings: &[&str]) {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if output.status.success() {
-        // Only a root test runner reaches here (see doc comment).
-        eprintln!("skipping {args:?}: process is root, command is expected to succeed");
-        return;
-    }
 
     assert!(
         stderr.contains("Root required"),
