@@ -1205,10 +1205,10 @@ mod tests {
     /// Unknown msgids fall back to the input string (no catalog installed).
     #[test]
     fn translate_falls_back_to_msgid() {
-        assert_eq!(
-            translate("facelock test msgid that no catalog contains"),
-            "facelock test msgid that no catalog contains"
-        );
+        // Via a binding so xgettext (which extracts literal `translate("...")`
+        // calls) does not sweep this probe into the catalog.
+        let probe = "facelock test msgid that no catalog contains";
+        assert_eq!(translate(probe), probe);
     }
 
     #[test]
@@ -1313,7 +1313,9 @@ mod tests {
 
         let localized = UserMessage::ConfirmRunSetupNow.localized();
         let machine = UserMessage::ConfirmRunSetupNow.machine();
-        let missing = translate("facelock msgid absent from the fixture catalog");
+        // Binding keeps this probe msgid out of xgettext extraction.
+        let absent_probe = "facelock msgid absent from the fixture catalog";
+        let missing = translate(absent_probe);
 
         // Restore before asserting so a failure cannot leak state.
         unsafe { std::env::remove_var("LANGUAGE") };

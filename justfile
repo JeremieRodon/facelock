@@ -174,6 +174,13 @@ install-files:
     install -dm755 /usr/share/facelock/quirks.d
     install -Dm644 config/quirks.d/*.toml /usr/share/facelock/quirks.d/
 
+    # Compiled translations (optional; produced by `just mo`, absent otherwise)
+    if [ -d target/locale ]; then
+        (cd target/locale && find . -name '*.mo' | while read -r mo; do
+            install -Dm644 "$mo" "/usr/share/locale/${mo#./}"
+        done)
+    fi
+
     # systemd unit
     install -Dm644 systemd/facelock-daemon.service /usr/lib/systemd/system/facelock-daemon.service
     if [ -f /etc/systemd/system/facelock-daemon.service ] && \
@@ -342,6 +349,9 @@ uninstall-files:
     rm -rf /usr/share/facelock
     rm -f /etc/facelock/config.toml.default
 
+    # Remove installed translation catalogs (ours only)
+    rm -f /usr/share/locale/*/LC_MESSAGES/facelock.mo /usr/share/locale/*/LC_MESSAGES/pam_facelock.mo
+
     systemctl daemon-reload 2>/dev/null || true
 
     echo ""
@@ -356,6 +366,66 @@ uninstall-files:
     echo "==> To remove the facelock group (after removing all members):"
     echo "==>   sudo gpasswd -d <username> facelock"
     echo "==>   sudo groupdel facelock"
+
+# ---------------------------------------------------------------------------
+# Localization (optional tooling)
+#
+# gettext is NOT required to build, test, or install facelock — English is
+# compiled in as the fallback. These recipes exist for translators and fail
+# with a clear message when the gettext tools are absent.
+# ---------------------------------------------------------------------------
+
+# Regenerate translation templates (po/*.pot) from source. The CLI catalog
+# extracts every `translate("...")` literal in the message seam
+# (crates/facelock-cli/src/message.rs — the one place CLI user-facing English
+# lives); the PAM catalog extracts `gettext("...")` from pam-facelock.
+# xgettext has no Rust mode, but --language=C tokenizes these files correctly
+# because the seam keeps msgids as single-line plain literals (see the
+# "Adding a message" pattern in message.rs).
+pot:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v xgettext >/dev/null; then
+        echo "error: xgettext not found — install the gettext package." >&2
+        echo "       (Translations are optional; building facelock does not need this.)" >&2
+        exit 1
+    fi
+    xgettext --language=C --keyword=translate --from-code=UTF-8 --no-wrap \
+        --package-name=facelock --copyright-holder="Facelock Contributors" \
+        -o po/facelock.pot crates/facelock-cli/src/message.rs
+    xgettext --language=C --keyword=gettext --from-code=UTF-8 --no-wrap \
+        --package-name=pam_facelock --copyright-holder="Facelock Contributors" \
+        -o po/pam_facelock.pot crates/pam-facelock/src/lib.rs
+    echo "Regenerated po/facelock.pot and po/pam_facelock.pot"
+
+# Compile translations po/<lang>/{facelock,pam_facelock}.po into
+# target/locale/<lang>/LC_MESSAGES/<domain>.mo. `just install` installs
+# target/locale/ under /usr/share/locale if present. To start a new
+# translation: mkdir -p po/de && msginit -i po/facelock.pot -o po/de/facelock.po -l de
+# To verify a translation manually without installing system-wide:
+#   FACELOCK_LOCALEDIR=$PWD/target/locale LANGUAGE=de facelock list
+mo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v msgfmt >/dev/null; then
+        echo "error: msgfmt not found — install the gettext package." >&2
+        echo "       (Translations are optional; building facelock does not need this.)" >&2
+        exit 1
+    fi
+    found=0
+    for po in po/*/*.po; do
+        [ -e "$po" ] || continue
+        found=1
+        lang=$(basename "$(dirname "$po")")
+        domain=$(basename "$po" .po)
+        out="target/locale/$lang/LC_MESSAGES/$domain.mo"
+        mkdir -p "$(dirname "$out")"
+        msgfmt --check -o "$out" "$po"
+        echo "  $po -> $out"
+    done
+    if [ "$found" = 0 ]; then
+        echo "no .po files under po/<lang>/ — nothing to compile"
+    fi
 
 # Bump version and prepare a release commit + tag
 # Usage: just release 0.2.0
