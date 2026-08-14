@@ -109,17 +109,30 @@ impl Default for PamSecurityConfig {
     }
 }
 
-#[derive(Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)] // Variants used via deserialization
 enum PamNotificationMode {
     Off,
+    /// Default must agree with `PamNotificationConfig::default()` below and
+    /// with facelock-core's `NotificationMode` (Terminal). This enum-level
+    /// default is what a present `[notification]` section with `mode` omitted
+    /// produces; the struct `Default` is what an absent section produces.
+    /// The two had drifted (`Both` here, `Terminal` there) — benign only
+    /// because `terminal()` treats Both and Terminal identically.
+    #[default]
     Terminal,
     Desktop,
-    #[default]
     Both,
 }
 
+/// Private mirror of the `[notification]` table in facelock-core's
+/// `NotificationConfig` — the canonical schema. The dependency ceiling
+/// (libc/toml/serde/zbus only) forbids sharing the types; keep field names
+/// and defaults in lockstep by hand. The flags gate the same event
+/// vocabulary as `facelock_core::notify::NotifyEvent`: `notify_prompt` ↔
+/// Scanning, `notify_on_success` ↔ Success. (This module renders them as
+/// PAM conversation text; desktop delivery is the daemon's job.)
 #[derive(Deserialize)]
 struct PamNotificationConfig {
     #[serde(default)]
@@ -1098,6 +1111,44 @@ timeout_secs = 10
         assert!(!config.security.disabled);
         assert!(config.security.abort_if_ssh);
         assert_eq!(config.recognition.timeout_secs, DEFAULT_TIMEOUT_SECS);
+    }
+
+    /// D9 drift pin: a `[notification]` section present with every key
+    /// omitted (serde field defaults) must parse identically to no section
+    /// at all (`PamNotificationConfig::default()`). The mode enum's
+    /// `#[default]` had drifted to `Both` while the struct default said
+    /// `Terminal` — undetected because `terminal()` treats both identically.
+    #[test]
+    fn notification_section_present_with_keys_omitted_equals_absent() {
+        let present: PamConfig = toml::from_str("[notification]\n").unwrap();
+        let absent: PamConfig = toml::from_str("").unwrap();
+        let default = PamNotificationConfig::default();
+        for config in [&present.notification, &absent.notification] {
+            assert_eq!(config.mode, default.mode);
+            assert_eq!(config.notify_prompt, default.notify_prompt);
+            assert_eq!(config.notify_on_success, default.notify_on_success);
+        }
+    }
+
+    /// Conformance with the canonical schema, in the only form the
+    /// dependency ceiling allows: parse the same shipped template
+    /// facelock-core ships and require the effective notification settings
+    /// to equal our defaults. The template has an active `[notification]`
+    /// header with every key commented — exactly the shape that exposed the
+    /// default drift — and any future template default that this crate does
+    /// not mirror will fail here visibly.
+    #[test]
+    fn shipped_template_notification_settings_equal_defaults() {
+        let template = include_str!("../../../config/facelock.toml");
+        let config: PamConfig = toml::from_str(template).unwrap();
+        let default = PamNotificationConfig::default();
+        assert_eq!(config.notification.mode, default.mode);
+        assert_eq!(config.notification.notify_prompt, default.notify_prompt);
+        assert_eq!(
+            config.notification.notify_on_success,
+            default.notify_on_success
+        );
+        assert!(config.notification.terminal());
     }
 
     #[test]
