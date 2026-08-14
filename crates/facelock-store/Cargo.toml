@@ -9,6 +9,7 @@ license.workspace = true
 facelock-core = { path = "../facelock-core" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 bytemuck = { version = "1", features = ["derive"] }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

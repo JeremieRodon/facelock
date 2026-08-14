@@ -1157,6 +1157,7 @@ dependencies = [
  "facelock-core",
  "rusqlite",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

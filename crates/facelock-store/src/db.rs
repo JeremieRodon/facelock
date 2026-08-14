@@ -4,18 +4,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
 
-use facelock_core::error::{FacelockError, Result};
 use facelock_core::fs_security::ensure_mode;
 use facelock_core::types::{FaceEmbedding, FaceModelInfo};
 
+use crate::error::{Result, StoreError};
 use crate::migrations::run_migrations;
 
+#[derive(Debug)]
 pub struct FaceStore {
     conn: rusqlite::Connection,
-}
-
-fn map_err(e: rusqlite::Error) -> FacelockError {
-    FacelockError::Storage(e.to_string())
+    /// Where this store lives, kept so post-open failures can name the
+    /// database they failed on. `:memory:` for [`FaceStore::open_memory`].
+    path: PathBuf,
 }
 
 impl FaceStore {
@@ -29,10 +29,11 @@ impl FaceStore {
     /// a store of biometric templates. A missing database must be an error the
     /// caller sees.
     ///
-    /// Errors when the file is missing, unreadable, or not a SQLite database.
-    /// The error type does not yet distinguish those cases — use
-    /// [`FaceStore::database_exists`] first when the caller needs to tell
-    /// "fresh install" apart from "cannot read".
+    /// The error says why: [`StoreError::Absent`] for a missing file (a
+    /// fresh install a caller may legitimately proceed on),
+    /// [`StoreError::Denied`]/[`StoreError::Corrupt`]/[`StoreError::Busy`]
+    /// when the file is there but cannot be used — cases that must never be
+    /// read as "nothing enrolled".
     ///
     /// **Migrations do run.** Not creating and not migrating are separate
     /// concerns: a database that is *present* but on an older schema still has
@@ -41,14 +42,13 @@ impl FaceStore {
     /// under [`FaceStore::create`].
     pub fn open_existing(db_path: &Path) -> Result<Self> {
         // The flags below are what actually guarantee no file is created; this
-        // check only exists so the common case reports "no database" instead of
-        // SQLite's undifferentiated "unable to open database file".
-        if !Self::database_exists(db_path) {
-            return Err(FacelockError::Storage(format!(
-                "no database at {}",
-                db_path.display()
-            )));
-        }
+        // stat exists to classify the common failures precisely. ENOENT is the
+        // only evidence for `Absent`: a stat the filesystem *refuses* (e.g. an
+        // unsearchable parent directory) is `Denied`, because a bare
+        // `is_file()` there would report a possibly-present database as
+        // absent — which a destructive guard would read as "nothing to
+        // protect".
+        Self::stat_existing(db_path)?;
 
         let conn = rusqlite::Connection::open_with_flags(
             db_path,
@@ -56,11 +56,28 @@ impl FaceStore {
             // `file:` URI with query parameters.
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|e| {
-            FacelockError::Storage(format!("failed to open {}: {e}", db_path.display()))
-        })?;
+        .map_err(|e| StoreError::classify(db_path, e))?;
 
         Self::init(conn, db_path)
+    }
+
+    /// Classify what is at `db_path` before a no-create open: absent, a
+    /// non-file, or unstatable. `Ok(())` means a regular file is present.
+    fn stat_existing(db_path: &Path) -> Result<()> {
+        match std::fs::metadata(db_path) {
+            Ok(m) if m.is_file() => Ok(()),
+            Ok(_) => Err(StoreError::Corrupt {
+                path: db_path.to_path_buf(),
+                detail: "path exists but is not a regular file".into(),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StoreError::Absent {
+                path: db_path.to_path_buf(),
+            }),
+            Err(e) => Err(StoreError::Denied {
+                path: db_path.to_path_buf(),
+                detail: format!("cannot stat: {e}"),
+            }),
+        }
     }
 
     /// Create the database if absent, then open it read-write.
@@ -70,8 +87,11 @@ impl FaceStore {
     /// should use [`FaceStore::open_existing`] — see its docs for why creating
     /// as a side effect of reading strands a user's templates.
     pub fn create(db_path: &Path) -> Result<Self> {
-        // `Connection::open` implies SQLITE_OPEN_CREATE.
-        let conn = rusqlite::Connection::open(db_path).map_err(map_err)?;
+        // `Connection::open` implies SQLITE_OPEN_CREATE, so `Absent` cannot
+        // come back from this constructor — an uncreatable path (missing or
+        // unwritable parent) surfaces as `Denied`.
+        let conn =
+            rusqlite::Connection::open(db_path).map_err(|e| StoreError::classify(db_path, e))?;
         Self::init(conn, db_path)
     }
 
@@ -90,10 +110,10 @@ impl FaceStore {
 
     /// Whether a database file is present at this path.
     ///
-    /// A cheap `stat`, no connection opened and no schema inspected — enough to
-    /// tell "fresh install" from "cannot read" before calling
-    /// [`FaceStore::open_existing`], which cannot express that difference in
-    /// its error type today.
+    /// A cheap `stat`, no connection opened and no schema inspected. Note it
+    /// cannot distinguish "absent" from "unstatable": for any decision that
+    /// treats those differently, call [`FaceStore::open_existing`] and match
+    /// on [`StoreError::Absent`] vs [`StoreError::Denied`] instead.
     pub fn database_exists(db_path: &Path) -> bool {
         db_path.is_file()
     }
@@ -103,10 +123,13 @@ impl FaceStore {
     /// used to obtain `conn` differ between them.
     fn init(conn: rusqlite::Connection, db_path: &Path) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(map_err)?;
+            .map_err(|e| StoreError::classify(db_path, e))?;
         run_migrations(&conn)?;
         secure_database_files(db_path)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: db_path.to_path_buf(),
+        })
     }
 
     /// Open database in read-only mode for authentication queries.
@@ -116,23 +139,39 @@ impl FaceStore {
     /// so never brings a database into existence; it differs in giving up write
     /// access entirely, which is why it also cannot migrate.
     pub fn open_readonly(db_path: &Path) -> Result<Self> {
+        // Same stat classification as `open_existing`: a missing file is
+        // `Absent`, not an undifferentiated open failure.
+        Self::stat_existing(db_path)?;
         let conn = rusqlite::Connection::open_with_flags(
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(map_err)?;
+        .map_err(|e| StoreError::classify(db_path, e))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(map_err)?;
-        Ok(Self { conn })
+            .map_err(|e| StoreError::classify(db_path, e))?;
+        Ok(Self {
+            conn,
+            path: db_path.to_path_buf(),
+        })
     }
 
     /// Open an in-memory database for testing.
     pub fn open_memory() -> Result<Self> {
-        let conn = rusqlite::Connection::open_in_memory().map_err(map_err)?;
+        let path = Path::new(":memory:");
+        let conn =
+            rusqlite::Connection::open_in_memory().map_err(|e| StoreError::classify(path, e))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(map_err)?;
+            .map_err(|e| StoreError::classify(path, e))?;
         run_migrations(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Classify a rusqlite failure from this store's connection.
+    fn err(&self, e: rusqlite::Error) -> StoreError {
+        StoreError::classify(&self.path, e)
     }
 
     /// Add a face model with its embedding. Returns the new model ID.
@@ -159,7 +198,7 @@ impl FaceStore {
         embedder_model: &str,
         device_id: Option<&str>,
     ) -> Result<u32> {
-        let tx = self.conn.unchecked_transaction().map_err(map_err)?;
+        let tx = self.conn.unchecked_transaction().map_err(|e| self.err(e))?;
 
         // Stored as INTEGER (i64) in SQLite. Cast keeps the code portable
         // across rusqlite versions (0.39+ no longer impls ToSql/FromSql for u64
@@ -173,7 +212,7 @@ impl FaceStore {
             "INSERT INTO face_models (user, label, created_at, embedder_model, device_id) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![user, label, created_at, embedder_model, device_id],
         )
-        .map_err(map_err)?;
+        .map_err(|e| self.err(e))?;
 
         let model_id = tx.last_insert_rowid() as u32;
 
@@ -182,9 +221,9 @@ impl FaceStore {
             "INSERT INTO face_embeddings (model_id, embedding) VALUES (?1, ?2)",
             params![model_id, bytes],
         )
-        .map_err(map_err)?;
+        .map_err(|e| self.err(e))?;
 
-        tx.commit().map_err(map_err)?;
+        tx.commit().map_err(|e| self.err(e))?;
         Ok(model_id)
     }
 
@@ -197,7 +236,7 @@ impl FaceStore {
                 "INSERT INTO face_embeddings (model_id, embedding) VALUES (?1, ?2)",
                 params![model_id, bytes],
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(())
     }
 
@@ -210,7 +249,7 @@ impl FaceStore {
                 "INSERT INTO face_embeddings (model_id, embedding, sealed) VALUES (?1, ?2, ?3)",
                 params![model_id, data, sealed_int],
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(())
     }
 
@@ -223,7 +262,7 @@ impl FaceStore {
                 "DELETE FROM face_models WHERE user = ?1 AND label = ?2",
                 params![user, label],
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(affected > 0)
     }
 
@@ -237,7 +276,7 @@ impl FaceStore {
                  JOIN face_embeddings fe ON fe.model_id = fm.id
                  WHERE fm.user = ?1",
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let rows = stmt
             .query_map(params![user], |row| {
@@ -245,17 +284,22 @@ impl FaceStore {
                 let blob: Vec<u8> = row.get(1)?;
                 Ok((id, blob))
             })
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let mut results = Vec::new();
         for row in rows {
-            let (id, blob) = row.map_err(map_err)?;
+            let (id, blob) = row.map_err(|e| self.err(e))?;
             if blob.len() != 512 * 4 {
-                return Err(FacelockError::Storage(format!(
-                    "invalid embedding blob size: expected {} bytes, got {}",
-                    512 * 4,
-                    blob.len()
-                )));
+                // Wrong-size template data is a corrupt store, not a failed
+                // query: the row exists but cannot mean what it must.
+                return Err(StoreError::Corrupt {
+                    path: self.path.clone(),
+                    detail: format!(
+                        "invalid embedding blob size: expected {} bytes, got {}",
+                        512 * 4,
+                        blob.len()
+                    ),
+                });
             }
             let floats: &[f32] = bytemuck::cast_slice(&blob);
             let mut embedding = [0f32; 512];
@@ -270,7 +314,7 @@ impl FaceStore {
         let mut stmt = self
             .conn
             .prepare("SELECT id, user, label, created_at, embedder_model, device_id FROM face_models WHERE user = ?1")
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let rows = stmt
             .query_map(params![user], |row| {
@@ -285,11 +329,11 @@ impl FaceStore {
                     device_id: row.get::<_, Option<String>>(5)?,
                 })
             })
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(row.map_err(map_err)?);
+            results.push(row.map_err(|e| self.err(e))?);
         }
         Ok(results)
     }
@@ -302,15 +346,15 @@ impl FaceStore {
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT user FROM face_models ORDER BY user")
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(row.map_err(map_err)?);
+            results.push(row.map_err(|e| self.err(e))?);
         }
         Ok(results)
     }
@@ -324,7 +368,7 @@ impl FaceStore {
                 "DELETE FROM face_models WHERE id = ?1 AND user = ?2",
                 params![model_id, user],
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(affected > 0)
     }
 
@@ -333,7 +377,7 @@ impl FaceStore {
         let affected = self
             .conn
             .execute("DELETE FROM face_models WHERE user = ?1", params![user])
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(affected as u32)
     }
 
@@ -351,7 +395,7 @@ impl FaceStore {
                  JOIN face_embeddings fe ON fe.model_id = fm.id
                  WHERE fm.user = ?1",
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let rows = stmt
             .query_map(params![user], |row| {
@@ -360,11 +404,11 @@ impl FaceStore {
                 let sealed: bool = row.get::<_, i64>(2)? != 0;
                 Ok((id, blob, sealed))
             })
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(row.map_err(map_err)?);
+            results.push(row.map_err(|e| self.err(e))?);
         }
         Ok(results)
     }
@@ -388,7 +432,7 @@ impl FaceStore {
                  JOIN face_embeddings fe ON fe.model_id = fm.id
                  WHERE fm.user = ?1",
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let rows = stmt
             .query_map(params![user], |row| {
@@ -398,11 +442,11 @@ impl FaceStore {
                 let device_id: Option<String> = row.get(3)?;
                 Ok((id, blob, sealed, device_id))
             })
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(row.map_err(map_err)?);
+            results.push(row.map_err(|e| self.err(e))?);
         }
         Ok(results)
     }
@@ -433,7 +477,7 @@ impl FaceStore {
         embedder_model: &str,
         device_id: Option<&str>,
     ) -> Result<u32> {
-        let tx = self.conn.unchecked_transaction().map_err(map_err)?;
+        let tx = self.conn.unchecked_transaction().map_err(|e| self.err(e))?;
 
         // Stored as INTEGER (i64) in SQLite. Cast keeps the code portable
         // across rusqlite versions (0.39+ no longer impls ToSql/FromSql for u64
@@ -447,7 +491,7 @@ impl FaceStore {
             "INSERT INTO face_models (user, label, created_at, embedder_model, device_id) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![user, label, created_at, embedder_model, device_id],
         )
-        .map_err(map_err)?;
+        .map_err(|e| self.err(e))?;
 
         let model_id = tx.last_insert_rowid() as u32;
         let sealed_int: i64 = if sealed { 1 } else { 0 };
@@ -456,9 +500,9 @@ impl FaceStore {
             "INSERT INTO face_embeddings (model_id, embedding, sealed) VALUES (?1, ?2, ?3)",
             params![model_id, data, sealed_int],
         )
-        .map_err(map_err)?;
+        .map_err(|e| self.err(e))?;
 
-        tx.commit().map_err(map_err)?;
+        tx.commit().map_err(|e| self.err(e))?;
         Ok(model_id)
     }
 
@@ -476,12 +520,13 @@ impl FaceStore {
                 "UPDATE face_embeddings SET embedding = ?1, sealed = ?2 WHERE id = ?3",
                 params![data, sealed_int, embedding_id],
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         if affected == 0 {
-            return Err(FacelockError::Storage(format!(
-                "embedding ID {embedding_id} not found"
-            )));
+            return Err(StoreError::Query {
+                path: self.path.clone(),
+                detail: format!("embedding ID {embedding_id} not found"),
+            });
         }
         Ok(())
     }
@@ -496,7 +541,7 @@ impl FaceStore {
                 [],
                 |row| row.get(0),
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         let unsealed: u32 = self
             .conn
             .query_row(
@@ -504,7 +549,7 @@ impl FaceStore {
                 [],
                 |row| row.get(0),
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok((sealed, unsealed))
     }
 
@@ -519,7 +564,7 @@ impl FaceStore {
                  FROM face_embeddings fe
                  JOIN face_models fm ON fm.id = fe.model_id",
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let rows = stmt
             .query_map([], |row| {
@@ -529,11 +574,11 @@ impl FaceStore {
                 let sealed: bool = row.get::<_, i64>(3)? != 0;
                 Ok((id, user, blob, sealed))
             })
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(row.map_err(map_err)?);
+            results.push(row.map_err(|e| self.err(e))?);
         }
         Ok(results)
     }
@@ -550,7 +595,7 @@ impl FaceStore {
                 "INSERT INTO rate_limit (user, attempt_time) VALUES (?1, ?2)",
                 params![user, now],
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(())
     }
 
@@ -576,7 +621,7 @@ impl FaceStore {
                 params![user, cutoff],
                 |row| row.get(0),
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(count < max_attempts)
     }
 
@@ -593,7 +638,7 @@ impl FaceStore {
                 "DELETE FROM rate_limit WHERE attempt_time <= ?1",
                 params![cutoff],
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(())
     }
 
@@ -608,7 +653,7 @@ impl FaceStore {
         match result {
             Ok(model) => Ok(Some(model)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(map_err(e)),
+            Err(e) => Err(self.err(e)),
         }
     }
 
@@ -621,7 +666,7 @@ impl FaceStore {
                 params![user, embedder_model],
                 |row| row.get(0),
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(count > 0)
     }
 
@@ -634,7 +679,7 @@ impl FaceStore {
                 params![user],
                 |row| row.get(0),
             )
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(count > 0)
     }
 
@@ -643,7 +688,7 @@ impl FaceStore {
         let count: u32 = self
             .conn
             .query_row("SELECT COUNT(*) FROM face_models", [], |row| row.get(0))
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(count > 0)
     }
 
@@ -652,7 +697,7 @@ impl FaceStore {
         let affected = self
             .conn
             .execute("DELETE FROM face_models", [])
-            .map_err(map_err)?;
+            .map_err(|e| self.err(e))?;
         Ok(affected as u32)
     }
 }
@@ -663,11 +708,9 @@ fn secure_database_files(db_path: &Path) -> Result<()> {
         sqlite_sidecar_path(db_path, "-wal"),
         sqlite_sidecar_path(db_path, "-shm"),
     ] {
-        ensure_mode(&path, 0o600).map_err(|e| {
-            FacelockError::Storage(format!(
-                "failed to secure database file {}: {e}",
-                path.display()
-            ))
+        ensure_mode(&path, 0o600).map_err(|e| StoreError::Denied {
+            detail: format!("failed to secure database file: {e}"),
+            path: path.clone(),
         })?;
     }
 
@@ -1327,6 +1370,117 @@ mod tests {
         let dir = tmp.path().join("subdir");
         std::fs::create_dir(&dir).unwrap();
         assert!(!FaceStore::database_exists(&dir));
+    }
+
+    /// Whether the test process would bypass the permission checks some of
+    /// the `Denied` tests rely on (root ignores file modes).
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self")
+            .map(|m| m.uid() == 0)
+            .unwrap_or(false)
+    }
+
+    /// The failure classes as they arise from a real filesystem: a missing
+    /// file is `Absent` — a *state*, carrying the path a caller may then
+    /// legitimately create at — never an undifferentiated error.
+    #[test]
+    fn missing_file_is_absent_with_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("facelock.db");
+
+        match FaceStore::open_existing(&missing).unwrap_err() {
+            StoreError::Absent { path } => assert_eq!(path, missing),
+            other => panic!("a missing database must classify as Absent, got {other:?}"),
+        }
+        match FaceStore::open_readonly(&missing).unwrap_err() {
+            StoreError::Absent { path } => assert_eq!(path, missing),
+            other => panic!("open_readonly must agree on Absent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_file_is_corrupt_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("facelock.db");
+        std::fs::write(&db, b"this is not a sqlite database").unwrap();
+
+        let err = FaceStore::open_existing(&db).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn directory_at_path_is_corrupt_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+
+        let err = FaceStore::open_existing(&dir).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn locked_database_is_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("facelock.db");
+
+        // A rollback-journal database (NOT the WAL mode FaceStore sets up),
+        // so BEGIN EXCLUSIVE really excludes readers.
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder
+            .execute_batch("CREATE TABLE t(x); BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        let err = FaceStore::open_existing(&db).unwrap_err();
+        assert!(matches!(err, StoreError::Busy { .. }), "got {err:?}");
+        drop(holder);
+    }
+
+    /// The distinction the type exists for: a database facelock cannot even
+    /// stat must read as `Denied` — "cannot tell" — never as `Absent`, which
+    /// a destructive guard is entitled to treat as "nothing to protect".
+    #[cfg(unix)]
+    #[test]
+    fn unstatable_path_is_denied_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return; // root bypasses the permission bits this test relies on
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("locked");
+        std::fs::create_dir(&parent).unwrap();
+        let db = parent.join("facelock.db");
+        drop(FaceStore::create(&db).unwrap());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0)).unwrap();
+
+        let result = FaceStore::open_existing(&db);
+        // Restore before asserting so the tempdir can clean up on failure.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, StoreError::Denied { .. }),
+            "an unstatable database must be Denied, never Absent: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_is_denied_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return; // root bypasses the permission bits this test relies on
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("facelock.db");
+        drop(FaceStore::create(&db).unwrap());
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0)).unwrap();
+
+        let err = FaceStore::open_existing(&db).unwrap_err();
+        assert!(matches!(err, StoreError::Denied { .. }), "got {err:?}");
     }
 
     #[test]
