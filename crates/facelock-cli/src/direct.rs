@@ -436,7 +436,7 @@ warmup_frames = 2
     #[test]
     fn auto_detected_device_inherits_quirk_state() {
         let config = test_config();
-        let device = make_device("/dev/video2", "Logitech BRIO IR", "MJPG");
+        let device = make_device("/dev/video2", "BRIO IR", "GREY");
         let dir = write_quirks_dir(
             r#"
 [[quirk]]
