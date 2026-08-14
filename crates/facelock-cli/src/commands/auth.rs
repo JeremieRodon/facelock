@@ -33,15 +33,9 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     };
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            // `facelock`, not `facelock_cli`: the crate builds as a bin target
-            // named `facelock`, so that is the target its own events carry.
-            // Filtering on `facelock_cli` matched nothing and silently dropped
-            // every diagnostic this command emits — including the reason an
-            // auth attempt failed. `daemon.rs` already gets this right.
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "facelock=info,facelock_daemon=info".into()),
-        )
+        // See crate::logging's module doc for why this must not build its
+        // own fallback filter by hand.
+        .with_env_filter(crate::logging::default_env_filter())
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();

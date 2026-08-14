@@ -3,6 +3,7 @@ mod commands;
 pub mod direct;
 pub mod health;
 mod ipc_client;
+mod logging;
 pub mod message;
 pub mod notifications;
 pub mod resolved;
@@ -11,7 +12,6 @@ pub mod state_layout;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
 use commands::TpmCommand;
 use commands::bench::BenchCommand;
@@ -249,7 +249,7 @@ fn main() -> anyhow::Result<()> {
         other => {
             // Default tracing init for all other commands
             tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
+                .with_env_filter(logging::default_env_filter())
                 .with_target(false)
                 .init();
 

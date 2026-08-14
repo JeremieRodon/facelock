@@ -1400,4 +1400,39 @@ auth_bin = "/usr/local/bin/evil"
         )));
         assert!(!is_timeout_zbus_error(&io_err));
     }
+
+    // --- E2: shared-schema conformance (domain-object-map.md §1) ---
+
+    /// The shipped config template is parsed by two independent, deliberately
+    /// unmerged schemas: facelock-core's `Config` (see
+    /// `crates/facelock-core/tests/config_template_test.rs`) and this
+    /// crate's private `PamConfig`, kept minimal by the PAM dependency
+    /// ceiling. This is PAM's half of that contract: if a future key drifts
+    /// so one side gains a key the other rejects (a `deny_unknown_fields`
+    /// creeping onto either schema, or a new required field with no
+    /// `#[serde(default)]`), this fails loudly in CI instead of surfacing as
+    /// a silent config parse error at `pam_sm_authenticate` time on a real
+    /// system.
+    #[test]
+    fn shipped_config_template_parses_as_pam_config() {
+        const TEMPLATE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/facelock.toml"
+        ));
+        let config: PamConfig = toml::from_str(TEMPLATE)
+            .expect("PamConfig must parse the same shipped template facelock-core parses");
+
+        // Every key this template documents for PAM is shipped commented out
+        // (illustrating syntax, not overriding anything), so parsing it must
+        // be indistinguishable from parsing an empty document.
+        assert_eq!(config.daemon.mode, "daemon");
+        assert!(!config.security.disabled);
+        assert!(config.security.abort_if_ssh);
+        assert!(config.security.abort_if_lid_closed);
+        assert!(config.security.pam_policy.is_none());
+        assert_eq!(config.recognition.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert!(config.notification.terminal());
+        assert!(config.notification.notify_prompt);
+        assert!(config.notification.notify_on_success);
+    }
 }
