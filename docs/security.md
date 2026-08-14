@@ -536,8 +536,9 @@ Implementation note:
 #### A0. Config File Trust (Required)
 
 The PAM module runs in a root context, so `/etc/facelock/config.toml` is an
-attack vector: a writable config could redirect `auth_bin`, disable
-anti-spoofing knobs, or change the daemon mode. Before parsing, the module
+attack vector: a writable config could disable anti-spoofing knobs or change
+the daemon mode. (The oneshot binary path itself is fixed to
+`/usr/bin/facelock` and is not caller-influenced.) Before parsing, the module
 verifies that the config file **and every parent directory** are root-owned
 and not group- or world-writable. The file check uses `fstat` on the opened
 descriptor so the validated inode is exactly the one read (no TOCTOU). An

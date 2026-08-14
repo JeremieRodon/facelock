@@ -214,9 +214,12 @@ run_test_contains "Rate limit: daemon encodes recoverable error in-band (model_i
 
 # With the in-band encoding the PAM module classifies the error itself
 # (rate limited -> PAM_AUTH_ERR) instead of retrying as a root oneshot.
-# A marker auth_bin proves no oneshot child is ever spawned.
+# Swapping a marker stub in at /usr/bin/facelock proves no oneshot child is
+# ever spawned (the module spawns that fixed path; an auth_bin config
+# redirect would be ignored and make this test vacuous). The daemon keeps
+# answering from its already-exec'd binary while the file is swapped.
 run_test "Rate limit: PAM fails without oneshot escalation" \
-    "printf '#!/bin/bash\ntouch /tmp/oneshot-invoked\nexit 2\n' > /usr/local/bin/oneshot-marker && chmod 755 /usr/local/bin/oneshot-marker && sed -i '/^\[daemon\]/a auth_bin = \"/usr/local/bin/oneshot-marker\"' /etc/facelock/config.toml && rm -f /tmp/oneshot-invoked; timeout 30 pamtester facelock-test testuser authenticate < /dev/null; rc=\$?; sed -i '/^auth_bin = /d' /etc/facelock/config.toml; test \$rc -ne 0 && test ! -f /tmp/oneshot-invoked"
+    "printf '#!/bin/bash\ntouch /tmp/oneshot-invoked\nexit 2\n' > /usr/local/bin/oneshot-marker && chmod 755 /usr/local/bin/oneshot-marker && rm -f /tmp/oneshot-invoked && mv /usr/bin/facelock /usr/bin/facelock.orig && install -m 755 /usr/local/bin/oneshot-marker /usr/bin/facelock; timeout 30 pamtester facelock-test testuser authenticate < /dev/null; rc=\$?; mv -f /usr/bin/facelock.orig /usr/bin/facelock; test \$rc -ne 0 && test ! -f /tmp/oneshot-invoked"
 
 run_test "Rate limit: clear seeded attempts" \
     "sqlite3 $FACELOCK_DB \"DELETE FROM rate_limit WHERE user = 'testuser';\""

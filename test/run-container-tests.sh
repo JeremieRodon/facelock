@@ -139,11 +139,20 @@ printf '#!/bin/bash\nenv > /tmp/oneshot-child-env\nexit 2\n' > /usr/local/bin/fa
 chmod 755 /usr/local/bin/facelock-env-capture
 rm -f /tmp/preload-log /tmp/oneshot-child-env
 
-sed -i '/^\[daemon\]/a mode = "oneshot"\nauth_bin = "/usr/local/bin/facelock-env-capture"' /etc/facelock/config.toml
+# Intercept the oneshot spawn by BEING /usr/bin/facelock for the duration
+# rather than pointing an auth_bin config key at the stub: the PAM module
+# spawns the oneshot binary by that fixed path (post-#109 the key does not
+# exist; pre-#109 its default is the same path and nothing here sets it), so
+# the swap works on both sides of that change and the assertions can never
+# pass vacuously through an ignored redirect.
+sed -i '/^\[daemon\]/a mode = "oneshot"' /etc/facelock/config.toml
 sed -i '/^\[security\]/a abort_if_ssh = false' /etc/facelock/config.toml
+mv /usr/bin/facelock /usr/bin/facelock.orig
+install -m 755 /usr/local/bin/facelock-env-capture /usr/bin/facelock
 env LD_PRELOAD=/tmp/preload-marker.so SSH_CONNECTION='192.0.2.1 1111 192.0.2.2 22' \
     pamtester facelock-test testuser authenticate < /dev/null > /dev/null 2>&1 || true
-sed -i '/^mode = "oneshot"/d;/^auth_bin = /d;/^abort_if_ssh = false/d' /etc/facelock/config.toml
+mv -f /usr/bin/facelock.orig /usr/bin/facelock
+sed -i '/^mode = "oneshot"/d;/^abort_if_ssh = false/d' /etc/facelock/config.toml
 
 run_test "env_clear: marker was active in the PAM process" \
     "grep -q pamtester /tmp/preload-log" \
