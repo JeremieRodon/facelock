@@ -2935,6 +2935,16 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+/// Serializes the tests that set the process-global config-path override.
+/// Cargo runs a binary's tests on many threads in one process, so two such
+/// tests interleaving would read or write through each other's override. Take
+/// this lock before `set_process_config_override`, and declare it before the
+/// clearing Drop guard so the override is cleared while the lock is still
+/// held. A poisoned lock (a previous test panicked) is recovered rather than
+/// cascading the failure.
+#[cfg(test)]
+static CONFIG_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Choice-flag tests
 //
 // These run as an unprivileged user with no camera, no TPM and no network. The
@@ -3245,6 +3255,10 @@ mod choice_tests {
     /// Writes through `paths::config_path()`, so it needs the process override.
     #[test]
     fn encryption_none_sets_method_none() {
+        let _lock = super::CONFIG_OVERRIDE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         struct OverrideGuard;
         impl Drop for OverrideGuard {
             fn drop(&mut self) {
@@ -3316,15 +3330,12 @@ mod tests {
 
     #[test]
     fn check_model_empty_sha256_accepts_any() {
-        let dir = std::env::temp_dir().join("facelock_cli_test_setup");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
         std::fs::write(&path, b"test data").unwrap();
 
         let status = check_model(&path, "").unwrap();
         assert!(matches!(status, ModelStatus::Present));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3431,9 +3442,8 @@ account include   system-login
 
     #[test]
     fn check_model_correct_sha256() {
-        let dir = std::env::temp_dir().join("facelock_cli_test_sha");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
         std::fs::write(&path, b"hello world").unwrap();
 
         // SHA256 of "hello world"
@@ -3443,15 +3453,16 @@ account include   system-login
 
         let status = check_model(&path, "0000000000000000").unwrap();
         assert!(matches!(status, ModelStatus::BadChecksum));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn update_config_models_scenarios() {
-        let dir = std::env::temp_dir().join("facelock_test_models_scenarios");
-        std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("config.toml");
+        let _lock = super::CONFIG_OVERRIDE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
 
         struct ProcessConfigOverrideGuard;
 
@@ -3461,7 +3472,6 @@ account include   system-login
             }
         }
 
-        facelock_core::paths::clear_process_config_override();
         facelock_core::paths::set_process_config_override(config_path.clone());
         let _override_guard = ProcessConfigOverrideGuard;
 
@@ -3528,8 +3538,6 @@ account include   system-login
             "embedder_sha256 = \"4ab1d6435d639628a6f3e5008dd4f929edf4c4124b1a7169e1048f9fef534cdf\""
         ));
         assert!(result.contains("threshold = 0.75"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
