@@ -7,7 +7,7 @@ use facelock_core::ipc::{IpcDeviceInfo, PreviewFace};
 use facelock_core::types::{FaceModelInfo, MatchResult};
 use facelock_daemon::auth::{AuthOutcome, ErrorKind};
 
-use crate::message::Message;
+use crate::message::{AccessMessage, explain};
 
 /// Check if running as root; if not, offer to re-exec via sudo.
 ///
@@ -15,7 +15,7 @@ use crate::message::Message;
 /// If stdin is a TTY, prompts the user and re-execs. Otherwise bails
 /// with an actionable error message.
 pub fn require_root(hint: &str) -> anyhow::Result<()> {
-    use crate::message::{AccessMessage, Terminal, fail};
+    use crate::message::{Terminal, fail};
 
     if Uid::current().is_root() {
         return Ok(());
@@ -30,14 +30,12 @@ pub fn require_root(hint: &str) -> anyhow::Result<()> {
         }));
     }
 
-    // Interactive: offer to re-exec with sudo
-    Terminal.prompt(&AccessMessage::SudoReexecPrompt);
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("failed to read input")?;
-    let answer = input.trim().to_lowercase();
-    if answer == "n" || answer == "no" {
+    // Interactive: offer to re-exec with sudo. The prompt defaults to yes,
+    // and the hint that says so is appended by the sink — answer tokens and
+    // their advertised spelling are one English contract and never enter a
+    // catalog, or a translator could localize a hint the parser will not
+    // honour.
+    if !Terminal.confirm_default_yes(&AccessMessage::SudoReexecPrompt)? {
         return Err(fail(AccessMessage::RootRequired {
             hint: hint.to_string(),
         }));
@@ -132,8 +130,7 @@ pub fn send_enroll(
     // into a duplicate label.
     let result: (u32, u32) = proxy.call("Enroll", &(user, label)).map_err(|e| {
         if is_timeout_error(&e) {
-            anyhow::Error::new(e)
-                .context(crate::message::AccessMessage::EnrollTimedOutClientSide.localized())
+            anyhow::Error::new(e).context(explain(&AccessMessage::EnrollTimedOutClientSide))
         } else {
             anyhow::Error::new(e).context("D-Bus Enroll call failed")
         }
@@ -196,11 +193,13 @@ fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
     if !is_access_denied(&err) {
         return err;
     }
-    // Context strings render on stderr for a human, so they localize (D10).
+    // Context strings render on stderr for a human, so they localize (D10);
+    // `explain` also emits the machine line the sinks emit, so the hint stays
+    // visible in the debug event stream.
     if is_root_required_denial(&err) {
-        err.context(crate::message::AccessMessage::AccessDeniedRootHint.localized())
+        err.context(explain(&AccessMessage::AccessDeniedRootHint))
     } else {
-        err.context(crate::message::AccessMessage::AccessDeniedGroupHint.localized())
+        err.context(explain(&AccessMessage::AccessDeniedGroupHint))
     }
 }
 
@@ -392,16 +391,6 @@ pub fn resolve_user(flag: Option<&str>) -> String {
                 }
             })
         })
-}
-
-/// Read a yes/no confirmation from stdin. Returns true if user confirms.
-pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
-    eprint!("{prompt} [y/N] ");
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("failed to read input")?;
-    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 #[cfg(test)]

@@ -7,8 +7,14 @@
 //! - [`Message::localized`] — gettext-translated text for a human (terminal
 //!   via [`Terminal`], desktop notification bodies, `anyhow` errors whose
 //!   `Display` lands on stderr via [`fail`]).
-//! - [`Message::machine`] — a C-locale, locale-independent event line for
-//!   machine sinks.
+//! - [`Message::machine`] — a C-locale, locale-independent event line for the
+//!   tracing side channel.
+//!
+//! `machine()` is a derived `Debug` rendering, which makes it a debugging aid
+//! and not a serialization format — renaming a field changes the output with
+//! nothing to catch it. Persisted records go through the audit crate's serde
+//! path, which owns its own field names and its own compatibility rules; do
+//! not route `machine()` into `audit.jsonl` or any other stored artifact.
 //!
 //! This is how D2 ("logs stay English") holds *by construction*: a message
 //! routed through this type cannot reach a log sink in translated form,
@@ -117,7 +123,11 @@ unsafe extern "C" {
         domainname: *const libc::c_char,
         codeset: *const libc::c_char,
     ) -> *const libc::c_char;
-    safe fn setlocale(category: libc::c_int, locale: *const libc::c_char) -> *const libc::c_char;
+    // Not `safe`: glibc marks setlocale MT-Unsafe (const:locale) while
+    // dgettext and bindtextdomain are MT-safe. It mutates process-global
+    // state every later translation reads, so each call carries a SAFETY
+    // note about who else could be running.
+    fn setlocale(category: libc::c_int, locale: *const libc::c_char) -> *const libc::c_char;
 }
 
 /// Initialize localization for this process. Call once, early in `main`.
@@ -131,7 +141,11 @@ unsafe extern "C" {
 pub fn init() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        setlocale(libc::LC_MESSAGES, c"".as_ptr());
+        // SAFETY: setlocale is MT-Unsafe against concurrent translation.
+        // `init` is documented as "call once, early in `main`" and the `Once`
+        // enforces the once — at that point the process is single-threaded,
+        // so nothing can be inside dgettext while the locale changes.
+        unsafe { setlocale(libc::LC_MESSAGES, c"".as_ptr()) };
         let dir =
             std::env::var("FACELOCK_LOCALEDIR").unwrap_or_else(|_| "/usr/share/locale".to_string());
         if let Ok(c_dir) = CString::new(dir) {
@@ -184,10 +198,15 @@ pub trait Message: std::fmt::Debug {
     /// byte-identical to the historical inline string.
     fn localized(&self) -> String;
 
-    /// Render for a machine sink: the C-locale event line. Derived from the
-    /// variant's `Debug` form — variant and field names are the stable
+    /// Render for the tracing side channel: the C-locale event line. Derived
+    /// from the variant's `Debug` form — variant and field names are the
     /// vocabulary, values print locale-independently, and gettext is never
     /// consulted, which is what makes D2 hold by construction.
+    ///
+    /// Derived `Debug` is not a serialization format. This output is for
+    /// humans reading `RUST_LOG=facelock=debug`; anything persisted (audit
+    /// records above all) goes through serde, where the field names are a
+    /// declared contract rather than an accident of the type definition.
     fn machine(&self) -> String {
         format!("{self:?}")
     }
@@ -221,18 +240,55 @@ impl Terminal {
         eprintln!("{}", msg.localized());
     }
 
-    /// Inline prompt to stderr — no trailing newline; the caller reads the
-    /// answer from stdin.
-    pub fn prompt(&self, msg: &dyn Message) {
-        trace(msg);
-        eprint!("{}", msg.localized());
-    }
-
-    /// Localized y/N confirmation via the shared stdin reader.
+    /// Localized confirmation, defaulting to no.
     pub fn confirm(&self, msg: &dyn Message) -> anyhow::Result<bool> {
         trace(msg);
-        crate::ipc_client::confirm(&msg.localized())
+        eprint!("{}", prompt_line(msg, "[y/N]"));
+        Ok(matches!(read_answer()?.as_str(), "y" | "yes"))
     }
+
+    /// Localized confirmation, defaulting to yes.
+    pub fn confirm_default_yes(&self, msg: &dyn Message) -> anyhow::Result<bool> {
+        trace(msg);
+        eprint!("{}", prompt_line(msg, "[Y/n]"));
+        Ok(!matches!(read_answer()?.as_str(), "n" | "no"))
+    }
+}
+
+/// The exact bytes of an inline prompt: the localized question, the English
+/// answer hint, one trailing space, no newline.
+fn prompt_line(msg: &dyn Message, hint: &str) -> String {
+    format!("{} {hint} ", msg.localized())
+}
+
+/// Read one answer from stdin, trimmed and lowercased.
+///
+/// The hint (`[y/N]`, `[Y/n]`) is appended by the prompting method and the
+/// tokens are matched here, so the two halves of the contract sit together.
+/// Neither half may enter a catalog: the tokens below are English, so a
+/// translated hint would advertise an answer this parser cannot accept.
+///
+/// This lives in the sink rather than in `ipc_client` — the prompt is written
+/// here, so the answer is read here. `ipc_client` imports the message types,
+/// so the seam calling back into it was a cycle waiting to bite.
+fn read_answer() -> anyhow::Result<String> {
+    use anyhow::Context;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("failed to read input")?;
+    Ok(input.trim().to_lowercase())
+}
+
+/// Localized text for an `anyhow` context layer, traced like any other render.
+///
+/// `.context(explain(&msg))`, never `.context(msg.localized())`: every sink
+/// emits the machine rendering next to the human one, and a context layer
+/// that skipped it would show up on stderr while going missing from the
+/// `RUST_LOG=facelock=debug` event stream.
+pub fn explain(msg: &dyn Message) -> String {
+    trace(msg);
+    msg.localized()
 }
 
 /// An error whose `Display` is destined for a human on stderr (the CLI's
@@ -338,6 +394,26 @@ mod tests {
         );
     }
 
+    /// The answer hint is appended by the sink and the question alone is the
+    /// msgid, so a translator cannot advertise an answer `read_answer` will
+    /// not accept. The composed bytes are the ones these prompts always had.
+    #[test]
+    fn answer_hints_are_appended_not_translated() {
+        assert_eq!(
+            AccessMessage::SudoReexecPrompt.localized(),
+            "Root required. Re-run with sudo?",
+            "the [Y/n] hint must not be part of the msgid"
+        );
+        assert_eq!(
+            prompt_line(&AccessMessage::SudoReexecPrompt, "[Y/n]"),
+            "Root required. Re-run with sudo? [Y/n] "
+        );
+        assert_eq!(
+            prompt_line(&FaceMessage::ConfirmRunSetupNow, "[y/N]"),
+            "Run setup now? [y/N] "
+        );
+    }
+
     /// Every message in every domain renders with all placeholders
     /// substituted — a leftover `{name}` means a template/argument mismatch.
     ///
@@ -434,7 +510,15 @@ mod tests {
         .unwrap();
 
         // A non-C locale for LC_MESSAGES, else glibc ignores LANGUAGE.
-        let original = setlocale(libc::LC_MESSAGES, std::ptr::null());
+        //
+        // SAFETY: setlocale is MT-Unsafe and cargo runs tests on parallel
+        // threads, so this is the one call site that cannot appeal to being
+        // single-threaded. `LOCALE_MUTATION` serializes locale-mutating tests
+        // against each other; what remains is a window of a few lines against
+        // plain dgettext calls, which is why the fixture translates a single
+        // msgid no other test pins.
+        let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+        let original = unsafe { setlocale(libc::LC_MESSAGES, std::ptr::null()) };
         let original: CString = if original.is_null() {
             c"C".to_owned()
         } else {
@@ -442,7 +526,7 @@ mod tests {
         };
         let usable = [c"en_US.UTF-8", c"en_US.utf8", c"C.UTF-8", c"C.utf8"]
             .into_iter()
-            .find(|l| !setlocale(libc::LC_MESSAGES, l.as_ptr()).is_null());
+            .find(|l| !unsafe { setlocale(libc::LC_MESSAGES, l.as_ptr()) }.is_null());
         if usable.is_none() {
             eprintln!("skipping .mo lookup assertions: no usable non-C locale in this environment");
             return;
@@ -463,7 +547,8 @@ mod tests {
 
         // Restore before asserting so a failure cannot leak state.
         unsafe { std::env::remove_var("LANGUAGE") };
-        setlocale(libc::LC_MESSAGES, original.as_ptr());
+        // SAFETY: as above, still holding `_locale`.
+        unsafe { setlocale(libc::LC_MESSAGES, original.as_ptr()) };
         bindtextdomain(GETTEXT_DOMAIN.as_ptr(), c"/usr/share/locale".as_ptr());
 
         assert_eq!(localized, "XX-RUN-SETUP-NOW", "catalog hit must translate");
@@ -473,6 +558,10 @@ mod tests {
             "catalog miss must fall back to the msgid"
         );
     }
+
+    /// Held across every test that calls `setlocale`, so two of them cannot
+    /// interleave their save/mutate/restore sequences.
+    static LOCALE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Minimal GNU MO encoder: header entry plus the given pairs.
     /// Entries must be sorted by msgid (binary-search format, no hash table).

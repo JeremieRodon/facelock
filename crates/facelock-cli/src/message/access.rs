@@ -47,7 +47,10 @@ impl Message for AccessMessage {
                 translate("Root required.\n  Run: {hint}"),
                 &[("hint", hint.clone())],
             ),
-            SudoReexecPrompt => translate("Root required. Re-run with sudo? [Y/n] "),
+            // The "[Y/n]" hint is appended by the sink, not carried here:
+            // `Terminal::confirm_default_yes` owns both the hint and the
+            // English answer tokens it parses.
+            SudoReexecPrompt => translate("Root required. Re-run with sudo?"),
             AccessDeniedRootHint => translate(
                 "Access denied: this operation requires root.\n  Re-run with sudo, or as root.",
             ),

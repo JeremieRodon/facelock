@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: facelock\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-14 13:58-0700\n"
+"POT-Creation-Date: 2026-08-14 14:03-0700\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -33,40 +33,40 @@ msgid ""
 "  Run: {hint}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/access.rs:50
-msgid "Root required. Re-run with sudo? [Y/n] "
+#: crates/facelock-cli/src/message/access.rs:53
+msgid "Root required. Re-run with sudo?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/access.rs:52
+#: crates/facelock-cli/src/message/access.rs:55
 msgid ""
 "Access denied: this operation requires root.\n"
 "  Re-run with sudo, or as root."
 msgstr ""
 
-#: crates/facelock-cli/src/message/access.rs:55
+#: crates/facelock-cli/src/message/access.rs:58
 msgid ""
 "Access denied. If you are not in the 'facelock' group, add yourself:\n"
 "  sudo usermod -aG facelock $USER\n"
 "then log out and back in (or re-run: sudo facelock setup). Note: some operations require root regardless of group membership."
 msgstr ""
 
-#: crates/facelock-cli/src/message/access.rs:58
+#: crates/facelock-cli/src/message/access.rs:61
 msgid "enrollment timed out client-side; the daemon may have completed it — run `facelock list` before retrying"
 msgstr ""
 
-#: crates/facelock-cli/src/message/access.rs:61
+#: crates/facelock-cli/src/message/access.rs:64
 msgid ""
 "Warning: daemon.mode = \"daemon\" but the facelock daemon is unreachable — falling back to direct camera access.\n"
 "Start it with: sudo systemctl start facelock-daemon"
 msgstr ""
 
-#: crates/facelock-cli/src/message/access.rs:64
+#: crates/facelock-cli/src/message/access.rs:67
 msgid ""
 "Graphical preview requires the daemon. In oneshot mode, use --text-only.\n"
 "Falling back to text-only mode.\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/access.rs:67
+#: crates/facelock-cli/src/message/access.rs:70
 msgid ""
 "Graphical preview requires the daemon, which is configured but not reachable.\n"
 "Falling back to text-only mode. Start the daemon with: sudo systemctl start facelock-daemon\n"
