@@ -74,11 +74,10 @@ static PROXY: std::sync::OnceLock<Proxy<'static>> = std::sync::OnceLock::new();
 
 /// Get the blocking D-Bus proxy to the daemon (15-second method timeout).
 ///
-/// The underlying connection is created once per process and reused: the
-/// daemon keys its polkit frame authorization (`org.facelock.preview-frames`)
-/// on the caller's unique bus name, so a preview session must keep a single
-/// connection for its grant to apply across frames. Failures are not cached —
-/// the next call retries the connection.
+/// The underlying connection is created once per process and reused, so a
+/// multi-request session (a preview streaming frames) does not pay a bus
+/// handshake per call. Failures are not cached — the next call retries the
+/// connection.
 fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     if let Some(proxy) = PROXY.get() {
         return Ok(proxy.clone());

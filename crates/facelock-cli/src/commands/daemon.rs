@@ -1,7 +1,7 @@
 //! The `facelock daemon` command: process setup for the D-Bus server.
 //!
 //! The server itself — the `org.facelock.Daemon` service, per-method
-//! authorization, capture slot, polkit frame gating, idle timeout — lives in
+//! authorization, capture slot, idle timeout — lives in
 //! `facelock_daemon::server` so its authorization layer is integration-
 //! testable (D6). This command keeps the process-level concerns: the root
 //! check, tracing init, and building the production handler from config

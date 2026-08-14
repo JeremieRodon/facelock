@@ -217,10 +217,8 @@ fn render_frame(
     let stride = width * 4;
 
     if jpeg_data.is_empty() {
-        // The daemon strips raw frame bytes until the caller is authorized
-        // via polkit (org.facelock.preview-frames); the first frame request
-        // triggers the agent prompt. Show the detection summary without
-        // imagery while unauthorized.
+        // The daemon strips raw frame bytes from any non-root reply. Show
+        // the detection summary without imagery when they are absent.
         render_metadata_only(canvas, width, height, fps, faces);
         return;
     }
