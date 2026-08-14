@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: facelock\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-14 14:03-0700\n"
+"POT-Creation-Date: 2026-08-14 14:26-0700\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -57,7 +57,7 @@ msgstr ""
 #: crates/facelock-cli/src/message/access.rs:64
 msgid ""
 "Warning: daemon.mode = \"daemon\" but the facelock daemon is unreachable — falling back to direct camera access.\n"
-"Start it with: sudo systemctl start facelock-daemon"
+"Start the facelock-daemon service to use it."
 msgstr ""
 
 #: crates/facelock-cli/src/message/access.rs:67
@@ -69,7 +69,7 @@ msgstr ""
 #: crates/facelock-cli/src/message/access.rs:70
 msgid ""
 "Graphical preview requires the daemon, which is configured but not reachable.\n"
-"Falling back to text-only mode. Start the daemon with: sudo systemctl start facelock-daemon\n"
+"Falling back to text-only mode. Start the facelock-daemon service to use it.\n"
 msgstr ""
 
 #: crates/facelock-cli/src/message/device.rs:38
