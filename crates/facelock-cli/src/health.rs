@@ -94,11 +94,16 @@ impl Health {
             };
         };
 
+        // The model files are probed as a *value*, and the fallback's
+        // `models_present` is derived from it here, before it is lifted into
+        // a `Fact`. Deriving it from the lifted fact instead would fold an
+        // undetermined answer into `false` (N4) — see
+        // [`probe_oneshot_fallback_at`].
         let models = ModelFiles::probe(config);
         let fallback = probe_oneshot_fallback_at(
             Path::new(AUTH_BIN),
             Path::new(&config.storage.db_path),
-            models.all_present(),
+            &models,
         );
         Health {
             config: config_health,
@@ -185,15 +190,22 @@ impl OneshotFallback {
     }
 }
 
+/// Takes the [`ModelFiles`] **value**, not the [`Fact`] it is later lifted
+/// into. A `bool` argument let the caller write
+/// `models.known().is_some_and(|m| m.all_present())`, which answers a
+/// confident `false` for a fact nobody established — the report would then
+/// state "models: missing / fallback not usable" on the strength of a probe
+/// that did not run. Taking the value makes that call unrepresentable rather
+/// than merely unreachable.
 fn probe_oneshot_fallback_at(
     auth_bin: &Path,
     db_path: &Path,
-    models_present: bool,
+    models: &ModelFiles,
 ) -> OneshotFallback {
     OneshotFallback {
         auth_bin: auth_bin.display().to_string(),
         auth_bin_present: auth_bin.is_file(),
-        models_present,
+        models_present: models.all_present(),
         database_present: db_path.is_file(),
     }
 }
@@ -507,6 +519,7 @@ mod tests {
     use std::fs;
 
     use crate::commands::enrollment_marker::Marker;
+    use crate::resolved::ProbedFile;
 
     fn config_with(toml: &str) -> Config {
         Config::parse(toml).expect("test config parses")
@@ -684,6 +697,24 @@ mod tests {
     // Oneshot fallback (F7)
     // -----------------------------------------------------------------------
 
+    /// A `ModelFiles` for a directory that either holds both files or
+    /// neither — the only distinction the fallback derivation reads.
+    fn model_files(present: bool) -> ModelFiles {
+        let dir = PathBuf::from("/usr/share/facelock/models");
+        ModelFiles {
+            detector: ProbedFile {
+                path: dir.join("det.onnx"),
+                present,
+            },
+            embedder: ProbedFile {
+                path: dir.join("emb.onnx"),
+                present,
+            },
+            dir_present: true,
+            dir,
+        }
+    }
+
     #[test]
     fn fallback_is_usable_only_with_binary_models_and_database() {
         let dir = tempfile::tempdir().unwrap();
@@ -692,21 +723,63 @@ mod tests {
         fs::write(&bin, b"#!").unwrap();
         fs::write(&db, b"db").unwrap();
 
-        let fallback = probe_oneshot_fallback_at(&bin, &db, true);
+        let fallback = probe_oneshot_fallback_at(&bin, &db, &model_files(true));
         assert!(fallback.auth_bin_present);
         assert!(fallback.database_present);
+        assert!(fallback.models_present);
         assert!(fallback.usable());
 
-        let no_models = probe_oneshot_fallback_at(&bin, &db, false);
+        let no_models = probe_oneshot_fallback_at(&bin, &db, &model_files(false));
+        assert!(!no_models.models_present);
         assert!(!no_models.usable());
 
-        let no_bin = probe_oneshot_fallback_at(&dir.path().join("missing"), &db, true);
+        let no_bin =
+            probe_oneshot_fallback_at(&dir.path().join("missing"), &db, &model_files(true));
         assert!(!no_bin.auth_bin_present);
         assert!(!no_bin.usable());
 
-        let no_db = probe_oneshot_fallback_at(&bin, &dir.path().join("missing.db"), true);
+        let no_db =
+            probe_oneshot_fallback_at(&bin, &dir.path().join("missing.db"), &model_files(true));
         assert!(!no_db.database_present);
         assert!(!no_db.usable());
+    }
+
+    /// N4 at the derivation site. `models_present` must be read off the
+    /// `ModelFiles` *value*; the shape this replaced passed
+    /// `models.known().is_some_and(|m| m.all_present())`, and `Fact::known`
+    /// answers `None` for an unknown fact — so an undetermined model probe
+    /// would have rendered as a confident "models: missing / fallback not
+    /// usable", a guessed false answer from a fact nobody established. That
+    /// was unreachable only because `ModelFiles::probe` happens to be
+    /// infallible today, which is a property of the implementation and not of
+    /// the types. `probe_oneshot_fallback_at` now takes `&ModelFiles`, so the
+    /// old expression does not type-check; this pin fails if a `Fact` is ever
+    /// routed back through `known()` inside the constructor.
+    #[test]
+    fn probe_derives_the_fallback_from_the_model_value_not_a_fact() {
+        let source =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/health.rs"))
+                .unwrap();
+        let body = source
+            .split_once("pub fn probe(loaded: &ConfigLoad) -> Health {")
+            .expect("Health::probe must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("Health::probe must close at method indentation")
+            .0;
+        // Comment lines are ignored so the prose above may name the shape it
+        // forbids (same rule as the pins in `resolved`).
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("known()"),
+            "Health::probe must derive the fallback's models_present from the \
+             ModelFiles value, never from a Fact — an Unknown fact collapses \
+             to a confident false (N4). Body was:\n{body}"
+        );
     }
 
     // -----------------------------------------------------------------------
