@@ -6,3 +6,4 @@ pub mod handler;
 pub mod liveness;
 pub mod quality;
 pub mod rate_limit;
+pub mod server;
