@@ -160,7 +160,11 @@ enum Commands {
     /// Check system status
     Status,
     /// List available camera devices
-    Devices,
+    Devices {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the persistent authentication daemon
     Daemon {
         /// Path to config file
@@ -333,7 +337,7 @@ fn main() -> anyhow::Result<()> {
                         Commands::Preview { text_only, user } => {
                             commands::preview::run(&config, text_only, user)
                         }
-                        Commands::Devices => commands::devices::run(&config),
+                        Commands::Devices { json } => commands::devices::run(&config, json),
                         Commands::Bench { command } => commands::bench::run(&config, command),
                         Commands::Tpm { command } => commands::tpm::run(&config, command),
                         Commands::Encrypt { generate_key } => {
