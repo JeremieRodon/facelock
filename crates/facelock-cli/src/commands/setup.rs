@@ -2713,6 +2713,14 @@ const PAM_CANDIDATES: &[PamCandidate] = &[
         description: "KDE Plasma screen lock",
         default_enabled: true,
     },
+    // Opt-in, unlike the other lock screens: this is an Omarchy-specific service
+    // file, so leave the choice to users who know they have it.
+    PamCandidate {
+        service: "omarchy-lock-face",
+        category: PamCategory::LockScreen,
+        description: "omarchy-lock-face (Omarchy face-unlock screen lock)",
+        default_enabled: false,
+    },
     PamCandidate {
         service: "gdm-password",
         category: PamCategory::DisplayManager,
@@ -3600,6 +3608,31 @@ account include   system-login
         assert!(!found.contains(&"sddm"));
         assert!(!found.contains(&"gdm-password"));
         assert!(!found.contains(&"swaylock"));
+    }
+
+    #[test]
+    fn omarchy_lock_face_is_offered_but_opt_in() {
+        let candidate = PAM_CANDIDATES
+            .iter()
+            .find(|c| c.service == "omarchy-lock-face")
+            .expect("omarchy-lock-face must be offered by the wizard");
+        assert_eq!(candidate.category, PamCategory::LockScreen);
+        assert!(
+            !candidate.default_enabled,
+            "omarchy-lock-face is opt-in: the multi-select must not pre-check it"
+        );
+
+        // ...and, like every other candidate, it is only offered when its
+        // service file is actually present.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let present = |base: &Path| {
+            candidates_in(base)
+                .iter()
+                .any(|c| c.service == "omarchy-lock-face")
+        };
+        assert!(!present(tmp.path()));
+        std::fs::write(tmp.path().join("omarchy-lock-face"), "").unwrap();
+        assert!(present(tmp.path()));
     }
 
     #[test]
