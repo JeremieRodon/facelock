@@ -77,6 +77,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One-shot `facelock auth` no longer outlives its PAM host or lights the
+  camera during the model load** (ADR 008 §7). Three changes, no new exit
+  code and no change to the existing one: the ONNX engine now loads *before*
+  the camera opens, so the IR LED is lit for the scan rather than for the
+  model load as well; SIGTERM, SIGINT and SIGHUP end the scan through the same
+  cancel token, which lets `Drop` run STREAMOFF and turn the emitter off
+  before exiting 2 with a `cancelled` log line; and the PAM module sets
+  `PR_SET_PDEATHSIG = SIGTERM` on the child, so a killed PAM host (an aborted
+  locker helper, a killed `sudo`) takes the helper with it instead of leaving
+  it scanning, reparented to init, with the camera on. The PAM module's own
+  timeout now sends SIGTERM and waits up to 500 ms before SIGKILL; it used to
+  SIGKILL immediately, which skips `Drop` and can leave an XU-controlled IR
+  emitter lit.
 - **An authentication whose caller has gone away now ends within one frame**
   (ADR 008 §5). Nothing could shorten the scan loop before: when a screen
   locker aborted PAM because the password was typed first, or a `sudo` was

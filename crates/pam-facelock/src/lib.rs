@@ -783,9 +783,87 @@ fn oneshot_child_env(
     env
 }
 
+/// How long an overrunning one-shot child gets to exit on SIGTERM before it
+/// is killed. Generous: the child's own cancel check runs once per captured
+/// frame, so it normally exits in well under one frame time.
+const ONESHOT_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Poll interval while waiting out [`ONESHOT_TERM_GRACE`].
+const ONESHOT_TERM_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The two things the termination sequence needs from a child process.
+///
+/// A trait rather than a `std::process::Child` in the signature purely so the
+/// sequence itself — the part that is auth-adjacent policy, not mechanism —
+/// can be unit-tested without spawning anything.
+trait Terminable {
+    /// Send a signal to the child.
+    fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()>;
+    /// Has it exited yet? Non-blocking.
+    fn has_exited(&mut self) -> std::io::Result<bool>;
+}
+
+impl Terminable for std::process::Child {
+    fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: `kill` with a pid we own and a valid signal number. A dead
+        // child yields ESRCH, which is reported as an error, never UB.
+        let rc = unsafe { libc::kill(self.id() as libc::pid_t, signal) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn has_exited(&mut self) -> std::io::Result<bool> {
+        self.try_wait().map(|status| status.is_some())
+    }
+}
+
+/// Stop an overrunning one-shot child: **SIGTERM, wait, then SIGKILL**.
+///
+/// The module used to send SIGKILL straight away. A killed `facelock auth`
+/// never runs `Drop`, so the camera is closed by the kernel without a
+/// STREAMOFF and, on hardware whose IR emitter is under explicit XU control,
+/// the LED stays on. SIGTERM gives the child the chance to end its scan and
+/// clean up; SIGKILL is the backstop for a child wedged in a driver call,
+/// where leaking the emitter beats hanging the PAM stack.
+///
+/// Returns the signals actually sent, in order — which is what the tests
+/// assert on.
+fn terminate_oneshot_child<T: Terminable>(
+    child: &mut T,
+    grace: std::time::Duration,
+) -> Vec<libc::c_int> {
+    let mut sent = Vec::with_capacity(2);
+    if child.signal(libc::SIGTERM).is_ok() {
+        sent.push(libc::SIGTERM);
+    }
+
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        // An error here means we cannot tell whether it exited, which is
+        // treated as "not yet" — the grace period still bounds the wait, and
+        // the SIGKILL below is harmless against a dead child.
+        if child.has_exited().unwrap_or(false) {
+            return sent;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(ONESHOT_TERM_POLL.min(grace));
+    }
+
+    if child.signal(libc::SIGKILL).is_ok() {
+        sent.push(libc::SIGKILL);
+    }
+    sent
+}
+
 /// Run facelock auth as a subprocess for daemonless authentication.
 /// Exit codes: 0 = matched, 1 = no match, 2+ = error.
 fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_int {
+    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     let timeout_secs = config.recognition.timeout_secs as u64 + 3; // buffer for model load
@@ -803,7 +881,8 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
         }
     };
 
-    let result = Command::new(&auth_bin)
+    let mut command = Command::new(&auth_bin);
+    command
         .arg("auth")
         .arg("--user")
         .arg(user)
@@ -817,8 +896,34 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
         .envs(oneshot_child_env(std::env::vars_os()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
+
+    // Tie the child's life to this PAM host's. If the host is killed — a
+    // screen locker's PAM helper torn down on unlock, a killed `sudo` — the
+    // kernel sends the child SIGTERM, which `facelock auth` handles by
+    // ending its scan and running `Drop` (STREAMOFF, IR emitter off). Without
+    // it the child is reparented to init and keeps the camera on, alone, for
+    // the rest of its timeout: the one-shot analogue of the daemon's caller
+    // watch (ADR 008 §7).
+    //
+    // SAFETY: `pre_exec` runs in the forked child between fork and exec,
+    // where only async-signal-safe work is allowed. `prctl` is a single
+    // syscall with no allocation, no locks and no libc state — it is one of
+    // the operations `pre_exec` exists for. PDEATHSIG is cleared by exec only
+    // for setuid binaries; `facelock` is not one (its trust is verified
+    // above), so it survives into the execed image.
+    unsafe {
+        command.pre_exec(|| {
+            // The result is deliberately ignored: losing the parent-death
+            // signal costs the promptness, never the authentication — the
+            // child still exits on its own timeout, and the kill sequence
+            // below still applies.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+
+    let result = command.spawn();
 
     let mut child = match result {
         Ok(c) => c,
@@ -862,7 +967,16 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
+                    // SIGTERM first, SIGKILL only if it will not go. A
+                    // SIGKILL skips the child's `Drop`, so the V4L2 stream is
+                    // torn down by the kernel with no STREAMOFF and an
+                    // XU-controlled IR emitter is left lit until something
+                    // else turns it off (ADR 008 §7).
+                    terminate_oneshot_child(&mut child, ONESHOT_TERM_GRACE);
+                    // Non-blocking reap of the now-dead child. Deliberately
+                    // not `wait()`: if the signals could not be delivered,
+                    // blocking here would hang the whole PAM stack.
+                    let _ = child.try_wait();
                     log_auth(service, "timeout (oneshot)", user, LOG_WARNING);
                     return PAM_AUTH_ERR;
                 }
@@ -1471,6 +1585,69 @@ auth_bin = "/usr/local/bin/evil"
             pam_code_for_daemon_error("IR camera required for authentication. ...");
         assert_eq!(code, PAM_IGNORE);
         assert_eq!(reason, "ir_required");
+    }
+
+    /// A child that records what it was sent and exits when told to.
+    struct FakeChild {
+        sent: Vec<libc::c_int>,
+        exits_on_term: bool,
+    }
+
+    impl Terminable for FakeChild {
+        fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()> {
+            self.sent.push(signal);
+            Ok(())
+        }
+
+        fn has_exited(&mut self) -> std::io::Result<bool> {
+            Ok(self.exits_on_term && self.sent.contains(&libc::SIGTERM))
+        }
+    }
+
+    /// The ordering that matters: a well-behaved child is asked to stop, not
+    /// killed. A SIGKILL skips `Drop`, so the V4L2 stream is never told to
+    /// STREAMOFF and an XU-controlled IR emitter is left lit.
+    #[test]
+    fn a_child_that_exits_on_sigterm_is_never_killed() {
+        let mut child = FakeChild {
+            sent: Vec::new(),
+            exits_on_term: true,
+        };
+        let sent = terminate_oneshot_child(&mut child, std::time::Duration::from_millis(50));
+        assert_eq!(sent, vec![libc::SIGTERM]);
+        assert!(
+            !sent.contains(&libc::SIGKILL),
+            "a child that exited on SIGTERM must not be killed"
+        );
+    }
+
+    /// The backstop: a child wedged in a driver call is killed after the
+    /// grace period. Leaking the emitter beats hanging the PAM stack.
+    #[test]
+    fn a_wedged_child_is_killed_after_the_grace_period() {
+        let grace = std::time::Duration::from_millis(60);
+        let mut child = FakeChild {
+            sent: Vec::new(),
+            exits_on_term: false,
+        };
+        let started = std::time::Instant::now();
+        let sent = terminate_oneshot_child(&mut child, grace);
+        assert_eq!(
+            sent,
+            vec![libc::SIGTERM, libc::SIGKILL],
+            "SIGTERM must come first, and SIGKILL only after it"
+        );
+        assert!(
+            started.elapsed() >= grace,
+            "the child was killed before its grace period ran out"
+        );
+    }
+
+    /// The grace period is the documented one: half a second, matching the
+    /// container assertion that the child exits within it.
+    #[test]
+    fn the_sigterm_grace_period_is_half_a_second() {
+        assert_eq!(ONESHOT_TERM_GRACE, std::time::Duration::from_millis(500));
     }
 
     /// A cancelled attempt is an abstention, never a failure: the daemon
