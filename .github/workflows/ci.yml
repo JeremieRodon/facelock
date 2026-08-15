@@ -169,6 +169,41 @@ jobs:
           TCTI: swtpm:host=localhost,port=2321
         run: cargo test --workspace --features tpm
 
+  catalog-check:
+    name: Translation Catalog Freshness
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm \
+            git \
+            gettext \
+            just
+
+      - uses: actions/checkout@v7
+
+      # po/*.pot are GENERATED from source by `just pot`. Nothing else
+      # verifies the committed copies still match the code: `msgfmt
+      # --check-format` (see the `mo` recipe) only validates the
+      # `{placeholder}` contract of an existing translation against its own
+      # msgid — it says nothing about whether msgids still correspond to
+      # strings the code actually contains. A stale catalog (e.g. from a bad
+      # merge/rerere resolution — this has already happened once, see
+      # po/facelock.pot's history) passes every other gate silently.
+      # Regenerate and diff: any drift fails the build.
+      #
+      # Deliberately NOT part of `just check`: PR #130 made the pot/mo
+      # recipes opt-in and tolerant specifically so building, testing, and
+      # `just check` never require gettext. Wiring `just pot` into `just
+      # check` would silently reverse that and make xgettext a hard
+      # dependency for every contributor just to catch one class of bug.
+      # This job is CI-only for exactly that reason.
+      - name: Verify translation catalogs are up to date
+        run: |
+          just pot
+          git diff --exit-code po/
+
   container-pam-test:
     name: Container PAM Smoke Test
     runs-on: ubuntu-latest
