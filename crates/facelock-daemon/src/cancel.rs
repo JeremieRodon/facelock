@@ -17,6 +17,18 @@
 //! Every loop that can run for a perceptible time — the auth loop, the
 //! enroll loop, and both frame-discard loops — checks it once per iteration,
 //! so a request ends within one frame of the token being set.
+//!
+//! **One token per request, minted fresh, never reset.** There is no way to
+//! clear a token, because a clearable token has to be shared with somebody
+//! else to be worth clearing — and a shared one is cross-talk waiting to
+//! happen. zbus dispatches every method call in its own task, so with a
+//! single daemon-lifetime token any second call (including one about to be
+//! denied) could clear the flag an in-flight request was about to read, and
+//! any departure watch registered against it could cancel a request that was
+//! never its caller's. A token is created by the request it belongs to,
+//! handed to that request's loops and to that request's caller-departure
+//! watch, and dropped with it. "Fresh" and "un-cancelled" are then the same
+//! statement, which is why arming does not exist.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,15 +43,6 @@ impl CancelToken {
     /// A fresh, un-cancelled token.
     pub fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
-    }
-
-    /// Clear the flag for a request that is about to start.
-    ///
-    /// Called once per request, by whoever also arranges the watchers — so
-    /// arming always *precedes* subscribing, and a cancellation that arrives
-    /// between the two cannot be erased by a later reset.
-    pub fn arm(&self) {
-        self.0.store(false, Ordering::SeqCst);
     }
 
     /// Stop the in-flight request. Takes no lock, so it is safe to call from
@@ -92,11 +95,17 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
+    /// The absence of a reset is the design, not an omission: every request
+    /// mints its own, so "is this cancelled" is only ever a question about
+    /// *this* request, and no other request can answer it.
     #[test]
-    fn arming_clears_a_previous_cancellation() {
-        let token = CancelToken::new();
-        token.cancel();
-        token.arm();
-        assert!(!token.is_cancelled());
+    fn two_tokens_never_share_a_flag() {
+        let first = CancelToken::new();
+        let second = CancelToken::new();
+        second.cancel();
+        assert!(
+            !first.is_cancelled(),
+            "a second request's cancellation reached the first request"
+        );
     }
 }

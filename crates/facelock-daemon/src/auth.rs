@@ -927,7 +927,12 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
 /// from "we looked and said no") and logged, but never a `MatchResult`: the
 /// rate limiter charges failed *attempts*, and the user never got to make
 /// one.
-fn cancelled(
+///
+/// Crate-visible because a cancellation can also be noticed *before* the scan
+/// loop is reached — the token can already be set when `CameraLease::acquire`
+/// runs — and that ending must reach the same writer, or the audit trail
+/// would depend on how early the caller went away (`Handler`, ADR 008 §5).
+pub(crate) fn cancelled(
     config: &Config,
     user: &str,
     source: AuditSource,

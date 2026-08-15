@@ -144,6 +144,86 @@ impl Drop for CaptureGuard {
     }
 }
 
+/// The cancel token of the request currently holding the capture slot, if
+/// any — the one handle suspend, `ReleaseCamera` and shutdown have on
+/// whatever is in flight.
+///
+/// They cannot reach it any other way: cancelling means setting a flag the
+/// running request reads, and the running request is holding the handler
+/// mutex, so anything that has to take that mutex first is already too late.
+/// Hence a slot of its own, guarded by a mutex held only long enough to clone
+/// a token out of it — never across a capture, never nested inside the
+/// handler lock.
+///
+/// The generation counter is what makes a *stale* token harmless. Requests
+/// overlap at the edges (one is delivering its notification while the next
+/// has already claimed the capture slot), so "clear the slot when my request
+/// ends" must mean "clear it only if it is still mine". Without that, a
+/// finishing request would clear its successor's entry and the next
+/// `ReleaseCamera` would find an empty slot and cancel nothing.
+#[derive(Clone, Debug, Default)]
+pub struct CurrentRequest(Arc<CurrentRequestInner>);
+
+#[derive(Debug, Default)]
+struct CurrentRequestInner {
+    slot: Mutex<Option<(u64, CancelToken)>>,
+    generation: AtomicU64,
+}
+
+impl CurrentRequest {
+    /// Publish `token` as the in-flight request's, until the returned guard
+    /// drops. Called once the request is certain to run — after
+    /// authorization, after the capture slot is claimed — so a rejected call
+    /// never displaces the request it was rejected in favour of.
+    fn install(&self, token: CancelToken) -> CurrentRequestGuard {
+        let generation = self.0.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.lock() = Some((generation, token));
+        CurrentRequestGuard {
+            current: self.clone(),
+            generation,
+        }
+    }
+
+    /// Cancel whatever is in flight. Lock-free from the request's point of
+    /// view (this mutex is not the handler's), and a no-op when the slot is
+    /// empty — nothing is running, so there is nothing to stop.
+    pub fn cancel(&self) {
+        if let Some((_, token)) = self.lock().as_ref() {
+            token.cancel();
+        }
+    }
+
+    /// A poisoned slot is recovered rather than propagated: the only code
+    /// that holds this lock stores or clones, so a poisoned mutex means some
+    /// *other* thread panicked, and refusing to cancel over it would leave
+    /// the camera streaming into a suspend.
+    fn lock(&self) -> MutexGuard<'_, Option<(u64, CancelToken)>> {
+        match self.0.slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// Clears the [`CurrentRequest`] slot when its request ends — but only if the
+/// slot still names that request (see the generation counter above).
+struct CurrentRequestGuard {
+    current: CurrentRequest,
+    generation: u64,
+}
+
+impl Drop for CurrentRequestGuard {
+    fn drop(&mut self) {
+        let mut slot = self.current.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|(installed, _)| *installed == self.generation)
+        {
+            *slot = None;
+        }
+    }
+}
+
 /// A running watch on the caller's bus name, aborted when the request that
 /// registered it ends.
 ///
@@ -526,12 +606,11 @@ where
     config_mtime: Arc<Mutex<Option<std::time::SystemTime>>>,
     /// In-flight guard for camera-capture operations (DoS control).
     capture_slot: Arc<CaptureSlot>,
-    /// The daemon's cancel token, installed on the handler (and re-installed
-    /// on every rebuilt handler) so that suspend, `ReleaseCamera`, shutdown
-    /// and the per-request caller watch can stop an in-flight capture
-    /// **without taking the handler mutex** — which is exactly what the
-    /// request being cancelled is holding (ADR 008 §5).
-    cancel: CancelToken,
+    /// The cancel token of the request currently holding that capture slot,
+    /// so suspend, `ReleaseCamera` and shutdown can stop it **without taking
+    /// the handler mutex** — which is exactly what the request being
+    /// cancelled is holding (ADR 008 §5).
+    current: CurrentRequest,
     /// Builds per-user notifiers for auth outcomes. Injected from `main` so
     /// the server never names the delivery implementation (D9) — a
     /// prerequisite for moving this server out of facelock-cli.
@@ -549,31 +628,30 @@ where
     /// Construct the service around a built handler. [`run_dbus_server`]
     /// does this with production types; integration tests with mocks.
     pub fn new(
-        mut handler: Handler<C, E>,
+        handler: Handler<C, E>,
         startup_config_mtime: Option<std::time::SystemTime>,
         rebuild: Option<HandlerRebuild<C, E>>,
         notifier_factory: NotifierFactory,
     ) -> Self {
-        // One token for the daemon's lifetime. Minted here rather than read
-        // off the handler because a config reload builds a *new* handler, and
-        // every watcher already holding a clone must keep working across that
-        // swap — so the service owns it and the handler adopts it.
-        let cancel = CancelToken::new();
-        handler.set_cancel_token(cancel.clone());
         Self {
             handler: Arc::new(Mutex::new(handler)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
             capture_slot: Arc::new(CaptureSlot::default()),
-            cancel,
+            // The slot starts empty: nothing is in flight, so there is
+            // nothing to cancel. It survives a config reload untouched
+            // because it holds a *request's* token, not the handler's — and
+            // reload only runs between requests anyway.
+            current: CurrentRequest::default(),
             notifier_factory,
             rebuild,
         }
     }
 
-    /// The daemon's cancel token, for the watchers `run_dbus_server` spawns.
-    pub fn cancel_token(&self) -> CancelToken {
-        self.cancel.clone()
+    /// The in-flight request's cancel token, for the suspend watcher
+    /// `run_dbus_server` spawns and for the tests that stand in for it.
+    pub fn current_request(&self) -> CurrentRequest {
+        self.current.clone()
     }
 
     /// Check if the config file has been modified since the handler was built.
@@ -603,17 +681,13 @@ where
 
         info!("config file changed, reloading");
 
-        let mut new_handler = match rebuild() {
+        let new_handler = match rebuild() {
             Ok(handler) => handler,
             Err(e) => {
                 warn!("failed to reload config: {e} — continuing with old config");
                 return;
             }
         };
-        // The rebuilt handler starts with a token of its own; replace it with
-        // the service's, so the watchers already holding clones keep reaching
-        // whatever is in flight after the swap.
-        new_handler.set_cancel_token(self.cancel.clone());
 
         // Swap in the new handler
         if let Ok(mut guard) = self.handler.lock() {
@@ -649,13 +723,25 @@ where
     /// charged. The diagnostic carve-out now lives in
     /// [`FacelockService::test_authenticate_as`], where it is asked for
     /// explicitly instead of inferred.
+    ///
+    /// `cancel` is this request's token and nobody else's — the glue mints it
+    /// per call and subscribes the caller-departure watch to it, so a second
+    /// caller (even one about to be denied) can neither clear it nor have its
+    /// own departure land on this request (ADR 008 §5).
     pub async fn authenticate_as(
         &self,
         caller: CallerIdentity,
         user: &str,
+        cancel: CancelToken,
     ) -> fdo::Result<AuthResult> {
-        self.run_authentication(caller, user, Method::Authenticate, AuthIntent::Authenticate)
-            .await
+        self.run_authentication(
+            caller,
+            user,
+            Method::Authenticate,
+            AuthIntent::Authenticate,
+            cancel,
+        )
+        .await
     }
 
     /// The root-only diagnostic entry point behind `facelock test` (N11,
@@ -672,9 +758,16 @@ where
         &self,
         caller: CallerIdentity,
         user: &str,
+        cancel: CancelToken,
     ) -> fdo::Result<AuthResult> {
-        self.run_authentication(caller, user, Method::TestAuthenticate, AuthIntent::Test)
-            .await
+        self.run_authentication(
+            caller,
+            user,
+            Method::TestAuthenticate,
+            AuthIntent::Test,
+            cancel,
+        )
+        .await
     }
 
     /// The body both authentication entry points share, so the diagnostic
@@ -689,18 +782,26 @@ where
         user: &str,
         method: Method,
         intent: AuthIntent,
+        cancel: CancelToken,
     ) -> fdo::Result<AuthResult> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
         authorize_method(&caller, method, Some(user))?;
         let caller_is_root = caller.uid == 0;
         let capture_guard = self.capture_slot.try_acquire(method.name())?;
+        // Publish the token only now. Both `?` above return without ever
+        // touching the slot, which is the point: the capture slot is what
+        // decides which request is *the* request, so a denied or busy-rejected
+        // call must not be able to displace the entry belonging to the one
+        // actually running — nor to leave its own dead token behind for the
+        // next suspend to cancel instead. Dropped at the end of this method.
+        let _current = self.current.install(cancel.clone());
         let handler = self.handler.clone();
         let notifier_factory = self.notifier_factory.clone();
         let user = user.to_string();
         let result = tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
-            let response = handler.handle_authenticate(user.clone(), intent);
+            let response = handler.handle_authenticate(user.clone(), intent, &cancel);
             // Notification settings come from the handler's config — the
             // freshest parse, since maybe_reload_handler ran at method entry.
             // No mid-request file re-read (D7).
@@ -755,16 +856,21 @@ where
         result.map(|auth| auth.redact_similarity_unless_root(caller_is_root))
     }
 
+    /// `cancel` is this request's own token; see [`Self::authenticate_as`].
     pub async fn enroll_as(
         &self,
         caller: CallerIdentity,
         user: &str,
         label: &str,
+        cancel: CancelToken,
     ) -> fdo::Result<(u32, u32)> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
         authorize_method(&caller, Method::Enroll, None)?;
         let capture_guard = self.capture_slot.try_acquire("Enroll")?;
+        // Same ordering rule as `run_authentication`: authorized and holding
+        // the capture slot, therefore this is the request in flight.
+        let _current = self.current.install(cancel.clone());
         let handler = self.handler.clone();
         let user = user.to_string();
         let label = label.to_string();
@@ -772,7 +878,7 @@ where
             let _capture_guard = capture_guard;
             let mut handler = lock_handler_with_timeout(&handler)?;
             let request = DaemonRequest::Enroll { user, label };
-            let response = handler.handle(request);
+            let response = handler.handle_with_cancel(request, &cancel);
             match response {
                 DaemonResponse::Enrolled {
                     model_id,
@@ -981,11 +1087,11 @@ where
     pub async fn release_camera_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::ReleaseCamera, None)?;
-        // Set the token before queuing for the handler mutex. If a capture is
-        // in flight it holds that mutex, so the store below is the only thing
-        // that reaches it — and it is what lets the lock be acquired at all,
-        // within one frame instead of at `timeout_secs`.
-        self.cancel.cancel();
+        // Cancel the in-flight request before queuing for the handler mutex.
+        // If a capture is in flight it holds that mutex, so the store below is
+        // the only thing that reaches it — and it is what lets the lock be
+        // acquired at all, within one frame instead of at `timeout_secs`.
+        self.current.cancel();
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -1014,7 +1120,7 @@ where
         authorize_method(&caller, Method::Shutdown, None)?;
         // Same reason as `ReleaseCamera`: stop the capture before waiting on
         // the mutex it is holding.
-        self.cancel.cancel();
+        self.current.cancel();
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -1041,11 +1147,17 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         user: &str,
     ) -> fdo::Result<AuthResult> {
         let caller = resolve_caller_identity(&hdr, connection).await?;
-        // Arm first, then subscribe: a cancellation that arrives after the
-        // subscription can never be erased by a later reset (ADR 008 §5).
-        self.cancel.arm();
-        let _watch = watch_caller_departure(connection, hdr.sender(), self.cancel_token()).await;
-        let result = self.authenticate_as(caller, user).await;
+        // One token for this call and nothing else. zbus dispatches each
+        // method in its own task, so anything shared between calls is shared
+        // between *concurrent* calls: a token owned by the service could be
+        // cleared out from under an in-flight request by a second caller, and
+        // a departure watch subscribed against it would cancel whoever
+        // happened to be running when some other client exited. Minted fresh
+        // here, watched here, and passed down — nobody else can reach it
+        // (ADR 008 §5).
+        let cancel = CancelToken::new();
+        let _watch = watch_caller_departure(connection, hdr.sender(), cancel.clone()).await;
+        let result = self.authenticate_as(caller, user, cancel).await;
 
         // Emit auth_attempted signal (best-effort, don't fail auth if signal
         // fails). The payload deliberately carries no similarity score — the
@@ -1071,9 +1183,9 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         user: &str,
     ) -> fdo::Result<AuthResult> {
         let caller = resolve_caller_identity(&hdr, connection).await?;
-        self.cancel.arm();
-        let _watch = watch_caller_departure(connection, hdr.sender(), self.cancel_token()).await;
-        let result = self.test_authenticate_as(caller, user).await;
+        let cancel = CancelToken::new();
+        let _watch = watch_caller_departure(connection, hdr.sender(), cancel.clone()).await;
+        let result = self.test_authenticate_as(caller, user, cancel).await;
 
         // Emitted for the same reason and with the same payload as
         // `Authenticate`'s: a camera-backed attempt happened for `user`.
@@ -1095,9 +1207,9 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         // `facelock enroll` is a long capture loop; Ctrl-C on the CLI drops
         // its bus connection and must end it, not leave the camera running
         // to the enrollment deadline.
-        self.cancel.arm();
-        let _watch = watch_caller_departure(connection, hdr.sender(), self.cancel_token()).await;
-        self.enroll_as(caller, user, label).await
+        let cancel = CancelToken::new();
+        let _watch = watch_caller_departure(connection, hdr.sender(), cancel.clone()).await;
+        self.enroll_as(caller, user, label, cancel).await
     }
 
     async fn list_models(
@@ -1357,7 +1469,7 @@ async fn run_dbus_server(
     let service = FacelockService::new(handler, startup_config_mtime, rebuild, notifier_factory);
     let handler = service.handler.clone();
     let last_activity = service.last_activity.clone();
-    let service_cancel = service.cancel_token();
+    let current_request = service.current_request();
 
     let _connection = zbus::connection::Builder::system()?
         .name(BUS_NAME)?
@@ -1379,9 +1491,9 @@ async fn run_dbus_server(
     // Spawn a background task to release the camera on system suspend.
     // Best-effort: if logind is unavailable, log a warning and continue.
     let handler_for_sleep = handler.clone();
-    let cancel_for_sleep = service_cancel.clone();
+    let current_for_sleep = current_request.clone();
     tokio::spawn(async move {
-        if let Err(e) = watch_sleep_signals(handler_for_sleep, cancel_for_sleep).await {
+        if let Err(e) = watch_sleep_signals(handler_for_sleep, current_for_sleep).await {
             tracing::warn!("failed to watch logind sleep signals: {e}");
         }
     });
@@ -1418,7 +1530,7 @@ async fn run_dbus_server(
 /// ```
 async fn watch_sleep_signals(
     handler: Arc<Mutex<ProductionHandler>>,
-    cancel: CancelToken,
+    current: CurrentRequest,
 ) -> zbus::Result<()> {
     let connection = zbus::Connection::system().await?;
     let proxy = zbus::Proxy::new(
@@ -1436,10 +1548,10 @@ async fn watch_sleep_signals(
         let suspending: bool = signal.body().deserialize().unwrap_or(false);
         if suspending {
             // Lock-free and first: a capture in flight is holding the handler
-            // mutex, so the token is the only thing that reaches it. This
+            // mutex, so its token is the only thing that reaches it. This
             // replaces the old single `try_lock` that gave up with a "handler
             // busy" warning and left the camera streaming into suspend.
-            cancel.cancel();
+            current.cancel();
             let handler = handler.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 // The cancelled request exits within one frame and drops the
@@ -1874,6 +1986,94 @@ mod tests {
             cancel.cancel();
         }
         assert!(cancel.is_cancelled());
+    }
+
+    /// Each caller's watch is subscribed against that caller's own token, so
+    /// B leaving cannot end A's authentication. This is the shape of the
+    /// glue, replayed: two requests, two tokens, one departure.
+    #[test]
+    fn one_callers_departure_never_cancels_anothers_request() {
+        let alice = CancelToken::new();
+        let bob = CancelToken::new();
+
+        // Bob's watch fires. It holds only Bob's token.
+        if caller_departed(":1.43", ":1.43", None) {
+            bob.cancel();
+        }
+
+        assert!(bob.is_cancelled(), "Bob's own request must end");
+        assert!(
+            !alice.is_cancelled(),
+            "Bob's departure reached Alice's in-flight authentication"
+        );
+    }
+
+    // --- ADR 008 §5: the in-flight request slot ---
+
+    /// Nothing running, nothing to stop. `ReleaseCamera` on an idle daemon
+    /// must not leave a set flag lying around for the next request to find.
+    #[test]
+    fn cancelling_an_empty_slot_is_a_no_op() {
+        let current = CurrentRequest::default();
+        current.cancel();
+        let next = CancelToken::new();
+        let _guard = current.install(next.clone());
+        assert!(
+            !next.is_cancelled(),
+            "a cancel with nothing in flight reached the next request"
+        );
+    }
+
+    /// What suspend, `ReleaseCamera` and shutdown do: reach exactly the
+    /// request that is running.
+    #[test]
+    fn cancel_reaches_the_installed_request() {
+        let current = CurrentRequest::default();
+        let in_flight = CancelToken::new();
+        let _guard = current.install(in_flight.clone());
+        current.cancel();
+        assert!(in_flight.is_cancelled());
+    }
+
+    /// The generation check. Requests overlap at the edges — one is still
+    /// finishing while the next has claimed the capture slot — so the older
+    /// guard's drop must not clear the newer entry, or the next cancellation
+    /// would find the slot empty and stop nothing.
+    #[test]
+    fn a_finishing_request_never_clears_its_successors_slot() {
+        let current = CurrentRequest::default();
+        let first = CancelToken::new();
+        let second = CancelToken::new();
+
+        let first_guard = current.install(first.clone());
+        let _second_guard = current.install(second.clone());
+        drop(first_guard);
+
+        current.cancel();
+        assert!(
+            second.is_cancelled(),
+            "the request in flight was not reached"
+        );
+        assert!(
+            !first.is_cancelled(),
+            "a cancellation reached a request that had already finished"
+        );
+    }
+
+    /// And the converse: once a request's guard has dropped with the slot
+    /// still its own, the slot is empty — a stale token can never be
+    /// cancelled in place of the next request's.
+    #[test]
+    fn a_finished_requests_token_is_not_left_in_the_slot() {
+        let current = CurrentRequest::default();
+        let finished = CancelToken::new();
+        drop(current.install(finished.clone()));
+
+        current.cancel();
+        assert!(
+            !finished.is_cancelled(),
+            "a finished request stayed cancellable"
+        );
     }
 
     #[test]

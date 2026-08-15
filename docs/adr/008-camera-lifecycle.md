@@ -79,10 +79,10 @@ stateDiagram-v2
     Warm --> Closed: deadline · ReleaseCamera · suspend · reload · shutdown
 ```
 
-**`CameraLease`** — one struct inside `Handler` owning `camera: Option<C>`, `deadline: Option<Instant>`, `cancel: Arc<AtomicBool>`. All request arms use it; nothing else touches the camera or the deadline.
+**`CameraLease`** — one struct inside `Handler` owning `camera: Option<C>` and `deadline: Option<Instant>`. All request arms use it; nothing else touches the camera or the deadline. The cancel token is *not* a field: it belongs to the request, arrives as an argument to `acquire`, and dies with the request (§5).
 
 ```rust
-fn acquire(&mut self, cfg) -> Result<&mut C>   // Closed: open + discard(warmup)  |  Warm: discard(MMAP_BUFFERS-1); clears deadline, resets cancel
+fn acquire(&mut self, cfg, cancel) -> Result<&mut C>   // Closed: open + discard(warmup)  |  Warm: discard(MMAP_BUFFERS-1); clears deadline
 fn finish(&mut self, outcome: Outcome)         // Success|Cancelled|Error → drop camera; Failure → deadline = now + release_secs (or drop if 0)
 fn touch_preview(&mut self)                    // deadline = now + max(release_secs, PREVIEW_MIN_HOLD=2s)
 fn expire(&mut self, now)                      // deadline passed → drop camera   (called from the 250 ms poll)
@@ -103,7 +103,9 @@ Warm reuse skips warmup (AE is settled) but discards `MMAP_BUFFERS − 1` frames
 
 ## 5. Cancellation
 
-One token, one rule: **the request ends within one frame, `finish(Cancelled)`, no rate-limit charge, audit `cancelled`.** The auth loop (`auth.rs:572`), enroll loop (`enroll.rs:187`), and both discard loops check the token per iteration.
+One token **per request**, one rule: **the request ends within one frame, `finish(Cancelled)`, no rate-limit charge, audit `cancelled`.** The auth loop (`auth.rs:572`), enroll loop (`enroll.rs:187`), and both discard loops check the token per iteration — including a cancellation noticed before the camera opens, which audits the same way with `frame_count: 0`.
+
+The token is minted by the `#[interface]` glue for the one call it belongs to, and there is deliberately no way to clear one. zbus dispatches each method in its own task, so a token shared across calls is shared across *concurrent* calls: a second caller (even one about to be denied) could clear the flag an in-flight request had not read yet, and a departure watch subscribed against it could cancel a request that was never its caller's. Fresh and un-cancelled are therefore the same statement. Suspend, `ReleaseCamera` and shutdown reach the running request through a small lock-free slot on the service holding the token of whichever request currently owns the capture slot; it is published only *after* authorization and the capture-slot claim, and generation-checked on clear, so a rejected or already-finished request can neither displace nor erase the entry of the one actually running.
 
 Who sets it:
 
@@ -111,7 +113,7 @@ Who sets it:
 |---|---|
 | Caller's bus connection disappears — PAM host aborted/killed (omarchy shell `abort()`, sudo exit), CLI Ctrl-C, client crash | Per request: glue takes `hdr.sender()`, races the blocking work against `DBusProxy::receive_name_owner_changed_with_args([(0, sender)])`; a `(sender, old, "")` event sets the token. Subscription failure → log, degrade to timeout-bounded (today). A client that dies before we subscribe is missed → also timeout-bounded, accepted. |
 | polkit agent `CancelAuthentication` | Agent uses a **dedicated `Connection::system()` per `Authenticate`** and drops it on cancel — same mechanism, no new API. |
-| Suspend, `ReleaseCamera`, shutdown | Set the token directly (it's an `Arc<AtomicBool>`, no handler lock needed). |
+| Suspend, `ReleaseCamera`, shutdown | Set the in-flight request's token through the service's current-request slot (it's an `Arc<AtomicBool>`, no handler lock needed). Nothing in flight → nothing to cancel. |
 | One-shot: SIGTERM/SIGINT/SIGHUP, parent death | `signal_hook::flag::register` into the same token type; PDEATHSIG delivers SIGTERM (§7). |
 
 Not doing (until a client needs it): an explicit `Cancel()` D-Bus method. If Quattro's PAM helper turns out to keep its connection alive across `abort()`, that is the moment to add it — one method, caller-UID authz.

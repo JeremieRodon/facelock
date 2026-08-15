@@ -813,7 +813,8 @@ fn test_intent_does_not_consume_rate_limit_budget() {
     // Run more failed attempts than max_attempts (1). None may report "rate
     // limited" — the budget starts and stays at zero recorded failures.
     for i in 0..3 {
-        let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Test);
+        let resp =
+            handler.handle_authenticate("testuser".into(), AuthIntent::Test, &CancelToken::new());
         assert!(
             matches!(
                 resp,
@@ -893,7 +894,11 @@ fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
 
     // The real-authentication intent, which always charges; the diagnostic
     // carve-out exists only for `facelock test`.
-    let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Authenticate);
+    let resp = handler.handle_authenticate(
+        "testuser".into(),
+        AuthIntent::Authenticate,
+        &CancelToken::new(),
+    );
     match resp {
         DaemonResponse::Error { ref message } => {
             assert!(
@@ -1007,4 +1012,104 @@ fn auth_loop_wipes_the_callers_embeddings_on_failure() {
             "caller-side embedding {id} was not wiped on the failure path"
         );
     }
+}
+
+/// A cancellation that arrives *before* the camera opens is audited as
+/// `cancelled`, exactly like one noticed mid-scan (ADR 008 §5,
+/// docs/contracts.md).
+///
+/// This is the earliest and most common cancellation there is — a locker that
+/// aborts PAM the moment a password is typed produces it — and it used to
+/// leave no trace at all: `CameraLease::acquire` reported the frozen string,
+/// `handle_authenticate` returned it straight to the caller, and the audit
+/// writer that every other ending goes through was never reached. The trail
+/// then said nothing about the attempts that were abandoned fastest.
+///
+/// `frame_count` is 0 because none were captured, which is also how a reader
+/// tells this row from a mid-scan cancellation.
+#[test]
+fn a_cancellation_before_the_camera_opens_is_still_audited() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db_path = temp_db_path("cancel-before-open-audit");
+    cleanup_db(&db_path);
+    // A dedicated directory: write_audit_entry chmods the log's parent.
+    let dir = std::env::temp_dir().join(format!(
+        "facelock-cancel-audit-{}-{unique}",
+        std::process::id()
+    ));
+    let log_path = dir.join("audit.jsonl");
+
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+    config.recognition.timeout_secs = 1;
+    config.audit.enabled = true;
+    config.audit.path = log_path.display().to_string();
+
+    {
+        let store = FaceStore::create(&db_path).unwrap();
+        store
+            .add_model("testuser", "front", &fixtures::known_embedding(0), "")
+            .unwrap();
+    }
+
+    // A factory that panics if called: the point of this path is that the
+    // camera is never opened, so reaching it at all would be the bug.
+    let factory: MockCameraFactory =
+        Box::new(|_cfg| panic!("a cancelled request must not open the camera"));
+
+    let mut handler = Handler::new(
+        config.clone(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
+        FaceStore::create(&db_path).unwrap(),
+        RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        ),
+        facelock_core::types::CameraCaps::default(),
+        Some(factory),
+        None,
+    )
+    .unwrap();
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Authenticate, &cancel);
+    match resp {
+        DaemonResponse::Error { ref message } => assert_eq!(
+            message, "cancelled",
+            "the frozen wire string PAM matches exactly"
+        ),
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+
+    let written = std::fs::read_to_string(&log_path).expect("audit log must exist");
+    let entries: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("audit entry must be valid JSON"))
+        .collect();
+    assert_eq!(entries.len(), 1, "one attempt, one entry: {entries:?}");
+    assert_eq!(entries[0]["result"], "cancelled");
+    assert_eq!(entries[0]["user"], "testuser");
+    assert_eq!(entries[0]["source"], "daemon");
+    assert_eq!(entries[0]["frame_count"], 0);
+    assert!(
+        entries[0]["similarity"].is_null(),
+        "no comparison ran, so there is no score to report"
+    );
+
+    // And it is an abstention, not a failed attempt: nothing is charged.
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect.check_rate_limit("testuser", 1, 60).unwrap(),
+        "a cancellation must leave the rate-limit budget untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    cleanup_db(&db_path);
 }
