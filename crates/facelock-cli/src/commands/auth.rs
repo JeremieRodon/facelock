@@ -174,7 +174,19 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             return 1;
         }
     };
-    let models = store.list_models(&user).unwrap_or_default();
+    let listed = store.list_models(&user);
+    // Converge this user's enrollment marker from the list we just read (#137),
+    // before the authentication decides anything. Free: the count is already in
+    // hand. This is the daemonless install's only convergence point — the
+    // daemon's startup reconcile never runs there.
+    //
+    // Here and not above `pre_check_audited`: hoisting it would put a marker
+    // rewrite (temp file, chown, rename) behind every rate-limited attempt —
+    // filesystem work an attacker can drive from the wrong side of the rate
+    // limiter. The cost is that a pre-flight rejection does not converge; the
+    // next attempt that reaches this line does.
+    converge_enrollment_marker(&config, &user, listed.as_ref().ok().map(|m| m.len() as u32));
+    let models = listed.unwrap_or_default();
 
     let start = std::time::Instant::now();
     // Wipes `stored` (D11): nothing below may read the plaintext set again.
@@ -262,6 +274,25 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             error!("unexpected response");
             2
         }
+    }
+}
+
+/// Write `user`'s enrollment marker from a model count just read from the
+/// authoritative store (#137).
+///
+/// `models` is `None` when the store could not be listed — leave the existing
+/// marker alone rather than guessing it away, the same rule
+/// [`crate::commands::enrollment_marker::refresh`] follows. A count of zero is
+/// a real answer ("no models") and does delete the marker.
+///
+/// Called unconditionally, before the authentication attempt and regardless of
+/// its outcome: an upgraded user whose face is not recognised today still needs
+/// `is-enrolled` to tell the truth. Best-effort throughout — `set` logs its own
+/// failures and never propagates, so nothing here can fail an authentication.
+fn converge_enrollment_marker(config: &Config, user: &str, models: Option<u32>) {
+    match models {
+        Some(models) => super::enrollment_marker::set(config, user, models),
+        None => debug!(user = %user, "model list unavailable; enrollment marker left unchanged"),
     }
 }
 
@@ -550,5 +581,100 @@ path = "{audit_path}"
         );
         assert!(resp.is_none(), "gates must pass, got {resp:?}");
         assert!(audit_lines(&audit_path).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Enrollment marker convergence (#137)
+    // -----------------------------------------------------------------------
+
+    use super::converge_enrollment_marker;
+    use crate::commands::enrollment_marker::{MarkerState, marker_dir, read_marker_in};
+
+    /// A config pointing an entire installation at `dir`: the marker directory
+    /// is derived from `storage.db_path`. "alice" has no passwd entry, so the
+    /// write skips its `chown` and the test needs no privileges.
+    fn marker_config(dir: &std::path::Path) -> Config {
+        let mut config = Config::parse("").expect("empty config parses to defaults");
+        config.storage.db_path = dir.join("facelock.db").to_string_lossy().into_owned();
+        config
+    }
+
+    /// #137 on a daemonless install: the marker the upgrade never wrote gets
+    /// written the first time the user authenticates — whatever the
+    /// authentication then decides, since this runs before it.
+    #[test]
+    fn oneshot_converges_an_absent_marker_from_the_model_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = marker_config(tmp.path());
+        let base = marker_dir(&config);
+
+        converge_enrollment_marker(&config, "alice", Some(2));
+
+        match read_marker_in(&base, "alice") {
+            MarkerState::Enrolled(m) => assert_eq!(m.models, 2),
+            other => panic!("expected alice enrolled, got {other:?}"),
+        }
+
+        // Same idempotence the daemon path relies on.
+        converge_enrollment_marker(&config, "alice", Some(2));
+        assert!(matches!(
+            read_marker_in(&base, "alice"),
+            MarkerState::Enrolled(m) if m.models == 2
+        ));
+    }
+
+    /// A count of zero is a real answer from the store: the user has no models,
+    /// so the marker must go.
+    #[test]
+    fn oneshot_convergence_clears_the_marker_at_zero_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = marker_config(tmp.path());
+        let base = marker_dir(&config);
+
+        converge_enrollment_marker(&config, "alice", Some(1));
+        converge_enrollment_marker(&config, "alice", Some(0));
+
+        assert_eq!(read_marker_in(&base, "alice"), MarkerState::Absent);
+    }
+
+    /// An unreadable store is not evidence of anything. Guessing "zero" from a
+    /// failed `list_models` would delete a correct marker on a transient
+    /// database error — the opposite of the bug being fixed.
+    #[test]
+    fn oneshot_convergence_leaves_the_marker_alone_when_the_count_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = marker_config(tmp.path());
+        let base = marker_dir(&config);
+
+        converge_enrollment_marker(&config, "alice", Some(3));
+        converge_enrollment_marker(&config, "alice", None);
+
+        assert!(
+            matches!(read_marker_in(&base, "alice"), MarkerState::Enrolled(m) if m.models == 3),
+            "an unknown count must not overwrite a known one"
+        );
+    }
+
+    /// Structural pin, in the style of `resolved.rs`: the convergence call sits
+    /// ahead of the authentication attempt in `run`'s straight-line code. That
+    /// ordering is the whole of "regardless of whether authentication succeeds"
+    /// — move the call below the result and convergence silently becomes
+    /// conditional on a face being recognised, which is exactly the population
+    /// #137 is about.
+    #[test]
+    fn marker_convergence_precedes_the_authentication_attempt() {
+        let src = include_str!("auth.rs");
+        // First occurrence is the call in `run`; the definition and this test
+        // both live further down the file.
+        let converge = src
+            .find("converge_enrollment_marker(")
+            .expect("run() must converge the marker");
+        let authenticate = src
+            .find("::authenticate_with_embeddings(")
+            .expect("run() must attempt an authentication");
+        assert!(
+            converge < authenticate,
+            "marker convergence must run before the authentication attempt"
+        );
     }
 }

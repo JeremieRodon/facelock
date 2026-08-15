@@ -180,6 +180,30 @@ fn build_handler() -> Result<(ProductionHandler, u64), String> {
     Ok((handler, idle_timeout_secs))
 }
 
+/// Converge every enrollment marker with the database, once, at startup (#137).
+///
+/// Markers are newer than the databases they describe, so an install upgraded
+/// from a release without them has enrolled users and an empty `enrolled/` —
+/// and `facelock is-enrolled` answers "not enrolled" for a user whose face
+/// authentication works. This is the same shape as
+/// [`crate::state_layout::ensure_state_layout`] a few lines above in
+/// `build_handler`: it does not ask "has this run before?", it re-derives the
+/// right answer from the authoritative source, so it needs no ledger and
+/// cannot drift from one.
+///
+/// Deliberately in `run` and not in `build_handler`: the daemon's config
+/// reload goes through the builder, and reconciling is a startup concern, not
+/// something to repeat on every edit of the config file.
+///
+/// Best-effort by contract: a marker is a hint for `is-enrolled`, so failing
+/// to write one must never stop the daemon from serving authentications.
+fn reconcile_enrollment_markers(config: &Config) {
+    match crate::commands::enrollment_marker::reconcile_all(config) {
+        Ok(()) => info!("enrollment markers reconciled"),
+        Err(e) => warn!("enrollment markers not reconciled: {e:#}"),
+    }
+}
+
 /// `--config` is honored through the process-level override `main` installs
 /// before dispatch, which is what `Config::load()` and
 /// `paths::config_path()` both read — so startup, the live reload and the
@@ -205,6 +229,11 @@ pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
         }
     };
 
+    // After the handler, so the store exists and the state layout has been
+    // ensured; the handler owns the parsed config, so this adds no second read
+    // of the config file (resolved::config_load_call_sites_are_pinned).
+    reconcile_enrollment_markers(&handler.config);
+
     let config_mtime = std::fs::metadata(facelock_core::paths::config_path())
         .and_then(|m| m.modified())
         .ok();
@@ -220,4 +249,101 @@ pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
         notifier_factory,
     )
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::commands::enrollment_marker::{MarkerState, marker_dir, read_marker_in};
+
+    /// A config pointing an entire installation at `dir` — the marker
+    /// directory is derived from `storage.db_path`, so this is all it takes.
+    fn config_rooted_at(dir: &Path) -> Config {
+        let mut config = Config::parse("").expect("empty config parses to defaults");
+        config.storage.db_path = dir.join("facelock.db").to_string_lossy().into_owned();
+        config
+    }
+
+    /// The account the test runs as: `reconcile_all` skips users with no
+    /// passwd entry, and `chown`ing to your own uid/gid is a no-op an
+    /// unprivileged test may perform.
+    fn current_account() -> Option<String> {
+        nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+    }
+
+    /// #137: a database enrolled before markers existed, plus an empty
+    /// `enrolled/`, is exactly the state an upgrade from v0.1.4 leaves behind.
+    /// Daemon startup is what fixes it on a daemon-mode install — and fixes it
+    /// again, unchanged, on every restart after that.
+    #[test]
+    fn startup_reconcile_backfills_an_upgraded_install_and_repeats_cleanly() {
+        let Some(me) = current_account() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_rooted_at(tmp.path());
+
+        {
+            let store = FaceStore::create(Path::new(&config.storage.db_path)).unwrap();
+            store.add_model(&me, "front", &[0.0f32; 512], "").unwrap();
+        }
+        let base = marker_dir(&config);
+        assert!(!base.exists(), "the upgrade leaves no markers behind");
+
+        reconcile_enrollment_markers(&config);
+        match read_marker_in(&base, &me) {
+            MarkerState::Enrolled(m) => assert_eq!(m.models, 1, "count comes from the database"),
+            other => panic!("expected {me} enrolled after startup reconcile, got {other:?}"),
+        }
+
+        // Restart: same derivation, same answer, no ledger consulted.
+        reconcile_enrollment_markers(&config);
+        assert!(matches!(
+            read_marker_in(&base, &me),
+            MarkerState::Enrolled(m) if m.models == 1
+        ));
+    }
+
+    /// Failure isolation: reconcile is best-effort, so a database it cannot
+    /// open is logged and stepped over. If this ever propagates, a corrupt
+    /// state directory stops the daemon from serving authentications — which
+    /// is a far worse outcome than a stale `is-enrolled` answer.
+    #[test]
+    fn startup_reconcile_swallows_a_database_it_cannot_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_rooted_at(tmp.path());
+        // Not a database. Stands in for any reconcile failure; asserted to
+        // actually fail first so this test cannot go vacuous.
+        std::fs::write(&config.storage.db_path, b"not a sqlite file").unwrap();
+        assert!(
+            crate::commands::enrollment_marker::reconcile_all(&config).is_err(),
+            "test setup must produce a reconcile failure to swallow"
+        );
+
+        reconcile_enrollment_markers(&config);
+    }
+
+    /// Nothing about reconciling may bring a database into existence — the
+    /// daemon's own `FaceStore::create` owns that decision, and it has already
+    /// run by the time this is called.
+    #[test]
+    fn startup_reconcile_creates_no_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_rooted_at(tmp.path());
+
+        reconcile_enrollment_markers(&config);
+
+        assert!(
+            !Path::new(&config.storage.db_path).exists(),
+            "reconcile must not create a database as a side effect"
+        );
+        assert!(
+            marker_dir(&config).is_dir(),
+            "the marker directory is still created"
+        );
+    }
 }

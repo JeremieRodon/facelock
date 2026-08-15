@@ -140,8 +140,14 @@ af_inet_unrestricted() {
 export -f af_inet_unrestricted
 
 if [ -d /run/systemd/system ] && systemctl show facelock-daemon >/dev/null 2>&1; then
-    run_test "unit: CapabilityBoundingSet is empty" '[ -z "$(unit_prop CapabilityBoundingSet)" ]'
-    run_test "unit: AmbientCapabilities is empty" '[ -z "$(unit_prop AmbientCapabilities)" ]'
+    # Not empty: the notification privilege-drop needs CAP_SETUID+CAP_SETGID
+    # (ambient, to survive the exec into runuser), and startup needs CAP_CHOWN
+    # to chown the state tree and the enrollment markers on an upgraded install.
+    # CAP_CHOWN is bounding-only and dropped in-process once the bus name is
+    # claimed — asserting it is *absent* from the ambient set is the half that
+    # matters here. See docs/security.md, Phase 3.
+    run_test "unit: CapabilityBoundingSet is SETUID+SETGID+CHOWN only" 'v=$(unit_prop CapabilityBoundingSet); echo "$v" | grep -q cap_setuid && echo "$v" | grep -q cap_setgid && echo "$v" | grep -q cap_chown && [ "$(echo "$v" | tr " " "\n" | grep -c .)" = 3 ]'
+    run_test "unit: AmbientCapabilities is SETUID+SETGID only" 'v=$(unit_prop AmbientCapabilities); echo "$v" | grep -q cap_setuid && echo "$v" | grep -q cap_setgid && ! echo "$v" | grep -q cap_chown'
     run_test "unit: RestrictAddressFamilies is AF_UNIX+AF_NETLINK only" 'v=$(unit_prop RestrictAddressFamilies); echo "$v" | grep -q AF_UNIX && echo "$v" | grep -q AF_NETLINK && ! echo "$v" | grep -q AF_INET'
     # systemctl show expands @system-service into individual syscalls: assert
     # allowlist mode (no "~" prefix), a marker syscall the daemon needs

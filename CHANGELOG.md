@@ -46,8 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since the group is required to reach the daemon at all. The
   marker is a hint for the UI, not authority: it can drift, and PAM at
   authentication time remains authoritative. Markers are maintained by `enroll`,
-  `remove` and `clear`, and every `setup` run reconciles them from the database,
-  which backfills users enrolled before this feature existed.
+  `remove` and `clear`, and converged from the database — the authoritative
+  source — by every `setup` run, by daemon startup, and by the one-shot
+  `facelock auth` path for the user it is authenticating (#137). An install
+  upgraded from a release without markers therefore backfills itself on the
+  first daemon start or the first authentication, without a migration step:
+  each convergence re-derives the markers rather than replaying recorded
+  changes, so it is idempotent and keeps no state that a restored backup could
+  contradict.
 - **Enrollment failure breakdown** (#89): when enrollment captures too few
   frames, the error now reports why frames were rejected (too dark, no face,
   multiple faces, low quality, capture errors with the last error message) and
@@ -182,6 +188,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare "AccessDenied".
 
 ### Security
+
+- **`CAP_CHOWN` added to the daemon's capability bounding set, for startup
+  only** (#137). Root without `CAP_CHOWN` cannot `chown(2)` at all, and two
+  startup steps need it on an *upgraded* install: `ensure_state_layout` (which
+  chowns `/var/lib/facelock` to `root:facelock`, and whose failure is fatal —
+  the daemon exits 1) and the enrollment-marker reconcile (which chowns each
+  marker to its user). The capability is deliberately **not** ambient and is
+  cleared by the in-process `drop_capabilities()` as soon as the daemon claims
+  its bus name, so it is never held while authenticating anyone and no exec'd
+  child inherits it. `systemd-analyze security` moves 2.6 → 2.8 (still OK); it
+  scores the bounding set and cannot see the in-process drop.
 
 ## [0.1.4] - 2026-05-31
 

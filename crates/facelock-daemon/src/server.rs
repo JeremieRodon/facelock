@@ -1228,6 +1228,12 @@ async fn run_dbus_server(
 
     // Drop capabilities now that initialization is complete — camera fd is
     // open, models are loaded, D-Bus is connected, database is open.
+    //
+    // This is also what bounds CAP_CHOWN's window. The unit puts it in the
+    // bounding set (not the ambient set) for two startup-only chowns — the
+    // state layout and the enrollment-marker reconcile — and this call is what
+    // takes it away again, before the first authentication. See the capability
+    // block in systemd/facelock-daemon.service.
     match drop_capabilities() {
         Ok(()) => info!(
             "retained CAP_SETUID+CAP_SETGID for notification privilege-drop; dropped all others and set no-new-privs"

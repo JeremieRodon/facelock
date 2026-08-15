@@ -643,8 +643,10 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 
 **Phase 3 (shipped — capabilities, seccomp, network):**
 
-- `CapabilityBoundingSet=CAP_SETUID CAP_SETGID` / `AmbientCapabilities=CAP_SETUID CAP_SETGID` —
-  the daemon retains **exactly** these two capabilities and no others. Device access needs no
+- `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN` /
+  `AmbientCapabilities=CAP_SETUID CAP_SETGID` —
+  the daemon retains **exactly** the two ambient capabilities while it is serving
+  authentications, plus `CAP_CHOWN` for the duration of startup only. Device access needs no
   caps (`/dev/video*` and `/dev/tpmrm0` are root-owned and opened via standard file
   permissions), but the desktop-notification path execs `runuser -u <user> -- notify-send` to
   drop into the user's session bus, and `runuser` calls `setgroups()`/`setuid()`, which require
@@ -653,6 +655,17 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
   also narrows its in-process capability set to exactly these two after initialization
   (`drop_capabilities()` in `facelock-cli`, holding them in effective/permitted/inheritable);
   everything else is dropped.
+  - **`CAP_CHOWN` is startup-only.** It is in the bounding set but deliberately **not** ambient,
+    and `drop_capabilities()` clears it the moment the daemon has claimed its bus name — so it is
+    never held while authenticating anyone, and no exec'd child can inherit it. Root without
+    `CAP_CHOWN` cannot `chown(2)` at all, and two startup steps need it on an install that is
+    being *upgraded* rather than freshly packaged: `state_layout::ensure_state_layout`, which
+    chowns `/var/lib/facelock` and the files under it to `root:facelock` (a failure there is
+    fatal — the daemon exits 1), and the enrollment-marker reconcile, which chowns each marker
+    to the user it describes (#137). Both skip paths that are already correct, so a steady-state
+    install never chowns. The reachable blast radius is small: `ProtectSystem=strict` leaves only
+    `ReadWritePaths=/var/lib/facelock /var/log/facelock` and the private `/tmp` writable, and
+    `chown` on a read-only mount fails with `EROFS`.
   - **This was empirically required.** An earlier revision set both directives **empty** on the
     theory that the daemon needs no capabilities. That was wrong: on real hardware it broke
     notifications with `runuser: cannot set groups: Operation not permitted`.
@@ -691,11 +704,13 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
 - `User=` — the daemon must open the camera/TPM as root; non-root operation has not been
   validated on real hardware.
 
-**Exposure score:** `systemd-analyze security --offline=true` reports **2.6 (OK)** for the
+**Exposure score:** `systemd-analyze security --offline=true` reports **2.8 (OK)** for the
 Phase 1–3 unit, down from 7.1 (MEDIUM) with Phase 1–2 only. (The score rose from 2.2 to 2.6
 when the empty capability sets were corrected to `CAP_SETUID CAP_SETGID` — the two caps the
 notification privilege-drop genuinely needs; the small increase is the honest cost of a working
-notification path.) Verify with:
+notification path. It rose again from 2.6 to 2.8 with the startup-only `CAP_CHOWN` above:
+`systemd-analyze` scores the bounding set, so it cannot see that the capability is dropped
+in-process before the first authentication.) Verify with:
 ```bash
 systemd-analyze security facelock-daemon.service
 ```

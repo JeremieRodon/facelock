@@ -61,7 +61,21 @@ RestrictSUIDSGID=yes
 # is NOT a viable alternative: dbus-broker rejects UID 0 on a user session bus
 # ("Broken pipe"), so the setuid-via-runuser path — and thus these two caps —
 # is required.
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+#
+# CAP_CHOWN is a third capability, and unlike the two above it is a STARTUP-ONLY
+# one: it is in the bounding set but NOT Ambient, and drop_capabilities() clears
+# it as soon as the daemon has claimed its bus name — so it is never held while
+# authenticating anyone. Root without CAP_CHOWN cannot chown(2) at all, and two
+# startup steps need it on an install that is being upgraded rather than freshly
+# packaged:
+#   - state_layout::ensure_state_layout, which chowns /var/lib/facelock (and
+#     the files under it) to root:facelock. A failure here is fatal — the daemon
+#     exits 1 — so without this cap an upgraded install can fail to start.
+#   - the enrollment-marker reconcile (#137), which chowns each marker to the
+#     user it describes. Without this cap it would silently write nothing on
+#     every systemd install, which is where nearly all daemon-mode users are.
+# Both are no-ops once the tree is correct, so the steady state never chowns.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN
 AmbientCapabilities=CAP_SETUID CAP_SETGID
 # Only local sockets: D-Bus (system bus + per-user session bus for
 # notifications) is AF_UNIX. AF_NETLINK is retained conservatively: no
