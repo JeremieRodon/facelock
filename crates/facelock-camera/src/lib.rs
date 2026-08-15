@@ -6,7 +6,7 @@ pub mod preprocess;
 pub mod quirks;
 
 pub use caps::{ResolvedCamera, quirk_id};
-pub use capture::{Camera, is_dark_with_config};
+pub use capture::{Camera, MMAP_BUFFERS, is_dark_with_config};
 pub use device::{
     DeviceInfo, FormatInfo, IrSource, auto_detect_device, auto_detect_device_with,
     classify_ir_sources, ir_source, ir_source_resolved, ir_source_with_quirks, is_ir_camera,

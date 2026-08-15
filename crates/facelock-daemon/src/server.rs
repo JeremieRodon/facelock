@@ -24,7 +24,7 @@ use nix::unistd::{Uid, User};
 use tracing::{error, info, warn};
 use zbus::{fdo, interface, object_server::SignalEmitter};
 
-use crate::handler::{AuthIntent, DaemonRequest, DaemonResponse, Handler};
+use crate::handler::{AuthIntent, CAMERA_POLL_INTERVAL, DaemonRequest, DaemonResponse, Handler};
 
 /// Production type alias for the handler with real Camera and FaceEngine.
 pub type ProductionHandler = Handler<Camera<'static>, FaceEngine>;
@@ -1317,7 +1317,7 @@ async fn poll_shutdown(
     idle_timeout_secs: u64,
 ) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(CAMERA_POLL_INTERVAL).await;
 
         // Check idle timeout (0 = disabled)
         if idle_timeout_secs > 0 {
@@ -1339,7 +1339,7 @@ async fn poll_shutdown(
                 if h.shutdown_requested {
                     return true;
                 }
-                h.maybe_release_camera();
+                h.expire_camera(Instant::now());
             }
             false
         })

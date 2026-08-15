@@ -17,7 +17,7 @@ Camera settings.
 | `dark_threshold` | f32 | `0.6` | Fraction of pixels that must be darker than `dark_pixel_value` before the frame is treated as unusably dark. |
 | `dark_pixel_value` | u8 | `10` | Pixel brightness cutoff used by the dark-frame check. |
 | `ir_emitter` | bool | `false` | Attempt to enable a controllable IR emitter when the camera opens. Only needed for hardware that does not auto-enable its IR LED. |
-| `camera_release_secs` | u32 | `5` | Seconds to keep the camera open after daemon-mode auth before releasing it, to avoid repeated warmup cost on back-to-back requests. |
+| `camera_release_secs` | u32 | `3` | Daemon only. Seconds to keep the camera streaming after a **failed** authentication so an immediate retry skips the reopen cost. Success, cancellation and errors release the camera at once. `0` disables the hold entirely (it used to be silently substituted with 5). |
 
 ## [recognition]
 

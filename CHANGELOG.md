@@ -77,6 +77,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The daemon holds the camera open only after a failed authentication**
+  (ADR 008). Previously every request — success included — left the V4L2 stream
+  live for `device.camera_release_secs`, which on IR hardware is a visible
+  emitter LED burning for five seconds after the screen had already unlocked.
+  Success, cancellation and every error class now release the camera as the
+  request returns; only a no-match or timeout keeps it warm, because that is
+  the one ending a retry plausibly follows. The default drops from **5 to 3
+  seconds**, `0` now means *never hold* instead of being silently substituted
+  with 5, and the release is polled every 250 ms against an absolute deadline
+  rather than once a second. A warm reuse discards the stale V4L2 buffers
+  before analyzing anything, so a fresh attempt can never match on the tail of
+  the previous one. Preview frames keep their own floor of
+  `max(camera_release_secs, 2s)` so a live preview never reopens per frame.
+  **No action required on upgrade**: the key is unchanged in name and type, the
+  shipped config template has it commented out, and the daemon re-reads it per
+  request.
 - **`facelock status` says "cannot determine" instead of guessing**: a section
   whose probe failed — an unreadable database, a config that did not parse —
   now reports exactly that, and a daemon that is unreachable can never render

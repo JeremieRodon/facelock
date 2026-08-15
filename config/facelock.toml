@@ -43,10 +43,13 @@
 # Default: false
 # ir_emitter = false
 
-# In daemon mode, keep the camera open for this many seconds after
-# auth before releasing it to avoid repeated warmup cost.
-# Default: 5
-# camera_release_secs = 5
+# Daemon only. Seconds to keep the camera streaming after a FAILED
+# authentication so an immediate retry skips the reopen cost. Success,
+# cancellation and errors always release the camera at once — the
+# interaction is over, so the IR LED goes out with it.
+# Set it to zero to never hold: every attempt reopens, no LED after a miss.
+# Default: 3
+# camera_release_secs = 3
 
 
 # ── Face Recognition ────────────────────────────────────────────────

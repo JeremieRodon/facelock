@@ -329,6 +329,19 @@ on first use if absent. `method = "none"` (plaintext) is **refused at enrollment
 `security.allow_plaintext = true`. Auth always degrades to password on a decrypt failure —
 never a lockout.
 
+**Camera hold semantics (ADR 008).** `device.camera_release_secs` (default **3**) is the
+number of seconds the **daemon** keeps the camera streaming **after a failed
+authentication** — the one ending a retry plausibly follows — so that retry skips the
+reopen cost. Every other ending (success, cancellation, and any error, including a
+capture failure or an all-dark scan) releases the camera immediately: the interaction is
+over, and on IR hardware the emitter LED goes out with it. `0` means **never hold**; it
+previously fell back to 5 seconds. Enrollment follows the same rule (stored or failed, the
+interaction ended). Preview frames are exempt: each one extends the hold to
+`max(camera_release_secs, 2s)` so a ~10 fps preview never reopens per frame, and the CLI
+still calls `ReleaseCamera` on exit. The hold deadline is absolute and polled every 250 ms.
+One-shot mode (`facelock auth`) never holds — process exit is the release — and ignores
+the key. Changing the value needs no daemon restart: it is read per request.
+
 **Hard device binding (opt-in).** `security.bind_device_aad = true` folds the enrolling
 camera's `device_id` into the AES-GCM AAD, so a template cannot be decrypted under a
 different camera. Default false (fails closed on unstable ids). Complements the advisory

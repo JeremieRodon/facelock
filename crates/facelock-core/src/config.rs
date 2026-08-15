@@ -68,8 +68,12 @@ pub struct DeviceConfig {
     /// only if your camera requires explicit control.
     #[serde(default)]
     pub ir_emitter: bool,
-    /// Seconds to keep the camera open after auth before releasing it.
-    /// Avoids warmup frame cost on consecutive auths. Default: 5.
+    /// Daemon only. Seconds to keep the camera streaming after a **failed**
+    /// authentication, so the retry a failure invites skips the reopen cost.
+    /// Success, cancellation and errors always release immediately — the
+    /// interaction is over and the IR LED must go out with it (ADR 008).
+    /// `0` means never hold; it used to be silently substituted with 5.
+    /// Default: 3.
     #[serde(default = "default_camera_release_secs")]
     pub camera_release_secs: u32,
 }
@@ -538,7 +542,7 @@ fn default_dark_threshold() -> f32 {
     0.6
 }
 fn default_camera_release_secs() -> u32 {
-    5
+    3
 }
 fn default_dark_pixel_value() -> u8 {
     10
