@@ -206,10 +206,20 @@ facelock bench preview                  # frame capture + face detection latency
 facelock bench enrollment               # time to capture and embed snapshots (dry run, embeddings not stored)
 facelock bench model-load               # ONNX model load time (SCRFD + ArcFace)
 facelock bench calibrate                # sweep FAR/FRR thresholds and recommend optimal value
+facelock bench camera-reopen            # cost of reopening the camera: open / STREAMON / warmup split
 facelock bench report                   # full benchmark report
 ```
 
-`cold-auth`, `warm-auth`, `calibrate`, and `report` require enrolled faces. When encryption method is `tpm`, these subcommands require root.
+**Every `bench` subcommand requires root** (DEC-6): direct-mode access needs the
+`0600` root:root database whatever the subcommand, and the auth benchmarks may
+need TPM access besides. `cold-auth`, `warm-auth`, `calibrate`, and `report`
+additionally require enrolled faces.
+
+`camera-reopen` needs no enrolled face and loads no models — but is root like
+the rest: it closes and reopens the camera `--iterations` times (default 5) and
+reports the per-phase median. That total is what `device.camera_release_secs`
+trades LED-on time against — holding the stream warm after a failed attempt
+buys a retry exactly this much (ADR 008).
 
 ## facelock encrypt
 

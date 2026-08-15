@@ -43,10 +43,25 @@
 # Default: false
 # ir_emitter = false
 
-# In daemon mode, keep the camera open for this many seconds after
-# auth before releasing it to avoid repeated warmup cost.
-# Default: 5
-# camera_release_secs = 5
+# Daemon only. Seconds to keep the camera streaming after a FAILED
+# authentication so an immediate retry skips the reopen cost. Cancellation
+# and errors always release the camera at once — the interaction is over,
+# so the IR LED goes out with it — and so does a success, unless the key
+# below says otherwise.
+# Set it to zero to never hold: every attempt reopens, no LED after a miss.
+# Default: 3
+# camera_release_secs = 3
+
+# Daemon only. Seconds to keep the camera streaming after a SUCCESSFUL
+# authentication as well. Zero, the default, releases it at once: the
+# interaction is over, so holding on only keeps the camera (and on IR
+# hardware its emitter LED) lit for a retry nobody is going to make.
+# Raise it only if you repeat privileged actions with no authentication
+# caching in front of them (sudo with a zero timestamp_timeout, a polkit
+# action without auth_admin_keep), so each one is a fresh authentication
+# that would otherwise pay a camera reopen.
+# Default: 0
+# camera_release_after_success_secs = 0
 
 
 # ── Face Recognition ────────────────────────────────────────────────
@@ -72,6 +87,15 @@
 # Maximum seconds to attempt recognition before giving up.
 # Default: 5
 # timeout_secs = 5
+
+# Seconds to keep looking when no face at all has been detected.
+# Once a face is seen, timeout_secs above takes over — that is the case
+# worth waiting out. Ending an empty-chair attempt early stops the camera
+# (and on IR hardware its emitter LED) from running for nothing, and such an
+# attempt never counts against the rate limit.
+# Values above timeout_secs are clamped to it. 0 disables the early exit.
+# Default: 2
+# no_face_timeout_secs = 2
 
 # ONNX model files (must exist in daemon.model_dir).
 # Run `facelock setup` to select a model tier and download automatically.

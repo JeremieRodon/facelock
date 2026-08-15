@@ -118,15 +118,33 @@ echo "  2. sudo facelock enroll      (register your face)"
 
 # Only on full uninstall ($1 == 0), not upgrade.
 # Remove PAM lines that `facelock setup` may have added — otherwise stale
-# references to pam_facelock.so survive removal and can break sudo auth.
+# references to pam_facelock.so survive removal. facelock writes
+# `auth sufficient pam_facelock.so`, so with the module gone PAM logs a dlopen
+# failure, treats the module as failed and — being `sufficient` — falls through
+# to pam_unix: the cost is log noise and an auth stack that reads wrong, not a
+# lockout. At `required` (a hand-edit facelock never makes) the same stale line
+# would lock the service out, which is why the cleanup still matters.
 if [ $1 -eq 0 ]; then
-    for PAM_FILE in /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/hyprlock; do
+    # Every PAM service `facelock setup` can write to: the services offered by
+    # the setup multi-select (PAM_CANDIDATES in
+    # crates/facelock-cli/src/commands/setup.rs) plus the ones it gates behind
+    # a confirmation (SENSITIVE_SERVICES). `--service` accepts an arbitrary
+    # name, so this list can never be exhaustive; it covers everything facelock
+    # itself offers or gates. Missing files are skipped, so naming a service
+    # this host does not have is inert. A drift test in setup.rs
+    # (`packaging_uninstall_covers_every_pam_candidate`) fails if a new
+    # candidate is added without being listed here.
+    FACELOCK_PAM_SERVICES="sudo polkit-1 hyprlock swaylock kscreenlocker_greet gdm-password sddm lightdm omarchy-lock-face system-auth login sshd"
+
+    for service in $FACELOCK_PAM_SERVICES; do
+        PAM_FILE="/etc/pam.d/$service"
         if [ -f "$PAM_FILE" ] && grep -q 'pam_facelock\.so' "$PAM_FILE"; then
             sed -i '/pam_facelock\.so/d' "$PAM_FILE"
         fi
     done
     # Remove PAM safety backups created by `facelock setup`
-    for backup in /etc/pam.d/sudo.facelock-backup /etc/pam.d/polkit-1.facelock-backup /etc/pam.d/hyprlock.facelock-backup; do
+    for service in $FACELOCK_PAM_SERVICES; do
+        backup="/etc/pam.d/$service.facelock-backup"
         [ -f "$backup" ] && rm -f "$backup" && echo "Removed $backup"
     done
     # Kill facelock polkit agent if running (lets the DE's agent take over)

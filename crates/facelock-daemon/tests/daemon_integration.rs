@@ -5,6 +5,7 @@ use facelock_core::config::Config;
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
 use facelock_daemon::auth::AuthOutcome;
+use facelock_daemon::cancel::CancelToken;
 use facelock_daemon::handler::{AuthIntent, DaemonRequest, DaemonResponse};
 use facelock_store::FaceStore;
 use facelock_test_support::fixtures;
@@ -225,6 +226,7 @@ fn device_mismatch_never_reaches_success() {
         &config,
         "u",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     match resp {
         AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
@@ -258,6 +260,7 @@ fn device_mismatch_never_reaches_success() {
         &config,
         "u",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     match resp2 {
         AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
@@ -310,6 +313,7 @@ fn legacy_null_device_id_still_authenticates() {
         &config,
         "u",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     match resp {
         AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
@@ -451,6 +455,7 @@ fn static_matching_frames_report_variance_reason() {
         &config,
         "testuser",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
 
     match resp {
@@ -502,6 +507,7 @@ fn still_then_moving_frames_recover_and_authenticate() {
         &config,
         "testuser",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
 
     match resp {
@@ -551,6 +557,7 @@ fn failed_auth_writes_audit_entry() {
         &config,
         "testuser",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     assert!(
         matches!(resp, AuthOutcome::AuthResult(ref r) if !r.matched),
@@ -570,6 +577,7 @@ fn failed_auth_writes_audit_entry() {
         &config,
         "testuser",
         AuditSource::Test,
+        &CancelToken::new(),
     );
 
     let written = std::fs::read_to_string(&log_path).expect("audit log must exist");
@@ -686,7 +694,11 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
 
     let db_path_str = db_path.to_string_lossy().into_owned();
     let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
-    config.recognition.timeout_secs = 0;
+    // A second of scanning against an engine that *sees* a face and matches
+    // nothing. Since ADR 008 §4 only that kind of failure is charged, so an
+    // attempt that never saw anybody — which a zero-length scan also is —
+    // would make this test pass for the wrong reason.
+    config.recognition.timeout_secs = 1;
     config.security.rate_limit.max_attempts = 1;
     config.security.require_frame_variance = false;
     config.security.require_landmark_liveness = false;
@@ -702,7 +714,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
 
     let mut first_handler = Handler::new(
         config.clone(),
-        MockFaceEngine::no_faces(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
         FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
@@ -726,7 +738,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
 
     let mut restarted_handler = Handler::new(
         config.clone(),
-        MockFaceEngine::no_faces(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
         FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
@@ -767,7 +779,10 @@ fn test_intent_does_not_consume_rate_limit_budget() {
 
     let db_path_str = db_path.to_string_lossy().into_owned();
     let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
-    config.recognition.timeout_secs = 0;
+    // The engine sees a face and matches nothing, so each attempt is the one
+    // failure class that *is* charged (ADR 008 §4) — otherwise the intent
+    // rule under test would be masked by the no-face exemption.
+    config.recognition.timeout_secs = 1;
     config.security.rate_limit.max_attempts = 1;
     config.security.require_frame_variance = false;
     config.security.require_landmark_liveness = false;
@@ -783,7 +798,7 @@ fn test_intent_does_not_consume_rate_limit_budget() {
 
     let mut handler = Handler::new(
         config.clone(),
-        MockFaceEngine::no_faces(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
         FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
@@ -798,7 +813,8 @@ fn test_intent_does_not_consume_rate_limit_budget() {
     // Run more failed attempts than max_attempts (1). None may report "rate
     // limited" — the budget starts and stays at zero recorded failures.
     for i in 0..3 {
-        let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Test);
+        let resp =
+            handler.handle_authenticate("testuser".into(), AuthIntent::Test, &CancelToken::new());
         assert!(
             matches!(
                 resp,
@@ -878,7 +894,11 @@ fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
 
     // The real-authentication intent, which always charges; the diagnostic
     // carve-out exists only for `facelock test`.
-    let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Authenticate);
+    let resp = handler.handle_authenticate(
+        "testuser".into(),
+        AuthIntent::Authenticate,
+        &CancelToken::new(),
+    );
     match resp {
         DaemonResponse::Error { ref message } => {
             assert!(
@@ -934,6 +954,7 @@ fn auth_loop_wipes_the_callers_embeddings() {
         &config,
         "alice",
         AuditSource::Test,
+        &CancelToken::new(),
     );
 
     assert!(
@@ -975,6 +996,7 @@ fn auth_loop_wipes_the_callers_embeddings_on_failure() {
         &config,
         "alice",
         AuditSource::Test,
+        &CancelToken::new(),
     );
 
     assert!(
@@ -989,5 +1011,188 @@ fn auth_loop_wipes_the_callers_embeddings_on_failure() {
             e.iter().all(|&v| v == 0.0),
             "caller-side embedding {id} was not wiped on the failure path"
         );
+    }
+}
+
+/// A cancellation that arrives *before* the camera opens is audited as
+/// `cancelled`, exactly like one noticed mid-scan (ADR 008 §5,
+/// docs/contracts.md).
+///
+/// This is the earliest and most common cancellation there is — a locker that
+/// aborts PAM the moment a password is typed produces it — and it used to
+/// leave no trace at all: `CameraLease::acquire` reported the frozen string,
+/// `handle_authenticate` returned it straight to the caller, and the audit
+/// writer that every other ending goes through was never reached. The trail
+/// then said nothing about the attempts that were abandoned fastest.
+///
+/// `frame_count` is 0 because none were captured, which is also how a reader
+/// tells this row from a mid-scan cancellation.
+#[test]
+fn a_cancellation_before_the_camera_opens_is_still_audited() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db_path = temp_db_path("cancel-before-open-audit");
+    cleanup_db(&db_path);
+    // A dedicated directory: write_audit_entry chmods the log's parent.
+    let dir = std::env::temp_dir().join(format!(
+        "facelock-cancel-audit-{}-{unique}",
+        std::process::id()
+    ));
+    let log_path = dir.join("audit.jsonl");
+
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+    config.recognition.timeout_secs = 1;
+    config.audit.enabled = true;
+    config.audit.path = log_path.display().to_string();
+
+    {
+        let store = FaceStore::create(&db_path).unwrap();
+        store
+            .add_model("testuser", "front", &fixtures::known_embedding(0), "")
+            .unwrap();
+    }
+
+    // A factory that panics if called: the point of this path is that the
+    // camera is never opened, so reaching it at all would be the bug.
+    let factory: MockCameraFactory =
+        Box::new(|_cfg| panic!("a cancelled request must not open the camera"));
+
+    let mut handler = Handler::new(
+        config.clone(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
+        FaceStore::create(&db_path).unwrap(),
+        RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        ),
+        facelock_core::types::CameraCaps::default(),
+        Some(factory),
+        None,
+    )
+    .unwrap();
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Authenticate, &cancel);
+    match resp {
+        DaemonResponse::Error { ref message } => assert_eq!(
+            message, "cancelled",
+            "the frozen wire string PAM matches exactly"
+        ),
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+
+    let written = std::fs::read_to_string(&log_path).expect("audit log must exist");
+    let entries: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("audit entry must be valid JSON"))
+        .collect();
+    assert_eq!(entries.len(), 1, "one attempt, one entry: {entries:?}");
+    assert_eq!(entries[0]["result"], "cancelled");
+    assert_eq!(entries[0]["user"], "testuser");
+    assert_eq!(entries[0]["source"], "daemon");
+    assert_eq!(entries[0]["frame_count"], 0);
+    assert!(
+        entries[0]["similarity"].is_null(),
+        "no comparison ran, so there is no score to report"
+    );
+
+    // And it is an abstention, not a failed attempt: nothing is charged.
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect.check_rate_limit("testuser", 1, 60).unwrap(),
+        "a cancellation must leave the rate-limit budget untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    cleanup_db(&db_path);
+}
+
+/// ADR 008 §3/§4 end to end, through the real `Authenticate` request path:
+/// what `device.camera_release_after_success_secs` buys is that the *next*
+/// authentication does not reopen the camera. The factory is the observable —
+/// it is called exactly once per cold open — so this pins the feature by its
+/// only user-visible effect rather than by the lease's private fields.
+///
+/// Both columns matter: with the key at its default `0` a success closes the
+/// stream, so the second authentication pays a second open. That is the
+/// behavior of every install that never sets the key.
+#[test]
+fn a_success_hold_is_what_lets_the_next_authentication_skip_the_reopen() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // (camera_release_after_success_secs, expected camera opens for two
+    // consecutive successful authentications)
+    for (success_secs, expected_opens) in [(0, 2), (5, 1)] {
+        let db_path = temp_db_path(&format!("success-hold-{success_secs}"));
+        cleanup_db(&db_path);
+
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+        config.device.camera_release_after_success_secs = success_secs;
+        // Isolate the camera policy from the liveness gates: this test is
+        // about what happens *after* a match, not about earning one.
+        config.security.require_frame_variance = false;
+        config.security.require_landmark_liveness = false;
+
+        let face = unit_at_angle(0.0);
+        {
+            let store = FaceStore::create(&db_path).unwrap();
+            store.add_model("testuser", "front", &face, "").unwrap();
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let counter = opens.clone();
+        let factory: MockCameraFactory = Box::new(move |_cfg| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(MockCamera::bright(64, 64, 64))
+        });
+
+        let mut handler = Handler::new(
+            config.clone(),
+            MockFaceEngine::one_face(face),
+            FaceStore::create(&db_path).unwrap(),
+            RateLimiter::new(
+                config.security.rate_limit.max_attempts,
+                config.security.rate_limit.window_secs,
+            ),
+            facelock_core::types::CameraCaps::default(),
+            Some(factory),
+            None,
+        )
+        .unwrap();
+
+        for attempt in 0..2 {
+            let resp = handler.handle(DaemonRequest::Authenticate {
+                user: "testuser".into(),
+            });
+            assert!(
+                matches!(
+                    resp,
+                    DaemonResponse::AuthResult(MatchResult { matched: true, .. })
+                ),
+                "attempt {attempt} with camera_release_after_success_secs = \
+                 {success_secs} must match: {resp:?}"
+            );
+        }
+
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            expected_opens,
+            "two successful authentications with \
+             camera_release_after_success_secs = {success_secs} must open the \
+             camera {expected_opens} time(s)"
+        );
+
+        cleanup_db(&db_path);
     }
 }

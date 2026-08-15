@@ -288,6 +288,7 @@ impl<'a> Backend<'a> {
                     failure_reason: None,
                 }),
                 AuthOutcome::Error { message, .. } => bail!("daemon error: {message}"),
+                AuthOutcome::Cancelled => bail!("authentication cancelled"),
             },
             BackendKind::DirectByConfig | BackendKind::DirectByFallback => {
                 direct::authenticate(self.config, user)
