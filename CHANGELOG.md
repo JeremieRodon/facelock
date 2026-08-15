@@ -180,6 +180,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a caller that is not root or in the `facelock` group, the CLI now appends an
   actionable hint (add user to group, re-login, or re-run setup) instead of a
   bare "AccessDenied".
+- **Uninstall left `pam_facelock.so` lines behind**: the Arch, RPM and
+  `just uninstall` cleanup paths stripped the facelock line from three
+  `/etc/pam.d` files (`sudo`, `polkit-1`, `hyprlock`) while `facelock setup`
+  offers eight, so `swaylock`, `kscreenlocker_greet`, `gdm-password`, `sddm`
+  and `lightdm` kept a line pointing at a module that was no longer installed.
+  All four packaging paths now share one list per file covering every service
+  setup offers, plus the ones `--service` gates behind a confirmation
+  (`system-auth`, `login`, `sshd`). A test in `facelock-cli` reads the
+  packaging files and fails if a new PAM candidate is not covered.
+- **Debian/Ubuntu uninstall removed no PAM lines at all**: `debian/prerm`
+  delegated everything to `pam-auth-update --remove facelock`, which only
+  manages the shared `common-auth` profile — it knows nothing about the direct
+  `/etc/pam.d/<service>` edits `facelock setup --pam` makes, so *every*
+  configured service kept its line. `prerm` now runs the same explicit removal
+  loop as the other packagers in addition to the `pam-auth-update` call.
 
 ### Security
 

@@ -3621,6 +3621,68 @@ account include   system-login
         }
     }
 
+    /// The uninstall paths of all four packagers each hardcode the set of
+    /// `/etc/pam.d/<service>` files to strip `pam_facelock.so` out of, because
+    /// they are shell run by a package manager and cannot read
+    /// `PAM_CANDIDATES`. That duplication has already rotted once: the lists
+    /// covered three services while setup offered eight, so five services kept
+    /// a stale facelock line after the package was removed. Nothing failed
+    /// loudly — the drift is only visible on an uninstall nobody runs in CI.
+    ///
+    /// This pins the direction that matters: every service setup *offers* must
+    /// be *covered* by every packager. It is deliberately a superset check and
+    /// not set equality — the packaging lists also carry `SENSITIVE_SERVICES`
+    /// (reachable via `setup --pam --service <name> --yes`) and services that
+    /// are not candidates yet, and naming a service that no host has is inert
+    /// because every loop is guarded by `[ -f "$PAM_FILE" ]`. Equality would
+    /// turn "packaging cleans up more than setup writes" — always safe — into
+    /// a failure, and would break whenever a candidate lands in one branch and
+    /// the packaging list in another.
+    #[test]
+    fn packaging_uninstall_covers_every_pam_candidate() {
+        // Assembled so this test's own prose is not what it matches on.
+        let decl = format!("FACELOCK_PAM_SERVICES={}", '"');
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        for rel in [
+            "dist/facelock.install",
+            "dist/facelock.spec",
+            "dist/debian/prerm",
+            "justfile",
+        ] {
+            let path = root.join(rel);
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{rel} must be readable from the workspace: {e}"));
+
+            let listed: Vec<&str> = source
+                .lines()
+                .find_map(|l| l.trim_start().strip_prefix(&decl)?.split_once('"'))
+                .map(|(value, _)| value.split_whitespace().collect())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{rel} must declare its PAM service list on one line as \
+                         FACELOCK_PAM_SERVICES=\"svc svc ...\". It is the single \
+                         literal both uninstall loops (pam_facelock.so lines and \
+                         .facelock-backup files) read, and this test's only handle \
+                         on it."
+                    )
+                });
+
+            for candidate in PAM_CANDIDATES {
+                assert!(
+                    listed.contains(&candidate.service),
+                    "{rel} does not clean up /etc/pam.d/{svc}, but `facelock setup` \
+                     offers to write a pam_facelock.so line into it. Uninstalling \
+                     would leave that line behind, pointing at a module that is no \
+                     longer on disk. Add {svc} to FACELOCK_PAM_SERVICES in {rel} \
+                     (naming a service the host lacks is inert — the loops skip \
+                     missing files). Currently listed there: {listed:?}",
+                    svc = candidate.service,
+                );
+            }
+        }
+    }
+
     #[test]
     fn check_model_correct_sha256() {
         let dir = tempfile::tempdir().unwrap();
