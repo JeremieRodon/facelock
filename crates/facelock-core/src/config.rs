@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::paths;
 
@@ -99,6 +100,19 @@ pub struct RecognitionConfig {
     pub threshold: f32,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u32,
+    /// End an attempt early once this many seconds have passed with **no face
+    /// at all** detected. `timeout_secs` still bounds the other, slower case —
+    /// a face was seen and has not matched yet — which is the one worth
+    /// waiting out. Scanning an empty chair for the full timeout only keeps
+    /// the camera (and on IR hardware its emitter LED) lit for nothing, and
+    /// such an attempt is not a guess, so it also charges no rate-limit
+    /// budget (ADR 008 §3/§4).
+    ///
+    /// `0` disables the early exit. The effective value is clamped to
+    /// `timeout_secs` — see [`RecognitionConfig::effective_no_face_timeout`].
+    /// Default: 2.
+    #[serde(default = "default_no_face_timeout")]
+    pub no_face_timeout_secs: u32,
     #[serde(default = "default_confidence")]
     pub detection_confidence: f32,
     #[serde(default = "default_nms")]
@@ -128,6 +142,7 @@ impl Default for RecognitionConfig {
         Self {
             threshold: default_threshold(),
             timeout_secs: default_timeout(),
+            no_face_timeout_secs: default_no_face_timeout(),
             detection_confidence: default_confidence(),
             nms_threshold: default_nms(),
             detector_model: default_detector_model(),
@@ -137,6 +152,22 @@ impl Default for RecognitionConfig {
             execution_provider: default_execution_provider(),
             threads: default_threads(),
         }
+    }
+}
+
+impl RecognitionConfig {
+    /// How long an attempt may run before "nobody is there" ends it, or
+    /// `None` when the early exit is switched off (`no_face_timeout_secs = 0`).
+    ///
+    /// Clamped to `timeout_secs` rather than validated against it, on purpose
+    /// (ADR 008 §3, "no migration"): an existing `/etc/facelock/config.toml`
+    /// with a short `timeout_secs` — say 1 — predates this key and must keep
+    /// loading, and a no-face deadline past the overall deadline could never
+    /// fire anyway. So the pair can never be an invalid combination, only a
+    /// redundant one.
+    pub fn effective_no_face_timeout(&self) -> Option<Duration> {
+        (self.no_face_timeout_secs > 0)
+            .then(|| Duration::from_secs(self.no_face_timeout_secs.min(self.timeout_secs) as u64))
     }
 }
 
@@ -553,6 +584,9 @@ fn default_threshold() -> f32 {
 fn default_timeout() -> u32 {
     5
 }
+fn default_no_face_timeout() -> u32 {
+    2
+}
 fn default_confidence() -> f32 {
     0.5
 }
@@ -892,6 +926,47 @@ path = "/dev/video0"
         // Values below the 5s floor still yield the 15s minimum deadline.
         let config = Config::parse("[recognition]\ntimeout_secs = 2\n").unwrap();
         assert_eq!(config.enroll_timeout_secs(), 15);
+    }
+
+    /// ADR 008 §3. Table-driven over the three cases the key has: the
+    /// default, a value that outruns `timeout_secs`, and the off switch.
+    #[test]
+    fn no_face_timeout_defaults_to_two_and_clamps_to_the_overall_timeout() {
+        // (toml, expected effective no-face timeout in seconds)
+        let cases: &[(&str, Option<u64>)] = &[
+            // Default: 2s of an empty chair, well inside the 5s default timeout.
+            ("", Some(2)),
+            // Clamped, not rejected: a config written before this key existed
+            // may already carry a timeout shorter than the new default.
+            ("[recognition]\ntimeout_secs = 1\n", Some(1)),
+            (
+                "[recognition]\ntimeout_secs = 3\nno_face_timeout_secs = 10\n",
+                Some(3),
+            ),
+            // Under the timeout, the value is used as written.
+            (
+                "[recognition]\ntimeout_secs = 30\nno_face_timeout_secs = 4\n",
+                Some(4),
+            ),
+            // 0 disables the early exit entirely.
+            ("[recognition]\nno_face_timeout_secs = 0\n", None),
+        ];
+
+        for (toml, expected) in cases {
+            let config = Config::parse(toml)
+                .unwrap_or_else(|e| panic!("{toml:?} must load — this key never rejects: {e}"));
+            assert_eq!(
+                config.recognition.effective_no_face_timeout(),
+                expected.map(Duration::from_secs),
+                "wrong effective no-face timeout for {toml:?}"
+            );
+        }
+
+        assert_eq!(
+            Config::default().recognition.no_face_timeout_secs,
+            2,
+            "the documented default"
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@ Face detection and embedding parameters.
 |-----|------|---------|-------------|
 | `threshold` | f32 | `0.80` | Cosine similarity threshold for accepting a face match. Must be between 0.0 and 1.0. Higher values are stricter. See the range guide below. |
 | `timeout_secs` | u32 | `5` | Maximum seconds to attempt recognition before giving up. Must be > 0. |
+| `no_face_timeout_secs` | u32 | `2` | Seconds to keep scanning when **no face at all** has been detected. Once a face is seen, `timeout_secs` takes over — "seen, not matched yet" is the case worth waiting out. An empty-chair attempt ends early and charges no rate-limit budget. Clamped to `timeout_secs` (never an error); `0` disables the early exit. |
 | `detection_confidence` | f32 | `0.5` | Minimum confidence for the face detector to report a detection. Lower values detect more faces but increase false positives. |
 | `nms_threshold` | f32 | `0.4` | Non-maximum suppression threshold for overlapping detections. |
 | `detector_model` | string | `"scrfd_2.5g_bnkps.onnx"` | ONNX detector model filename. Must exist in `daemon.model_dir`. Bundled models are verified against the manifest; custom models require `detector_sha256`. |

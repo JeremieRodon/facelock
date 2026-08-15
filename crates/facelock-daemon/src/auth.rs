@@ -563,6 +563,11 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
 
     let deadline =
         Instant::now() + std::time::Duration::from_secs(config.recognition.timeout_secs as u64);
+    // The shorter deadline that applies only while the camera has seen nobody
+    // at all (ADR 008 §4). `None` when the early exit is disabled. Clamped to
+    // `timeout_secs` by the accessor, so it can never outlive `deadline`.
+    let no_face_timeout = config.recognition.effective_no_face_timeout();
+    let no_face_deadline = no_face_timeout.map(|d| start + d);
     let threshold = config.recognition.threshold;
     let mut best_similarity: f32 = 0.0;
     // Sliding window over the most recent matched-frame embeddings. The gate
@@ -595,6 +600,24 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
         // frame of the token being set — not at `timeout_secs` (ADR 008 §5).
         if cancel.is_cancelled() {
             return cancelled(config, user, source, start, frame_count);
+        }
+        // Nobody is there. Also checked before the blocking capture, and only
+        // while no face has been seen: once one has, this is the "seen you,
+        // not matched yet" case that `timeout_secs` exists to bound, and the
+        // user is worth waiting for. Scanning an empty chair for the full
+        // timeout only keeps the IR emitter lit for nothing (ADR 008 §4).
+        //
+        // Ends the attempt exactly as the outer deadline does — `break`, not
+        // a separate outcome: to every caller this is the same "no face was
+        // detected" non-match, which the rate limiter then declines to charge.
+        if !face_detected && no_face_deadline.is_some_and(|d| Instant::now() >= d) {
+            debug!(
+                user,
+                frames = frame_count,
+                no_face_timeout_secs = no_face_timeout.map_or(0, |d| d.as_secs()),
+                "no face seen within the no-face timeout, ending the attempt early"
+            );
+            break;
         }
         let frame = match camera.capture() {
             Ok(f) => f,
@@ -1173,6 +1196,149 @@ enabled = false
         );
         assert!(matches!(outcome, AuthOutcome::Cancelled));
         assert_eq!(camera.captures, 0);
+    }
+
+    /// An engine that finds a face on every frame and matches nothing (the
+    /// compare set these tests pass is empty), i.e. the "we can see you, that
+    /// is not you yet" case `timeout_secs` exists to bound.
+    struct SeeingEngine;
+
+    impl FaceProcessor for SeeingEngine {
+        fn process(
+            &mut self,
+            _frame: &Frame,
+        ) -> facelock_core::error::Result<Vec<(facelock_core::types::Detection, FaceEmbedding)>>
+        {
+            Ok(vec![(
+                facelock_test_support::fixtures::center_detection(0.95),
+                facelock_test_support::fixtures::known_embedding(0),
+            )])
+        }
+    }
+
+    fn no_face_config(no_face_timeout_secs: u32, timeout_secs: u32) -> Config {
+        Config::parse(&format!(
+            r#"
+[recognition]
+timeout_secs = {timeout_secs}
+no_face_timeout_secs = {no_face_timeout_secs}
+
+[security]
+require_ir = false
+require_frame_variance = false
+require_landmark_liveness = false
+
+[audit]
+enabled = false
+"#
+        ))
+        .expect("test config must parse")
+    }
+
+    /// Runs an attempt against a camera that never stops producing frames,
+    /// returning the outcome and how long the loop actually ran.
+    fn run_attempt<E: FaceProcessor>(
+        engine: &mut E,
+        config: &Config,
+    ) -> (AuthOutcome, std::time::Duration) {
+        let token = CancelToken::new();
+        let mut camera = CancellingCamera {
+            captures: 0,
+            cancel_at: u32::MAX,
+            token: token.clone(),
+            caps: CameraCaps::default(),
+        };
+        let started = Instant::now();
+        let outcome = authenticate_with_embeddings(
+            &mut camera,
+            engine,
+            &mut [],
+            &[],
+            config,
+            "alice",
+            AuditSource::Daemon,
+            &token,
+        );
+        (outcome, started.elapsed())
+    }
+
+    #[track_caller]
+    fn assert_unmatched_without_a_face(outcome: &AuthOutcome) {
+        match outcome {
+            AuthOutcome::AuthResult(mr) => {
+                assert!(!mr.matched, "must not authenticate: {mr:?}");
+                assert!(
+                    !mr.face_detected,
+                    "nobody was there, so the reply must say so: {mr:?}"
+                );
+            }
+            other => panic!("expected an ordinary non-match, got {other:?}"),
+        }
+    }
+
+    /// ADR 008 §4: an empty chair ends the attempt at `no_face_timeout_secs`,
+    /// not at `timeout_secs` — 1 s here rather than the 30 s the camera and
+    /// its IR emitter would otherwise stay lit for.
+    ///
+    /// The ending is deliberately the *same* outcome the full timeout
+    /// produces, so nothing downstream (PAM's sentinel, the audit trail)
+    /// gains a case.
+    #[test]
+    fn no_face_ends_the_attempt_at_the_no_face_timeout() {
+        let config = no_face_config(1, 30);
+        let (outcome, elapsed) = run_attempt(&mut BlindEngine, &config);
+
+        assert_unmatched_without_a_face(&outcome);
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1),
+            "ended before its own no-face deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "sat through timeout_secs instead of the no-face timeout: {elapsed:?}"
+        );
+    }
+
+    /// The other half of the rule: the no-face deadline stops applying the
+    /// moment a face is detected. Somebody who is present but not yet
+    /// recognized — bad angle, glasses, a moment of stillness — gets the full
+    /// `timeout_secs`, which is the whole reason the two are separate keys.
+    #[test]
+    fn a_face_seen_once_buys_the_full_timeout() {
+        let config = no_face_config(1, 2);
+        let (outcome, elapsed) = run_attempt(&mut SeeingEngine, &config);
+
+        match outcome {
+            AuthOutcome::AuthResult(mr) => {
+                assert!(!mr.matched, "the compare set is empty: {mr:?}");
+                assert!(mr.face_detected, "a face was detected: {mr:?}");
+            }
+            other => panic!("expected an ordinary non-match, got {other:?}"),
+        }
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1900),
+            "the no-face deadline fired even though a face had been seen: {elapsed:?}"
+        );
+    }
+
+    /// `0` disables the early exit: the attempt runs to `timeout_secs` even
+    /// with nobody in front of the camera, which is what an operator who
+    /// wants the old behavior back sets.
+    #[test]
+    fn a_zero_no_face_timeout_runs_to_the_full_timeout() {
+        let config = no_face_config(0, 2);
+        assert_eq!(
+            config.recognition.effective_no_face_timeout(),
+            None,
+            "0 must switch the deadline off, not make it instant"
+        );
+        let (outcome, elapsed) = run_attempt(&mut BlindEngine, &config);
+
+        assert_unmatched_without_a_face(&outcome);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1900),
+            "the disabled no-face deadline still ended the attempt: {elapsed:?}"
+        );
     }
 
     /// A rate-limit *check* that fails is a storage fault, not a lockout.

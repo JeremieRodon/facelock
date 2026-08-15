@@ -694,7 +694,11 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
 
     let db_path_str = db_path.to_string_lossy().into_owned();
     let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
-    config.recognition.timeout_secs = 0;
+    // A second of scanning against an engine that *sees* a face and matches
+    // nothing. Since ADR 008 §4 only that kind of failure is charged, so an
+    // attempt that never saw anybody — which a zero-length scan also is —
+    // would make this test pass for the wrong reason.
+    config.recognition.timeout_secs = 1;
     config.security.rate_limit.max_attempts = 1;
     config.security.require_frame_variance = false;
     config.security.require_landmark_liveness = false;
@@ -710,7 +714,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
 
     let mut first_handler = Handler::new(
         config.clone(),
-        MockFaceEngine::no_faces(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
         FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
@@ -734,7 +738,7 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
 
     let mut restarted_handler = Handler::new(
         config.clone(),
-        MockFaceEngine::no_faces(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
         FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
@@ -775,7 +779,10 @@ fn test_intent_does_not_consume_rate_limit_budget() {
 
     let db_path_str = db_path.to_string_lossy().into_owned();
     let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
-    config.recognition.timeout_secs = 0;
+    // The engine sees a face and matches nothing, so each attempt is the one
+    // failure class that *is* charged (ADR 008 §4) — otherwise the intent
+    // rule under test would be masked by the no-face exemption.
+    config.recognition.timeout_secs = 1;
     config.security.rate_limit.max_attempts = 1;
     config.security.require_frame_variance = false;
     config.security.require_landmark_liveness = false;
@@ -791,7 +798,7 @@ fn test_intent_does_not_consume_rate_limit_budget() {
 
     let mut handler = Handler::new(
         config.clone(),
-        MockFaceEngine::no_faces(),
+        MockFaceEngine::one_face(unit_at_angle(0.0)),
         FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,

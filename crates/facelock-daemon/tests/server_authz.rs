@@ -8,8 +8,8 @@
 //! root-only catch-all), the in-band `-2`/`-3`/`-4` sentinel encoding with its
 //! byte-exact protocol strings, similarity redaction for non-root callers
 //! (and the `-4` sentinel that keeps a redacted caller able to tell a
-//! face-seen non-match from an empty frame), and which entry point charges
-//! the rate limit (N11).
+//! face-seen non-match from an empty frame), and which entry point — and
+//! which kind of failure — charges the rate limit (N11, ADR 008 §4).
 //!
 //! NOT covered here, deliberately: the zbus wiring — caller-identity
 //! resolution from message headers (`GetConnectionUnixUser`), signal
@@ -139,9 +139,36 @@ fn cleanup_db(path: &Path) {
 }
 
 /// A service whose store lives at `db_path` and holds one enrolled model for
-/// `user`, with an engine that never sees a face — so every attempt fails and
-/// the only question is what it costs. `max_attempts` sets the budget.
+/// `user`, with an engine that sees a face on every frame and matches none of
+/// them — so every attempt is a real failed attempt (a guess, and a wrong
+/// one) and the only question is what it costs. `max_attempts` sets the
+/// budget.
+///
+/// Deliberately not `MockFaceEngine::no_faces()`: since ADR 008 §4 an attempt
+/// where the camera saw nobody charges nothing, so a blind engine would make
+/// every "this failure is charged" test below pass vacuously. That case has
+/// its own helper, [`unseen_service_at`].
 fn failing_service_at(db_path: &Path, user: &str, max_attempts: u32) -> MockService {
+    service_at(
+        db_path,
+        user,
+        max_attempts,
+        MockFaceEngine::one_face(unrelated_embedding()),
+    )
+}
+
+/// The counterpart: an engine that never sees a face, for the attempts that
+/// must cost nothing.
+fn unseen_service_at(db_path: &Path, user: &str, max_attempts: u32) -> MockService {
+    service_at(db_path, user, max_attempts, MockFaceEngine::no_faces())
+}
+
+fn service_at(
+    db_path: &Path,
+    user: &str,
+    max_attempts: u32,
+    engine: MockFaceEngine,
+) -> MockService {
     let store = FaceStore::create(db_path).unwrap();
     store
         .add_model(
@@ -151,11 +178,7 @@ fn failing_service_at(db_path: &Path, user: &str, max_attempts: u32) -> MockServ
             "test-embedder",
         )
         .unwrap();
-    service(handler_with(
-        test_config(max_attempts, 1),
-        MockFaceEngine::no_faces(),
-        store,
-    ))
+    service(handler_with(test_config(max_attempts, 1), engine, store))
 }
 
 fn caller(uid: u32, username: Option<&str>) -> CallerIdentity {
@@ -510,7 +533,10 @@ async fn root_failed_authenticate_charges_the_rate_limit() {
 
     let first = svc.authenticate_as(root(), "alice").await.unwrap();
     assert!(!first.matched);
-    assert_eq!(first.model_id, -1, "an ordinary non-match: {first:?}");
+    assert_eq!(
+        first.model_id, -4,
+        "a face was seen and did not match — the failure that is charged: {first:?}"
+    );
 
     let inspect = FaceStore::create(&db_path).unwrap();
     assert!(
@@ -560,6 +586,41 @@ async fn a_cancelled_authenticate_charges_no_rate_limit() {
     cleanup_db(&db_path);
 }
 
+/// The complement of the pin above: a failure where the camera never saw a
+/// face costs no budget (ADR 008 §4). It is not a guess — nobody was there —
+/// and charging it means a laptop opened in front of an empty desk, or a
+/// locker that starts face auth on every wake, burns the user's whole
+/// allowance before they sit down and meets them with a lockout.
+///
+/// Asserted twice over: through the reply of a *second* attempt (which would
+/// be the `-2` rate-limit rejection if the first had charged) and directly
+/// against the on-disk `rate_limit` table.
+#[tokio::test]
+async fn a_no_face_authenticate_charges_no_rate_limit() {
+    let db_path = temp_db_path("no-face-charges-nothing");
+    cleanup_db(&db_path);
+    // Budget of one failed attempt — neither no-face run may reach it.
+    let svc = unseen_service_at(&db_path, "alice", 1);
+
+    for attempt in 0..2 {
+        let reply = svc.authenticate_as(root(), "alice").await.unwrap();
+        assert!(!reply.matched);
+        assert_eq!(
+            reply.model_id, -1,
+            "attempt {attempt} must stay an ordinary no-face non-match, never \
+             a rate-limit rejection: {reply:?}"
+        );
+    }
+
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect.check_rate_limit("alice", 1, 60).unwrap(),
+        "an attempt at an empty chair must leave the budget untouched"
+    );
+
+    cleanup_db(&db_path);
+}
+
 /// The other half: a non-root user's own failed attempts are charged, as
 /// they always were.
 #[tokio::test]
@@ -570,7 +631,7 @@ async fn user_failed_authenticate_charges_the_rate_limit() {
 
     let charged = svc.authenticate_as(alice(), "alice").await.unwrap();
     assert!(!charged.matched);
-    assert_eq!(charged.model_id, -1);
+    assert_eq!(charged.model_id, -4, "a face was seen and did not match");
 
     let limited = svc.authenticate_as(alice(), "alice").await.unwrap();
     assert_eq!(limited.model_id, -2);
@@ -595,9 +656,9 @@ async fn test_authenticate_does_not_charge_the_rate_limit() {
         let result = svc.test_authenticate_as(root(), "alice").await.unwrap();
         assert!(!result.matched);
         assert_eq!(
-            result.model_id, -1,
-            "test attempt {attempt} must be an ordinary non-match, not a \
-             rate-limit rejection: {result:?}"
+            result.model_id, -4,
+            "test attempt {attempt} must be an ordinary face-seen non-match, \
+             not a rate-limit rejection: {result:?}"
         );
     }
 

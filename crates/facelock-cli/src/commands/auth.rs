@@ -217,9 +217,17 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     // camera-based auth loop. The oneshot path relies on those entries, so no
     // additional audit logging is needed here for the auth result itself.
 
+    // The same rule the daemon handler applies: a failed attempt charges the
+    // shared budget, but only if a face was actually seen. An attempt at an
+    // empty chair is not a guess (ADR 008 §4), and both transports write to
+    // the same `rate_limit` table, so they must agree on what counts.
     if matches!(
         response,
-        AuthOutcome::AuthResult(MatchResult { matched: false, .. })
+        AuthOutcome::AuthResult(MatchResult {
+            matched: false,
+            face_detected: true,
+            ..
+        })
     ) {
         if let Err(e) = rate_limiter.record_failure(&store, &user) {
             error!("rate limit record: {e}");

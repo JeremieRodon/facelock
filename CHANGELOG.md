@@ -77,6 +77,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An authentication at an empty chair ends early and costs no rate-limit
+  budget** (ADR 008 §3/§4). A new `recognition.no_face_timeout_secs` (default
+  **2**) ends an attempt once that many seconds have passed with no face
+  detected at all; `recognition.timeout_secs` still bounds the slower case a
+  timeout is actually for — a face was seen and has not matched yet. A laptop
+  opened in front of nobody therefore lights its IR emitter for 2 seconds
+  instead of 5. The key is additive with a serde default, is clamped to
+  `timeout_secs` rather than validated against it, and `0` disables the early
+  exit, so no existing `/etc/facelock/config.toml` needs to change. Separately,
+  and regardless of that timeout, a failed attempt in which the camera never
+  saw a face no longer calls the rate limiter on either the daemon or the
+  one-shot path: an empty chair is not a guess, and charging it let a locker
+  that starts face auth on every wake spend the user's whole 5-attempt budget
+  before they sat down — the real attempt then met a lockout. A face that
+  *was* seen and did not match is charged exactly as before. The early ending
+  reports the same outcome the full timeout reports, so no client, sentinel or
+  audit result gains a case.
 - **One-shot `facelock auth` no longer outlives its PAM host or lights the
   camera during the model load** (ADR 008 §7). Three changes, no new exit
   code and no change to the existing one: the ONNX engine now loads *before*

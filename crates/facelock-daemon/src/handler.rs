@@ -942,8 +942,16 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         self.lease.finish(Outcome::from(&result), &self.config);
         // Only failed auths count against the rate limit, and only for the
         // real-authentication intent (see [`AuthIntent`]).
+        //
+        // An attempt where the camera never saw a face is not one of them: an
+        // empty chair is not a guess (ADR 008 §4). A locker that starts face
+        // auth on every wake, or a laptop opened in front of nobody, would
+        // otherwise burn the user's whole budget without a single attempt
+        // being made — and the real one, when they sit down, meets a lockout.
+        // A face that *was* seen and did not match still charges: that is a
+        // guess, and a wrong one.
         if let AuthOutcome::AuthResult(ref mr) = result {
-            if !mr.matched && intent.charges_rate_limit() {
+            if !mr.matched && mr.face_detected && intent.charges_rate_limit() {
                 if let Err(e) = self.rate_limiter.record_failure(&self.store, &user) {
                     warn!(user, error = %e, "failed to record auth failure");
                 }

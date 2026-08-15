@@ -76,6 +76,15 @@
 # Default: 5
 # timeout_secs = 5
 
+# Seconds to keep looking when no face at all has been detected.
+# Once a face is seen, timeout_secs above takes over — that is the case
+# worth waiting out. Ending an empty-chair attempt early stops the camera
+# (and on IR hardware its emitter LED) from running for nothing, and such an
+# attempt never counts against the rate limit.
+# Values above timeout_secs are clamped to it. 0 disables the early exit.
+# Default: 2
+# no_face_timeout_secs = 2
+
 # ONNX model files (must exist in daemon.model_dir).
 # Run `facelock setup` to select a model tier and download automatically.
 #

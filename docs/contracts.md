@@ -158,8 +158,20 @@ in exactly two documented ways:
    root already owns the database and can clear the limiter directly, so
    exempting *consumption* for it costs nothing.
 
-`Authenticate` always charges a failed attempt, on every transport and for
-every caller including root.
+`Authenticate` charges a failed attempt on every transport and for every
+caller including root — with one exception, added by ADR 008 §4: **an attempt
+where the camera never saw a face charges nothing** (`face_detected == false`,
+the `-1` wire sentinel). Nobody was there, so no guess was made; a screen
+locker that starts face auth on every wake, or a laptop opened in front of an
+empty desk, would otherwise spend the user's whole budget before they sit
+down. A face that *was* seen and did not match (`-4`) still charges. The rule
+is identical on the daemon and one-shot paths, which share the `rate_limit`
+table.
+
+Such an attempt also ends early, at `recognition.no_face_timeout_secs`
+(default 2, clamped to `timeout_secs`, `0` disables) rather than at
+`timeout_secs`; the outcome it reports is exactly the one the full timeout
+reports, so no client gains a case.
 
 The rate-limit *check* (whether `user` is already over budget) is unaffected
 by any of the above and still runs on both methods and both transports: an
@@ -293,7 +305,7 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | Section | Key fields |
 |---------|-----------|
 | `[device]` | `path` (Option), `max_height`, `rotation`, `warmup_frames`, `dark_threshold`, `dark_pixel_value`, `ir_emitter`, `camera_release_secs` |
-| `[recognition]` | `threshold`, `timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
+| `[recognition]` | `threshold`, `timeout_secs`, `no_face_timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
 | `[daemon]` | `mode` (DaemonMode enum), `model_dir`, `idle_timeout_secs` |
 | `[storage]` | `db_path` |
 | `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `bind_templates_to_device`, `device_match_granularity`, `bind_legacy_templates`, `bind_device_aad`, `allow_plaintext`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
@@ -403,7 +415,7 @@ CREATE TABLE rate_limit (
 );
 ```
 
-Only failed authentication attempts are recorded in `rate_limit`. Daemon mode and oneshot mode share the same SQLite-backed window, so daemon restarts do not clear lockout state.
+Only failed authentication attempts are recorded in `rate_limit`, and only those where a face was actually detected (ADR 008 §4 — see §facelock test Semantics for the full charging rule). Daemon mode and oneshot mode share the same SQLite-backed window, so daemon restarts do not clear lockout state.
 
 **Schema version** is tracked in `schema_version`; migrations are additive and forward-only. Current version: **6**. Migration V6 adds the nullable `face_models.device_id` column (Plan 02 device coupling); pre-V6 databases open cleanly, keep their rows, and leave `device_id` NULL. NULL rows are governed by `security.bind_legacy_templates` (default allow-with-warn), so upgrades never lock a user out.
 
