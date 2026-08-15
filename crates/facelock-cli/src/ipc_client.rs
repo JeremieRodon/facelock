@@ -5,7 +5,7 @@ use zbus::blocking::Proxy;
 use facelock_core::dbus_interface::*;
 use facelock_core::ipc::{IpcDeviceInfo, PreviewFace};
 use facelock_core::types::{FaceModelInfo, MatchResult};
-use facelock_daemon::auth::{AuthOutcome, ErrorKind};
+use facelock_daemon::auth::{AuthOutcome, CANCELLED_MESSAGE, ErrorKind};
 
 use crate::message::{AccessMessage, explain};
 
@@ -244,6 +244,13 @@ pub fn test_authenticate(user: &str) -> anyhow::Result<AuthOutcome> {
 /// daemon's renderer and the one place that match lives on this side.
 fn decode_auth_result(result: AuthResult) -> AuthOutcome {
     if !result.matched && result.model_id == -2 {
+        // A cancellation shares the recoverable-error encoding but is not a
+        // rejection class: it says the attempt was abandoned, not that this
+        // face was refused. Recovered by its frozen string, the same way
+        // `ErrorKind::classify` recovers the others.
+        if result.label == CANCELLED_MESSAGE {
+            return AuthOutcome::Cancelled;
+        }
         return AuthOutcome::Error {
             kind: ErrorKind::classify(&result.label),
             message: result.label,

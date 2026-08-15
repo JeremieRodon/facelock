@@ -8,6 +8,7 @@ use facelock_store::FaceStore;
 use facelock_tpm::SoftwareSealer;
 use tracing::{debug, info, warn};
 
+use crate::cancel::CancelToken;
 use crate::quality;
 
 /// The outcome of an enrollment attempt — shared by the daemon handler
@@ -15,8 +16,18 @@ use crate::quality;
 /// CLI never needs the handler's own request/response enums (D5).
 #[derive(Debug, Clone)]
 pub enum EnrollOutcome {
-    Enrolled { model_id: u32, embedding_count: u32 },
-    Error { message: String },
+    Enrolled {
+        model_id: u32,
+        embedding_count: u32,
+    },
+    Error {
+        message: String,
+    },
+    /// The caller went away, the system is suspending, or the process was
+    /// signalled. Same rule as [`crate::auth::AuthOutcome::Cancelled`]: the
+    /// enrollment was abandoned, not refused, and the camera closes at once
+    /// (ADR 008 §5).
+    Cancelled,
 }
 
 const MIN_CAPTURES: usize = 3;
@@ -155,6 +166,7 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
     label: &str,
     sealer: Option<&SoftwareSealer>,
     device_id: Option<&str>,
+    cancel: &CancelToken,
 ) -> EnrollOutcome {
     // Clear any previous model with the same label (re-enrollment)
     match store.remove_model_by_label(user, label) {
@@ -185,6 +197,12 @@ pub fn enroll<C: CameraSource, E: FaceProcessor>(
     let mut rejections = RejectionStats::default();
 
     while Instant::now() < deadline && (stored_count as usize) < MAX_CAPTURES {
+        // Checked before the inter-frame sleep and the blocking capture, so
+        // an abandoned enrollment ends within one frame (ADR 008 §5).
+        if cancel.is_cancelled() {
+            info!(user, label, captures = stored_count, "enrollment cancelled");
+            return EnrollOutcome::Cancelled;
+        }
         // Delay between captures for varied angles
         let since_last = Instant::now().duration_since(last_capture);
         if since_last < INTER_FRAME_DELAY {
@@ -542,6 +560,7 @@ mod tests {
             "2026-08-08-1",
             None,
             None,
+            &CancelToken::new(),
         );
 
         match &response {

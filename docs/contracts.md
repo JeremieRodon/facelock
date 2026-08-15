@@ -158,8 +158,20 @@ in exactly two documented ways:
    root already owns the database and can clear the limiter directly, so
    exempting *consumption* for it costs nothing.
 
-`Authenticate` always charges a failed attempt, on every transport and for
-every caller including root.
+`Authenticate` charges a failed attempt on every transport and for every
+caller including root — with one exception, added by ADR 008 §4: **an attempt
+where the camera never saw a face charges nothing** (`face_detected == false`,
+the `-1` wire sentinel). Nobody was there, so no guess was made; a screen
+locker that starts face auth on every wake, or a laptop opened in front of an
+empty desk, would otherwise spend the user's whole budget before they sit
+down. A face that *was* seen and did not match (`-4`) still charges. The rule
+is identical on the daemon and one-shot paths, which share the `rate_limit`
+table.
+
+Such an attempt also ends early, at `recognition.no_face_timeout_secs`
+(default 2, clamped to `timeout_secs`, `0` disables) rather than at
+`timeout_secs`; the outcome it reports is exactly the one the full timeout
+reports, so no client gains a case.
 
 The rate-limit *check* (whether `user` is already over budget) is unaffected
 by any of the above and still runs on both methods and both transports: an
@@ -278,7 +290,9 @@ binary; none of it touches the data itself.
 
 ### Audit Log Entries
 
-`audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
+`audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`, `cancelled`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
+
+`cancelled` (ADR 008 §5) is an attempt that was **abandoned, not answered**: the caller's bus connection went away, the system suspended, `ReleaseCamera` arrived, or a one-shot process was signalled. It is deliberately not a `failure` — no comparison reached a verdict, so it charges no rate-limit budget. The entry carries `frame_count` and `duration_ms` (how far the attempt got) and no `similarity`.
 
 `source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (`facelock test`, on either transport: the daemon's `TestAuthenticate` method or the in-process direct loop). It records the **enforcement path, not the caller's identity**: `daemon` and `oneshot` are fully-enforced authentications whose failures count against the rate limit, while `test` skips the SSH/lid physical-presence gates and charges nothing. So a `success` stamped `test` is a recognition result, not a policy-approved authentication — and a real authentication is never stamped `test`, whatever privilege its caller holds. The field is absent on entries written before it existed.
 
@@ -290,8 +304,8 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 
 | Section | Key fields |
 |---------|-----------|
-| `[device]` | `path` (Option), `max_height`, `rotation`, `warmup_frames`, `dark_threshold`, `dark_pixel_value`, `ir_emitter`, `camera_release_secs` |
-| `[recognition]` | `threshold`, `timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
+| `[device]` | `path` (Option), `max_height`, `rotation`, `warmup_frames`, `dark_threshold`, `dark_pixel_value`, `ir_emitter`, `camera_release_secs`, `camera_release_after_success_secs` |
+| `[recognition]` | `threshold`, `timeout_secs`, `no_face_timeout_secs`, `detector_model`, `detector_sha256`, `embedder_model`, `embedder_sha256`, `threads`, `execution_provider` |
 | `[daemon]` | `mode` (DaemonMode enum), `model_dir`, `idle_timeout_secs` |
 | `[storage]` | `db_path` |
 | `[security]` | `disabled`, `suppress_unknown`, `require_landmark_liveness`, `require_ir`, `require_frame_variance`, `frame_variance_max_similarity`, `ir_texture_min_stddev`, `min_auth_frames`, `bind_templates_to_device`, `device_match_granularity`, `bind_legacy_templates`, `bind_device_aad`, `allow_plaintext`, `abort_if_ssh`, `abort_if_lid_closed`, `pam_policy`, `rate_limit` |
@@ -328,6 +342,24 @@ templates are encrypted at rest by default. The keyfile is auto-generated at mod
 on first use if absent. `method = "none"` (plaintext) is **refused at enrollment** unless
 `security.allow_plaintext = true`. Auth always degrades to password on a decrypt failure —
 never a lockout.
+
+**Camera hold semantics (ADR 008).** `device.camera_release_secs` (default **3**) is the
+number of seconds the **daemon** keeps the camera streaming **after a failed
+authentication** — the one ending a retry plausibly follows — so that retry skips the
+reopen cost. A success releases the camera immediately **unless**
+`device.camera_release_after_success_secs` (default **0**) is greater than zero, in which
+case a success holds for that many seconds instead; it is an opt-in for repeated
+privileged actions with no authentication caching in front of them, and at its default
+nothing about a success changes. Cancellation and every error (including a capture failure
+or an all-dark scan) always release immediately, whatever both keys say: the interaction is
+over, and on IR hardware the emitter LED goes out with it. `camera_release_secs = 0` means
+**never hold** after a failure; it previously fell back to 5 seconds. Enrollment follows
+the same rule as authentication, on both keys. Preview frames are exempt: each one extends
+the hold to `max(camera_release_secs, 2s)` so a ~10 fps preview never reopens per frame,
+and the CLI still calls `ReleaseCamera` on exit. The hold deadline is absolute and polled
+every 250 ms. One-shot mode (`facelock auth`) never holds — process exit is the release —
+and ignores both keys. Changing either value needs no daemon restart: they are read per
+request.
 
 **Hard device binding (opt-in).** `security.bind_device_aad = true` folds the enrolling
 camera's `device_id` into the AES-GCM AAD, so a template cannot be decrypted under a
@@ -388,7 +420,7 @@ CREATE TABLE rate_limit (
 );
 ```
 
-Only failed authentication attempts are recorded in `rate_limit`. Daemon mode and oneshot mode share the same SQLite-backed window, so daemon restarts do not clear lockout state.
+Only failed authentication attempts are recorded in `rate_limit`, and only those where a face was actually detected (ADR 008 §4 — see §facelock test Semantics for the full charging rule). Daemon mode and oneshot mode share the same SQLite-backed window, so daemon restarts do not clear lockout state.
 
 **Schema version** is tracked in `schema_version`; migrations are additive and forward-only. Current version: **6**. Migration V6 adds the nullable `face_models.device_id` column (Plan 02 device coupling); pre-V6 databases open cleanly, keep their rows, and leave `device_id` NULL. NULL rows are governed by `security.bind_legacy_templates` (default allow-with-warn), so upgrades never lock a user out.
 
@@ -515,17 +547,34 @@ it; `ErrorKind::render` is the only place any of these sentences is written.
 The wire has no field for the class, so the CLI's D-Bus client reconstructs it
 with `ErrorKind::classify`, the exact inverse of `render`.
 
-Two rendered messages are **frozen protocol** because the PAM module
-substring-matches them to choose its return code, and it cannot link the daemon
+Three rendered messages are **frozen protocol** because the PAM module
+matches them to choose its return code, and it cannot link the daemon
 crate to share the type (its dependency ceiling is libc/toml/serde/zbus):
 
 | Substring PAM matches | Class | PAM code |
 |---|---|---|
 | `rate limited` | `RateLimited` | `PAM_AUTH_ERR` |
 | `IR camera required` | `IrRequired` | `PAM_IGNORE` |
+| `cancelled` (matched **exactly**) | `AuthOutcome::Cancelled` | `PAM_IGNORE` |
 
-Changing either string is a protocol break. They are pinned byte-exactly in
-`crates/facelock-daemon/src/auth.rs` (renderer) and
+Changing any of these strings is a protocol break.
+
+`cancelled` is not an `ErrorKind`. A rejection class is a statement about this
+user's face; a cancellation is the absence of one, so it is its own
+`AuthOutcome` variant (`facelock_daemon::auth::CANCELLED_MESSAGE`) that reuses
+the recoverable-error encoding to cross a wire with no field for it. PAM
+abstains on it: the attempt was abandoned, so the daemon has no opinion and the
+password modules run. It is matched exactly rather than as a substring, so an
+arbitrary error message that happens to mention cancelling cannot claim the row.
+
+**`auth_attempted` and a cancelled attempt.** The signal carries only `user` and
+`matched`, and its signature is frozen; a cancelled attempt therefore emits
+`auth_attempted(user, false)`, indistinguishable on the signal from a non-match.
+The audit log is where the two are told apart (`cancelled` vs `failure`).
+
+They are pinned byte-exactly in
+`crates/facelock-daemon/src/auth.rs` (renderer, including the frozen
+cancellation string) and
 `crates/facelock-daemon/tests/server_authz.rs` (wire), and every class's
 message, audit label and exit code are pinned together in
 `crates/facelock-cli/src/commands/auth.rs`.

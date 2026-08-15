@@ -28,6 +28,12 @@ const WARM_ITERATIONS: u32 = 10;
 /// Number of snapshots for enrollment benchmark.
 const ENROLLMENT_SNAPSHOTS: u32 = 5;
 
+/// Default number of reopen cycles for `bench camera-reopen`.
+///
+/// Five is enough for a stable median without keeping the IR emitter lit for
+/// long: each cycle costs a full cold open plus the warmup discard.
+const REOPEN_ITERATIONS: u32 = 5;
+
 #[derive(Subcommand)]
 pub enum BenchCommand {
     /// Measure cold auth latency (model load + first auth)
@@ -42,6 +48,12 @@ pub enum BenchCommand {
     ModelLoad,
     /// Sweep thresholds and measure FAR/FRR
     Calibrate,
+    /// Measure what reopening the camera costs (open, STREAMON, warmup)
+    CameraReopen {
+        /// Number of close→open→first-usable-frame cycles to time
+        #[arg(long, default_value_t = REOPEN_ITERATIONS)]
+        iterations: u32,
+    },
     /// Generate a benchmark report
     Report,
 }
@@ -59,6 +71,7 @@ pub fn run(config: &Config, command: BenchCommand) -> Result<()> {
         BenchCommand::Enrollment => cmd_enrollment(config),
         BenchCommand::ModelLoad => cmd_model_load(config),
         BenchCommand::Calibrate => cmd_calibrate(config),
+        BenchCommand::CameraReopen { iterations } => cmd_camera_reopen(config, iterations),
         BenchCommand::Report => cmd_report(config),
     }
 }
@@ -471,6 +484,161 @@ fn cmd_calibrate(config: &Config) -> Result<()> {
 
         conf += 0.10;
     }
+
+    Ok(())
+}
+
+/// One timed close→open→first-usable-frame cycle, split by phase.
+///
+/// The split is the point of the benchmark: "reopening costs ~400 ms" was an
+/// assertion nobody had measured (ADR 008 §2), and the three phases have
+/// different fixes — a slow `open` is driver/format negotiation, a slow
+/// `first_frame` is the sensor starting to stream, a slow `warmup` is
+/// `device.warmup_frames` (or a quirk override) buying AGC/AE settling time.
+#[derive(Default)]
+struct ReopenSplit {
+    /// Resolve the device, open it, negotiate the capture format. No frames.
+    open_ms: u64,
+    /// The first `capture()`, which is what actually issues `STREAMON`: the
+    /// V4L2 stream starts lazily on the first dequeue, so the cost of
+    /// starting the sensor lands here rather than in `open`.
+    first_frame_ms: u64,
+    /// The rest of the warmup discard (the frame above was its first).
+    warmup_ms: u64,
+    /// The first frame an authentication would actually analyze.
+    usable_ms: u64,
+}
+
+impl ReopenSplit {
+    fn total_ms(&self) -> u64 {
+        self.open_ms + self.first_frame_ms + self.warmup_ms + self.usable_ms
+    }
+}
+
+/// Time what it costs to go from no camera to the first frame an
+/// authentication can analyze.
+///
+/// This is the number `device.camera_release_secs` is traded against: holding
+/// the stream open after a failed attempt spends LED-on time to save exactly
+/// this, so the hold length is only arguable once it has been measured on the
+/// device in question (ADR 008 §9, §11).
+fn cmd_camera_reopen(config: &Config, iterations: u32) -> Result<()> {
+    if iterations == 0 {
+        bail!("--iterations must be at least 1");
+    }
+
+    println!("=== Camera Reopen Benchmark ===");
+    println!(
+        "Measuring: open + format negotiation, STREAMON + first frame, warmup discard, \
+         first usable frame ({} iterations)",
+        iterations
+    );
+    println!();
+
+    let mut splits: Vec<ReopenSplit> = Vec::with_capacity(iterations as usize);
+    let mut device_path = String::new();
+    let mut format = String::new();
+    let mut warmup_frames = 0u32;
+
+    for i in 0..iterations {
+        // Every iteration starts closed: the previous camera was dropped
+        // before this timer started, so its STREAMOFF and IR-emitter shutdown
+        // are not billed to this open.
+        let mut split = ReopenSplit::default();
+
+        let open_start = Instant::now();
+        let resolved = direct::resolve_camera_device(config)?;
+        // Quirk override beats the config value, the same rule the auth path
+        // applies (`direct::open_camera`). Read before `open` consumes the
+        // resolution.
+        let warmup = resolved
+            .quirk
+            .as_ref()
+            .and_then(|q| q.warmup_frames)
+            .unwrap_or(config.device.warmup_frames);
+        let path = resolved.info.path.clone();
+        let mut camera = resolved
+            .open(&config.device)
+            .context("Failed to open camera")?;
+        split.open_ms = open_start.elapsed().as_millis() as u64;
+
+        let first_start = Instant::now();
+        camera
+            .capture()
+            .context("Failed to capture the first frame")?;
+        split.first_frame_ms = first_start.elapsed().as_millis() as u64;
+
+        let warmup_start = Instant::now();
+        // `1..warmup`, not `0..warmup`: the capture above already spent the
+        // first of the warmup frames. Empty for `warmup <= 1`.
+        for _ in 1..warmup {
+            camera.capture().context("Failed to capture warmup frame")?;
+        }
+        split.warmup_ms = warmup_start.elapsed().as_millis() as u64;
+
+        // With no warmup configured the frame captured above is already the
+        // one an authentication would analyze, so there is nothing left to
+        // charge — capturing another would report a cost the real path never
+        // pays.
+        if warmup > 0 {
+            let usable_start = Instant::now();
+            camera
+                .capture()
+                .context("Failed to capture the first usable frame")?;
+            split.usable_ms = usable_start.elapsed().as_millis() as u64;
+        }
+
+        device_path = path;
+        format = camera.format().trim().to_string();
+        warmup_frames = warmup;
+
+        println!(
+            "iteration {:<2} open {:>5}ms  first_frame {:>5}ms  warmup {:>5}ms  \
+             usable {:>5}ms  total {:>5}ms",
+            i + 1,
+            split.open_ms,
+            split.first_frame_ms,
+            split.warmup_ms,
+            split.usable_ms,
+            split.total_ms()
+        );
+        info!(
+            iteration = i + 1,
+            open_ms = split.open_ms,
+            first_frame_ms = split.first_frame_ms,
+            warmup_ms = split.warmup_ms,
+            usable_ms = split.usable_ms,
+            total_ms = split.total_ms(),
+            "camera reopen iteration"
+        );
+
+        // Explicit, and load-bearing: the drop runs STREAMOFF and disables the
+        // IR emitter, which is what makes the next iteration a cold open.
+        drop(camera);
+        splits.push(split);
+    }
+
+    let mut opens: Vec<u64> = splits.iter().map(|s| s.open_ms).collect();
+    let mut firsts: Vec<u64> = splits.iter().map(|s| s.first_frame_ms).collect();
+    let mut warmups: Vec<u64> = splits.iter().map(|s| s.warmup_ms).collect();
+    let mut usables: Vec<u64> = splits.iter().map(|s| s.usable_ms).collect();
+    let mut totals: Vec<u64> = splits.iter().map(|s| s.total_ms()).collect();
+
+    println!();
+    println!("Device:         {}", device_path);
+    println!("Format:         {}", format);
+    println!("Warmup frames:  {}", warmup_frames);
+    println!();
+    println!("Median split ({} iterations):", iterations);
+    println!("  open:         {}ms", percentile(&mut opens, 50));
+    println!("  first_frame:  {}ms", percentile(&mut firsts, 50));
+    println!("  warmup:       {}ms", percentile(&mut warmups, 50));
+    println!("  usable:       {}ms", percentile(&mut usables, 50));
+    println!("  total:        {}ms", percentile(&mut totals, 50));
+    println!();
+    println!(
+        "camera_release_secs trades this reopen cost against LED-on time after a failed attempt (ADR 008)"
+    );
 
     Ok(())
 }

@@ -555,6 +555,22 @@ Implementation note:
 - Daemon mode and oneshot mode use the same window and thresholds
 - Restarting the daemon must not reset a user's lockout state
 
+**An attempt where no face was detected is not charged** (ADR 008 §4). The
+limiter exists to bound *guessing* — presenting material to the camera and
+being told no — and an empty chair presents nothing. Charging it made the
+budget consumable without any attacker input: a lock screen that starts face
+auth on every wake, a laptop opened facing an empty desk, or an unattended
+`sudo` prompt would each spend the five attempts on nobody, so the user's real
+attempt met a lockout. The distinction is the detector's, not the caller's
+(`face_detected` on the result, the `-4` versus `-1` wire sentinel), so it
+cannot be asked for: an attacker who wants a free attempt has to keep their
+face out of frame, which is also an attempt that could never have succeeded.
+A detected face that fails any later gate — no match, IR texture, frame
+variance, landmark liveness — is charged as it always was. A no-face attempt
+also *ends* after `recognition.no_face_timeout_secs` (default 2) instead of
+running the full `recognition.timeout_secs`, which turns the camera and its IR
+emitter off that much sooner.
+
 ### 5. PAM Module Hardening
 
 #### A0. Config File Trust (Required)

@@ -17,11 +17,11 @@ No daemon needed -- the CLI auto-falls back to direct mode when no daemon is run
 
 | Mode | Config | How it works | Latency |
 |------|--------|-------------|---------|
-| **Daemon** | `mode = "daemon"` (default) | PAM connects via D-Bus, persistent daemon | ~150-600ms |
-| **D-Bus activation** | systemd + D-Bus service | systemd starts daemon on demand | ~700ms+ cold |
-| **Oneshot** | `mode = "oneshot"` | PAM spawns `facelock auth` subprocess | ~700ms+ |
+| **Daemon** | `mode = "daemon"` (default) | PAM connects via D-Bus, persistent daemon | fastest: no model load, no reopen when warm |
+| **D-Bus activation** | systemd + D-Bus service | systemd starts daemon on demand | + daemon start on the first call |
+| **Oneshot** | `mode = "oneshot"` | PAM spawns `facelock auth` subprocess | + model load on every call |
 
-Daemon latency depends on camera state: ~600ms with a cold camera, ~150-180ms on back-to-back auths when the camera is already warm.
+Daemon latency depends on camera state: a cold attempt pays a camera reopen, a retry within `device.camera_release_secs` of a failed attempt does not. That reopen cost is a property of your camera and driver, not a number to quote from someone else's laptop -- measure it with `sudo facelock bench camera-reopen`, which prints the open / STREAMON / warmup split.
 
 The CLI works in all modes -- it connects to the daemon if available, otherwise operates directly.
 

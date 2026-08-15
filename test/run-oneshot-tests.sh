@@ -57,6 +57,42 @@ run_test_contains() {
     return 1
 }
 
+# ADR 008 §9: like run_test, but a check may report that there was nothing to
+# observe (exit 3) instead of passing or failing — a one-shot that answered
+# before it could be signalled is not a lifecycle bug. Anything the check
+# printed is echoed either way, so a SKIP always says which precondition was
+# missing.
+run_test_or_skip() {
+    local name="$1"
+    local cmd="$2"
+
+    echo -n "TEST: $name ... "
+    local result=0
+    set +o pipefail
+    # `|| result=$?` rather than `set +e`: errexit stays exactly as the script
+    # set it, so a check that returns non-zero reports a FAIL here instead of
+    # aborting the run.
+    eval "$cmd" > /tmp/test-output 2>&1 || result=$?
+    set -o pipefail
+
+    case "$result" in
+        0)
+            echo "PASS"
+            PASS=$((PASS + 1))
+            sed 's/^/      /' /tmp/test-output
+            ;;
+        3)
+            echo "SKIP"
+            sed 's/^/      /' /tmp/test-output
+            ;;
+        *)
+            echo "FAIL (exit=$result)"
+            cat /tmp/test-output
+            FAIL=$((FAIL + 1))
+            ;;
+    esac
+}
+
 echo "=== Oneshot Mode Tests (fully daemonless, with camera) ==="
 echo ""
 
@@ -411,6 +447,165 @@ trap - EXIT
 # PAM authentication (the real deal — no daemon)
 run_test "pamtester authenticates (oneshot, no daemon)" \
     "timeout --foreground $LIVE_TIMEOUT pamtester facelock-test testuser authenticate"
+
+# --- ADR 008: one-shot lifecycle (signals, parent death) ---
+#
+# The invariant (§7): a one-shot never holds the camera, and its exit is the
+# release. Both assertions below therefore care about the same thing — that the
+# process runs its own `Drop` (STREAMOFF, IR emitter off) rather than being
+# killed outright — which is why the exit code matters as much as the timing:
+# 2 means facelock decided to stop, 143 means the signal did it and Drop never
+# ran.
+
+# Milliseconds since the epoch.
+now_ms() {
+    echo $(( $(date +%s%N) / 1000000 ))
+}
+
+# Wait until pid $1 has a /dev/video* device open, i.e. it is past the ONNX
+# model load and actually scanning. Returns 1 if it never gets there.
+#
+# This is what makes the 500 ms budgets below measure what they claim to. A
+# signal that lands inside the model load is only acted on when the load
+# returns (ADR 008 §8 says as much: the token is checked *between* engine and
+# camera), so signalling at a fixed offset would time the ONNX loader instead
+# of the cancellation. /proc is all it takes to tell the two apart, and it
+# needs no tooling the image does not already have.
+wait_until_scanning() {
+    local pid="$1"
+    local deadline=$(( $(now_ms) + 20000 ))
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        kill -0 "$pid" 2>/dev/null || return 1
+        if ls -l /proc/"$pid"/fd 2>/dev/null | grep -q '/dev/video'; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+# ADR 008 §7: SIGTERM must end `facelock auth` through its own cancel token —
+# exit 2, within one frame — not kill it. A process killed by an unhandled
+# SIGTERM reports 143 and skips `Drop`, which is exactly the path that leaves
+# an XU-controlled IR emitter lit.
+adr008_oneshot_sigterm_exits_cleanly() {
+    local pid rc start elapsed
+    facelock auth --user testuser --config /etc/facelock/config.toml \
+        > /tmp/adr008-oneshot-term.log 2>&1 &
+    pid=$!
+
+    if ! wait_until_scanning "$pid"; then
+        rc=0
+        wait "$pid" || rc=$?
+        cat /tmp/adr008-oneshot-term.log
+        echo "the one-shot never reached the camera (exit=$rc); nothing to signal"
+        return 3
+    fi
+
+    start=$(now_ms)
+    kill -TERM "$pid" 2>/dev/null || true
+    rc=0
+    wait "$pid" || rc=$?
+    elapsed=$(( $(now_ms) - start ))
+
+    if [ "$rc" -ne 2 ]; then
+        cat /tmp/adr008-oneshot-term.log
+        echo "exit=$rc after SIGTERM, expected 2 (143 means the signal killed it and Drop never ran)"
+        return 1
+    fi
+    if [ "$elapsed" -gt 500 ]; then
+        echo "exited ${elapsed}ms after SIGTERM, expected within 500ms (one frame)"
+        return 1
+    fi
+    if pgrep -f "facelock auth" > /dev/null 2>&1; then
+        echo "a facelock auth process survived the signal:"
+        pgrep -af "facelock auth" || true
+        return 1
+    fi
+    echo "exited 2 in ${elapsed}ms, no process left"
+}
+
+# ADR 008 §7 and acceptance (4): a one-shot must not outlive its PAM host. The
+# module sets PR_SET_PDEATHSIG = SIGTERM in pre_exec, so killing the host
+# delivers SIGTERM to the child, which then takes the clean exit above. Only
+# PAM can exercise this — the flag is set by the module, not by whatever shell
+# happens to be the parent — so the host here is pamtester.
+adr008_oneshot_dies_with_pam_host() {
+    local pam_pid child start elapsed
+    command -v pgrep > /dev/null 2>&1 || {
+        echo "pgrep is unavailable; cannot observe the child"
+        return 3
+    }
+
+    pamtester facelock-test testuser authenticate < /dev/null \
+        > /tmp/adr008-pdeathsig.log 2>&1 &
+    pam_pid=$!
+
+    child=""
+    local deadline=$(( $(now_ms) + 20000 ))
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        child="$(pgrep -f 'facelock auth' 2>/dev/null | head -1)"
+        if [ -n "$child" ] && ls -l /proc/"$child"/fd 2>/dev/null | grep -q '/dev/video'; then
+            break
+        fi
+        child=""
+        kill -0 "$pam_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if [ -z "$child" ]; then
+        kill -9 "$pam_pid" 2>/dev/null || true
+        wait "$pam_pid" 2>/dev/null || true
+        cat /tmp/adr008-pdeathsig.log
+        echo "no 'facelock auth' child reached the camera; nothing to orphan"
+        return 3
+    fi
+
+    # SIGKILL, so the host cannot tidy up after itself: whatever ends the child
+    # is the kernel's PDEATHSIG, not PAM.
+    start=$(now_ms)
+    kill -9 "$pam_pid" 2>/dev/null || true
+    wait "$pam_pid" 2>/dev/null || true
+    while kill -0 "$child" 2>/dev/null; do
+        if [ $(( $(now_ms) - start )) -gt 500 ]; then
+            echo "facelock auth (pid $child) outlived its PAM host by more than 500ms"
+            kill -9 "$child" 2>/dev/null || true
+            return 1
+        fi
+        sleep 0.02
+    done
+    elapsed=$(( $(now_ms) - start ))
+
+    if pgrep -f "facelock auth" > /dev/null 2>&1; then
+        echo "another facelock auth process is still running:"
+        pgrep -af "facelock auth" || true
+        return 1
+    fi
+    echo "child gone ${elapsed}ms after its PAM host was killed"
+}
+
+# Both checks need an attempt that is still running when the signal arrives. A
+# forged device_id makes every enrolled template ineligible, so the scan runs
+# to recognition.timeout_secs instead of matching on the first frame and
+# exiting before there is anything to signal. Neither attempt charges the rate
+# limiter: a cancelled attempt is not a guess (ADR 008 §5).
+# Captured as a SQL literal so the window really is a window: `quote()` renders
+# a real fingerprint as a quoted string and a legacy row as the bare token
+# NULL, which is the one distinction a plain SELECT loses — and writing NULL
+# back unconditionally would silently un-couple the template from its camera
+# for every test after this point.
+ADR008_DEVID="$(sqlite3 "$DB" "SELECT quote(device_id) FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo 'NULL')"
+[ -n "$ADR008_DEVID" ] || ADR008_DEVID='NULL'
+sqlite3 "$DB" "UPDATE face_models SET device_id='ffff:ffff:forged' WHERE user='testuser'" || true
+
+run_test_or_skip "ADR 008: SIGTERM ends facelock auth cleanly (exit 2, not 143)" \
+    "adr008_oneshot_sigterm_exits_cleanly"
+
+run_test_or_skip "ADR 008: facelock auth dies with its PAM host (PDEATHSIG)" \
+    "adr008_oneshot_dies_with_pam_host"
+
+sqlite3 "$DB" "UPDATE face_models SET device_id=$ADR008_DEVID WHERE user='testuser'" || true
+
+# --- End ADR 008 one-shot lifecycle ---
 
 # facelock auth rejects unknown user
 run_test "facelock auth rejects unknown user" \

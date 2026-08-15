@@ -13,6 +13,7 @@ use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
 use facelock_daemon::auth::AuthOutcome;
 use facelock_daemon::auth::{PreCheckContext, pre_check_audited_with_context};
+use facelock_daemon::cancel::CancelToken;
 use facelock_daemon::enroll::EnrollOutcome;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
@@ -151,6 +152,8 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
                 failure_reason: None,
             }),
             AuthOutcome::Error { message, .. } => bail!("{message}"),
+            // No camera has been opened yet, so nothing can have cancelled.
+            AuthOutcome::Cancelled => bail!("authentication cancelled"),
         };
     }
 
@@ -177,12 +180,16 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
         config,
         user,
         AuditSource::Test,
+        // The direct path has no bus connection to watch and no signal
+        // handler of its own; `facelock auth` installs one (ADR 008 §7).
+        &CancelToken::new(),
     );
 
     match response {
         AuthOutcome::AuthResult(result) => Ok(result),
         AuthOutcome::Error { message, .. } => bail!("{message}"),
         AuthOutcome::Suppressed => bail!("unexpected auth response"),
+        AuthOutcome::Cancelled => bail!("authentication cancelled"),
     }
 }
 
@@ -296,6 +303,7 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
         label,
         software_sealer.as_ref(),
         device_id.as_deref(),
+        &CancelToken::new(),
     );
 
     match response {
@@ -304,6 +312,7 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
             embedding_count,
         } => Ok((model_id, embedding_count)),
         EnrollOutcome::Error { message } => bail!("{message}"),
+        EnrollOutcome::Cancelled => bail!("enrollment cancelled"),
     }
 }
 
