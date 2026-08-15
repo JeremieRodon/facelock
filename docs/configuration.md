@@ -68,7 +68,7 @@ Controls how the PAM module reaches the face engine.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | string | `"daemon"` | `"daemon"` connects to a persistent daemon via D-Bus system bus (~200ms warm, ~600ms cold). `"oneshot"` spawns `facelock auth` per PAM call (slower, ~600ms+, no background process). |
+| `mode` | string | `"daemon"` | `"daemon"` connects to a persistent daemon via D-Bus system bus (models stay loaded; only a cold attempt pays a camera reopen — measure it with `facelock bench camera-reopen`). `"oneshot"` spawns `facelock auth` per PAM call (slower: model load on every call, no background process). |
 | `model_dir` | string | `"/var/lib/facelock/models"` | Directory containing ONNX model files. An explicitly configured value is honored verbatim and never rewritten. |
 | `idle_timeout_secs` | u64 | `0` | Shut down the daemon after this many idle seconds. `0` means never. Useful with D-Bus activation. |
 

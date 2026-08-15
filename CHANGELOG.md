@@ -74,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compares the target user's marker against the database and prints a
   diagnostic when they disagree (or when the marker is unreadable), pointing
   at `sudo facelock setup` to reconcile. `is-enrolled` itself is unchanged.
+- **`facelock bench camera-reopen`**: measures what it actually costs to go
+  from a closed camera to the first frame an authentication can analyze, split
+  into device open + format negotiation, `STREAMON` + first frame, warmup
+  discard, and first usable frame, over `--iterations` cycles (default 5). This
+  is the number `device.camera_release_secs` trades LED-on time against —
+  holding the stream warm after a failed attempt buys a retry exactly this
+  much (ADR 008) — and it had never been measured: the docs asserted "~400 ms"
+  and "~600 ms cold" from nobody's hardware in particular. Those figures are
+  gone from the docs in favor of pointing at this subcommand, since the answer
+  is a property of the camera and its driver, not of facelock. Needs no
+  enrolled face and loads no models.
 
 ### Changed
 
