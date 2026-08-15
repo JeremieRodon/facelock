@@ -636,18 +636,39 @@ denied_services = ["login", "sshd", "su"]
 
 ### 6. Daemon Process Hardening
 
-#### A. Capability Dropping (Recommended)
+#### A. Capability Dropping (Implemented — verified, and fatal if it did not happen)
 
-After initialization, drop unnecessary capabilities:
+Once initialization is complete — camera fd open, models loaded, database open, bus name
+claimed — the daemon narrows its own capability set to
+[`retained_capability_mask()`](../crates/facelock-daemon/src/server.rs): `CAP_SETUID` +
+`CAP_SETGID` and nothing else (`capset` on all three of effective/permitted/inheritable, plus
+`PR_SET_NO_NEW_PRIVS`). Those two are the notification privilege-drop's, and only its; see
+Phase 3 in §6.B for why they cannot be given up.
 
-```rust
-// After opening camera, loading models, connecting to D-Bus:
-// Drop all capabilities except what's needed for ongoing operation
-use caps::{CapSet, Capability};
-caps::clear(None, CapSet::Effective)?;
-caps::clear(None, CapSet::Permitted)?;
-// Only keep what's needed: nothing (camera fd already open, D-Bus session attached)
-```
+**The drop is then read back and checked.** `capget` reports what the kernel actually left
+behind, and `drop_capabilities_or_refuse()` compares it against the retained mask:
+
+| Outcome | What the daemon does |
+|---------|----------------------|
+| Nothing beyond the retained set is held | Serve. This is the steady state. |
+| Anything beyond it survived (including a `capset` that failed outright) | **Refuse to serve** — return before the first authentication, release the bus name, exit non-zero |
+| Held set is *narrower* than the retained mask | Warn and serve — desktop notifications may not work, nothing the security model promised is violated |
+| `capget` itself failed | **Refuse to serve** — an unverifiable guarantee is not a guarantee |
+
+The check is deliberately one-sided ("is anything *extra* still here?"). A daemon started under
+a narrower bounding set than the shipped unit grants cannot raise into the retained mask, so its
+`capset` fails; that costs notifications and must not stop it from authenticating anyone. The
+ambient set needs no separate check — the kernel clears a capability from ambient the moment it
+leaves permitted or inheritable.
+
+**Why fatal.** This used to warn and continue, which was defensible while the dropped set held
+nothing the security model had promised to remove. With `CAP_CHOWN` in the bounding set for
+startup (§6.B, #137), a failed drop would leave the daemon serving every authentication with
+`chown(2)` in reach and only a journal line to say so. Refusing is not a lockout: PAM degrades to
+the password exactly as it does when the daemon is not running at all — the same trade
+`ensure_state_layout` already makes earlier in startup, and the same fail-closed convention as
+the model SHA-256 check. `Restart=on-failure` will retry, and systemd's start rate limiting stops
+the loop.
 
 #### B. systemd Hardening (Implemented)
 
@@ -669,19 +690,24 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
   `CAP_SETGID` + `CAP_SETUID`. They are declared **Ambient** (not merely in the bounding set) so
   the caps survive the exec into the non-setuid `runuser` under `NoNewPrivileges=yes`. The daemon
   also narrows its in-process capability set to exactly these two after initialization
-  (`drop_capabilities()` in `facelock-cli`, holding them in effective/permitted/inheritable);
-  everything else is dropped.
-  - **`CAP_CHOWN` is startup-only.** It is in the bounding set but deliberately **not** ambient,
-    and `drop_capabilities()` clears it the moment the daemon has claimed its bus name — so it is
-    never held while authenticating anyone, and no exec'd child can inherit it. Root without
-    `CAP_CHOWN` cannot `chown(2)` at all, and two startup steps need it on an install that is
+  (`drop_capabilities_or_refuse()` in `facelock-daemon/src/server.rs`, holding them in
+  effective/permitted/inheritable); everything else is dropped.
+  - **`CAP_CHOWN` is startup-only, and that is enforced rather than attempted.** It is in the
+    bounding set but deliberately **not** ambient, and the in-process drop clears it the moment
+    the daemon has claimed its bus name — so it is never held while authenticating anyone, and no
+    exec'd child can inherit it. Root without `CAP_CHOWN` cannot `chown(2)` at all, and two
+    startup steps need it on an install that is
     being *upgraded* rather than freshly packaged: `state_layout::ensure_state_layout`, which
     chowns `/var/lib/facelock` and the files under it to `root:facelock` (a failure there is
     fatal — the daemon exits 1), and the enrollment-marker reconcile, which chowns each marker
     to the user it describes (#137). Both skip paths that are already correct, so a steady-state
     install never chowns. The reachable blast radius is small: `ProtectSystem=strict` leaves only
     `ReadWritePaths=/var/lib/facelock /var/log/facelock` and the private `/tmp` writable, and
-    `chown` on a read-only mount fails with `EROFS`.
+    `chown` on a read-only mount fails with `EROFS`. **The drop is verified with `capget` and the
+    daemon refuses to serve if anything beyond the retained set survived it** — see §6.A. Until
+    #137 the drop was best-effort (`warn!("failed to drop capabilities (continuing)")`), which
+    was tolerable only because the dropped set held nothing the security model had promised to
+    remove. It does now.
   - **This was empirically required.** An earlier revision set both directives **empty** on the
     theory that the daemon needs no capabilities. That was wrong: on real hardware it broke
     notifications with `runuser: cannot set groups: Operation not permitted`.

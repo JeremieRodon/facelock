@@ -303,10 +303,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chowns `/var/lib/facelock` to `root:facelock`, and whose failure is fatal —
   the daemon exits 1) and the enrollment-marker reconcile (which chowns each
   marker to its user). The capability is deliberately **not** ambient and is
-  cleared by the in-process `drop_capabilities()` as soon as the daemon claims
-  its bus name, so it is never held while authenticating anyone and no exec'd
-  child inherits it. `systemd-analyze security` moves 2.6 → 2.8 (still OK); it
-  scores the bounding set and cannot see the in-process drop.
+  cleared by the in-process capability drop as soon as the daemon claims its bus
+  name, so it is never held while authenticating anyone and no exec'd child
+  inherits it. `systemd-analyze security` moves 2.6 → 2.8 (still OK); it scores
+  the bounding set and cannot see the in-process drop.
+- **The daemon's capability drop is now verified, and refuses to serve if it did
+  not happen.** It used to log `failed to drop capabilities (continuing)` and
+  carry on, which made "narrowed after initialization" a best-effort claim. That
+  was defensible while the dropped set held nothing the security model had
+  promised to remove; with `CAP_CHOWN` in the bounding set (above) it is not — a
+  failed drop would leave the daemon serving every authentication with
+  `chown(2)` in reach. The daemon now reads its capabilities back with `capget`
+  and exits before answering a single call if anything beyond
+  `CAP_SETUID`+`CAP_SETGID` survived. Refusing is not a lockout: PAM degrades to
+  the password exactly as it does when the daemon is not running. A daemon
+  started under a *narrower* set than the shipped unit grants still runs (it
+  holds nothing extra) with a warning that notifications may not work.
 
 ## [0.1.4] - 2026-05-31
 

@@ -46,6 +46,10 @@ pub enum ServerError {
     Bus(#[from] zbus::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The daemon is still holding a capability it promised to drop before
+    /// serving anyone. See [`drop_capabilities_or_refuse`].
+    #[error("refusing to serve authentications: {0}")]
+    Capabilities(String),
 }
 
 /// Maximum time to wait for the handler mutex before returning a "busy" error.
@@ -1373,6 +1377,78 @@ const fn retained_capability_mask() -> u32 {
     (1 << 7) | (1 << 6)
 }
 
+/// CAP_CHOWN's capability number.
+///
+/// Named because docs/security.md makes a promise about this one specifically:
+/// the shipped unit puts CAP_CHOWN in the daemon's *bounding* set (never the
+/// ambient set) for two startup-only chowns — `ensure_state_layout` and the
+/// enrollment-marker reconcile (#137) — and the drop below is the whole of
+/// what takes it away again before the first authentication.
+const CAP_CHOWN: u32 = 0;
+
+/// The capability sets a process actually holds, as read back from `capget`.
+///
+/// Each field is a mask over capability numbers 0-63: the two 32-bit words
+/// `_LINUX_CAPABILITY_VERSION_3` uses, low word in the low half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct HeldCapabilities {
+    effective: u64,
+    permitted: u64,
+    inheritable: u64,
+}
+
+/// Capabilities held beyond [`retained_capability_mask`], across all three sets.
+///
+/// Zero means the daemon holds exactly what it promised to hold — nothing
+/// wider. Deliberately one-sided: it answers "is anything *extra* still here?"
+/// and never "are the retained caps present?". A daemon started under a
+/// narrower capability set than the shipped unit grants (an operator edit, an
+/// unusual container) holds *fewer* caps than the mask, which costs
+/// notifications and nothing else — it is not a security failure and must not
+/// stop the daemon.
+///
+/// The ambient set needs no separate check: the kernel clears a capability
+/// from ambient the moment it leaves permitted or inheritable, so an ambient
+/// cap that survived is a permitted cap that survived.
+///
+/// Pure so the policy is testable without privilege or syscalls — the same
+/// reason [`retained_capability_mask`] is a `const fn`.
+const fn capabilities_beyond_retained(held: HeldCapabilities) -> u64 {
+    let want = retained_capability_mask() as u64;
+    (held.effective | held.permitted | held.inheritable) & !want
+}
+
+/// Render a capability mask for a log line: the hex `capsh --decode=` takes,
+/// with CAP_CHOWN called out by name when present because that is the one
+/// docs/security.md names.
+fn describe_capability_mask(mask: u64) -> String {
+    if mask & (1u64 << CAP_CHOWN) != 0 {
+        format!("{mask:#018x} (includes CAP_CHOWN)")
+    } else {
+        format!("{mask:#018x}")
+    }
+}
+
+// capget/capset use syscall numbers directly since libc doesn't expose the cap
+// structs on all platforms. Shared by the drop and by the read-back that
+// verifies it.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// `_LINUX_CAPABILITY_VERSION_3`. Two [`CapData`] words: caps 0-31, then 32-63.
+const LINUX_CAP_V3: u32 = 0x2008_0522;
+
 /// Drop all Linux capabilities except CAP_SETUID + CAP_SETGID, and set
 /// PR_SET_NO_NEW_PRIVS.
 ///
@@ -1383,27 +1459,10 @@ const fn retained_capability_mask() -> u32 {
 /// [`retained_capability_mask`] in the effective, permitted, AND inheritable
 /// sets, and everything else is cleared.
 ///
-/// Returns `Ok(())` on success. Errors are non-fatal — the caller should
-/// warn and continue.
+/// Returns `Ok(())` on success. Callers must not treat an error as merely
+/// advisory: [`drop_capabilities_or_refuse`] is the entry point, and it decides
+/// what a failure costs by *reading back* what is actually held.
 fn drop_capabilities() -> std::result::Result<(), String> {
-    // capget/capset use syscall numbers directly since libc doesn't expose
-    // the cap structs on all platforms.
-    #[repr(C)]
-    struct CapHeader {
-        version: u32,
-        pid: i32,
-    }
-
-    #[repr(C)]
-    struct CapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-
-    // _LINUX_CAPABILITY_VERSION_3 = 0x20080522
-    const LINUX_CAP_V3: u32 = 0x2008_0522;
-
     unsafe {
         // Prevent the process (and children) from ever gaining new privileges
         let ret = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -1454,6 +1513,103 @@ fn drop_capabilities() -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Ask the kernel which capabilities this process actually holds.
+///
+/// `capget` is in `@system-service`, so the unit's seccomp allowlist permits
+/// it (docs/security.md, Phase 3).
+fn read_capabilities() -> std::result::Result<HeldCapabilities, String> {
+    let mut header = CapHeader {
+        version: LINUX_CAP_V3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(), CapData::default()];
+    // SAFETY: `header` and `data` are correctly sized and aligned for
+    // _LINUX_CAPABILITY_VERSION_3, which requires exactly two CapData words.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
+    };
+    if ret != 0 {
+        return Err(format!(
+            "capget syscall failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let word = |lo: u32, hi: u32| u64::from(lo) | (u64::from(hi) << 32);
+    Ok(HeldCapabilities {
+        effective: word(data[0].effective, data[1].effective),
+        permitted: word(data[0].permitted, data[1].permitted),
+        inheritable: word(data[0].inheritable, data[1].inheritable),
+    })
+}
+
+/// Drop capabilities, verify the drop actually happened, and refuse to serve if
+/// it did not.
+///
+/// This used to log `failed to drop capabilities (continuing)` and carry on.
+/// That was tolerable while the dropped set held nothing the security model had
+/// promised to remove — the two retained caps were the whole story, and a
+/// failed drop cost only the "narrowed after init" nicety. It is not tolerable
+/// now: the shipped unit's bounding set includes **CAP_CHOWN** for two
+/// startup-only chowns (#137), and docs/security.md tells the reader it is
+/// "never held while authenticating anyone". A warning cannot keep that
+/// promise — a failed drop would leave the daemon serving every authentication
+/// with `chown(2)` in reach, announced only in the journal.
+///
+/// So the guarantee is *checked* rather than assumed: `capget` reports what the
+/// kernel really left behind, and anything beyond
+/// [`retained_capability_mask`] ends startup. Verifying beats trusting
+/// `capset`'s return code — it also catches a mask that stopped being what this
+/// code thinks it is.
+///
+/// The refusal is deliberately narrow, and asymmetric:
+///
+/// - **Extra capabilities held → fatal.** The daemon exits before the first
+///   authentication. PAM degrades to the password, exactly as it does when the
+///   daemon is not running at all, so this is never a lockout — the same
+///   trade `state_layout::ensure_state_layout` already makes a few lines
+///   earlier in startup, and the same "fail closed" convention as the model
+///   SHA-256 check.
+/// - **Drop failed but nothing extra is held → warn and continue.** The daemon
+///   was started under a narrower capability set than the shipped unit grants,
+///   so `capset` could not *raise* into the retained mask. Notifications may
+///   not work; nothing about the security model is violated, and refusing here
+///   would turn an operator's hardening edit into a daemon that will not run.
+/// - **The read-back itself failed → fatal.** An unverifiable guarantee is not
+///   a guarantee.
+fn drop_capabilities_or_refuse() -> std::result::Result<(), String> {
+    let dropped = drop_capabilities();
+
+    let held = read_capabilities()
+        .map_err(|e| format!("could not verify that capabilities were dropped: {e}"))?;
+    let extra = capabilities_beyond_retained(held);
+    if extra != 0 {
+        let why = match &dropped {
+            Ok(()) => "the drop reported success".to_string(),
+            Err(e) => format!("the drop failed: {e}"),
+        };
+        return Err(format!(
+            "still holding capabilities that must be dropped before serving: {} ({why})",
+            describe_capability_mask(extra)
+        ));
+    }
+
+    match dropped {
+        Ok(()) => info!(
+            "retained CAP_SETUID+CAP_SETGID for notification privilege-drop; verified all others dropped (including CAP_CHOWN) and set no-new-privs"
+        ),
+        Err(e) => warn!(
+            "capability drop reported a failure, but nothing beyond the retained set is held — \
+             started under a narrower capability set than the shipped unit grants? \
+             desktop notifications may not work: {e}"
+        ),
+    }
+    Ok(())
+}
+
 async fn run_dbus_server(
     handler: ProductionHandler,
     idle_timeout_secs: u64,
@@ -1487,12 +1643,12 @@ async fn run_dbus_server(
     // state layout and the enrollment-marker reconcile — and this call is what
     // takes it away again, before the first authentication. See the capability
     // block in systemd/facelock-daemon.service.
-    match drop_capabilities() {
-        Ok(()) => info!(
-            "retained CAP_SETUID+CAP_SETGID for notification privilege-drop; dropped all others and set no-new-privs"
-        ),
-        Err(e) => warn!("failed to drop capabilities (continuing): {e}"),
-    }
+    //
+    // `?`, not a warning: the bus name is already claimed above, so from here
+    // on every failure to narrow the process is a failure the *clients* would
+    // pay for. Returning unwinds `_connection`, releases the name, and exits
+    // non-zero before a single authentication is served.
+    drop_capabilities_or_refuse().map_err(ServerError::Capabilities)?;
 
     // Spawn a background task to release the camera on system suspend.
     // Best-effort: if logind is unavailable, log a warning and continue.
@@ -2117,5 +2273,139 @@ mod tests {
 
         // Exactly two bits set, and none in the high word (caps 32-63).
         assert_eq!(mask.count_ones(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // The capability drop is verified, not assumed (#137)
+    // -----------------------------------------------------------------------
+
+    /// Every set holding exactly the retained mask is the intended steady
+    /// state: nothing extra, so nothing to refuse.
+    #[test]
+    fn a_clean_drop_leaves_nothing_beyond_the_retained_set() {
+        let want = u64::from(retained_capability_mask());
+        let held = HeldCapabilities {
+            effective: want,
+            permitted: want,
+            inheritable: want,
+        };
+        assert_eq!(capabilities_beyond_retained(held), 0);
+    }
+
+    /// The deliberate asymmetry: holding *fewer* caps than the mask is not a
+    /// violation. A daemon started under a narrower bounding set than the
+    /// shipped unit grants (an operator edit, an unusual container) cannot
+    /// raise into the retained mask, so `capset` fails — that costs desktop
+    /// notifications and nothing the security model promised, and must not
+    /// stop the daemon from serving.
+    #[test]
+    fn holding_fewer_caps_than_retained_is_not_a_violation() {
+        // CAP_SETUID only: CAP_SETGID was never in the bounding set.
+        let held = HeldCapabilities {
+            effective: 1 << 7,
+            permitted: 1 << 7,
+            inheritable: 0,
+        };
+        assert_eq!(capabilities_beyond_retained(held), 0);
+    }
+
+    /// **The load-bearing test.** CAP_CHOWN surviving in *any* of the three
+    /// sets is the failure docs/security.md's "never held while authenticating
+    /// anyone" claim is about. Checked per-set because they are not
+    /// interchangeable: `permitted` is what `chown(2)` needs here, and
+    /// `inheritable` is what an exec'd child could carry away.
+    #[test]
+    fn cap_chown_surviving_in_any_set_is_refused() {
+        let want = u64::from(retained_capability_mask());
+        let chown = 1u64 << CAP_CHOWN;
+        for (label, held) in [
+            (
+                "effective",
+                HeldCapabilities {
+                    effective: want | chown,
+                    permitted: want,
+                    inheritable: want,
+                },
+            ),
+            (
+                "permitted",
+                HeldCapabilities {
+                    effective: want,
+                    permitted: want | chown,
+                    inheritable: want,
+                },
+            ),
+            (
+                "inheritable",
+                HeldCapabilities {
+                    effective: want,
+                    permitted: want,
+                    inheritable: want | chown,
+                },
+            ),
+        ] {
+            assert_eq!(
+                capabilities_beyond_retained(held),
+                chown,
+                "CAP_CHOWN left in the {label} set was not detected"
+            );
+        }
+    }
+
+    /// A failed drop leaves *everything* — the case the old
+    /// `warn!("failed to drop capabilities (continuing)")` waved through. Full
+    /// root under the shipped bounding set is CAP_SETUID + CAP_SETGID +
+    /// CAP_CHOWN, so the extra is exactly the capability the unit added.
+    #[test]
+    fn a_drop_that_did_not_happen_is_refused() {
+        let bounding = u64::from(retained_capability_mask()) | (1 << CAP_CHOWN);
+        let held = HeldCapabilities {
+            effective: bounding,
+            permitted: bounding,
+            inheritable: bounding,
+        };
+        assert_eq!(capabilities_beyond_retained(held), 1 << CAP_CHOWN);
+    }
+
+    /// Capabilities above 31 live in the second `capget` word. Reading only
+    /// the low word would silently ignore half the capability space.
+    #[test]
+    fn capabilities_in_the_high_word_are_not_missed() {
+        // CAP_CHECKPOINT_RESTORE = 40.
+        let high = 1u64 << 40;
+        let held = HeldCapabilities {
+            effective: 0,
+            permitted: high,
+            inheritable: 0,
+        };
+        assert_eq!(capabilities_beyond_retained(held), high);
+    }
+
+    /// The refusal has to be readable in a journal at 3am: a hex mask
+    /// `capsh --decode=` accepts, and CAP_CHOWN spelled out because that is
+    /// the capability the docs make a promise about.
+    #[test]
+    fn the_refusal_names_cap_chown() {
+        let described = describe_capability_mask(1 << CAP_CHOWN);
+        assert!(described.contains("CAP_CHOWN"), "got {described}");
+        assert!(described.contains("0x"), "got {described}");
+        assert!(
+            !describe_capability_mask(1 << 21).contains("CAP_CHOWN"),
+            "CAP_SYS_ADMIN must not be reported as CAP_CHOWN"
+        );
+    }
+
+    /// Smoke test for the `capget` wiring itself — the struct layout and the
+    /// two-word V3 read are the parts a unit test on masks cannot cover. Runs
+    /// unprivileged: every process can read its own capability sets, and the
+    /// kernel guarantees effective is a subset of permitted whatever they are.
+    #[test]
+    fn this_process_can_read_back_its_own_capabilities() {
+        let held = read_capabilities().expect("capget on self must succeed");
+        assert_eq!(
+            held.effective & !held.permitted,
+            0,
+            "effective must be a subset of permitted; got {held:?}"
+        );
     }
 }
