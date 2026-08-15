@@ -295,57 +295,113 @@ if grep -q '^require_ir' /tmp/facelock-requireir.toml; then
 else
     sed -i '/^\[security\]/a require_ir = true' /tmp/facelock-requireir.toml
 fi
-# Enumerated with the quirks DB already aside, so the [IR] tags here mean exactly
-# what the auth gate will decide for the same nodes. `facelock devices` is the
-# only format enumerator in the image (no v4l-utils), and the BRIO assertions
-# above already parse this same listing.
-NOQUIRK_DEVICES="$(facelock devices)"
-# The first node offering a non-mono format, i.e. one the rule above classifies as
-# NOT IR. The fourcc list mirrors IR_TYPICAL_FOURCCS in facelock-camera's
-# device.rs. Format lines read `      FOURCC (description) — sizes`, so a `(` in
-# the second field is what tells them from Name:/Driver:/Formats: and from any log
-# line the binary writes to stdout. Selecting on format evidence rather than on
-# the absence of the [IR] tag is deliberate: if the classifier ever regressed and
-# tagged a colour node [IR], this picks it anyway and the assertion says so
-# instead of quietly skipping.
-NON_IR_NODE="$(printf '%s\n' "$NOQUIRK_DEVICES" | awk '
-    $1 ~ /^\/dev\/video/ { node = $1; next }
-    node != "" && NF >= 2 && $2 ~ /^\(/ && $1 !~ /^(GREY|Y8|Y10|Y12|Y16)$/ && pick == "" { pick = node }
-    END { print pick }
+# Enumerated with the quirks DB already aside, so `is_ir` here means exactly
+# what the auth gate will decide for the same nodes. `--json` is serde-derived
+# (facelock_core::ipc::IpcDeviceInfo, see main.rs's `devices` subcommand)
+# rather than the human-readable renderer this used to awk-parse: a renderer
+# layout change (columns, wording, the `[IR]` tag) can no longer silently
+# break this selection the way it could before — see `select_camera_node`
+# below for how a genuinely broken selector is told apart from "this host
+# has no camera of that kind" (the loud-skip requirement this replaces).
+NOQUIRK_DEVICES_JSON="$(facelock devices --json)"
+
+# Parses $NOQUIRK_DEVICES_JSON once to assert it is a non-empty array before
+# either selection below decides anything. A malformed/non-array payload
+# (from json.load or the isinstance check) exits non-zero, and because this
+# runs under `set -euo pipefail` with no `|| true`, that aborts the whole
+# script instead of being swallowed into an empty selection — a broken
+# producer fails loud. Zero devices is the one legitimate reason both
+# selections below skip: nothing was passed through to classify.
+DEVICE_COUNT="$(printf '%s' "$NOQUIRK_DEVICES_JSON" | python3 -c '
+import json, sys
+
+devices = json.load(sys.stdin)
+if not isinstance(devices, list):
+    sys.exit(f"selector error: expected a JSON array of devices, got {type(devices).__name__}")
+print(len(devices))
 ')"
-if [ -n "$NON_IR_NODE" ]; then
-    cp /tmp/facelock-requireir.toml /tmp/facelock-requireir-nonir.toml
-    pin_device_path /tmp/facelock-requireir-nonir.toml "$NON_IR_NODE"
-    run_test "facelock auth refuses non-IR camera when require_ir=true (anti-spoof, H1; pinned $NON_IR_NODE)" \
-        "facelock auth --user testuser --config /tmp/facelock-requireir-nonir.toml" \
-        2
-    # Exit 2 is shared by every pre-flight rejection — and by a config parse error,
-    # which is what a stale device.path pin in the source config would produce. Pin
-    # the rejection to the IR gate itself so neither can read as a pass. Piping
-    # into grep makes the test's status grep's, as in the auto-detect assertion above.
-    run_test "the refusal above is the IR gate, not another pre-flight rejection" \
-        "facelock auth --user testuser --config /tmp/facelock-requireir-nonir.toml 2>&1 | grep -q 'IR camera required but device is not IR'"
+
+# Prints the path of the first device in $NOQUIRK_DEVICES_JSON matching $1
+# ("non_ir" or "ir"), or nothing (exit 0) if every device classified fine but
+# none matched — the legitimate skip case. jq is not in this test image (see
+# test/Containerfile); python3 is (the fake-daemon harness already requires
+# it), so it parses the JSON.
+#
+# A device missing an expected key, or of the wrong type, is a genuine
+# selector/schema break — not "no camera" — so it is left to raise
+# (KeyError/TypeError) and propagate as a non-zero exit rather than being
+# caught and mapped to an empty result. Combined with $DEVICE_COUNT above,
+# that is what turns "the awk selects nothing" into "the script fails" for a
+# broken selector, per the plan this replaces.
+#
+# NON_IR selection mirrors the old awk's format-evidence rule (not the is_ir
+# field) deliberately: if the classifier ever regressed and marked a colour
+# node is_ir=true, this still finds it and the assertion says so instead of
+# quietly skipping. IR_NOQUIRK selection uses is_ir directly — the JSON
+# equivalent of the old renderer's `[IR]` tag.
+read -r -d '' SELECT_CAMERA_NODE_PY <<'PYEOF' || true
+import json
+import sys
+
+want = sys.argv[1]
+devices = json.load(sys.stdin)
+if not isinstance(devices, list):
+    sys.exit(f"selector error: expected a JSON array of devices, got {type(devices).__name__}")
+
+IR_FOURCCS = {"GREY", "Y8", "Y10", "Y12", "Y16"}
+
+for dev in devices:
+    path = dev["path"]
+    is_ir = dev["is_ir"]
+    fourccs = [fmt["fourcc"].strip() for fmt in dev["formats"]]
+
+    if want == "non_ir" and any(fc not in IR_FOURCCS for fc in fourccs):
+        print(path)
+        sys.exit(0)
+    if want == "ir" and is_ir:
+        print(path)
+        sys.exit(0)
+PYEOF
+select_camera_node() {
+    python3 -c "$SELECT_CAMERA_NODE_PY" "$1"
+}
+
+if [ "$DEVICE_COUNT" -eq 0 ]; then
+    echo "TEST: facelock auth refuses non-IR camera when require_ir=true ... SKIP (facelock devices --json enumerated no cameras)"
+    echo "TEST: require_ir=true admits a genuine IR node ... SKIP (facelock devices --json enumerated no cameras)"
 else
-    echo "TEST: facelock auth refuses non-IR camera when require_ir=true ... SKIP (no node enumerates a colour format; nothing on this host classifies as non-IR)"
-fi
-# Converse half of the contract: with a genuinely IR node pinned, that same
-# require_ir = true config must NOT refuse. Asserted as "the gate did not fire and
-# the run reached capture" rather than "auth exited 0": a successful match would
-# additionally need a live face in front of THIS node at this instant and a
-# template enrolled from it, neither of which holds on an arbitrary host. The exit
-# code is ignored for the same reason; the probe log is teed so a failure here
-# reports the camera error that caused it instead of an empty output.
-IR_NODE_NOQUIRK="$(printf '%s\n' "$NOQUIRK_DEVICES" | awk '
-    $1 ~ /^\/dev\/video/ && $2 == "[IR]" && pick == "" { pick = $1 }
-    END { print pick }
-')"
-if [ -n "$IR_NODE_NOQUIRK" ]; then
-    cp /tmp/facelock-requireir.toml /tmp/facelock-requireir-ir.toml
-    pin_device_path /tmp/facelock-requireir-ir.toml "$IR_NODE_NOQUIRK"
-    run_test "require_ir=true admits a genuine IR node (converse, H1; pinned $IR_NODE_NOQUIRK)" \
-        "RUST_LOG=info timeout --foreground 20 facelock auth --user testuser --config /tmp/facelock-requireir-ir.toml 2>&1 | tee /tmp/ir-admit-probe.log || true; ! grep -q 'IR camera required but device is not IR' /tmp/ir-admit-probe.log && grep -q 'camera format negotiated' /tmp/ir-admit-probe.log"
-else
-    echo "TEST: require_ir=true admits a genuine IR node ... SKIP (no [IR]-classified node; this host exposes no mono-only sensor)"
+    NON_IR_NODE="$(printf '%s' "$NOQUIRK_DEVICES_JSON" | select_camera_node non_ir)"
+    if [ -n "$NON_IR_NODE" ]; then
+        cp /tmp/facelock-requireir.toml /tmp/facelock-requireir-nonir.toml
+        pin_device_path /tmp/facelock-requireir-nonir.toml "$NON_IR_NODE"
+        run_test "facelock auth refuses non-IR camera when require_ir=true (anti-spoof, H1; pinned $NON_IR_NODE)" \
+            "facelock auth --user testuser --config /tmp/facelock-requireir-nonir.toml" \
+            2
+        # Exit 2 is shared by every pre-flight rejection — and by a config parse error,
+        # which is what a stale device.path pin in the source config would produce. Pin
+        # the rejection to the IR gate itself so neither can read as a pass. Piping
+        # into grep makes the test's status grep's, as in the auto-detect assertion above.
+        run_test "the refusal above is the IR gate, not another pre-flight rejection" \
+            "facelock auth --user testuser --config /tmp/facelock-requireir-nonir.toml 2>&1 | grep -q 'IR camera required but device is not IR'"
+    else
+        echo "TEST: facelock auth refuses non-IR camera when require_ir=true ... SKIP (no node enumerates a colour format; nothing on this host classifies as non-IR)"
+    fi
+    # Converse half of the contract: with a genuinely IR node pinned, that same
+    # require_ir = true config must NOT refuse. Asserted as "the gate did not fire and
+    # the run reached capture" rather than "auth exited 0": a successful match would
+    # additionally need a live face in front of THIS node at this instant and a
+    # template enrolled from it, neither of which holds on an arbitrary host. The exit
+    # code is ignored for the same reason; the probe log is teed so a failure here
+    # reports the camera error that caused it instead of an empty output.
+    IR_NODE_NOQUIRK="$(printf '%s' "$NOQUIRK_DEVICES_JSON" | select_camera_node ir)"
+    if [ -n "$IR_NODE_NOQUIRK" ]; then
+        cp /tmp/facelock-requireir.toml /tmp/facelock-requireir-ir.toml
+        pin_device_path /tmp/facelock-requireir-ir.toml "$IR_NODE_NOQUIRK"
+        run_test "require_ir=true admits a genuine IR node (converse, H1; pinned $IR_NODE_NOQUIRK)" \
+            "RUST_LOG=info timeout --foreground 20 facelock auth --user testuser --config /tmp/facelock-requireir-ir.toml 2>&1 | tee /tmp/ir-admit-probe.log || true; ! grep -q 'IR camera required but device is not IR' /tmp/ir-admit-probe.log && grep -q 'camera format negotiated' /tmp/ir-admit-probe.log"
+    else
+        echo "TEST: require_ir=true admits a genuine IR node ... SKIP (no [IR]-classified node; this host exposes no mono-only sensor)"
+    fi
 fi
 # Restore the system quirks DB inline so the remaining tests see it, then drop the
 # trap now that shared state is consistent again.
