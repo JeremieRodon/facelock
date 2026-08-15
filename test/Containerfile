@@ -5,8 +5,7 @@ FROM archlinux:latest
 # `sqlite` provides the sqlite3 CLI used by the device-coupling E2E assertions
 # (Plan 02) to inspect/seed face_models.device_id deterministically.
 # `python`/`python-gobject` back the fake-daemon harness for the PAM trust-boundary tests (Plan 05).
-# `polkit` backs the preview-frame authorization tests (Plan 06).
-RUN pacman -Syu --noconfirm pam sudo base-devel libxkbcommon just dbus polkit onnxruntime-cpu protobuf python python-gobject sqlite && pacman -Scc --noconfirm
+RUN pacman -Syu --noconfirm pam sudo base-devel libxkbcommon just dbus onnxruntime-cpu protobuf python python-gobject sqlite && pacman -Scc --noconfirm
 
 # Build pamtester from upstream source (curl and the toolchain come from base-devel above)
 COPY test/install-pamtester.sh /tmp/install-pamtester.sh
@@ -48,7 +47,8 @@ COPY test/fake-facelock-daemon.py /fake-facelock-daemon.py
 COPY test/run-container-tests.sh /run-tests.sh
 COPY test/run-integration-tests.sh /run-integration-tests.sh
 COPY test/run-oneshot-tests.sh /run-oneshot-tests.sh
-RUN chmod +x /run-tests.sh /run-integration-tests.sh /run-oneshot-tests.sh
+COPY test/run-layout-tests.sh /run-layout-tests.sh
+RUN chmod +x /run-tests.sh /run-integration-tests.sh /run-oneshot-tests.sh /run-layout-tests.sh
 
 # Clean up build dir to save image size
 RUN rm -rf /build

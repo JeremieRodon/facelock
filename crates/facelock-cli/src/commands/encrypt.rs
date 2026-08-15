@@ -36,9 +36,8 @@ fn obtain_sealer(config: &Config) -> Result<facelock_tpm::SoftwareSealer> {
     }
 }
 
-pub fn run_encrypt(generate_key: bool) -> Result<()> {
+pub fn run_encrypt(config: &Config, generate_key: bool) -> Result<()> {
     crate::ipc_client::require_root("sudo facelock encrypt")?;
-    let config = Config::load()?;
 
     if generate_key {
         match config.encryption.method {
@@ -96,9 +95,12 @@ pub fn run_encrypt(generate_key: bool) -> Result<()> {
         println!("Proceeding to encrypt embeddings...");
     }
 
-    let sealer = obtain_sealer(&config).context("failed to obtain encryption sealer")?;
+    let sealer = obtain_sealer(config).context("failed to obtain encryption sealer")?;
 
-    let store = FaceStore::open(Path::new(&config.storage.db_path))
+    // `open_existing`, never `create`: nothing to encrypt or decrypt means a
+    // missing database is an error to report, not a file to bring into being
+    // at whatever path a typo'd config names.
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("failed to open face database")?;
 
     let all = store
@@ -141,11 +143,13 @@ pub fn run_encrypt(generate_key: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run_decrypt() -> Result<()> {
+pub fn run_decrypt(config: &Config) -> Result<()> {
     crate::ipc_client::require_root("sudo facelock decrypt")?;
-    let config = Config::load()?;
 
-    let store = FaceStore::open(Path::new(&config.storage.db_path))
+    // `open_existing`, never `create`: nothing to encrypt or decrypt means a
+    // missing database is an error to report, not a file to bring into being
+    // at whatever path a typo'd config names.
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("failed to open face database")?;
 
     let all = store
@@ -172,7 +176,7 @@ pub fn run_decrypt() -> Result<()> {
 
     // Decrypt software-encrypted embeddings
     if !sw_encrypted.is_empty() {
-        let sealer = obtain_sealer(&config).context("failed to obtain encryption sealer")?;
+        let sealer = obtain_sealer(config).context("failed to obtain encryption sealer")?;
 
         println!(
             "Decrypting {} software-encrypted embedding(s)...",

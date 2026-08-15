@@ -42,14 +42,47 @@ jobs:
       - name: Build workspace with TPM
         run: cargo build --workspace --features tpm
 
+      # --all-targets so test/bench code is linted too; without it a
+      # deny-by-default lint in a test never fails CI. Keep in sync with the
+      # justfile `lint` recipe, which is the same command.
       - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run clippy with TPM
-        run: cargo clippy --workspace --features tpm -- -D warnings
+        run: cargo clippy --workspace --all-targets --features tpm -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace
+
+      # Build the PAM module ALONE — not via --workspace. `cargo build --workspace`
+      # unifies features across crates, so facelock-cli/facelock-polkit (which both
+      # request zbus ["tokio","blocking-api"]) silently repair an incoherent zbus
+      # feature set in pam-facelock. That masks a real breakage: zbus's `blocking`
+      # module is gated by `blocking-api`, NOT by the `blocking` feature, and with
+      # default-features off you must also pick a runtime (`tokio` or `async-io`).
+      # A standalone build is the only thing that proves the PAM crate compiles on
+      # its own. Keep in sync with `just check-pam-standalone`.
+      - name: Build pam-facelock in isolation
+        run: cargo build -p pam-facelock
+
+      # The whole point of PR #107 is to keep the PAM module's dependency surface
+      # small, so forbid the async-io runtime backend: async-io/async-signal/polling
+      # plus the async-executor/async-fs/async-lock trio that only the async-io zbus
+      # backend pulls. We deliberately do NOT forbid signal-hook-registry: the
+      # correct tokio backend pulls it transitively via tokio's "process" feature,
+      # so listing it here would reject the very fix that shrinks the surface. If you
+      # think you need to add signal-hook-registry back, you have probably
+      # reintroduced the async-io backend — check for async-io first.
+      # Keep in sync with `just check-pam-standalone`.
+      - name: Verify pam-facelock dependency surface
+        run: |
+          cargo tree -p pam-facelock --edges normal --prefix none | awk '{print $1}' | sort -u > /tmp/pam-deps
+          echo "pam-facelock crate count: $(wc -l < /tmp/pam-deps)"
+          if grep -Eq '^(async-io|async-signal|async-executor|async-fs|async-lock|polling)$' /tmp/pam-deps; then
+            echo "forbidden async-io backend crates in pam-facelock (expected the tokio backend)"
+            exit 1
+          fi
+          echo "pam-facelock dependency guard passed"
 
       - name: Build release binaries
         run: |

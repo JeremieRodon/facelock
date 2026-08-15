@@ -16,7 +16,7 @@ Facelock is designed to keep biometric data under the user's exclusive control:
 - **Local-only inference**: All face detection and recognition runs on-device via ONNX Runtime. No images, embeddings, or metadata are ever transmitted over the network.
 - **No telemetry**: Facelock contains zero analytics, tracking, or phone-home code. After the one-time model download during `facelock setup`, it never contacts any server.
 - **No cloud dependencies**: Authentication works fully offline. No account registration, no API keys, no external services.
-- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (640, root:facelock). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
+- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (600, root:root, inside a 710 root:facelock directory). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
 - **Open source**: All code is MIT/Apache-2.0 licensed. No proprietary blobs or obfuscated network calls. Privacy claims are verifiable by reading the source.
 
 ## Attack Vectors & Mitigations
@@ -41,17 +41,22 @@ require_ir = true  # Refuse to authenticate on RGB-only cameras
 Implementation (`facelock-camera/src/device.rs`, `ir_source_with_quirks`):
 
 ```rust
-// IR classification is honest about its evidence, surfaced as IrSource:
-//   Quirk  – hardware quirks DB force_ir = true (authoritative, both directions)
-//   Format – native IR format (GREY/Y16) CORROBORATED by an IR name token
-//   Name   – an "ir"/"infrared" name *token* (tokenized, not substring)
-//   None   – not IR
+// IR classification is DERIVED from queried device evidence, surfaced as IrSource:
+//   Quirk  – hardware quirks DB force_ir, corroborated (authoritative, both directions)
+//   Format – the device's OWN queried capture formats are mono-only/IR-typical
+//            (GREY/Y8/Y10/Y12/Y16, with NO color format mixed in)
+//   None   – not classified as IR
 //
-// Per-node precedence:
-// 1. quirks DB force_ir is authoritative;
-// 2. a native GREY/Y16 format counts ONLY when corroborated by a name token;
-// 3. a name token alone is sufficient;
-// 4. otherwise not-IR.
+// The free-text device name is NEVER, by itself, sufficient to classify a
+// device as IR (#98): a crafted CARD_LABEL ("Fake IR Camera") on a
+// v4l2loopback node exposing only YUYV/MJPG does not classify as IR. Per-node:
+// 1. a quirks DB force_ir match is authoritative — by USB vendor:product ID
+//    unconditionally; by device NAME ONLY when corroborated by a real USB
+//    identity or the device's own mono-format evidence (#98 Task 3);
+// 2. otherwise IR-ness is derived SOLELY from the device's own queried
+//    formats: a mono-ONLY format set is IR, any set with a color format is not;
+// 3. the device name is consulted only as an auto-detection tiebreak hint,
+//    among nodes that ALREADY qualify by evidence — never to classify a node.
 pub fn ir_source_with_quirks(device, quirks) -> IrSource { ... }
 
 // Node-level disambiguation for multi-node USB devices: force_ir means "this
@@ -77,11 +82,15 @@ if config.security.require_ir && !device_is_ir {
 
 **Rationale**: Phone screens and printed photos do not emit infrared light correctly. An IR camera sees a flat, textureless surface where a real face would have depth and skin texture in IR. This single check eliminates the vast majority of spoofing attacks.
 
-**Why mere GREY/Y16 availability is not enough (H1)**: many ordinary RGB UVC webcams *enumerate* a GREY format alongside YUYV/MJPG. The previous heuristic (`contains("ir")` OR any GREY/Y16 format) misclassified those as IR, silently defeating `require_ir = true`. It also matched the substring "ir" inside unrelated names ("Sirius", "AIR-Cam"). The classifier now requires a whole `ir`/`infrared` **token** or a **quirks `force_ir`** entry, and treats a GREY/Y16 format as IR **only when corroborated** by one of those. This is why `require_ir` is now load-bearing rather than trivially bypassable.
+**Why the name alone is not enough, and what IS the evidence (H1, #98/#99)**: IR classification is derived **solely from queried device evidence** — the pixel formats the device actually enumerates — never from its free-text name. A node qualifies as IR only when it enumerates *exclusively* IR-typical mono formats (GREY/Y8/Y10/Y12/Y16) with **no color format mixed in**. Many ordinary RGB UVC webcams enumerate a GREY format *alongside* YUYV/MJPG; those do **not** qualify (this is what the old "H1" concern was about, now resolved by the mono-**only** requirement rather than by name corroboration). The previous heuristic (`contains("ir")` OR any GREY/Y16 format) misclassified plain webcams as IR and matched the substring "ir" inside unrelated names ("Sirius", "AIR-Cam"), silently defeating `require_ir = true`. Now a crafted `CARD_LABEL` on a color-only v4l2loopback device does not classify as IR no matter what it is named (#98), and the quirk `name_pattern` matcher is **anchored** (it matches the whole device name, not a substring) so it no longer fires on the "ir" inside those unrelated names (#99). The name is used only as a tiebreak hint when auto-detection chooses among nodes that *already* qualify by evidence, and as one corroboration path for a name-only `force_ir` quirk — never as a standalone classification signal. This is why `require_ir` is now load-bearing rather than trivially bypassable.
+
+**Quirk `force_ir` corroboration (#98 Task 3)**: a quirks `force_ir = true` entry that matched by **USB vendor:product ID** is authoritative on its own — a software-only virtual device (v4l2loopback) has no real USB node, so it can never win a USB-ID match. A `force_ir = true` entry that matched only by device **name**, however, requires corroboration before it is trusted: either the device has a real (even if DB-unlisted) USB identity, or its own queried formats independently support IR. Without either, a crafted name that happens to match a shipped pattern falls through to the evidence-only heuristic instead of being trusted. (`force_ir = false` remains authoritative unconditionally — the conservative "not IR" direction is always honored.)
+
+**Honest residual — format evidence is not unforgeable**: deriving IR-ness from queried formats raises the attacker's cost from "set a free-text `CARD_LABEL` string" to "also negotiate a mono-**only** pixel format", and removes the old path where a bare name token (or a name-only quirk) could escalate a device to IR. It does **not** make the evidence unforgeable. A `v4l2loopback` device (loading the module requires **root**) or a programmable USB gadget can present a mono-only (GREY/Y16/…) format set and **will** classify as IR — the format check cannot distinguish a genuine IR sensor from a device that merely advertises IR-typical formats. The remaining backstops against a fabricated IR device are the **liveness / frame-variance checks** (§B) and the **privilege required to create such a device** in the first place (root to load `v4l2loopback`, or physical access to attach USB-gadget hardware). `require_ir` is one layer of a layered defense, not a standalone attestation of a real IR sensor.
 
 **Why `force_ir` is device-level, not node-level (hardware-verified regression)**: on a real Logitech BRIO, treating every quirk-matched node as IR made *both* `/dev/video0` (the RGB sensor) and `/dev/video2` (the IR sensor) classify IR — so setup stopped auto-selecting and auto-detect captured from the RGB sensor (white LED) instead of the IR sensor. The sibling-format disambiguation above restores per-node honesty: exactly one BRIO node is `[IR]`, and auto-detection prefers the format-corroborated IR node.
 
-**Limitation**: classification is still heuristic without a hardware allow-list. Some genuine IR cameras report neither an IR name token nor a known quirk; add a quirks `force_ir` entry (`/etc/facelock/quirks.d/`) for such hardware (and set `format_preference` to the IR node's native format, e.g. `"GREY"`, when the camera exposes multiple capture nodes). The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
+**Limitation**: classification is capability-based, not a hardware allow-list. A genuine IR camera that exposes its IR and color streams on a *single* V4L2 node (so its format set is not mono-only) and is not covered by a shipped quirk will not auto-classify as IR. Add a quirks `force_ir` entry keyed by **USB vendor:product ID** (`/etc/facelock/quirks.d/`) for such hardware — a VID:PID match is authoritative — and set `format_preference` to the IR node's native format (e.g. `"GREY"`) when the camera exposes multiple capture nodes. Prefer a USB-ID quirk over a name-only one: a name-only `force_ir` is trusted only when corroborated by the device's own mono-format evidence or a real USB identity, so it is not a reliable override on its own. The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
 
 #### B. Frame Variance Check (Required)
 
@@ -272,6 +281,12 @@ chmod 755 /var/lib/facelock/models
 chmod 644 /var/lib/facelock/models/*.onnx
 ```
 
+The model files are public, SHA-256-verified downloads, so their own modes are
+permissive — what keeps users outside the `facelock` group away from them is
+the `0710` state directory above; see `docs/contracts.md` § *One gate at the
+top*. What the modes here must guarantee is only that nobody but root can
+**write** them.
+
 ### 3. Embedding / Database Security
 
 **Attack**: Read or modify the SQLite database to extract biometric data or inject fake embeddings.
@@ -281,15 +296,111 @@ chmod 644 /var/lib/facelock/models/*.onnx
 #### A. Database File Permissions (Required)
 
 ```bash
-# Database owned by root, readable only by root and facelock group
-chown root:facelock /var/lib/facelock/facelock.db
-chmod 640 /var/lib/facelock/facelock.db
+# Database owned by root, readable by root only. The facelock group requests
+# authentication through the daemon; it never reads templates.
+chown root:root /var/lib/facelock/facelock.db
+chmod 600 /var/lib/facelock/facelock.db
 ```
 
 Runtime note:
-- The daemon/setup paths must also secure SQLite `-wal` and `-shm` sidecar files to `0640`
+- The daemon/setup paths must also secure SQLite `-wal` and `-shm` sidecar files to `0600`
 - Audit logs and snapshots must be created with explicit restrictive modes instead of relying on ambient umask
 - The systemd service should set `UMask=0027` as a baseline defense-in-depth default
+
+#### A2. One Gate at the Top (`/var/lib/facelock` is 0710)
+
+```
+/var/lib/facelock/            0710 root:facelock   traverse-only, NOT listable
+  facelock.db                 0600 root:root
+  facelock.db-wal / -shm      0600 root:root
+  models/                     0755 root:root       public, SHA-256 verified
+  enrolled/                   0710 root:facelock   markers only
+    <user>                    0600 <user>:<user>
+
+/var/log/facelock/            0700 root:root
+  audit.jsonl                 0600 root:root
+  snapshots/                  0700 root:root
+```
+
+The state directory grants "other" **nothing**. A local user outside the
+`facelock` group cannot reach anything below it — not the database, not the
+markers, not even the world-readable models — regardless of the children's own
+modes. That single gate is the security boundary; the children's modes are
+defense in depth behind it.
+
+The `facelock` group gets traverse-only (`--x`): a member can open a path it
+already knows by name — its own `enrolled/<user>` marker, a model file — but
+cannot `readdir` the directory, cannot read the `0600 root:root` database, and
+cannot read the audit log or snapshots. **The group is a D-Bus access grant,
+not a file-read grant**: members request authentication through the daemon,
+which reads the templates as root and answers yes or no.
+
+Two consequences worth stating explicitly:
+
+- **D-Bus is required for user-run screen lockers** (hyprlock/swaylock). Their
+  PAM stack runs as the user, and no group membership makes the database or
+  the `0600 root:root` encryption key readable, so the daemon is the only
+  path. Root-invoked PAM (`sudo`, `login`, `sshd`) additionally has the
+  oneshot fallback, which reads the files directly as root.
+- **Known residual**: a group member can `stat` a name it can guess —
+  `facelock.db` (size, mtime), `enrolled/<user>` (existence) — because
+  traversal permits exactly that. Closing it would mean denying the group the
+  traversal that `is-enrolled` and model loading depend on. Accepted.
+
+**The enforcement mechanism is a guard test, not this document.** The test in
+`crates/facelock-cli/src/state_layout.rs` walks every entry under the state
+directory and asserts nothing carries "other" bits, with `models/` (public
+data) as the single allowed exception, and that the state directory itself
+grants "other" nothing. A future change that drops a world-readable file into
+the state directory fails that test with a message that explains the rule.
+
+#### A3. Enrollment Markers (`/var/lib/facelock/enrolled` is 0710)
+
+`facelock is-enrolled` must not activate the daemon or open a camera — it runs
+repeatedly on the lock screen. It answers from a marker file rather than from
+the database, and *"enrolled"* means **"face auth is operational for me"**:
+reading the marker requires traversing two `0710 root:facelock` directories,
+so a caller outside the `facelock` group reads `EACCES` and reports
+not-enrolled — deliberately, since the group is required to reach the daemon
+at all. One `open(2)` answers group-membership and enrollment together,
+including the "enrolled but not yet re-logged-in after joining the group"
+state.
+
+```
+/var/lib/facelock/enrolled/          0710 root:facelock
+/var/lib/facelock/enrolled/<user>    0600 <user>:<user>
+```
+
+- **`0710` on the directory** permits group traversal to a known filename but
+  not `readdir`, so which accounts have face auth enrolled is not listable.
+- **The ownership is half the contract.** The group-execute bit only works
+  because the directory is owned `root:facelock`; a "consistency fix" to
+  `root:root` silently turns every unprivileged `is-enrolled` into
+  "not-enrolled". A guard test pins mode and ownership together.
+- **`0600` owned by the user** means "am I enrolled?" is answerable by that
+  user and by nobody else — the same privacy property as
+  `~/.ssh/authorized_keys`.
+- `EACCES` and `ENOENT` are both reported as not-enrolled, never as an error.
+  Under the operational-for-me semantics this is correct, not a compromise.
+
+Several places encode this layout and must stay in sync: `dist/facelock.tmpfiles`,
+`dist/facelock.install`, `dist/debian/postinst`, `dist/nix/module.nix`,
+`dist/openrc/facelock-daemon`, the `install-files` recipe in `justfile`,
+`secure_setup_paths()` in `crates/facelock-cli/src/commands/setup.rs`, the
+default path constants in `crates/facelock-core/src/paths.rs`, and the typed
+constants plus guard tests in `crates/facelock-cli/src/state_layout.rs`.
+
+The `justfile` one is easy to forget and the most expensive to get wrong:
+`test/Containerfile` builds the test image with `just install-files`, so if that
+recipe drifts the container tests exercise a layout no user ever runs — and may
+pass while doing it. `just test-arch-layout` asserts the shipped modes exactly.
+
+**The marker is a hint, not authority.** It can drift from the database (an
+out-of-band restore, for instance). That is acceptable because `is-enrolled`
+only decides whether to show a UI affordance: a stale marker degrades gracefully —
+the indicator appears, the PAM attempt fails, and the password context was
+running in parallel the whole time. **PAM at auth time remains authoritative.**
+Nothing in the authentication path may consult the marker.
 
 #### B. Embedding Sensitivity Warning (Required)
 
@@ -343,10 +454,12 @@ enabling it is a deliberate operator choice that commits to the reseal workflow.
 Access to the daemon is restricted by the D-Bus system bus policy defined in `dbus/org.facelock.Daemon.conf`. Only root and members of the `facelock` group are allowed to send messages to the daemon interface. The policy file is installed to `/usr/share/dbus-1/system.d/` and enforced by the bus daemon itself. Setup and package install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present, but `/usr/share/...` is the canonical install path.
 
 The daemon must also verify the caller UID via `GetConnectionUnixUser` on every method call and apply method-level authorization:
-- `Authenticate`, `ListModels`, `PreviewDetectFrame`: root or the matching Unix user
-- `Enroll`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `Shutdown`: root only
-- `ReleaseCamera`: root or the Unix user that owns the active preview camera session
-- `ListDevices`: root or a caller in the `facelock` group
+- `Authenticate`: root, or a non-root caller acting on their own username. This is the **only** user-scoped method, and it is architecture rather than policy: screen lockers run their PAM stack as the user, so a user must be able to request authentication for themselves.
+- Everything else is **root only**: `TestAuthenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`.
+
+The scope table's catch-all arm is root-only, so a method added later is closed until it is deliberately opened up. Two entries are spelled out explicitly rather than left to that catch-all, because their root-only scope is load-bearing rather than incidental:
+- `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter. For any weaker caller it would be a continuous similarity feed at camera framerate; together with score redaction, denying non-root callers closes the hill-climbing oracle by construction (see A5 below).
+- `TestAuthenticate` is the entry point that does *not* charge the rate limit, which is exactly why it is only safe to offer to root.
 
 The policy also self-contains two explicit defaults rather than relying on system-wide bus defaults:
 - `<deny own="org.facelock.Daemon"/>` in the default context (name-squatting protection; only root may own the name).
@@ -377,6 +490,21 @@ budget exhausted, password modules still run), everything else to
 `PAM_IGNORE`. D-Bus errors remain reserved for authorization failures and
 transport-level problems, which do fall back to the oneshot path.
 
+Daemon-side, the rejection's *class* is a type
+(`facelock_daemon::auth::ErrorKind`) and the message is rendered from it; the
+audit label and the oneshot exit code derive from the class, not from the text.
+PAM still matches the message because it cannot link the daemon crate, so the
+two strings it matches (`rate limited`, `IR camera required`) are frozen
+protocol — see docs/contracts.md, "Rejection classes".
+
+A non-match reply also states explicitly whether a face was detected
+(`model_id == -4`). PAM used to infer that from `similarity == 0.0`, which is
+wrong for any non-root caller because the score is redacted to `0.0` for all of
+them; a user-run locker therefore abstained on genuine non-matches. The
+face-detected bit is a detector signal, not a matcher signal — it says a face
+was present, never how close it came — so it is not a hill-climbing oracle and
+is not redacted.
+
 #### A4. Auth-Attempt Signal Hygiene (Implemented)
 
 **Attack**: Any local user adds a match rule (or runs `dbus-monitor`) and passively observes `AuthAttempted` broadcast signals to learn who authenticates when — and, if the payload carried the raw similarity score, uses it as a spoof-tuning oracle (iterate on a photo/mask until the score climbs).
@@ -385,17 +513,15 @@ transport-level problems, which do fall back to the oneshot path.
 - The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to the authorized caller.
 - The bus policy denies delivery of the daemon's signals in the default context; only root and `facelock`-group members may receive them.
 
-#### A5. Raw Frame Access Parity (Implemented — polkit-authorized)
+#### A5. Raw Frame Access Parity (Implemented — root-only)
 
 **Attack**: `PreviewFrame` is root-only, but a `facelock`-group member pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead — silently, with no user consent.
 
-**Mitigation**: `PreviewFrame` stays root-only. `PreviewDetectFrame` serves the `jpeg_data` frame bytes to root unconditionally; for a non-root caller the daemon requires an **interactive polkit authorization** for `org.facelock.preview-frames` (defaults: `allow_any=no`, `allow_inactive=no`, `allow_active=auth_self_keep` — the caller must type their own password in an active local session, and polkit keeps the grant only ~5 minutes). The daemon calls `CheckAuthorization` with `AllowUserInteraction=true` on the caller's unique bus name; the check runs in the background and never blocks the reply or holds the capture slot, so a pending prompt cannot starve `Authenticate`.
+**Mitigation**: both methods are root-only. `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter, so for any weaker caller it would be a continuous similarity feed at camera framerate; `authorize_method` therefore denies every non-root caller with `AccessDenied` before the method reaches the camera or the capture slot.
 
-**Fail closed**: while the verdict is pending, denied, timed out, or polkit is unreachable (any D-Bus error), the frame bytes are stripped and the caller gets detection/recognition metadata only (bounding boxes, confidence, similarity, recognized). Verdicts are cached per caller connection — granted for at most 120 s, denied for 15 s — and evicted the moment the caller's bus connection closes (`NameOwnerChanged`), so a grant can never outlive the connection it was issued to. This preserves the enroll/preview UX (the preview window prompts once via the user's polkit agent, then shows live frames) without ever handing out camera/IR imagery silently.
+**Fail closed**: on top of that denial the daemon strips `jpeg_data` from any non-root reply (`sanitize_preview_jpeg`), leaving detection/recognition metadata only. That strip is unreachable while the method stays root-only; it is kept deliberately, so a future regression in the authorization table cannot turn into raw camera/IR imagery on the wire.
 
-`auth_self_keep` rather than `auth_admin`: the resource is the caller's *own* camera preview (the bus policy already restricts daemon access to root/`facelock` group, and `PreviewDetectFrame` to the matching Unix user). Requiring the user's own password is proportionate consent for camera imagery; `auth_admin` would lock non-admin users out of enroll feedback entirely, which is the UX regression this design fixes.
-
-**Residual — similarity in detect metadata (accepted, self-scoped).** The stripped-frame response still returns per-face recognition metadata — bounding boxes, confidence, and the recognition *similarity* score — so the enroll/preview UI can give live quality feedback ("your face is recognized well, hold still to capture"). A raw similarity score is a spoof-tuning oracle in general (iterate a photo/mask until the number climbs), which is exactly why A4 removed it from the broadcast `AuthAttempted` signal. Here it is deliberately **retained but bounded**: `PreviewDetectFrame` is authorized only for **root or the caller's matching Unix user** (see the method-level authorization list above), so a non-root caller can read the similarity only for *their own* face against *their own* templates. There is no cross-user query path — obtaining another account's tuning score would require being root or being that user, in which case the score reveals nothing they could not already obtain by authenticating. The continuous score therefore serves enroll UX without functioning as an oracle against another account. This residual is accepted rather than coarsened; a future option is to bucket the score (`weak`/`good`/`strong`) if the self-scoped exposure is ever deemed too precise.
+**Residual — similarity in detect metadata (accepted, root-only).** The response returns per-face recognition metadata — bounding boxes, confidence, and the recognition *similarity* score — so the enroll/preview UI can give live quality feedback ("your face is recognized well, hold still to capture"). A raw similarity score is a spoof-tuning oracle in general (iterate a photo/mask until the number climbs), which is exactly why A4 removed it from the broadcast `AuthAttempted` signal. Here it reaches root only, and the score is redacted for any non-root caller regardless (defense in depth against the same regression). A future option is to bucket the score (`weak`/`good`/`strong`) if even the root-only exposure is ever deemed too precise.
 
 #### A6. Capture Contention Guard (Implemented)
 
@@ -434,8 +560,9 @@ Implementation note:
 #### A0. Config File Trust (Required)
 
 The PAM module runs in a root context, so `/etc/facelock/config.toml` is an
-attack vector: a writable config could redirect `auth_bin`, disable
-anti-spoofing knobs, or change the daemon mode. Before parsing, the module
+attack vector: a writable config could disable anti-spoofing knobs or change
+the daemon mode. (The oneshot binary path itself is fixed to
+`/usr/bin/facelock` and is not caller-influenced.) Before parsing, the module
 verifies that the config file **and every parent directory** are root-owned
 and not group- or world-writable. The file check uses `fstat` on the opened
 descriptor so the validated inode is exactly the one read (no TOCTOU). An

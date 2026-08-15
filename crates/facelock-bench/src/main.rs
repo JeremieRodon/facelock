@@ -25,6 +25,26 @@ const WARM_ITERATIONS: u32 = 10;
 /// Number of snapshots for enrollment benchmark.
 const ENROLLMENT_SNAPSHOTS: u32 = 5;
 
+/// Fallback `EnvFilter` directive used when `RUST_LOG` is unset (gap E9).
+///
+/// This crate's `[[bin]]` target and its Cargo.toml package name both are
+/// `facelock-bench` (target `facelock_bench`), so it does not have the
+/// facelock-cli's `facelock` vs `facelock_cli` naming mismatch. It also has
+/// no lib target to share a constant with facelock-cli's `logging` module
+/// across the crate boundary (see gap D6) and this crate's file ownership
+/// for this change does not extend into facelock-core, so this is an
+/// independently pinned analog rather than a truly shared constant — see
+/// `crates/facelock-cli/src/logging.rs` for the sibling definition.
+const DEFAULT_LOG_FILTER: &str = "facelock_bench=info";
+
+/// The `EnvFilter` this binary's tracing-subscriber init must use: honors
+/// `RUST_LOG` when set and valid, otherwise falls back to
+/// [`DEFAULT_LOG_FILTER`].
+fn default_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
+}
+
 #[derive(Parser)]
 #[command(
     name = "facelock-bench",
@@ -54,7 +74,9 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(default_env_filter())
+        .init();
 
     let cli = Cli::parse();
 
@@ -89,7 +111,9 @@ fn open_camera(config: &Config) -> Result<Camera<'static>> {
             .with_context(|| format!("Camera device {path} not accessible"))?;
         info!(device = %path, ir = is_ir_camera(&device_info), "Camera validated");
     }
-    Camera::open(&config.device, None)
+    // An empty quirks DB: the bench deliberately opens without quirk
+    // overrides, exactly as its old `quirk: None` call did.
+    Camera::open(&config.device, &facelock_camera::QuirksDb::default())
         .with_context(|| format!("Failed to open camera ({path_display})"))
 }
 
@@ -120,8 +144,8 @@ fn cmd_cold_auth() -> Result<()> {
     let mut camera = open_camera(&config)?;
 
     // Open store
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
 
     let embeddings = store.get_user_embeddings(&user)?;
     if embeddings.is_empty() {
@@ -169,8 +193,8 @@ fn cmd_warm_auth() -> Result<()> {
     // Pre-load everything
     let mut engine = load_engine(&config)?;
     let mut camera = open_camera(&config)?;
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
 
     let embeddings = store.get_user_embeddings(&user)?;
     if embeddings.is_empty() {
@@ -361,8 +385,8 @@ fn cmd_calibrate() -> Result<()> {
 
     let mut engine = load_engine(&config)?;
     let mut camera = open_camera(&config)?;
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
 
     let enrolled = store.get_user_embeddings(&user)?;
     if enrolled.is_empty() {
@@ -541,8 +565,8 @@ fn cmd_report() -> Result<()> {
     };
 
     // Warm auth benchmark
-    let store =
-        FaceStore::open(Path::new(&config.storage.db_path)).context("Failed to open face store")?;
+    let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
+        .context("Failed to open face store")?;
     let embeddings = store.get_user_embeddings(&user)?;
     let has_enrolled = !embeddings.is_empty();
 
@@ -782,6 +806,90 @@ mod tests {
         assert_eq!(pass_fail(201, 200), "FAIL");
     }
 
+    // --- E9: logging default (see DEFAULT_LOG_FILTER's doc comment) ---
+
+    #[test]
+    fn default_log_filter_pinned() {
+        assert_eq!(DEFAULT_LOG_FILTER, "facelock_bench=info");
+    }
+
+    #[test]
+    fn no_init_site_outside_the_constant_bypasses_default_env_filter() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut visited_files = 0usize;
+        let mut found_bypass = false;
+        let mut main_uses_helper = false;
+
+        visit_rs_files(&src_dir, &mut |path, contents| {
+            visited_files += 1;
+            // Skip the line range that is default_env_filter()'s own body —
+            // it is the one legitimate place the bypass pattern may appear —
+            // and stop at the `#[cfg(test)] mod tests` boundary: this is a
+            // single-file crate, so this very test's own source (which
+            // necessarily contains the bypass pattern as a string literal to
+            // search for) lives below that boundary and would otherwise
+            // trip its own check.
+            let mut in_definition_body = false;
+            for (line_no, line) in contents.lines().enumerate() {
+                if line.trim_start().starts_with("mod tests") {
+                    break;
+                }
+                if line.contains("fn default_env_filter") {
+                    in_definition_body = true;
+                    continue;
+                }
+                if in_definition_body {
+                    if line.trim_start() == "}" {
+                        in_definition_body = false;
+                    }
+                    continue;
+                }
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains("EnvFilter::try_from_default_env(")
+                    || line.contains("EnvFilter::from_default_env(")
+                {
+                    found_bypass = true;
+                    panic!(
+                        "{}:{}: builds an EnvFilter directly instead of calling \
+                         default_env_filter()",
+                        path.display(),
+                        line_no + 1
+                    );
+                }
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("main.rs")
+                && contents.contains(".with_env_filter(default_env_filter())")
+            {
+                main_uses_helper = true;
+            }
+        });
+
+        assert!(!found_bypass);
+        assert!(visited_files >= 1);
+        assert!(
+            main_uses_helper,
+            "expected main.rs's tracing_subscriber init to call default_env_filter()"
+        );
+    }
+
+    fn visit_rs_files(dir: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("dir entry read failed");
+            let path = entry.path();
+            if path.is_dir() {
+                visit_rs_files(&path, f);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let contents = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+                f(&path, &contents);
+            }
+        }
+    }
+
     #[test]
     fn test_find_best_match_empty() {
         assert!(!find_best_match(&[], &[], 0.5));
@@ -813,12 +921,8 @@ mod tests {
         let mut emb_a = [0.0f32; 512];
         let mut emb_b = [0.0f32; 512];
         // Orthogonal embeddings
-        for i in 0..256 {
-            emb_a[i] = 1.0 / (256.0f32).sqrt();
-        }
-        for i in 256..512 {
-            emb_b[i] = 1.0 / (256.0f32).sqrt();
-        }
+        emb_a[..256].fill(1.0 / (256.0f32).sqrt());
+        emb_b[256..].fill(1.0 / (256.0f32).sqrt());
         let faces = vec![(
             facelock_core::types::Detection {
                 bbox: facelock_core::types::BoundingBox {

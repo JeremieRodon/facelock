@@ -14,7 +14,7 @@ Cargo workspace with 11 crates:
 | `facelock-camera` | lib | V4L2 capture, auto-detection, preprocessing |
 | `facelock-face` | lib | ONNX inference (SCRFD + ArcFace) |
 | `facelock-store` | lib | SQLite face embedding storage |
-| `facelock-daemon` | lib | Auth/enroll logic, rate limiting, liveness, audit |
+| `facelock-daemon` | lib | Auth/enroll logic, rate limiting, liveness, audit, D-Bus server |
 | `facelock-cli` | bin | Unified CLI (`facelock` binary, includes `bench` subcommand) |
 | `facelock-bench` | bin | Standalone benchmark and calibration utility |
 | `pam-facelock` | cdylib | PAM module (libc + toml + serde + zbus only) |
@@ -79,8 +79,8 @@ Supported providers: `cpu` (default), `cuda` (NVIDIA), `rocm` (AMD), `openvino` 
 | facelock-core | serde, toml, thiserror, tracing, subtle, zeroize, zvariant |
 | facelock-camera | facelock-core, v4l, image, tracing |
 | facelock-face | facelock-core, ort, ndarray, image, sha2 |
-| facelock-store | facelock-core, rusqlite (bundled), bytemuck |
-| facelock-daemon | facelock-core, facelock-camera, facelock-face, facelock-store, facelock-tpm, signal-hook, nix |
+| facelock-store | facelock-core, rusqlite (bundled), bytemuck, thiserror |
+| facelock-daemon | facelock-core, facelock-camera, facelock-face, facelock-store, facelock-tpm, signal-hook, nix, zbus (tokio), tokio |
 | facelock-cli | facelock-core + all above, clap, reqwest, zbus, tokio, dialoguer |
 | facelock-bench | facelock-core, facelock-camera, facelock-face, facelock-store, clap, anyhow, tracing |
 | pam-facelock | **libc, toml, serde, zbus ONLY** |

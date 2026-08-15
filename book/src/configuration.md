@@ -71,7 +71,7 @@ Controls how the PAM module reaches the face engine.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `db_path` | string | `"/var/lib/facelock/facelock.db"` | SQLite database for face embeddings. File permissions should be 640, owned by `root:facelock`. |
+| `db_path` | string | `"/var/lib/facelock/facelock.db"` | SQLite database for face embeddings. File permissions should be 600, owned by `root:root`. |
 
 ## [security]
 

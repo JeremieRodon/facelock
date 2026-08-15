@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Complete flag surface for `facelock setup`**: every wizard step can now be
+  answered or declined from the command line. Choice flags `--camera
+  <PATH|auto>`, `--models <standard|balanced|high>`, `--execution-provider
+  <cpu|cuda|rocm|openvino|auto>` and `--encryption <tpm|keyfile|none|auto>`
+  supply a value and thereby replace the corresponding prompt (precedence: CLI
+  flag > config file > built-in default). Action flags `--no-pam`,
+  `--no-systemd` and `--no-enroll` decline an action outright, with `--pam`,
+  `--systemd` and `--enroll` as their forcing counterparts; each pair is an
+  override pair, so the later flag on the command line wins. There is
+  deliberately no `--skip-<x>-prompt` family: on the steps that change the
+  system, "skip" would have to mean "apply the default", so the one flag an
+  integrator reaches for to avoid facelock touching PAM would instead configure
+  it for every pre-checked service (`sudo`, `polkit-1`, `hyprlock`, `swaylock`,
+  `kscreenlocker_greet`, `lightdm`). `auto` means re-derive from the hardware,
+  not "use the default" — omitting a flag already gives the default.
+- **`--execution-provider=auto` detects the available GPU providers**: setup now
+  asks the loaded ONNX Runtime which execution providers it was built with and
+  selects `cuda` > `rocm` > `openvino` > `cpu`. A machine with
+  `onnxruntime-opt-cuda` installed previously got CPU inference and was never
+  told GPU was available. The choice is always explained on stdout, including
+  the CPU case ("the installed ONNX Runtime has no GPU execution providers
+  compiled in; selecting cpu"), so `cpu` is never a silent outcome.
+- **`facelock is-enrolled`**: a cheap, unprivileged query for whether a user has
+  a usable face enrollment, so a lock screen can decide whether to offer a
+  face-auth affordance. Named after systemd's `is-*` family (`systemctl
+  is-active --quiet`), and like those it prints the state word — `enrolled` or
+  `not-enrolled`. The exit code is the contract — `0` enrolled, `1` not
+  enrolled, `2` error, matching `grep`'s convention — with `--user`, `--json`
+  and `--quiet`. It answers from a
+  per-user marker under `/var/lib/facelock/enrolled/` (`0710 root:facelock`
+  directory, `0600` files owned by their user) and never activates the daemon
+  over D-Bus, opens a camera, or reads the database. "Enrolled" means "face
+  auth is operational for me": reaching the marker requires `facelock` group
+  membership, so a caller outside the group reports `not-enrolled` — correct,
+  since the group is required to reach the daemon at all. The
+  marker is a hint for the UI, not authority: it can drift, and PAM at
+  authentication time remains authoritative. Markers are maintained by `enroll`,
+  `remove` and `clear`, and every `setup` run reconciles them from the database,
+  which backfills users enrolled before this feature existed.
 - **Enrollment failure breakdown** (#89): when enrollment captures too few
   frames, the error now reports why frames were rejected (too dark, no face,
   multiple faces, low quality, capture errors with the last error message) and
@@ -20,9 +59,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invoking user can be determined), so daemon commands like `facelock
   preview`/`test` work after setup without a manual `usermod`. A log-out/log-in
   reminder is printed.
+- **`facelock status` reports whether the PAM oneshot fallback is usable**: a
+  new "Oneshot fallback" section says whether root-invoked PAM could
+  authenticate via `/usr/bin/facelock auth` with the daemon unreachable — the
+  binary, both configured model files, and the database must be present — and
+  names whichever prerequisite is missing.
+- **`facelock status` explains the camera**: when the configured (or
+  auto-detected) device can be interrogated, the report shows its
+  evidence-based IR classification and any camera-quirks entries that will
+  shape how it is opened, so "why does this camera behave that way" is
+  answerable from the report. Auto-detect additionally names the device it
+  would select right now.
+- **`facelock status` flags a stale `is-enrolled` marker**: running as root it
+  compares the target user's marker against the database and prints a
+  diagnostic when they disagree (or when the marker is unreadable), pointing
+  at `sudo facelock setup` to reconcile. `is-enrolled` itself is unchanged.
 
 ### Changed
 
+- **`facelock status` says "cannot determine" instead of guessing**: a section
+  whose probe failed — an unreadable database, a config that did not parse —
+  now reports exactly that, and a daemon that is unreachable can never render
+  as "no faces enrolled". Previously a broken config silently dropped several
+  sections from the report; every section now always renders, as its value or
+  as honestly unknown. Internally the command is a pure renderer over a
+  `Health` fact model, so the report — including the exact bytes the container
+  tests grep — is pinned by unit tests.
+- **State directory and log permissions tightened — no paths moved, no data
+  migration**. The database stays at `/var/lib/facelock/facelock.db` and the
+  models at `/var/lib/facelock/models`; what changes are modes and ownership:
+
+  ```
+  /var/lib/facelock/            0710 root:facelock   traverse-only, NOT listable
+    facelock.db (+-wal/-shm)    0600 root:root       was 0640 root:facelock
+    models/                     0755 root:root       unchanged
+    enrolled/                   0710 root:facelock   new — is-enrolled markers
+      <user>                    0600 <user>:<user>
+  /var/log/facelock/            0700 root:root       was 0750 root:facelock
+    audit.jsonl                 0600 root:root       was 0640 root:facelock
+    snapshots/                  0700 root:root       was 0750 root:facelock
+  ```
+
+  **One gate at the top.** The state directory grants "other" nothing, so a
+  local user outside the `facelock` group can reach nothing below it. The
+  group gets traverse-only: a member can open a path it knows by name — its
+  own enrollment marker, a model file — but cannot list the directory or read
+  the `0600 root:root` database. The group is a **D-Bus access grant, not a
+  file-read grant**: members request authentication through the daemon, which
+  reads the templates as root. This also closes the group's direct reads of
+  the audit log (per-user auth history) and snapshots (raw face images), both
+  strictly more sensitive than the encrypted templates. A guard test walks the
+  state directory and fails if any entry but `models/` carries "other" bits.
+
+  **D-Bus is required for user-run screen lockers** (hyprlock/swaylock): their
+  PAM stack runs as the user, and no group membership makes the database or
+  encryption key readable. Root-invoked PAM (`sudo`, `login`, `sshd`) also has
+  the oneshot fallback, which reads the files directly as root.
+
+  For an existing install the entire on-disk change is a `chmod`/`chown` of
+  the paths above plus `mkdir enrolled/`, applied idempotently by packaging
+  (tmpfiles `z` lines, install scriptlets, OpenRC `start_pre`, the NixOS
+  module, `just install-files`) and re-applied by any root invocation of the
+  binary. None of it touches the data itself. The places that encode the
+  layout and must stay in sync: `dist/facelock.tmpfiles`,
+  `dist/facelock.install`, `dist/debian/postinst`, `dist/nix/module.nix`,
+  `dist/openrc/facelock-daemon`, the `install-files` recipe in `justfile`,
+  `secure_setup_paths()`, the default path constants in
+  `crates/facelock-core/src/paths.rs`, and the typed constants plus guard
+  tests in `crates/facelock-cli/src/state_layout.rs`. `just test-arch-layout`
+  asserts the shipped modes end to end. See `docs/contracts.md` for the
+  permission table as a contract change and `docs/security.md` §A2/§A3 for the
+  rationale.
+- **`facelock setup` flags now compose instead of being mutually exclusive**:
+  `--pam` and/or `--systemd` on their own still perform just that action and
+  touch nothing else, but any flag that only makes sense while the base setup
+  runs — `--non-interactive`, a choice flag, or any of `--no-pam` /
+  `--no-systemd` / `--enroll` / `--no-enroll` — now forces the base setup, and
+  the requested actions run in addition to it. Single-flag behaviour is
+  unchanged; see the two silent flag drops under **Fixed**.
 - **Direct-mode enrollment unified with the daemon loop** (#89): `facelock
   enroll` in oneshot/direct mode previously ran a drifted copy of the
   enrollment loop that skipped the frame quality gate and the angle-diversity
@@ -45,6 +159,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`setup --systemd --pam` silently dropped `--pam`**: the dispatch was an
+  `if systemd {} else if pam {}` chain, so asking for both ran only systemd and
+  said nothing about it. It now runs both, systemd first, matching the order the
+  wizard uses for steps 8 and 9.
+- **`setup --non-interactive --pam` silently dropped `--non-interactive`**: the
+  same chain ran PAM only, skipping directory creation, model download and
+  verification, encryption and permission hardening. It now runs the base setup
+  and then PAM.
+- **Action modifiers no longer vanish without their action**: `--remove` and
+  `--service` require `--pam`, and `--disable` requires `--systemd`. Passing one
+  alone is now a parse error naming the missing flag instead of being ignored.
 - **D-Bus Enroll timeout race** (#89): the CLI's fixed 15-second D-Bus method
   timeout was at or below the daemon's enrollment deadline
   (3x `recognition.timeout_secs`, minimum 15s), so `facelock enroll` in daemon

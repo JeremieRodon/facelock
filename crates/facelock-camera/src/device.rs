@@ -14,13 +14,10 @@ pub struct DeviceInfo {
     pub formats: Vec<FormatInfo>,
 }
 
-/// A supported pixel format with its available sizes.
-#[derive(Debug, Clone)]
-pub struct FormatInfo {
-    pub fourcc: String,
-    pub description: String,
-    pub sizes: Vec<(u32, u32)>,
-}
+/// A supported pixel format with its available sizes. Defined in
+/// `facelock-core` so `CameraCaps` can carry it; re-exported here where the
+/// enumeration actually happens.
+pub use facelock_core::types::FormatInfo;
 
 /// List all V4L2 video capture devices.
 /// Returns an empty vec if no devices are found (does not error).
@@ -51,17 +48,23 @@ pub fn validate_device(path: &str) -> Result<DeviceInfo> {
 
 /// Provenance of an IR classification decision, for logging and honesty.
 ///
-/// Ordered by authoritativeness: a `Quirk` hit is definitive; `Format` means a
-/// native IR capture format (GREY/Y16) corroborated by an IR name token; `Name`
-/// means an IR name token alone; `None` means not classified as IR.
+/// Ordered by authoritativeness: a `Quirk` hit is definitive (a USB-ID match
+/// always; a name-only match only when corroborated — see
+/// [`ir_source_with_quirks`]); `Format` means the device's OWN queried
+/// capture formats support IR; `None` means not classified as IR.
+///
+/// The device's free-text name is NEVER, by itself, sufficient to classify a
+/// device as IR (#98) — IR-ness is derived from queried evidence. The name is
+/// still consulted, but only as a tiebreak hint during auto-detection
+/// selection (see [`pick_auto_device`]) and as part of quirk-match
+/// corroboration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrSource {
-    /// Hardware quirks DB `force_ir = true` — authoritative.
+    /// Hardware quirks DB `force_ir = true`, corroborated — authoritative.
     Quirk,
-    /// Native IR format (GREY/Y16) corroborated by an IR name token.
+    /// The device's own queried capture formats support IR (mono-only
+    /// format enumeration — see [`has_mono_only_formats`]).
     Format,
-    /// IR name token ("ir"/"infrared") present, no IR capture format.
-    Name,
     /// Not classified as IR.
     None,
 }
@@ -95,38 +98,91 @@ pub fn ir_source(device: &DeviceInfo) -> IrSource {
     ir_source_with_quirks(device, None)
 }
 
-/// True if the device natively exposes an IR-like capture format (GREY/Y16).
+/// V4L2 pixel formats intrinsic to IR/mono sensors. Fourcc strings are
+/// space-padded to 4 chars by the V4L2 API; compare trimmed.
+const IR_TYPICAL_FOURCCS: [&str; 5] = ["GREY", "Y16", "Y12", "Y10", "Y8"];
+
+fn is_ir_typical_fourcc(fourcc: &str) -> bool {
+    IR_TYPICAL_FOURCCS.contains(&fourcc.trim())
+}
+
+/// True if the device enumerates at least one IR-typical mono format
+/// (GREY/Y8/Y10/Y12/Y16), possibly alongside other (e.g. color) formats.
+///
+/// Used for multi-node USB device disambiguation, where a sibling node's
+/// mere *offering* of a mono format (not necessarily its ONLY format) is the
+/// relevant signal. See [`has_mono_only_formats`] for the stricter "this
+/// node IS an IR sensor" evidence used in classification.
 fn has_native_ir_format(device: &DeviceInfo) -> bool {
     device
         .formats
         .iter()
-        .any(|f| matches!(f.fourcc.as_str(), "GREY" | "Y16 "))
+        .any(|f| is_ir_typical_fourcc(&f.fourcc))
 }
 
-/// The quirk-free heuristic classification (name token / format corroboration).
+/// True if this device enumerates ONLY IR-typical mono capture formats
+/// (GREY/Y8/Y10/Y12/Y16), with at least one such format present.
+///
+/// A node that ALSO enumerates a color format (YUYV, MJPG, ...) alongside a
+/// mono one is an ordinary color sensor that happens to offer a mono mode
+/// too — not IR evidence (many ordinary RGB UVC webcams enumerate GREY
+/// alongside YUYV/MJPG). A node whose ENTIRE format set is mono/IR-typical is
+/// a genuine dedicated mono/IR sensor node.
+fn has_mono_only_formats(device: &DeviceInfo) -> bool {
+    !device.formats.is_empty()
+        && device
+            .formats
+            .iter()
+            .all(|f| is_ir_typical_fourcc(&f.fourcc))
+}
+
+/// An IR-ness verdict derived purely from queryable device evidence: the
+/// capture formats the device actually enumerates, NEVER the free-text
+/// device/card name, which is trivially attacker-controlled on virtual
+/// devices such as v4l2loopback (#98).
+///
+/// Format evidence is stronger than the name, but it is NOT unforgeable:
+/// deriving IR-ness from the enumerated formats raises the attacker's cost from
+/// "set a `CARD_LABEL` string" to "also negotiate a mono-only pixel format", yet
+/// a root-loaded `v4l2loopback` device or a programmable USB gadget can still
+/// present a mono-only (GREY/Y16/…) format set and thus classify as IR. The
+/// backstops against a fabricated IR device are the liveness / frame-variance
+/// checks and the privilege required to create such a device — not this signal
+/// alone. See `docs/security.md` §A ("Honest residual").
+fn has_queried_ir_evidence(device: &DeviceInfo) -> bool {
+    has_mono_only_formats(device)
+}
+
+/// The quirk-free heuristic classification, derived SOLELY from queried
+/// device evidence (#98 — never the free-text name). The device name is not
+/// consulted here at all; it is used only as a tiebreak hint during
+/// auto-detection selection (see [`pick_auto_device`]).
 fn heuristic_ir_source(device: &DeviceInfo) -> IrSource {
-    match (
-        has_ir_name_token(&device.name),
-        has_native_ir_format(device),
-    ) {
-        // Native IR format corroborated by the name token — strongest heuristic.
-        (true, true) => IrSource::Format,
-        // Name token alone is sufficient (e.g. "Infrared Camera").
-        (true, false) => IrSource::Name,
-        // Format alone (or nothing) is NOT sufficient — this is the H1 bypass fix.
-        (false, _) => IrSource::None,
+    if has_queried_ir_evidence(device) {
+        IrSource::Format
+    } else {
+        IrSource::None
     }
 }
 
 /// Classify a device's IR provenance, honoring the quirks DB as authoritative.
 ///
-/// Decision rules (H1 fix — mere *availability* of GREY/Y16 is NOT proof of IR):
-/// 1. A quirks DB `force_ir` value is authoritative in both directions.
-/// 2. A native IR capture format (GREY/Y16) counts only when corroborated by an
-///    IR name token → [`IrSource::Format`].
-/// 3. An IR name token alone → [`IrSource::Name`].
-/// 4. Otherwise → [`IrSource::None`] (a plain RGB webcam that merely enumerates
-///    GREY is not treated as IR).
+/// Decision rules:
+/// 1. A quirks DB `force_ir = false` is authoritative "not IR", regardless of
+///    how the quirk matched.
+/// 2. A quirks DB `force_ir = true` matched by USB vendor:product ID is
+///    authoritative "IR" — a virtual device (e.g. v4l2loopback) has no real
+///    USB node, so it can never win this path.
+/// 3. A quirks DB `force_ir = true` matched by device NAME ONLY requires
+///    corroboration before it is trusted: either the device has a real (if
+///    DB-unlisted) USB identity, or its own queried formats independently
+///    support IR (rule 4). Without corroboration a crafted device name alone
+///    cannot win `force_ir` through the quirks path either (#98 Task 3).
+/// 4. Otherwise, IR-ness is derived SOLELY from the device's own queried
+///    capture formats (mono-only enumeration — GREY/Y8/Y10/Y12/Y16). The
+///    free-text device name is NEVER, by itself, sufficient (#98): a crafted
+///    `CARD_LABEL` on a color-only device does not classify as IR no matter
+///    what it is called.
 ///
 /// CAVEAT (multi-node USB devices): one physical USB camera can expose several
 /// V4L2 capture nodes sharing the same VID:PID (e.g. the Logitech BRIO's RGB
@@ -151,15 +207,32 @@ fn ir_source_with_quirks_and_ids(
     quirks: Option<&crate::quirks::QuirksDb>,
     usb_ids: Option<&(String, String)>,
 ) -> IrSource {
-    // 1. Quirks database is authoritative (both true and false).
     if let Some(db) = quirks {
-        if let Some(quirk) = db.find_match_with_ids(device, usb_ids) {
-            if let Some(force_ir) = quirk.force_ir {
-                return if force_ir {
-                    IrSource::Quirk
-                } else {
-                    IrSource::None
-                };
+        if let Some((quirk, kind)) = db.find_match_with_kind(device, usb_ids) {
+            match quirk.force_ir {
+                Some(false) => return IrSource::None,
+                Some(true) => {
+                    let corroborated = match kind {
+                        // A real hardware identity match — authoritative on
+                        // its own.
+                        crate::quirks::QuirkMatchKind::UsbId => true,
+                        // A name-only match needs corroboration: either a
+                        // real (if DB-unlisted) USB identity, or the
+                        // device's own queried evidence. A virtual
+                        // v4l2loopback node has neither, so a crafted name
+                        // alone can no longer win force_ir through the
+                        // quirks path (#98 Task 3).
+                        crate::quirks::QuirkMatchKind::NameOnly => {
+                            usb_ids.is_some() || has_queried_ir_evidence(device)
+                        }
+                    };
+                    if corroborated {
+                        return IrSource::Quirk;
+                    }
+                    // Uncorroborated name-only force_ir: fall through to the
+                    // evidence-only heuristic below.
+                }
+                None => {}
             }
         }
     }
@@ -291,31 +364,51 @@ pub fn is_ir_camera_resolved(
 ///
 /// Classifies all nodes with [`classify_ir_sources`] (so multi-node USB devices
 /// resolve to their actual IR sensor node), then prefers: a quirks-confirmed IR
-/// node with a native IR format, then any quirks-confirmed IR node, then a
-/// heuristically-IR node (name token), then the first enumerated device. It
-/// never auto-selects an unknown camera *just because* it self-reports a
-/// GREY/Y16 format (H1).
+/// node with a native IR format, then any quirks-confirmed IR node, then an
+/// evidence-classified IR node (preferring one whose name also carries an IR
+/// token, as a tiebreak hint only), then the first enumerated device. It never
+/// auto-selects an unknown camera *just because* its NAME claims to be IR
+/// (#98) or *just because* it self-reports a GREY/Y16 format alongside color
+/// formats (H1) — only queried mono-only format evidence, or a corroborated
+/// quirk, counts.
 ///
 /// NOTE (seam for Plan 02): device selection here is by capability/heuristic, not
 /// by stable device identity. Plan 02 will pin the enrolled camera by identity.
 pub fn auto_detect_device() -> Result<DeviceInfo> {
+    auto_detect_device_with(&crate::quirks::QuirksDb::load())
+}
+
+/// [`auto_detect_device`] against a caller-supplied quirks DB.
+///
+/// Callers that have already loaded a DB use this so selection and the
+/// classification recorded afterwards are decided by the SAME quirk set —
+/// loading a second copy would let the two disagree if the quirks files
+/// changed in between, and costs a directory walk either way.
+pub fn auto_detect_device_with(quirks: &crate::quirks::QuirksDb) -> Result<DeviceInfo> {
     let devices = list_devices()?;
-    let quirks = crate::quirks::QuirksDb::load();
-    let sources = classify_ir_sources(&devices, Some(&quirks));
+    let sources = classify_ir_sources(&devices, Some(quirks));
     pick_auto_device(&devices, &sources)
         .cloned()
         .ok_or_else(|| FacelockError::Camera("no video devices found".into()))
 }
 
 /// Selection order for auto-detection, over pre-classified nodes.
+///
 /// Prefers the format-corroborated IR node so a multi-node camera's RGB
-/// sibling is never picked over its IR sensor.
+/// sibling is never picked over its IR sensor. Among evidence-classified
+/// nodes with no quirk, the device name is consulted only as a tiebreak hint
+/// (an IR name token breaks ties among already-qualified nodes; it never
+/// promotes a node with no format evidence — see [`heuristic_ir_source`]).
 fn pick_auto_device<'a>(devices: &'a [DeviceInfo], sources: &[IrSource]) -> Option<&'a DeviceInfo> {
     let nodes = || devices.iter().zip(sources);
     nodes()
         .find(|(d, s)| **s == IrSource::Quirk && has_native_ir_format(d))
         .or_else(|| nodes().find(|(_, s)| **s == IrSource::Quirk))
-        .or_else(|| nodes().find(|(_, s)| **s != IrSource::None))
+        .or_else(|| {
+            nodes()
+                .find(|(d, s)| **s != IrSource::None && has_ir_name_token(&d.name))
+                .or_else(|| nodes().find(|(_, s)| **s != IrSource::None))
+        })
         .map(|(d, _)| d)
         .or_else(|| devices.first())
 }
@@ -399,10 +492,23 @@ mod tests {
     }
 
     #[test]
-    fn is_ir_camera_grey_format_alone_is_not_ir() {
-        // H1 fix: merely enumerating GREY is NOT proof of IR. An RGB webcam that
-        // advertises a GREY format with no IR name token / quirk is not-IR.
+    fn is_ir_camera_mono_format_alone_is_ir_by_evidence() {
+        // #98 fix: IR-ness is DERIVED from queried device evidence, never
+        // from the free-text name. A device with an unrelated name that
+        // enumerates ONLY a mono/IR-typical format is genuine IR evidence
+        // ("a genuine IR-evidence device still classifies as IR" — no name
+        // corroboration needed).
         let device = device_with("USB Camera", &["GREY"]);
+        assert!(is_ir_camera(&device));
+        assert_eq!(ir_source(&device), IrSource::Format);
+    }
+
+    #[test]
+    fn crafted_card_label_with_color_formats_only_is_not_ir() {
+        // #98 regression: a v4l2loopback device can set CARD_LABEL to
+        // anything. A crafted "Fake IR Camera" label backed only by
+        // ordinary color formats must not defeat require_ir.
+        let device = device_with("Fake IR Camera", &["YUYV", "MJPG"]);
         assert!(!is_ir_camera(&device));
         assert_eq!(ir_source(&device), IrSource::None);
     }
@@ -410,7 +516,8 @@ mod tests {
     #[test]
     fn ir_classification_corpus() {
         // Real RGB camera name strings must classify not-IR, even the ones
-        // whose names contain the substring "ir" but not the token "ir".
+        // whose names contain the substring "ir" but not the token "ir" —
+        // and even though these carry no format evidence either.
         for name in [
             "Integrated Webcam",
             "USB2.0 HD UVC WebCam",
@@ -421,16 +528,21 @@ mod tests {
             let dev = device_with(name, &["YUYV", "MJPG"]);
             assert!(!is_ir_camera(&dev), "{name} should be not-IR");
         }
-        // A GREY-only RGB cam is still not-IR without corroboration.
-        assert!(!is_ir_camera(&device_with("Generic Cam", &["GREY"])));
-        // A name IR token classifies IR.
+        // A GREY-and-color mix (the H1 case) is still not-IR: only a
+        // mono-ONLY format set counts as evidence.
+        assert!(!is_ir_camera(&device_with(
+            "Generic Cam",
+            &["GREY", "YUYV"]
+        )));
+        // #98: an IR name token with only color formats is NOT sufficient —
+        // IR-ness must be derived from queried evidence, never the name.
         assert_eq!(
             ir_source(&device_with("Integrated IR Camera", &["YUYV"])),
-            IrSource::Name
+            IrSource::None
         );
         assert_eq!(
             ir_source(&device_with("Infrared Camera", &["MJPG"])),
-            IrSource::Name
+            IrSource::None
         );
     }
 
@@ -441,35 +553,69 @@ mod tests {
     }
 
     #[test]
-    fn is_ir_camera_infrared_name() {
-        // Name token "infrared" is sufficient on its own.
+    fn is_ir_camera_name_token_alone_is_not_ir() {
+        // #98 fix: a bare name token ("Infrared Camera") with only a color
+        // format (MJPG) must NOT classify as IR — name alone is never
+        // sufficient.
         let device = device_with("Infrared Camera", &["MJPG"]);
-        assert!(is_ir_camera(&device));
-        assert_eq!(ir_source(&device), IrSource::Name);
+        assert!(!is_ir_camera(&device));
+        assert_eq!(ir_source(&device), IrSource::None);
     }
 
     #[test]
-    fn is_ir_camera_y16_name_token_corroborated_is_format() {
-        // Y16 native format corroborated by an IR name token → Format provenance.
+    fn is_ir_camera_y16_alone_is_format_regardless_of_name() {
+        // Y16 native mono format alone → Format provenance, independent of
+        // the device name (#98: evidence-derived, not name-derived).
         let device = device_with("Integrated IR Camera", &["Y16 "]);
         assert!(is_ir_camera(&device));
         assert_eq!(ir_source(&device), IrSource::Format);
     }
 
     #[test]
-    fn is_ir_camera_y16_without_name_is_not_ir() {
-        // Y16 alone (no IR name token, no quirk) is no longer proof of IR.
+    fn is_ir_camera_y16_alone_is_ir_even_with_unrelated_name() {
+        // #98 fix: mono format evidence alone is sufficient, even when the
+        // device's name gives no IR hint at all — proving classification
+        // does not depend on the name in either direction.
         let device = device_with("Depth Camera", &["Y16 "]);
-        assert!(!is_ir_camera(&device));
+        assert!(is_ir_camera(&device));
+        assert_eq!(ir_source(&device), IrSource::Format);
     }
 
     #[test]
-    fn quirk_force_ir_is_authoritative() {
+    fn quirk_force_ir_usb_id_match_is_authoritative() {
+        let mut db = crate::quirks::QuirksDb::default();
+        db.push_quirk_for_test(crate::quirks::Quirk {
+            vendor_id: Some("dead".into()),
+            product_id: Some("beef".into()),
+            name_pattern: None,
+            force_ir: Some(true),
+            emitter_xu_guid: None,
+            emitter_xu_selector: None,
+            warmup_frames: None,
+            format_preference: None,
+            rotation: None,
+            notes: Some("test force_ir via USB ID".into()),
+        });
+        // No IR name token, no IR format — a USB-ID quirk match alone makes
+        // it IR, no corroboration needed.
+        let device = device_with("Generic Camera", &["YUYV"]);
+        let ids = Some(("dead".into(), "beef".into()));
+        assert_eq!(
+            ir_source_with_quirks_and_ids(&device, Some(&db), ids.as_ref()),
+            IrSource::Quirk
+        );
+    }
+
+    #[test]
+    fn quirk_force_ir_name_only_requires_corroboration() {
+        // #98 Task 3: a name-only quirk match must not grant force_ir on its
+        // own — it needs corroboration from a real USB identity or the
+        // device's own format evidence.
         let mut db = crate::quirks::QuirksDb::default();
         db.push_quirk_for_test(crate::quirks::Quirk {
             vendor_id: None,
             product_id: None,
-            name_pattern: Some("(?i)generic".into()),
+            name_pattern: Some("(?i)generic.*".into()),
             force_ir: Some(true),
             emitter_xu_guid: None,
             emitter_xu_selector: None,
@@ -478,18 +624,42 @@ mod tests {
             rotation: None,
             notes: Some("test force_ir".into()),
         });
-        // No IR name token, no IR format — quirk alone makes it IR.
-        let device = device_with("Generic Camera", &["YUYV"]);
-        assert!(is_ir_camera_with_quirks(&device, Some(&db)));
-        assert_eq!(ir_source_with_quirks(&device, Some(&db)), IrSource::Quirk);
 
-        // A quirk with force_ir = false is authoritative "not IR" even if the
-        // name has an IR token.
+        // No usb_ids (as on a virtual v4l2loopback node) and no format
+        // evidence of its own — must NOT be trusted.
+        let uncorroborated = device_with("Generic Camera", &["YUYV"]);
+        assert_eq!(
+            ir_source_with_quirks_and_ids(&uncorroborated, Some(&db), None),
+            IrSource::None,
+            "uncorroborated name-only force_ir must not grant IR"
+        );
+
+        // Corroborated by a real (if DB-unlisted) USB identity.
+        let real_ids = Some(("1234".into(), "5678".into()));
+        assert_eq!(
+            ir_source_with_quirks_and_ids(&uncorroborated, Some(&db), real_ids.as_ref()),
+            IrSource::Quirk,
+            "a name-only match backed by a real USB identity is corroborated"
+        );
+
+        // Corroborated by the device's own mono-format evidence.
+        let mono_evidence = device_with("Generic Camera", &["GREY"]);
+        assert_eq!(
+            ir_source_with_quirks_and_ids(&mono_evidence, Some(&db), None),
+            IrSource::Quirk,
+            "a name-only match backed by the device's own mono format evidence is corroborated"
+        );
+    }
+
+    #[test]
+    fn quirk_force_ir_false_is_authoritative_regardless_of_corroboration() {
+        // A quirk with force_ir = false is authoritative "not IR" even if
+        // the name has an IR token and the format looks IR-typical.
         let mut db_off = crate::quirks::QuirksDb::default();
         db_off.push_quirk_for_test(crate::quirks::Quirk {
             vendor_id: None,
             product_id: None,
-            name_pattern: Some("(?i)ir".into()),
+            name_pattern: Some("(?i)ir camera".into()),
             force_ir: Some(false),
             emitter_xu_guid: None,
             emitter_xu_selector: None,
@@ -498,8 +668,11 @@ mod tests {
             rotation: None,
             notes: None,
         });
-        let ir_named = device_with("Integrated IR Camera", &["GREY"]);
-        assert!(!is_ir_camera_with_quirks(&ir_named, Some(&db_off)));
+        let ir_named = device_with("IR Camera", &["GREY"]);
+        assert_eq!(
+            ir_source_with_quirks_and_ids(&ir_named, Some(&db_off), None),
+            IrSource::None
+        );
     }
 
     fn device_at(path: &str, name: &str, fourccs: &[&str]) -> DeviceInfo {
@@ -616,9 +789,10 @@ mod tests {
     }
 
     #[test]
-    fn multi_node_demoted_sibling_keeps_name_heuristic() {
-        // A demoted sibling falls back to the (quirk-free) heuristic: an IR
-        // name token still classifies it, honestly, as Name.
+    fn multi_node_demoted_sibling_falls_back_to_no_evidence() {
+        // A demoted sibling falls back to the (quirk-free) heuristic, which
+        // is evidence-only (#98): an IR name token alone does NOT resurrect
+        // an IR classification for a node with no format evidence of its own.
         let mut db = crate::quirks::QuirksDb::default();
         db.push_quirk_for_test(brio_quirk(None));
 
@@ -629,7 +803,7 @@ mod tests {
         let ids = vec![brio_ids(), brio_ids()];
 
         let sources = classify_ir_sources_with_ids(&devices, Some(&db), &ids);
-        assert_eq!(sources[0], IrSource::Name);
+        assert_eq!(sources[0], IrSource::None);
         assert_eq!(sources[1], IrSource::Quirk);
         // Selection still prefers the format-corroborated quirk node.
         let picked = pick_auto_device(&devices, &sources).expect("a device is picked");
@@ -637,14 +811,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_without_usb_ids_leaves_quirk_nodes_alone() {
-        // Nodes whose USB identity is unreadable cannot be grouped as siblings;
-        // a name-pattern quirk match stays authoritative (current behavior).
+    fn classify_without_usb_ids_uncorroborated_name_quirk_falls_back() {
+        // #98 Task 3: nodes whose USB identity is unreadable (as on a
+        // virtual v4l2loopback device) cannot corroborate a name-only quirk
+        // match. A node with no format evidence of its own is NOT granted
+        // force_ir just because its (attacker-controlled) name matches the
+        // pattern. A sibling node that DOES carry its own mono format
+        // evidence still classifies IR — via that evidence, not blind trust
+        // in the quirk.
         let mut db = crate::quirks::QuirksDb::default();
         db.push_quirk_for_test(crate::quirks::Quirk {
             vendor_id: None,
             product_id: None,
-            name_pattern: Some("(?i)generic".into()),
+            name_pattern: Some("(?i)generic.*".into()),
             force_ir: Some(true),
             emitter_xu_guid: None,
             emitter_xu_selector: None,
@@ -661,8 +840,16 @@ mod tests {
         let ids = vec![None, None];
 
         let sources = classify_ir_sources_with_ids(&devices, Some(&db), &ids);
-        assert_eq!(sources[0], IrSource::Quirk);
-        assert_eq!(sources[1], IrSource::Quirk);
+        assert_eq!(
+            sources[0],
+            IrSource::None,
+            "uncorroborated name-only force_ir must not grant IR"
+        );
+        assert_eq!(
+            sources[1],
+            IrSource::Quirk,
+            "corroborated by its own mono format evidence"
+        );
     }
 
     #[test]

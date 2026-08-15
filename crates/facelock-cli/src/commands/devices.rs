@@ -1,67 +1,54 @@
-use anyhow::Context;
 use facelock_core::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
+use crate::backend::Backend;
 use crate::ipc_client;
 
-pub fn run() -> anyhow::Result<()> {
-    let config = Config::load().context("failed to load config")?;
+pub fn run(config: &Config) -> anyhow::Result<()> {
+    // DEC-6/N13: `ListDevices` is root-only now (was facelock-group).
+    ipc_client::require_root("sudo facelock devices")?;
 
-    if ipc_client::should_use_direct(&config) {
-        return crate::direct::list_devices_direct();
+    // One selection, one enumeration (D1); both transports render here. The
+    // renderers used to live twice — this one and a direct copy that printed
+    // its own loop.
+    let backend = Backend::select(config);
+    let devices = backend.list_devices()?;
+
+    if devices.is_empty() {
+        println!("No video devices found.");
+        println!("Check that your camera is connected and the v4l2 module is loaded.");
+        return Ok(());
     }
 
-    // Only blame a missing daemon when the request wasn't refused: an
-    // AccessDenied already carries the group-membership hint as its headline.
-    let response = ipc_client::send_request(&DaemonRequest::ListDevices).map_err(|e| {
-        if ipc_client::is_access_denied(&e) {
-            e
-        } else {
-            e.context("failed to query daemon — is facelock-daemon running?")
-        }
-    })?;
+    // Format detail is a direct-only capability (the D-Bus DeviceInfo does
+    // not carry it) — stated by the caps instead of silently printing
+    // nothing.
+    let show_formats = backend.caps().device_formats;
 
-    match response {
-        DaemonResponse::Devices(devices) => {
-            if devices.is_empty() {
-                println!("No video devices found.");
-                println!("Check that your camera is connected and the v4l2 module is loaded.");
-                return Ok(());
-            }
+    println!("Available video devices:\n");
+    for dev in &devices {
+        let ir_tag = if dev.is_ir { " [IR]" } else { "" };
+        println!("  {}{ir_tag}", dev.path);
+        println!("    Name:    {}", dev.name);
+        println!("    Driver:  {}", dev.driver);
 
-            println!("Available video devices:\n");
-            for dev in &devices {
-                let ir_tag = if dev.is_ir { " [IR]" } else { "" };
-                println!("  {}{ir_tag}", dev.path);
-                println!("    Name:    {}", dev.name);
-                println!("    Driver:  {}", dev.driver);
-
-                if !dev.formats.is_empty() {
-                    println!("    Formats:");
-                    for fmt in &dev.formats {
-                        let sizes: Vec<String> =
-                            fmt.sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect();
-                        println!(
-                            "      {} ({}) — {}",
-                            fmt.fourcc.trim(),
-                            fmt.description,
-                            if sizes.is_empty() {
-                                "no sizes reported".to_string()
-                            } else {
-                                sizes.join(", ")
-                            }
-                        );
+        if show_formats && !dev.formats.is_empty() {
+            println!("    Formats:");
+            for fmt in &dev.formats {
+                let sizes: Vec<String> =
+                    fmt.sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect();
+                println!(
+                    "      {} ({}) — {}",
+                    fmt.fourcc.trim(),
+                    fmt.description,
+                    if sizes.is_empty() {
+                        "no sizes reported".to_string()
+                    } else {
+                        sizes.join(", ")
                     }
-                }
-                println!();
+                );
             }
         }
-        DaemonResponse::Error { message } => {
-            anyhow::bail!("daemon error: {message}");
-        }
-        _ => {
-            anyhow::bail!("unexpected response from daemon");
-        }
+        println!();
     }
 
     Ok(())
@@ -69,5 +56,6 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    // Device listing requires hardware or a running daemon.
+    // Device listing requires hardware or a running daemon; the transport
+    // fork and its failure policy are pinned in `crate::backend`.
 }

@@ -70,9 +70,9 @@ pub fn write_audit_entry(config: &AuditConfig, entry: &AuditEntry) {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         let ensure_parent = if Uid::current().is_root() {
-            ensure_private_dir(parent, 0o750)
+            ensure_private_dir(parent, 0o700)
         } else {
-            ensure_dir(parent, 0o750)
+            ensure_dir(parent, 0o700)
         };
         if let Err(e) = ensure_parent {
             warn!(
@@ -100,7 +100,7 @@ pub fn write_audit_entry(config: &AuditConfig, entry: &AuditEntry) {
         }
     };
 
-    match open_append_file(path, 0o640) {
+    match open_append_file(path, 0o600) {
         Ok(mut file) => {
             if let Err(e) = writeln!(file, "{line}") {
                 warn!("failed to write audit entry: {e}");

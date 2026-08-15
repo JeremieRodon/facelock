@@ -2,12 +2,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use facelock_core::config::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
+use facelock_daemon::auth::AuthOutcome;
+use facelock_daemon::handler::{AuthIntent, DaemonRequest, DaemonResponse};
 use facelock_store::FaceStore;
 use facelock_test_support::fixtures;
 use facelock_test_support::{MockCamera, MockFaceEngine};
+
+/// The camera factory `Handler::new` takes. Named because the spelled-out
+/// type trips `clippy::type_complexity`, which the `--all-targets` lint gate
+/// makes a hard failure. Each integration test file is its own crate, so this
+/// cannot be shared without exporting a test-only type from production code.
+type MockCameraFactory = Box<dyn Fn(&Config) -> Result<MockCamera, String> + Send + Sync>;
 
 // Import the handler module (it's pub in the crate)
 // We need to reference it via the crate directly since it's a binary crate.
@@ -81,6 +88,19 @@ fn mock_camera_wraps_around() {
     // Third capture wraps around
     let frame = cam.capture().unwrap();
     assert_eq!(frame.width, 64);
+}
+
+/// D8 compile-time pin: `CameraSource` is object-safe. The old trait carried
+/// `fn is_dark(..) where Self: Sized`, which made `dyn CameraSource`
+/// unusable; darkness is a free function now and capabilities live on the
+/// camera, so a boxed camera works.
+#[test]
+fn camera_source_is_object_safe() {
+    use facelock_core::traits::CameraSource;
+    let mut cam: Box<dyn CameraSource> = Box::new(MockCamera::bright(64, 64, 1));
+    let frame = cam.capture().unwrap();
+    assert_eq!(frame.width, 64);
+    assert!(!cam.capabilities().is_ir);
 }
 
 #[test]
@@ -174,7 +194,7 @@ fn device_mismatch_never_reaches_success() {
     );
 
     let emb = fixtures::known_embedding(7);
-    let stored = vec![(1u32, emb)];
+    let mut stored = vec![(1u32, emb)];
     let models = vec![FaceModelInfo {
         id: 1,
         user: "u".into(),
@@ -184,6 +204,8 @@ fn device_mismatch_never_reaches_success() {
         device_id: Some("aaaa:bbbb:".into()),
     }];
 
+    // The live camera's identity now rides on its caps — the auth loop asks
+    // the camera rather than taking a fingerprint parameter (D8).
     let mismatch = DeviceFingerprint {
         vid: Some("cccc".into()),
         pid: Some("dddd".into()),
@@ -191,20 +213,21 @@ fn device_mismatch_never_reaches_success() {
         by_path: None,
     };
     let mut engine = MockFaceEngine::one_face(emb);
-    let mut cam = MockCamera::bright(64, 64, 10);
+    let mut cam = MockCamera::bright(64, 64, 10).with_caps(facelock_core::types::CameraCaps {
+        fingerprint: mismatch,
+        ..Default::default()
+    });
     let resp = authenticate_with_embeddings(
         &mut cam,
         &mut engine,
-        &stored,
+        &mut stored,
         &models,
         &config,
         "u",
-        false,
-        &mismatch,
         AuditSource::Daemon,
     );
     match resp {
-        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+        AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
             assert!(
                 !matched,
                 "device mismatch must not authenticate a perfect embedding match"
@@ -220,21 +243,24 @@ fn device_mismatch_never_reaches_success() {
         serial: None,
         by_path: None,
     };
+    // A fresh compare set: the call above wiped `stored` in place (D11).
+    let mut stored = vec![(1u32, emb)];
     let mut engine2 = MockFaceEngine::one_face(emb);
-    let mut cam2 = MockCamera::bright(64, 64, 10);
+    let mut cam2 = MockCamera::bright(64, 64, 10).with_caps(facelock_core::types::CameraCaps {
+        fingerprint: matching,
+        ..Default::default()
+    });
     let resp2 = authenticate_with_embeddings(
         &mut cam2,
         &mut engine2,
-        &stored,
+        &mut stored,
         &models,
         &config,
         "u",
-        false,
-        &matching,
         AuditSource::Daemon,
     );
     match resp2 {
-        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+        AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
             assert!(matched, "matching device must authenticate");
         }
         other => panic!("unexpected response: {other:?}"),
@@ -254,7 +280,7 @@ fn legacy_null_device_id_still_authenticates() {
     config.recognition.timeout_secs = 2;
 
     let emb = fixtures::known_embedding(11);
-    let stored = vec![(1u32, emb)];
+    let mut stored = vec![(1u32, emb)];
     let models = vec![FaceModelInfo {
         id: 1,
         user: "u".into(),
@@ -272,20 +298,21 @@ fn legacy_null_device_id_still_authenticates() {
         by_path: None,
     };
     let mut engine = MockFaceEngine::one_face(emb);
-    let mut cam = MockCamera::bright(64, 64, 10);
+    let mut cam = MockCamera::bright(64, 64, 10).with_caps(facelock_core::types::CameraCaps {
+        fingerprint: live,
+        ..Default::default()
+    });
     let resp = authenticate_with_embeddings(
         &mut cam,
         &mut engine,
-        &stored,
+        &mut stored,
         &models,
         &config,
         "u",
-        false,
-        &live,
         AuditSource::Daemon,
     );
     match resp {
-        DaemonResponse::AuthResult(MatchResult { matched, .. }) => {
+        AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
             assert!(
                 matched,
                 "legacy NULL device_id must authenticate (allow-with-warn)"
@@ -314,9 +341,7 @@ fn warmup_frames_discarded_on_camera_open() {
     let capture_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _counter = capture_count.clone();
 
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| {
+    let factory: MockCameraFactory = Box::new(move |_cfg| {
         // Camera with enough frames for warmup + auth
         Ok(MockCamera::bright(64, 64, 20))
     });
@@ -326,8 +351,7 @@ fn warmup_frames_discarded_on_camera_open() {
         engine,
         store,
         rate_limiter,
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )
@@ -361,17 +385,14 @@ fn warmup_frames_zero_skips_discard() {
         config.security.rate_limit.window_secs,
     );
 
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 5)));
+    let factory: MockCameraFactory = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 5)));
 
     let mut handler = Handler::new(
         config,
         engine,
         store,
         rate_limiter,
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )
@@ -419,23 +440,21 @@ fn static_matching_frames_report_variance_reason() {
     let emb = unit_at_angle(0.0);
     let mut camera = MockCamera::bright(64, 64, 4);
     let mut engine = MockFaceEngine::one_face(emb);
-    let stored = vec![(1u32, emb)];
+    let mut stored = vec![(1u32, emb)];
     let models = vec![legacy_model(1)];
 
     let resp = facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
-        &stored,
+        &mut stored,
         &models,
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Daemon,
     );
 
     match resp {
-        DaemonResponse::AuthResult(r) => {
+        AuthOutcome::AuthResult(r) => {
             assert!(!r.matched, "static input must not authenticate");
             assert!(
                 r.similarity >= config.recognition.threshold,
@@ -472,23 +491,21 @@ fn still_then_moving_frames_recover_and_authenticate() {
     ];
     let mut camera = MockCamera::bright(64, 64, 16);
     let mut engine = MockFaceEngine::cycling(frames);
-    let stored = vec![(1u32, still)];
+    let mut stored = vec![(1u32, still)];
     let models = vec![legacy_model(1)];
 
     let resp = facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
-        &stored,
+        &mut stored,
         &models,
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Daemon,
     );
 
     match resp {
-        DaemonResponse::AuthResult(r) => {
+        AuthOutcome::AuthResult(r) => {
             assert!(
                 r.matched,
                 "still-then-moving user must authenticate once the window fills \
@@ -529,16 +546,14 @@ fn failed_auth_writes_audit_entry() {
     let resp = facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
-        &[],
+        &mut [],
         &[],
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Daemon,
     );
     assert!(
-        matches!(resp, DaemonResponse::AuthResult(ref r) if !r.matched),
+        matches!(resp, AuthOutcome::AuthResult(ref r) if !r.matched),
         "sanity: attempt with no enrolled templates must fail, got {resp:?}"
     );
 
@@ -550,12 +565,10 @@ fn failed_auth_writes_audit_entry() {
     facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
-        &[],
+        &mut [],
         &[],
         &config,
         "testuser",
-        false,
-        &facelock_core::types::DeviceFingerprint::default(),
         AuditSource::Test,
     );
 
@@ -612,9 +625,7 @@ fn keyfile_sealer_init_failure_fails_enroll_closed_no_plaintext() {
 
     // A camera + engine that WOULD drive a valid enrollment, so the pre-fix code
     // path reaches plaintext storage (proving the downgrade the fix closes).
-    let factory: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(640, 480, 40)));
+    let factory: MockCameraFactory = Box::new(move |_cfg| Ok(MockCamera::bright(640, 480, 40)));
     let engine = MockFaceEngine::cycling(vec![
         fixtures::known_embedding(0),
         fixtures::known_embedding(40),
@@ -629,8 +640,7 @@ fn keyfile_sealer_init_failure_fails_enroll_closed_no_plaintext() {
         engine,
         store,
         rate_limiter,
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory),
         None,
     )
@@ -682,26 +692,23 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
     config.security.require_landmark_liveness = false;
 
     {
-        let store = FaceStore::open(&db_path).unwrap();
+        let store = FaceStore::create(&db_path).unwrap();
         store
             .add_model("testuser", "front", &fixtures::known_embedding(0), "")
             .unwrap();
     }
 
-    let factory1: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+    let factory1: MockCameraFactory = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
 
     let mut first_handler = Handler::new(
         config.clone(),
         MockFaceEngine::no_faces(),
-        FaceStore::open(&db_path).unwrap(),
+        FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,
         ),
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory1),
         None,
     )
@@ -715,20 +722,17 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
         DaemonResponse::AuthResult(MatchResult { matched: false, .. })
     ));
 
-    let factory2: Box<
-        dyn Fn(&facelock_core::config::Config) -> Result<MockCamera, String> + Send + Sync,
-    > = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+    let factory2: MockCameraFactory = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
 
     let mut restarted_handler = Handler::new(
         config.clone(),
         MockFaceEngine::no_faces(),
-        FaceStore::open(&db_path).unwrap(),
+        FaceStore::create(&db_path).unwrap(),
         RateLimiter::new(
             config.security.rate_limit.max_attempts,
             config.security.rate_limit.window_secs,
         ),
-        false,
-        facelock_core::types::DeviceFingerprint::default(),
+        facelock_core::types::CameraCaps::default(),
         Some(factory2),
         None,
     )
@@ -743,4 +747,247 @@ fn failed_auth_rate_limit_persists_across_handler_restart() {
     ));
 
     cleanup_db(&db_path);
+}
+
+/// N11 (issue #96): `facelock test` must never consume the shared
+/// rate-limit budget on failure — a handful of failed test runs must not
+/// lock the user out of real authentication afterward.
+///
+/// This pins the handler half of that: `AuthIntent::Test` charges nothing.
+/// The intent is no longer inferred from the caller's privilege (which was
+/// the bug — `sudo`'s PAM stack is root too); it arrives from the root-only
+/// `TestAuthenticate` D-Bus method, which `tests/server_authz.rs` covers.
+#[test]
+fn test_intent_does_not_consume_rate_limit_budget() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    let db_path = temp_db_path("rate-limit-exempt");
+    cleanup_db(&db_path);
+
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+    config.recognition.timeout_secs = 0;
+    config.security.rate_limit.max_attempts = 1;
+    config.security.require_frame_variance = false;
+    config.security.require_landmark_liveness = false;
+
+    {
+        let store = FaceStore::create(&db_path).unwrap();
+        store
+            .add_model("testuser", "front", &fixtures::known_embedding(0), "")
+            .unwrap();
+    }
+
+    let factory: MockCameraFactory = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+
+    let mut handler = Handler::new(
+        config.clone(),
+        MockFaceEngine::no_faces(),
+        FaceStore::create(&db_path).unwrap(),
+        RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        ),
+        facelock_core::types::CameraCaps::default(),
+        Some(factory),
+        None,
+    )
+    .unwrap();
+
+    // Run more failed attempts than max_attempts (1). None may report "rate
+    // limited" — the budget starts and stays at zero recorded failures.
+    for i in 0..3 {
+        let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Test);
+        assert!(
+            matches!(
+                resp,
+                DaemonResponse::AuthResult(MatchResult { matched: false, .. })
+            ),
+            "test attempt {i} should run the auth loop normally, not report rate-limited: {resp:?}"
+        );
+    }
+
+    // Directly assert the on-disk rate_limit table is untouched: a fresh
+    // check against the same database must still report "not rate limited".
+    let inspect_store = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect_store.check_rate_limit("testuser", 1, 60).unwrap(),
+        "rate_limit table must be untouched by diagnostic (test) failures"
+    );
+
+    cleanup_db(&db_path);
+}
+
+/// C3 (issue #105): a storage failure while listing models during
+/// `Authenticate` must surface as `DaemonResponse::Error` — and must not
+/// consume rate-limit budget. Before the fix, a `list_models` error was
+/// folded into an empty model list, which filtered every stored embedding
+/// out of the device-allowed set, guaranteed "no match", and charged the
+/// user's rate-limit budget: retries walked straight into a silent lockout.
+///
+/// Failure injection: drop the `embedder_model` column from `face_models`
+/// (`label` is pinned by the `UNIQUE(user, label)` constraint). That way
+/// `pre_check`'s `has_models` (a `COUNT(*)`) and the embedding load (id +
+/// embedding only) still succeed, so the request gets past every earlier
+/// gate and exercises exactly the `list_models` call inside
+/// `handle_authenticate`.
+#[test]
+fn authenticate_storage_failure_is_error_and_charges_no_rate_limit() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    let db_path = temp_db_path("storage-failure-auth");
+    cleanup_db(&db_path);
+
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+    config.recognition.timeout_secs = 0;
+    config.security.rate_limit.max_attempts = 1;
+    config.security.require_frame_variance = false;
+    config.security.require_landmark_liveness = false;
+
+    {
+        let store = FaceStore::create(&db_path).unwrap();
+        store
+            .add_model("testuser", "front", &fixtures::known_embedding(0), "")
+            .unwrap();
+    }
+
+    // Corrupt the schema so only `list_models` fails (see doc comment). The
+    // injection — and the migration gating that keeps the handler's own
+    // re-open from healing it — lives in `facelock_test_support::
+    // schema_faults`, shared with facelock-cli's keygen-guard test.
+    facelock_test_support::schema_faults::drop_embedder_model_column(&db_path);
+
+    let factory: MockCameraFactory = Box::new(move |_cfg| Ok(MockCamera::bright(64, 64, 1)));
+
+    let mut handler = Handler::new(
+        config.clone(),
+        MockFaceEngine::no_faces(),
+        FaceStore::create(&db_path).unwrap(),
+        RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        ),
+        facelock_core::types::CameraCaps::default(),
+        Some(factory),
+        None,
+    )
+    .unwrap();
+
+    // The real-authentication intent, which always charges; the diagnostic
+    // carve-out exists only for `facelock test`.
+    let resp = handler.handle_authenticate("testuser".into(), AuthIntent::Authenticate);
+    match resp {
+        DaemonResponse::Error { ref message } => {
+            assert!(
+                message.contains("storage error"),
+                "error must name the storage failure, got: {message}"
+            );
+        }
+        other => panic!(
+            "a storage failure must be reported as Error, never as a no-match \
+             AuthResult; got {other:?}"
+        ),
+    }
+
+    // The part that bites users: the rate-limit counter must be unchanged.
+    // With max_attempts = 1, a single recorded failure would flip this check
+    // to "rate limited" — a fresh look at the same database must still say
+    // "not rate limited".
+    let inspect_store = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect_store.check_rate_limit("testuser", 1, 60).unwrap(),
+        "rate_limit counter must be unchanged by a storage-failure response"
+    );
+
+    cleanup_db(&db_path);
+}
+
+/// D11 (#100): the auth loop wipes the caller's plaintext compare set itself.
+///
+/// The rule used to be caller-side convention — a wrapper in facelock-cli for
+/// the two CLI callers, re-implemented inline in the daemon handler because
+/// the daemon cannot depend on the CLI. Now the callee owns it, so this one
+/// test covers every caller: the daemon handler, `facelock auth`, and direct
+/// mode all hand over a `&mut` buffer and get it back zeroized.
+#[test]
+fn auth_loop_wipes_the_callers_embeddings() {
+    let emb = fixtures::known_embedding(1);
+    let mut camera = MockCamera::bright(64, 64, 4);
+    let mut engine = MockFaceEngine::one_face(emb);
+    let mut config = test_config();
+    config.recognition.threshold = 0.45;
+    config.recognition.timeout_secs = 2;
+    config.security.require_frame_variance = false;
+    config.security.require_landmark_liveness = false;
+
+    let mut stored = vec![(1u32, emb)];
+    let models = vec![legacy_model(1)];
+
+    let response = facelock_daemon::auth::authenticate_with_embeddings(
+        &mut camera,
+        &mut engine,
+        &mut stored,
+        &models,
+        &config,
+        "alice",
+        AuditSource::Test,
+    );
+
+    assert!(
+        matches!(
+            response,
+            AuthOutcome::AuthResult(MatchResult { matched: true, .. })
+        ),
+        "auth loop must run to completion: {response:?}"
+    );
+    for (id, e) in &stored {
+        assert!(
+            e.iter().all(|&v| v == 0.0),
+            "caller-side embedding {id} was not wiped"
+        );
+    }
+}
+
+/// The same wipe on the failure path: a timed-out attempt leaves no plaintext
+/// behind either. The success path returns early from inside the loop, this
+/// one falls out of the bottom — both are covered by the guard, not by a
+/// hand-placed call at each return site.
+#[test]
+fn auth_loop_wipes_the_callers_embeddings_on_failure() {
+    let mut config = test_config();
+    config.recognition.timeout_secs = 1;
+
+    let enrolled = fixtures::known_embedding(3);
+    let presented = fixtures::known_embedding(9);
+    let mut camera = MockCamera::bright(64, 64, 4);
+    let mut engine = MockFaceEngine::one_face(presented);
+    let mut stored = vec![(1u32, enrolled)];
+    let models = vec![legacy_model(1)];
+
+    let response = facelock_daemon::auth::authenticate_with_embeddings(
+        &mut camera,
+        &mut engine,
+        &mut stored,
+        &models,
+        &config,
+        "alice",
+        AuditSource::Test,
+    );
+
+    assert!(
+        matches!(
+            response,
+            AuthOutcome::AuthResult(MatchResult { matched: false, .. })
+        ),
+        "sanity: a different face must not authenticate: {response:?}"
+    );
+    for (id, e) in &stored {
+        assert!(
+            e.iter().all(|&v| v == 0.0),
+            "caller-side embedding {id} was not wiped on the failure path"
+        );
+    }
 }

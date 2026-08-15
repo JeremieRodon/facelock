@@ -7,55 +7,57 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use facelock_camera::quirks::QuirksDb;
-use facelock_camera::{
-    Camera, DeviceInfo, auto_detect_device, is_ir_camera_resolved, list_devices, validate_device,
-};
-use facelock_core::config::DeviceConfig;
+use facelock_camera::{Camera, ResolvedCamera, auto_detect_device, list_devices, validate_device};
 use facelock_core::config::{Config, EncryptionMethod};
-use facelock_core::ipc::DaemonResponse;
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
+use facelock_daemon::auth::AuthOutcome;
+use facelock_daemon::auth::{PreCheckContext, pre_check_audited_with_context};
+use facelock_daemon::enroll::EnrollOutcome;
+use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
-use facelock_store::FaceStore;
+use facelock_store::{FaceStore, StoreError};
 use tracing::debug;
 
+/// Open the face database, applying the state-directory layout first.
+///
+/// This is the single choke point for every direct-mode store access —
+/// `enroll`, `list`, `remove`, `clear`, `test`, `preview` and the marker
+/// refresh all arrive here — which is why the layout hook lives at this layer
+/// rather than being repeated at each command. `daemon`, `auth` and `setup`
+/// keep their own explicit calls: they are cheap, and they document that those
+/// three must not depend on some later store access to fix the modes for them.
+///
+/// A layout failure only means modes could not be set — it cannot change what
+/// is read — so it is logged rather than blocking the caller; unprivileged
+/// callers hit it constantly.
 pub fn open_store(config: &Config) -> anyhow::Result<FaceStore> {
-    FaceStore::open(Path::new(&config.storage.db_path)).context("failed to open database")
+    crate::state_layout::ensure_state_layout_best_effort(config);
+
+    // `create`: first-time `enroll` legitimately brings the database into
+    // being here.
+    FaceStore::create(Path::new(&config.storage.db_path)).context("failed to open database")
 }
 
-#[derive(Clone)]
-struct ResolvedCameraDevice {
-    device: DeviceConfig,
-    device_quirk: Option<facelock_camera::quirks::Quirk>,
-    device_is_ir: bool,
-    device_fingerprint: facelock_core::types::DeviceFingerprint,
+/// Like [`open_store`], but never creates: [`StoreError::Absent`] comes back
+/// as a value instead of an empty database materializing at the path.
+///
+/// This is the constructor for guards and reporters — the call shapes that
+/// need "fresh install" and "cannot read" to be different answers. The typed
+/// error is the point: callers match `Absent` to proceed on "nothing
+/// enrolled" and treat every other class as "cannot tell", without sniffing
+/// message strings.
+pub fn open_store_existing(config: &Config) -> Result<FaceStore, StoreError> {
+    crate::state_layout::ensure_state_layout_best_effort(config);
+    FaceStore::open_existing(Path::new(&config.storage.db_path))
 }
 
-struct OpenedCamera {
-    camera: Camera<'static>,
-    device_is_ir: bool,
-    device_fingerprint: facelock_core::types::DeviceFingerprint,
-}
-
-fn build_resolved_camera_device(
-    config: &Config,
-    device_info: DeviceInfo,
-    quirks: &QuirksDb,
-) -> ResolvedCameraDevice {
-    let mut device = config.device.clone();
-    device.path = Some(device_info.path.clone());
-
-    ResolvedCameraDevice {
-        device_fingerprint: facelock_camera::device_fingerprint(&device_info.path),
-        device_quirk: quirks.find_match(&device_info).cloned(),
-        // Sibling-aware: on multi-node USB cameras only the IR sensor node
-        // counts as IR, not every node sharing the quirk's VID:PID.
-        device_is_ir: is_ir_camera_resolved(&device_info, Some(quirks)),
-        device,
-    }
-}
-
-fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCameraDevice> {
+/// Resolve and interrogate the configured (or auto-detected) camera device
+/// without opening it. The returned [`ResolvedCamera`] carries the caps
+/// (`is_ir`, fingerprint, formats, applied quirks) that used to be threaded
+/// around as loose values — pre-flight gates read `resolved.caps`, and the
+/// camera opened from it carries the very same caps.
+pub(crate) fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCamera> {
     let quirks = QuirksDb::load();
     let device_info = match config.device.path.as_deref() {
         Some(path) => validate_device(path)
@@ -65,20 +67,24 @@ fn resolve_camera_device(config: &Config) -> anyhow::Result<ResolvedCameraDevice
         }
     };
 
-    Ok(build_resolved_camera_device(config, device_info, &quirks))
+    Ok(ResolvedCamera::interrogate(device_info, &quirks))
 }
 
-fn open_camera_context(config: &Config) -> anyhow::Result<OpenedCamera> {
-    let resolved = resolve_camera_device(config)?;
-    let mut camera = Camera::open(&resolved.device, resolved.device_quirk.as_ref())
-        .context("failed to open camera")?;
-
+/// Open an already-resolved camera and discard warmup frames.
+fn open_resolved_camera(
+    config: &Config,
+    resolved: ResolvedCamera,
+) -> anyhow::Result<Camera<'static>> {
     // Discard warmup frames for AGC/AE stabilization.
     // Quirk override takes precedence over config value.
     let warmup = resolved
-        .device_quirk
+        .quirk
+        .as_ref()
         .and_then(|q| q.warmup_frames)
-        .unwrap_or(resolved.device.warmup_frames);
+        .unwrap_or(config.device.warmup_frames);
+    let mut camera = resolved
+        .open(&config.device)
+        .context("failed to open camera")?;
     if warmup > 0 {
         debug!(warmup, "discarding warmup frames");
         for _ in 0..warmup {
@@ -86,16 +92,12 @@ fn open_camera_context(config: &Config) -> anyhow::Result<OpenedCamera> {
         }
     }
 
-    Ok(OpenedCamera {
-        camera,
-        device_is_ir: resolved.device_is_ir,
-        device_fingerprint: resolved.device_fingerprint,
-    })
+    Ok(camera)
 }
 
 /// Open camera with quirks support and warmup frame discarding.
 pub fn open_camera(config: &Config) -> anyhow::Result<Camera<'static>> {
-    Ok(open_camera_context(config)?.camera)
+    open_resolved_camera(config, resolve_camera_device(config)?)
 }
 
 pub fn load_engine(config: &Config) -> anyhow::Result<FaceEngine> {
@@ -106,52 +108,81 @@ pub fn load_engine(config: &Config) -> anyhow::Result<FaceEngine> {
 /// Direct authentication — returns the full match result (including an
 /// internal failure reason when frames matched but a liveness gate blocked).
 ///
-/// This backs `facelock test` only, and it deliberately skips `pre_check`
-/// (rate limiting, `require_ir`, SSH/lid abort), so its audit entries are
-/// stamped `AuditSource::Test`: a success here is a recognition result, not a
-/// policy-approved authentication.
+/// This backs `facelock test` only (root-only, N11/issue #96). It runs the
+/// same pre-flight gates real authentication does — disabled check,
+/// enrollment/`suppress_unknown`, rate-limit *check*, `require_ir` — via
+/// `pre_check_audited_with_context`, except SSH/lid abort, which exist to
+/// stop an *attacker*'s physical-access shortcuts and are explicitly skipped
+/// for `test` via [`PreCheckContext::test`]. A failed attempt here never
+/// consumes the shared rate-limit budget: unlike the daemon and oneshot
+/// paths, this function simply never calls `RateLimiter::record_failure`.
+/// Audit entries are stamped `AuditSource::Test`.
 pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> {
     let store = open_store(config)?;
 
-    if !store.has_models(user).context("storage error")? {
-        return Ok(MatchResult {
-            matched: false,
-            model_id: None,
-            label: None,
-            similarity: 0.0,
-            failure_reason: None,
-        });
+    // Cheap device resolution only (no camera I/O), so a pre-check rejection
+    // never touches the camera. The same resolution is opened below once auth
+    // actually proceeds, so the caps the gates saw are the caps the camera
+    // carries.
+    let resolved = resolve_camera_device(config).context("failed to resolve camera device")?;
+
+    let rl = &config.security.rate_limit;
+    let rate_limiter = RateLimiter::new(rl.max_attempts, rl.window_secs);
+
+    if let Some(resp) = pre_check_audited_with_context(
+        config,
+        &store,
+        user,
+        &rate_limiter,
+        &resolved.caps,
+        AuditSource::Test,
+        PreCheckContext::test(),
+    ) {
+        return match resp {
+            AuthOutcome::AuthResult(mr) => Ok(mr),
+            // `suppress_unknown` short-circuit: no result to report, same as
+            // the plain not-enrolled case below from `test`'s point of view.
+            AuthOutcome::Suppressed => Ok(MatchResult {
+                matched: false,
+                model_id: None,
+                label: None,
+                similarity: 0.0,
+                face_detected: false,
+                failure_reason: None,
+            }),
+            AuthOutcome::Error { message, .. } => bail!("{message}"),
+        };
     }
 
-    let OpenedCamera {
-        mut camera,
-        device_is_ir,
-        device_fingerprint,
-    } = open_camera_context(config)?;
+    let mut camera = open_resolved_camera(config, resolved)?;
     let mut engine = load_engine(config)?;
 
     // Load embeddings with encryption support, matching the daemon handler path.
-    let stored = load_user_embeddings(&store, config, user)?;
-    let models = store.list_models(user).unwrap_or_default();
+    let mut stored = load_user_embeddings(&store, config, user)?;
+    // Same shape as the daemon's `handle_authenticate` (C3): a storage failure
+    // is an error, not an empty model list that guarantees "no match". No
+    // rate-limit charge exists on this path, but the falsehood is the same.
+    let models = store
+        .list_models(user)
+        .context("storage error listing face models")?;
 
     // Shared with daemon mode (crates/facelock-daemon/src/auth.rs). A local copy
     // of this loop previously lived here and silently drifted — do not re-fork it.
+    // It wipes `stored` (D11), so nothing below may read it again.
     let response = facelock_daemon::auth::authenticate_with_embeddings(
         &mut camera,
         &mut engine,
-        &stored,
+        &mut stored,
         &models,
         config,
         user,
-        device_is_ir,
-        &device_fingerprint,
         AuditSource::Test,
     );
 
     match response {
-        DaemonResponse::AuthResult(result) => Ok(result),
-        DaemonResponse::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected auth response"),
+        AuthOutcome::AuthResult(result) => Ok(result),
+        AuthOutcome::Error { message, .. } => bail!("{message}"),
+        AuthOutcome::Suppressed => bail!("unexpected auth response"),
     }
 }
 
@@ -196,8 +227,11 @@ fn init_software_sealer(config: &Config) -> anyhow::Result<Option<facelock_tpm::
     }
 }
 
-/// Load user embeddings, decrypting software-encrypted or TPM-sealed blobs as needed.
-/// Mirrors `Handler::load_user_embeddings` from the daemon path.
+/// Load user embeddings, decrypting software-encrypted or TPM-sealed blobs as
+/// needed. The per-row decrypt is the daemon handler's own implementation
+/// (`facelock_daemon::embeddings`, N10) — a local copy previously lived here
+/// and drifted (B3: it predated `tpm.seal_database` rows, which broke `bench`,
+/// `preview --text-only`, `test` and oneshot on sealed stores).
 pub fn load_user_embeddings(
     store: &FaceStore,
     config: &Config,
@@ -205,53 +239,31 @@ pub fn load_user_embeddings(
 ) -> anyhow::Result<Vec<(u32, facelock_core::types::FaceEmbedding)>> {
     let software_sealer = init_software_sealer(config)?;
 
-    // Fast path: no encryption configured
-    if software_sealer.is_none() {
+    // Fast path: nothing is configured that could have written encrypted rows.
+    // `seal_database` forces the raw path even without a software sealer, so a
+    // TPM-sealed blob is never misread as a raw embedding.
+    if !facelock_daemon::embeddings::needs_raw_rows(config, software_sealer.is_some()) {
         return store
             .get_user_embeddings(user)
             .context("storage error loading embeddings");
     }
 
-    // Slow path: load raw blobs (with device ids for opt-in AAD) and decrypt
-    let sealer = software_sealer.unwrap();
+    // Slow path: load raw blobs (with device ids for opt-in AAD) and decrypt.
+    // The TPM connection is lazy — only made when a TPM-sealed row is present.
     let raw_rows = store
         .get_user_embeddings_raw_with_device(user)
         .context("storage error loading raw embeddings")?;
 
-    let mut results = Vec::with_capacity(raw_rows.len());
-    for (id, blob, sealed, device_id) in &raw_rows {
-        let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
-            let aad = config.security.device_aad(device_id.as_deref());
-            sealer
-                .unseal_embedding_with_aad(blob, aad.as_deref())
-                .with_context(|| format!("software decryption failed for embedding {id}"))?
-        } else if *sealed {
-            #[cfg(feature = "tpm")]
-            {
-                bail!(
-                    "embedding {id} is TPM-sealed but direct path only supports software encryption — use the daemon"
-                );
-            }
-            #[cfg(not(feature = "tpm"))]
-            {
-                bail!("embedding {id} is TPM-sealed but TPM support is not compiled in");
-            }
-        } else {
-            // Plaintext raw embedding
-            anyhow::ensure!(
-                blob.len() == 512 * 4,
-                "invalid raw embedding size for id {id}: expected {} bytes, got {}",
-                512 * 4,
-                blob.len()
-            );
-            let floats: &[f32] = bytemuck::cast_slice(blob);
-            let mut emb = [0f32; 512];
-            emb.copy_from_slice(floats);
-            emb
-        };
-        results.push((*id, embedding));
-    }
-    Ok(results)
+    facelock_daemon::embeddings::decrypt_user_embeddings(
+        &raw_rows,
+        config,
+        software_sealer.as_ref(),
+        facelock_daemon::embeddings::TpmAccess::Lazy {
+            tcti: &config.tpm.tcti,
+            sealer: None,
+        },
+    )
+    .map_err(|message| anyhow::anyhow!(message))
 }
 
 /// Direct enrollment — returns (model_id, embedding_count).
@@ -262,9 +274,10 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
         .map_err(|m| anyhow::anyhow!(m))?;
 
     let store = open_store(config)?;
-    let opened = open_camera_context(config)?;
-    let device_id = opened.device_fingerprint.canonical_for_storage();
-    let mut camera = opened.camera;
+    let mut camera = open_camera(config)?;
+    // The enrolling camera's own identity — asked of the camera that records
+    // the template.
+    let device_id = camera.capabilities().fingerprint.canonical_for_storage();
     let mut engine = load_engine(config)?;
 
     // Initialize sealer if encryption is configured
@@ -286,80 +299,54 @@ pub fn enroll(config: &Config, user: &str, label: &str) -> anyhow::Result<(u32, 
     );
 
     match response {
-        DaemonResponse::Enrolled {
+        EnrollOutcome::Enrolled {
             model_id,
             embedding_count,
         } => Ok((model_id, embedding_count)),
-        DaemonResponse::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected enroll response"),
+        EnrollOutcome::Error { message } => bail!("{message}"),
     }
 }
 
-/// Direct device listing (no daemon needed).
-pub fn list_devices_direct() -> anyhow::Result<()> {
+/// Direct device enumeration (no daemon needed), in the transport shape the
+/// backend seam hands to the renderer.
+///
+/// The quirks DB is consulted so the reported `is_ir` matches the
+/// authoritative decision the auth path makes (e.g. a quirks `force_ir`
+/// camera), with node-level disambiguation for multi-node USB devices.
+/// Formats survive here — the D-Bus `DeviceInfo` type does not carry them
+/// (`BackendCaps::device_formats`).
+pub fn list_devices_info() -> anyhow::Result<Vec<facelock_core::ipc::IpcDeviceInfo>> {
     let devices = list_devices().context("failed to enumerate devices")?;
-
-    if devices.is_empty() {
-        println!("No video devices found.");
-        return Ok(());
-    }
-
-    // Consult the quirks DB so the displayed [IR] tag matches the authoritative
-    // decision the auth path makes (e.g. a quirks `force_ir` camera), with
-    // node-level disambiguation for multi-node USB devices.
     let quirks = facelock_camera::QuirksDb::load();
     let sources = facelock_camera::classify_ir_sources(&devices, Some(&quirks));
-    println!("Available video devices:\n");
-    for (dev, source) in devices.iter().zip(&sources) {
-        let ir_tag = if *source != facelock_camera::IrSource::None {
-            " [IR]"
-        } else {
-            ""
-        };
-        println!("  {}{ir_tag}", dev.path);
-        println!("    Name:    {}", dev.name);
-        println!("    Driver:  {}", dev.driver);
-
-        if !dev.formats.is_empty() {
-            println!("    Formats:");
-            for fmt in &dev.formats {
-                let sizes: Vec<String> =
-                    fmt.sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect();
-                println!(
-                    "      {} ({}) — {}",
-                    fmt.fourcc.trim(),
-                    fmt.description,
-                    if sizes.is_empty() {
-                        "no sizes reported".to_string()
-                    } else {
-                        sizes.join(", ")
-                    }
-                );
-            }
-        }
-        println!();
-    }
-
-    Ok(())
+    Ok(devices
+        .iter()
+        .zip(&sources)
+        .map(|(dev, source)| facelock_core::ipc::IpcDeviceInfo {
+            path: dev.path.clone(),
+            name: dev.name.clone(),
+            driver: dev.driver.clone(),
+            is_ir: *source != facelock_camera::IrSource::None,
+            formats: dev
+                .formats
+                .iter()
+                .map(|f| facelock_core::ipc::IpcFormatInfo {
+                    fourcc: f.fourcc.clone(),
+                    description: f.description.clone(),
+                    sizes: f.sizes.clone(),
+                })
+                .collect(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use facelock_camera::FormatInfo;
+    use facelock_camera::{DeviceInfo, FormatInfo};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_config() -> Config {
-        Config::parse(
-            r#"
-[device]
-warmup_frames = 2
-"#,
-        )
-        .unwrap()
-    }
 
     fn make_device(path: &str, name: &str, fourcc: &str) -> DeviceInfo {
         DeviceInfo {
@@ -388,8 +375,7 @@ warmup_frames = 2
 
     #[test]
     fn auto_detected_device_inherits_quirk_state() {
-        let config = test_config();
-        let device = make_device("/dev/video2", "Logitech BRIO IR", "MJPG");
+        let device = make_device("/dev/video2", "BRIO IR", "GREY");
         let dir = write_quirks_dir(
             r#"
 [[quirk]]
@@ -401,12 +387,13 @@ warmup_frames = 9
         let mut quirks = QuirksDb::default();
         quirks.load_dir(&dir);
 
-        let resolved = build_resolved_camera_device(&config, device, &quirks);
+        let resolved = ResolvedCamera::interrogate(device, &quirks);
 
-        assert_eq!(resolved.device.path.as_deref(), Some("/dev/video2"));
-        assert!(resolved.device_is_ir);
+        assert_eq!(resolved.info.path, "/dev/video2");
+        assert!(resolved.caps.is_ir);
+        assert_eq!(resolved.caps.applied_quirks.len(), 1);
         assert_eq!(
-            resolved.device_quirk.as_ref().and_then(|q| q.warmup_frames),
+            resolved.quirk.as_ref().and_then(|q| q.warmup_frames),
             Some(9)
         );
 
@@ -415,15 +402,84 @@ warmup_frames = 9
 
     #[test]
     fn unmatched_device_keeps_default_warmup_and_non_ir_state() {
-        let config = test_config();
         let device = make_device("/dev/video3", "USB Camera", "MJPG");
         let quirks = QuirksDb::default();
 
-        let resolved = build_resolved_camera_device(&config, device, &quirks);
+        let resolved = ResolvedCamera::interrogate(device, &quirks);
 
-        assert_eq!(resolved.device.path.as_deref(), Some("/dev/video3"));
-        assert_eq!(resolved.device.warmup_frames, 2);
-        assert!(!resolved.device_is_ir);
-        assert!(resolved.device_quirk.is_none());
+        assert_eq!(resolved.info.path, "/dev/video3");
+        assert!(!resolved.caps.is_ir);
+        // No quirk match: `open_resolved_camera` falls back to the config's
+        // own warmup_frames.
+        assert!(resolved.quirk.is_none());
+        assert!(resolved.caps.applied_quirks.is_empty());
+    }
+
+    // --- N8: encrypted-store loading in the direct path ---
+
+    #[test]
+    fn load_user_embeddings_decrypts_software_sealed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("facelock.key");
+        let config = Config::parse(&format!(
+            "[encryption]\nmethod = \"keyfile\"\nkey_path = \"{}\"\n",
+            key_path.display()
+        ))
+        .unwrap();
+
+        facelock_tpm::SoftwareSealer::generate_key_file(&key_path).unwrap();
+        let sealer = facelock_tpm::SoftwareSealer::from_key_file(&key_path).unwrap();
+        let emb: facelock_core::types::FaceEmbedding = [0.25; 512];
+        let blob = sealer.seal_embedding(&emb).unwrap();
+
+        let store = FaceStore::open_memory().unwrap();
+        store
+            .add_model_raw("alice", "front", &blob, true, "embedder")
+            .unwrap();
+
+        let loaded = load_user_embeddings(&store, &config, "alice").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, emb);
+    }
+
+    /// B3: a TPM-sealed row (version byte 0x01, written under
+    /// `tpm.seal_database`) must reach the TPM unseal path — never be misread
+    /// as a raw embedding via the fast path. Without the `tpm` feature the
+    /// passthrough sealer reports a clear "without TPM support" error; actual
+    /// hardware unsealing cannot be asserted in CI and is exercised only on a
+    /// machine with a TPM.
+    #[cfg(not(feature = "tpm"))]
+    #[test]
+    fn tpm_sealed_rows_error_clearly_without_tpm_support() {
+        let config =
+            Config::parse("[encryption]\nmethod = \"none\"\n\n[tpm]\nseal_database = true\n")
+                .unwrap();
+        let store = FaceStore::open_memory().unwrap();
+        let mut blob = vec![0x01u8];
+        blob.extend_from_slice(&[0u8; 64]);
+        store
+            .add_model_raw("alice", "front", &blob, true, "embedder")
+            .unwrap();
+
+        let err = load_user_embeddings(&store, &config, "alice").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("TPM unseal failed for embedding"), "{chain}");
+        assert!(chain.contains("without TPM support"), "{chain}");
+    }
+
+    /// `seal_database` forces the raw-row path even with no software sealer;
+    /// plaintext rows stored before sealing was enabled must still load.
+    #[test]
+    fn seal_database_slow_path_still_loads_plaintext_rows() {
+        let config =
+            Config::parse("[encryption]\nmethod = \"none\"\n\n[tpm]\nseal_database = true\n")
+                .unwrap();
+        let store = FaceStore::open_memory().unwrap();
+        let emb: facelock_core::types::FaceEmbedding = [0.75; 512];
+        store.add_model("alice", "front", &emb, "embedder").unwrap();
+
+        let loaded = load_user_embeddings(&store, &config, "alice").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, emb);
     }
 }

@@ -17,6 +17,9 @@ Stable contracts. Do not change without updating this document.
 | `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, enrollment, PAM); also manages `facelock` group membership (creates the group if missing, adds the invoking user) |
 | `facelock setup --systemd` | Install/enable systemd units |
 | `facelock setup --pam` | Install PAM module to `/etc/pam.d/` |
+| `facelock setup` choice flags | `--camera <PATH\|auto>`, `--models <standard\|balanced\|high>`, `--execution-provider <cpu\|cuda\|rocm\|openvino\|auto>`, `--encryption <tpm\|keyfile\|none\|auto>`. Precedence: CLI flag > config file > built-in default |
+| `facelock setup` action opt-outs | `--no-pam`, `--no-systemd`, `--no-enroll` decline an action outright (and their `--pam`/`--systemd`/`--enroll` counterparts force it). Later flag wins |
+| `facelock is-enrolled` | Report whether face auth is operational for a user. Exit code is the contract; no daemon activation, no camera. Requires `facelock` group membership to answer `enrolled` — a caller outside the group reports `not-enrolled`, which is correct: the group is required to reach the daemon at all |
 | `facelock enroll` | Capture and store a face |
 | `facelock test` | Test face recognition |
 | `facelock list` | List enrolled face models |
@@ -39,6 +42,130 @@ Stable contracts. Do not change without updating this document.
 | `facelock bench` | Benchmarks |
 | `facelock restart` | Restart daemon |
 
+### facelock setup Flag Composition
+
+Flags **compose**; they are not mutually exclusive. The rule:
+
+- `--pam` and/or `--systemd` **on their own** perform just that action and touch
+  nothing else. This preserves the historical standalone meaning, including
+  `--pam --service <name>`, `--pam --remove`, and `--systemd --disable`.
+- Any flag that only makes sense while the base setup runs — `--non-interactive`,
+  a choice flag, or any of `--no-pam` / `--no-systemd` / `--enroll` / `--no-enroll`
+  — forces the base setup to run, and the requested actions run **in addition**.
+
+Consequently `setup --systemd --pam` now runs both (it previously dropped
+`--pam`), and `setup --non-interactive --pam` now runs the base setup plus PAM
+(it previously dropped `--non-interactive`). Both were silent flag drops.
+`--remove` and `--service` require `--pam`, and `--disable` requires `--systemd`,
+so a dropped flag is now a parse error rather than silence.
+
+Supplying a choice flag suppresses the corresponding wizard step. `auto` means
+"re-derive from hardware", **not** "use the default" — omitting the flag already
+gives the default. Under `--non-interactive`, an unresolvable choice is an error,
+never a prompt.
+
+### CLI Privilege Model (DEC-6)
+
+The CLI is root by default: every subcommand requires root except the four
+listed below, which are unprivileged by design, not by omission.
+
+| Command | Why unprivileged |
+|---------|-------------------|
+| `facelock is-enrolled` | Answers from the caller's own `0600` marker file; the unprivileged integration point (see Exit Codes above). Never probes D-Bus |
+| `facelock hyprlock …` | Edits the user's own dotfile — root would write root-owned files into `$HOME`, which is wrong, not just unnecessary |
+| `facelock config` (display, no `--edit`) | Reads a `0644` file |
+| `--help`, `--version` | — |
+
+Every other command requires root. Two escalation behaviors apply, and each
+command uses exactly one:
+
+- **Interactive prompt.** `setup`, `enroll`, `test`, `preview`, `bench`,
+  `encrypt`, `decrypt`, `tpm`, `reseal`, `restart`, `config --edit`, `remove`,
+  `clear`, `list`, `status`, `devices`. Run as non-root with a TTY attached,
+  these ask `Root required. Re-run with sudo? [Y/n]` and re-exec via `sudo`
+  on yes. Run as non-root with no TTY (scripted, piped, or closed stdin),
+  they hard-error instead — `Root required.\n  Run: sudo facelock <cmd>` —
+  rather than hang waiting for input that will never arrive
+  (`ipc_client::require_root`).
+- **Hard error only.** `facelock audit` (and `facelock daemon`, whose own
+  root check predates this table) never offer the interactive prompt at all,
+  even with a TTY attached — both are typically invoked non-interactively or
+  as a long-running service, where a stray confirmation prompt is a hang, not
+  a convenience (`ipc_client::require_root_scripted`).
+
+`facelock auth` is not user-facing — PAM spawns it directly, and it is not
+part of this table.
+
+**Ordering guarantee (C6).** Every command that prompts for confirmation or
+runs an interactive question runs its root check **first**, before that
+prompt or any other output or side effect. `remove` and `clear` both ask a
+Y/N confirmation before deleting a face model; historically `remove`'s root
+check ran *after* that confirmation, so a facelock-group member (who lacks
+root) would confirm a destructive action and only then discover it was
+refused — this is fixed. The same ordering applies to `status`, `devices`,
+`preview`, `test`, `audit`, `bench`, and `config --edit`: the root check is
+the first statement in each command's entry point, before `Config::load()`
+or any `println!`.
+
+**AccessDenied hint.** A D-Bus `AccessDenied` reply carries an actionable
+hint (`ipc_client::add_access_denied_hint`) that distinguishes two causes: the
+daemon's own `require_root` rejection (most methods now, since almost every
+D-Bus method is root-only — see IPC Protocol below) gets a root-specific
+hint; a bus-policy rejection (caller is neither root nor in the `facelock`
+group) gets the group-membership hint. Telling a root-only rejection to
+"join the facelock group" is wrong — joining the group does not grant root.
+
+### facelock test Semantics (N11)
+
+`facelock test` is root-only (issue #96) and, being root, keeps full detail
+on both transports: on the daemon transport, `AuthResult.similarity` is
+redacted to non-root D-Bus callers only (`redact_similarity_unless_root`) —
+since `test` requires root, it always gets the real score. The direct
+transport never redacts.
+
+**`test` is a separate D-Bus method, not a privileged flavor of
+`Authenticate`.** On the daemon transport `facelock test` calls the
+root-only **`TestAuthenticate`** method; `Authenticate` is real
+authentication only. The daemon does not infer which it is serving from the
+caller's UID, and must not: `pam_facelock` runs inside the PAM stack of the
+authenticating program, and `sudo` is setuid-root — as are `login`, `su`,
+and root-run display-manager greeters — so a real failed face
+authentication at a `sudo` prompt reaches the daemon as UID 0. A design that
+exempted root callers from rate-limit consumption therefore left the limit
+inert on the primary documented PAM target. Intent travels with the method
+call instead (`AuthIntent` in `facelock_daemon::handler`).
+
+Both entry points run the same pre-flight gates — `security.disabled`,
+enrollment / `suppress_unknown`, the rate-limit check, and `require_ir` —
+via `facelock_daemon::auth::pre_check_audited*`. `TestAuthenticate` differs
+in exactly two documented ways:
+
+1. **The `abort_if_ssh` / `abort_if_lid_closed` gates are skipped**
+   (`PreCheckContext::test()`). Those two exist to stop an *attacker*'s
+   physical-access shortcuts, not to block an admin who is already root (by
+   construction, since `test` requires root) and is deliberately diagnosing
+   recognition over SSH or with the lid closed on a docked laptop. This is a
+   context flag threaded through `pre_check`, not a parallel copy of the gate
+   logic (issue #95 was exactly that kind of drift). It applies identically
+   on the direct transport, which calls `pre_check_audited_with_context`
+   directly — the two transports no longer diverge here, as they did while
+   `test` had no daemon-side method of its own to carry the context.
+2. **A failed attempt consumes no rate-limit budget.** The direct transport
+   gets this structurally (`direct::authenticate` never calls
+   `RateLimiter::record_failure`); the daemon transport gets it because
+   `TestAuthenticate` is the entry point that does not charge. Root-only is
+   what makes a budget-free authentication endpoint safe to offer at all —
+   root already owns the database and can clear the limiter directly, so
+   exempting *consumption* for it costs nothing.
+
+`Authenticate` always charges a failed attempt, on every transport and for
+every caller including root.
+
+The rate-limit *check* (whether `user` is already over budget) is unaffected
+by any of the above and still runs on both methods and both transports: an
+already-limited user's `test` run reports "rate limited", exactly like real
+auth would — surfacing an existing lockout instead of masking it.
+
 ## Operating Modes
 
 | Mode | Config | PAM Behavior | CLI Behavior |
@@ -47,6 +174,30 @@ Stable contracts. Do not change without updating this document.
 | Oneshot | `daemon.mode = "oneshot"` | Spawns `facelock auth` | Operates directly (no daemon) |
 
 The CLI silently falls back to direct mode when the daemon is not available on D-Bus, regardless of config mode.
+
+### facelock is-enrolled Exit Codes
+
+The exit code **is** the contract — `is-enrolled` is designed to drop into a
+shell one-liner, so integrations should branch on the status, not parse stdout.
+The name follows systemd's `is-*` family (`systemctl is-active`, `is-enabled`),
+which is the established idiom for a boolean query whose exit code is the answer;
+the codes themselves match `grep`'s 0 = match / 1 = no match / 2 = error.
+
+| Code | Meaning |
+|------|---------|
+| 0 | User has a usable enrollment |
+| 1 | Not enrolled / not usable (includes an unreadable or absent marker) |
+| 2 | Error — bad arguments, or a marker that exists but cannot be parsed |
+
+Default stdout is `enrolled` / `not-enrolled` — the state word, as `systemctl
+is-active` prints `active`. `--quiet` suppresses stdout and leaves only the exit
+code. `--json` emits `{"enrolled": bool, "models": N, "updated": "<ISO8601>"}`.
+
+`is-enrolled` answers from `/var/lib/facelock/enrolled/<user>` alone. It never
+activates the daemon over D-Bus, never opens a camera, and never reads the
+database — so it is safe to call repeatedly from a lock screen as an
+unprivileged user. The marker is a hint that can drift from the database; **PAM
+at auth time remains authoritative** and nothing in the auth path consults it.
 
 ### facelock auth Exit Codes
 
@@ -61,21 +212,75 @@ The CLI silently falls back to direct mode when the daemon is not available on D
 | Path | Owner | Mode | Purpose |
 |------|-------|------|---------|
 | `/etc/facelock/config.toml` | root:root | 644 | Configuration |
-| `/var/lib/facelock/facelock.db` | root:facelock | 640 | Face embeddings |
-| `/var/lib/facelock/models/` | root:root | 755 | ONNX models |
-| `/var/log/facelock/audit.jsonl` | root:facelock | 640 | Structured audit log |
-| `/var/log/facelock/snapshots/` | root:facelock | 750 | Auth snapshots |
+| `/var/lib/facelock/` | root:facelock | 710 | State dir. Traverse-only for the `facelock` group, nothing for anyone else: a group member can open a path it knows by name but cannot list the directory, and users outside the group reach nothing below this point |
+| `/var/lib/facelock/facelock.db` | root:root | 600 | Face embeddings. Read by the daemon (root) only; the `facelock` group requests authentication through the daemon, it does not read templates |
+| `/var/lib/facelock/models/` | root:root | 755 | ONNX models — public, SHA256-verified downloads; the `710` parent is the gate |
+| `/var/lib/facelock/enrolled/` | root:facelock | 710 | Enrollment markers; group-traversable but not listable |
+| `/var/lib/facelock/enrolled/<user>` | \<user\>:\<user\> | 600 | `{"models": N, "updated": "<ISO8601>"}` — a hint for `is-enrolled`, never authoritative |
+| `/var/log/facelock/` | root:root | 700 | Log dir — per-user auth history and raw face snapshots are root-only |
+| `/var/log/facelock/audit.jsonl` | root:root | 600 | Structured audit log |
+| `/var/log/facelock/snapshots/` | root:root | 700 | Auth snapshots (raw face images) |
 | `/usr/bin/facelock` | root:root | 755 | CLI binary |
 | `/lib/security/pam_facelock.so` | root:root | 755 | PAM module |
 
 All paths overridable via config. `FACELOCK_CONFIG` is honored for unprivileged processes, but privileged PAM/root auth flows ignore the environment and use either an explicit `--config` path or `/etc/facelock/config.toml`.
 Runtime-created DB sidecars (`-wal`, `-shm`), audit logs, and snapshots are created with explicit restrictive modes. The packaged systemd unit also sets `UMask=0027`.
 
+#### One gate at the top
+
+The state directory is `0710 root:facelock`: no permission bits for "other"
+at all, and traverse-only for the `facelock` group. That single gate is what
+protects everything below it — a local user outside the group cannot reach
+the database, the markers, or even the world-readable models, whatever their
+own modes say. Every entry below the gate is still locked down in its own
+right (`0600` database, `0710` markers directory) as defense in depth;
+`models/` is the one entry that carries "other" bits of its own, because its
+contents are public, SHA256-verified downloads.
+
+The `facelock` group is a **D-Bus access grant, not a file-read grant**: a
+member can request authentication through the daemon and open its own
+enrollment marker by name, but cannot list the state directory or read the
+database. D-Bus is therefore required for user-run screen lockers
+(hyprlock/swaylock) — their PAM stack runs as the user, and no group
+membership makes the `0600 root:root` database or encryption key readable.
+Root-invoked PAM (`sudo`, `login`, `sshd`) can also use the oneshot fallback,
+which reads the files directly as root.
+
+Known residual: a group member can `stat` a path it can guess by name —
+`facelock.db` (size, mtime) or `enrolled/<user>` (existence) — because
+traversal permits exactly that. Closing it would mean denying the group the
+traversal that `is-enrolled` and model loading depend on. Accepted.
+
+#### Contract change: permissions tightened (no paths moved)
+
+The default paths are unchanged — the database stays at
+`/var/lib/facelock/facelock.db` and the models at `/var/lib/facelock/models`;
+**no data moves on upgrade**. What changed are modes and ownership, recorded
+here per the repo rule that path and permission contracts live in this file:
+
+| Path | Was | Now |
+|------|-----|-----|
+| `/var/lib/facelock/` | 750 root:facelock | 710 root:facelock |
+| `/var/lib/facelock/facelock.db` (+`-wal`/`-shm`) | 640 root:facelock | 600 root:root |
+| `/var/lib/facelock/models/` | 755 root:root | 755 root:root (unchanged) |
+| `/var/lib/facelock/enrolled/` | — (new) | 710 root:facelock |
+| `/var/log/facelock/` | 750 root:facelock | 700 root:root |
+| `/var/log/facelock/audit.jsonl` | 640 root:facelock | 600 root:root |
+| `/var/log/facelock/snapshots/` | 750 root:facelock | 700 root:root |
+
+The group loses direct reads of the database, the audit log (per-user auth
+history) and the snapshots (raw face images) — all strictly more sensitive
+than anything the group needs, since every group operation goes through the
+daemon. For an existing install the entire on-disk change is a `chmod`/`chown`
+of the paths above plus `mkdir enrolled/` — idempotent, applied by packaging
+(tmpfiles, install scriptlets) and re-applied by any root invocation of the
+binary; none of it touches the data itself.
+
 ### Audit Log Entries
 
 `audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
 
-`source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (direct-mode `facelock test`, which runs the recognition loop in-process). It records the **enforcement path, not the caller's intent**: `facelock test` against a running daemon goes through `Authenticate` and is logged as `daemon`, because it runs the full `pre_check` gates (rate limiting, `require_ir`, SSH/lid abort) and its failures count against the rate limit. Only `test` skips those gates, so a `success` stamped `test` is a recognition result, not a policy-approved authentication. The field is absent on entries written before it existed.
+`source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (`facelock test`, on either transport: the daemon's `TestAuthenticate` method or the in-process direct loop). It records the **enforcement path, not the caller's identity**: `daemon` and `oneshot` are fully-enforced authentications whose failures count against the rate limit, while `test` skips the SSH/lid physical-presence gates and charges nothing. So a `success` stamped `test` is a recognition result, not a policy-approved authentication — and a real authentication is never stamped `test`, whatever privilege its caller holds. The field is absent on entries written before it existed.
 
 ## Config Schema
 
@@ -140,13 +345,19 @@ session and replays `PolicyPCR` — so a changed bound PCR makes unseal **fail**
 When `device.path` is omitted:
 1. Enumerate `/dev/video0` through `/dev/video63`
 2. Filter to VIDEO_CAPTURE devices
-3. Classify every node's IR provenance (quirks `force_ir` authoritative; name
-   token / format-corroboration heuristic otherwise), with node-level
-   disambiguation for multi-node USB devices: when several nodes share one
-   quirk-matched VID:PID and at least one has an IR-like format (GREY/Y16 or
-   the quirk's `format_preference`), only the format-bearing node(s) are IR
+3. Classify every node's IR provenance from queried evidence: a quirks
+   `force_ir` match (authoritative by USB vendor:product ID; a name-only match
+   only when corroborated by a real USB identity or the node's own mono-format
+   evidence), otherwise a node whose queried formats are mono-only/IR-typical
+   (GREY/Y8/Y10/Y12/Y16, with no color format mixed in). The device name never
+   classifies a node on its own. Node-level disambiguation for multi-node USB
+   devices: when several nodes share one quirk-matched VID:PID and at least one
+   has an IR-like format (GREY/Y16 or the quirk's `format_preference`), only the
+   format-bearing node(s) are IR
 4. Prefer a quirks-confirmed IR node with a native IR format, then any
-   quirks-confirmed IR node, then a name-token IR node
+   quirks-confirmed IR node, then an evidence-classified IR node (breaking ties
+   toward one whose name also carries an `ir`/`infrared` token — a hint only,
+   never a promotion of a node that lacks format evidence)
 5. Fall back to first available device
 
 ## Database Schema
@@ -194,35 +405,38 @@ The daemon registers on the system bus via D-Bus activation.
 - **Interface**: `org.facelock.Daemon`
 
 ### Methods
-`Authenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
+`Authenticate`, `TestAuthenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
 
-Method authorization contract:
-- `Authenticate`, `ListModels`, `PreviewDetectFrame`: root or the matching Unix user.
-- `Enroll`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `Shutdown`: root only.
-- `ReleaseCamera`: root or the Unix user that owns the active preview camera session.
-- `ListDevices`, `Ping`: resolve caller UID before replying and rely on the system bus policy for admission control.
+Method authorization contract (updated under DEC-6/N13 — the CLI's
+root-by-default privilege map left no unprivileged consumer for most of
+these, so tightening them to root-only closes the per-frame similarity
+hill-climbing oracle by construction rather than by redacting fields):
+- `Authenticate`: root or the matching Unix user. The one user-scoped method
+  — screen lockers run their PAM stack as the user, so this is architecture,
+  not policy. It is **real authentication**: a failed attempt always
+  consumes rate-limit budget, whatever the caller's UID.
+- `TestAuthenticate`: **root only.** Same arguments and same `AuthResult`
+  reply as `Authenticate`, and the same gates except that it skips the
+  SSH/lid physical-presence aborts and charges no rate-limit budget on
+  failure (see "facelock test Semantics" above). It exists so the daemon
+  never has to infer a caller's purpose from their privilege; root-only is
+  what makes a budget-free endpoint safe to expose.
+- Every other method — `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`,
+  `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`,
+  `Ping`, `Shutdown` — is root only. The bus policy
+  (`dbus/org.facelock.Daemon.conf`) stays interface-scoped (grants send
+  access to root and the `facelock` group for the whole interface, so adding
+  a method needs no policy edit); the per-method root/user-scoped decision is
+  the in-daemon check on the caller UID from `GetConnectionUnixUser`, keyed
+  by a table-driven scope (`authorize_method` in `facelock_daemon::server`)
+  so a new method is root-only by default until deliberately opened up.
 
-Raw camera frames require privilege. `PreviewFrame` remains root-only.
-`PreviewDetectFrame` returns the `jpeg_data` frame bytes to root
-unconditionally; a non-root caller receives them **only** after an
-interactive polkit authorization for the action
-**`org.facelock.preview-frames`** (shipped in `dbus/org.facelock.policy`,
-installed to `/usr/share/polkit-1/actions/org.facelock.policy`; defaults
-`allow_any=no`, `allow_inactive=no`, `allow_active=auth_self_keep`). The
-daemon checks the caller via
-`org.freedesktop.PolicyKit1.Authority.CheckAuthorization` (subject = the
-caller's unique bus name, `AllowUserInteraction=true`); the first frame
-request triggers the caller's polkit agent prompt. While unauthorized —
-denied, prompt pending, polkit unreachable, or any D-Bus error — the daemon
-**fails closed**: `jpeg_data` is empty and the caller receives detection and
-recognition metadata (bounding boxes, confidence, similarity, recognized)
-only.
-
-The polkit verdict is cached per caller **connection** (keyed by unique bus
-name): granted verdicts for at most 120 s, denied/errored verdicts for 15 s,
-and every cached verdict dies when the caller's bus connection closes
-(whichever comes first). Clients that want frames across a preview session
-must therefore keep one D-Bus connection open for the whole session.
+Raw camera frames require privilege. Both `PreviewFrame` and
+`PreviewDetectFrame` are root-only, so a non-root caller is denied with
+`AccessDenied` before either method touches the camera. On top of that
+denial the daemon strips `jpeg_data` from any non-root reply, so raw
+camera/IR imagery cannot reach an unprivileged caller even if the
+authorization table were ever to regress.
 
 Method timeouts: `Enroll` runs synchronously inside the method call for up to
 `Config::enroll_timeout_secs()` seconds server-side (`3 × max(recognition.timeout_secs, 5)`
@@ -236,21 +450,22 @@ Enrollment behavior is mode-independent: oneshot (`facelock enroll` in direct
 mode) and the daemon's `Enroll` method run the same capture loop, so the
 quality gate and the angle-diversity check apply in both.
 
-Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and
-`PreviewDetectFrame` are serialized by an in-flight capture guard. While one
-capture is in progress, a concurrent call to any of these methods fails
-**immediately** with an `org.freedesktop.DBus.Error.Failed` error whose
-message contains `daemon busy` (no queuing on the internal handler lock).
+Capture concurrency: `Authenticate`, `TestAuthenticate`, `Enroll`,
+`PreviewFrame`, and `PreviewDetectFrame` are serialized by an in-flight
+capture guard. While one capture is in progress, a concurrent call to any of
+these methods fails **immediately** with an
+`org.freedesktop.DBus.Error.Failed` error whose message contains `daemon
+busy` (no queuing on the internal handler lock).
 Clients (PAM included) must treat this like any other daemon error — degrade
 to the next auth mechanism (password), never a lockout.
 
 ### Signals
-- `AuthAttempted(user: s, matched: b)` — emitted after each authentication
-  attempt. The payload intentionally carries **no similarity score** (the raw
-  biometric score is an information leak / spoof-tuning oracle). The system
-  bus policy (`dbus/org.facelock.Daemon.conf`) denies signal reception from
-  the daemon by default; only root and members of the `facelock` group may
-  receive it.
+- `AuthAttempted(user: s, matched: b)` — emitted after each camera-backed
+  attempt, from `Authenticate` and `TestAuthenticate` alike. The payload
+  intentionally carries **no similarity score** (the raw biometric score is
+  an information leak / spoof-tuning oracle). The system bus policy
+  (`dbus/org.facelock.Daemon.conf`) denies signal reception from the daemon
+  by default; only root and members of the `facelock` group may receive it.
 
 ### Response types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`
@@ -260,20 +475,60 @@ to the next auth mechanism (password), never a lockout.
 ### Authenticate error encoding
 
 `Authenticate` returns `AuthResult (matched: b, model_id: i, label: s, similarity: d)`.
+`TestAuthenticate` returns the same type with the same sentinels — one
+encoding, so the two cannot drift.
 Sentinel `model_id` values (only meaningful with `matched == false`):
 
 | model_id | Meaning |
 |----------|---------|
 | >= 0 | Matched model id (with `matched == true`) |
-| -1 | No match / no enrolled faces |
+| -1 | No match, and no face was detected (also: no enrolled faces, and the pre-camera gates) |
 | -2 | Recoverable daemon error; `label` carries the error message (rate limited, IR required, camera/storage failure) |
 | -3 | Suppressed: no enrolled models and `security.suppress_unknown = true` |
+| -4 | No match, and the detector **did** see a face |
 
 Recoverable errors travel **in-band** (model_id `-2`), not as D-Bus errors, so
 clients can distinguish "the daemon decided auth cannot proceed" from "the
 daemon is unavailable". D-Bus errors remain for authorization failures,
 daemon-busy, and transport problems. In particular, a rate-limited state is a
 daemon decision and must never make the PAM client retry via a root oneshot.
+
+`-4` exists because `similarity` cannot carry "was a face seen?": the score is
+redacted to `0.0` for every non-root caller, so a user-run locker (hyprlock)
+could not tell a genuine face-seen non-match from an empty frame and abstained
+(`PAM_IGNORE`) for both. It is a *detector* signal — a face was present, never
+how close it came to an enrolled template — so unlike `similarity` it is not a
+hill-climbing oracle and is not redacted.
+
+A PAM module older than `-4` decodes it as an ordinary non-match (its sentinel
+match falls through to the same arm as `-1`), so a daemon newer than the
+installed module degrades to the previous behavior rather than breaking. In the
+other direction, a `-1` reply carries no face-seen signal at all, and the module
+falls back to the score test it used before.
+
+### Rejection classes (`AuthOutcome::Error`)
+
+The class of a rejection is carried as a type
+(`facelock_daemon::auth::ErrorKind`), not inferred from its message. The audit
+`result` label, the oneshot exit code, and the message itself all derive from
+it; `ErrorKind::render` is the only place any of these sentences is written.
+The wire has no field for the class, so the CLI's D-Bus client reconstructs it
+with `ErrorKind::classify`, the exact inverse of `render`.
+
+Two rendered messages are **frozen protocol** because the PAM module
+substring-matches them to choose its return code, and it cannot link the daemon
+crate to share the type (its dependency ceiling is libc/toml/serde/zbus):
+
+| Substring PAM matches | Class | PAM code |
+|---|---|---|
+| `rate limited` | `RateLimited` | `PAM_AUTH_ERR` |
+| `IR camera required` | `IrRequired` | `PAM_IGNORE` |
+
+Changing either string is a protocol break. They are pinned byte-exactly in
+`crates/facelock-daemon/src/auth.rs` (renderer) and
+`crates/facelock-daemon/tests/server_authz.rs` (wire), and every class's
+message, audit label and exit code are pinned together in
+`crates/facelock-cli/src/commands/auth.rs`.
 
 ### Daemon peer verification (PAM client)
 
@@ -288,7 +543,8 @@ the module falls through (oneshot fallback / password), never `PAM_SUCCESS`.
 | Outcome | PAM Code |
 |---------|----------|
 | Face matched | `PAM_SUCCESS` (0) |
-| No match | `PAM_AUTH_ERR` (7) |
+| No match, face seen (model_id -4) | `PAM_AUTH_ERR` (7) |
+| No match, no face seen (model_id -1) | `PAM_IGNORE` (25) |
 | Rate limited (daemon, model_id -2) | `PAM_AUTH_ERR` (7) — no oneshot fallback |
 | IR required / internal daemon error (model_id -2) | `PAM_IGNORE` (25) — no oneshot fallback |
 | Suppressed (model_id -3) | `PAM_AUTHINFO_UNAVAIL` (9) |
@@ -347,11 +603,16 @@ treats a decline as a fall-through to another agent or as an outright denial.
 | Minimum auth frames (= variance window size) | `security.min_auth_frames` | 3 |
 | Frame variance default const | `DEFAULT_FRAME_VARIANCE_MAX_SIMILARITY` | 0.985 |
 
-IR classification requires a whole `ir`/`infrared` name token or a quirks `force_ir`
-entry; a GREY/Y16 format alone is not treated as IR. A `force_ir` quirk is
-device-level ("this USB device has an IR sensor"): when the device exposes multiple
-capture nodes and at least one has an IR-like format, only the format-bearing
-node(s) classify IR (see `docs/security.md` §A). Frame variance is passive
+IR classification is derived from queried device evidence: a node is IR when its
+enumerated pixel formats are mono-only/IR-typical (GREY/Y8/Y10/Y12/Y16, with no
+color format mixed in), or when a quirks `force_ir` entry matches (authoritative
+by USB vendor:product ID; a name-only match requires corroborating format
+evidence or a real USB identity). The free-text device name never classifies a
+device on its own, and a GREY/Y16 format offered *alongside* a color format is
+not treated as IR. A `force_ir` quirk is device-level ("this USB device has an
+IR sensor"): when the device exposes multiple capture nodes and at least one has
+an IR-like format, only the format-bearing node(s) classify IR (see
+`docs/security.md` §A). Frame variance is passive
 anti-photo only (does not stop video replay); it is evaluated over a sliding window
 of the most recent `min_auth_frames` matched frames (see `docs/security.md` §B), with
 a 0.985 cutoff rejecting truly static input (≳0.999) with margin; the

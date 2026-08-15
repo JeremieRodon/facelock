@@ -5,6 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The domain layer (backend selection, health/status renderer, message seam,
+# resolved-config, logging default, state layout, transport client) lives in
+# this library so it can be integration-tested from `tests/` and shared, rather
+# than being sealed inside a bin-only crate (gap D6). `src/main.rs` is the thin
+# `facelock` binary: clap wiring plus dispatch into this library.
+[lib]
+name = "facelock_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "facelock"
 path = "src/main.rs"
@@ -36,14 +45,15 @@ libc = "0.2"
 nix = { version = "0.31", features = ["user"] }
 facelock-tpm = { path = "../facelock-tpm" }
 zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-futures-util = "0.3"
 tss-esapi = { workspace = true, optional = true }
 zeroize = "1"
 bytemuck = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Schema-level failure injection lives in facelock-test-support::schema_faults,
+# which owns the rusqlite dependency it needs.
+facelock-test-support = { path = "../facelock-test-support" }
 
 [features]
 default = ["wayland"]

@@ -15,6 +15,7 @@ pub use align::{AlignedFace, align_face, compute_affine_matrix};
 pub use detector::FaceDetector;
 pub use embedder::FaceEmbedder;
 pub use models::{ModelManifest, resolve_model_sha256, verify_model};
+pub use provider::{ProviderDetection, ProviderKind, detect_execution_provider};
 
 /// Full face-processing pipeline: detect, align, embed.
 pub struct FaceEngine {

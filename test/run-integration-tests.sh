@@ -85,25 +85,10 @@ mkdir -p /run/dbus
 dbus-uuidgen --ensure=/etc/machine-id >/dev/null 2>&1 || true
 dbus-daemon --system --fork --nopidfile
 
-# Start polkitd so PreviewDetectFrame's frame authorization exercises a real
-# polkit round-trip. No authentication agent is registered in the container,
-# so interactive authorization is impossible — the daemon must FAIL CLOSED
-# (stripped frames) unless an explicit test rule grants the action.
-POLKITD_PID=""
-if [ -x /usr/lib/polkit-1/polkitd ]; then
-    /usr/lib/polkit-1/polkitd --no-debug > /tmp/polkitd.log 2>&1 &
-    POLKITD_PID=$!
-    sleep 1
-fi
-
 cleanup() {
     if [ -n "${DAEMON_PID:-}" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
-    fi
-    rm -f /etc/polkit-1/rules.d/90-facelock-test.rules
-    if [ -n "${POLKITD_PID:-}" ]; then
-        kill "$POLKITD_PID" 2>/dev/null || true
     fi
     pkill dbus-daemon 2>/dev/null || true
 }
@@ -214,9 +199,12 @@ run_test_contains "Rate limit: daemon encodes recoverable error in-band (model_i
 
 # With the in-band encoding the PAM module classifies the error itself
 # (rate limited -> PAM_AUTH_ERR) instead of retrying as a root oneshot.
-# A marker auth_bin proves no oneshot child is ever spawned.
+# Swapping a marker stub in at /usr/bin/facelock proves no oneshot child is
+# ever spawned (the module spawns that fixed path; an auth_bin config
+# redirect would be ignored and make this test vacuous). The daemon keeps
+# answering from its already-exec'd binary while the file is swapped.
 run_test "Rate limit: PAM fails without oneshot escalation" \
-    "printf '#!/bin/bash\ntouch /tmp/oneshot-invoked\nexit 2\n' > /usr/local/bin/oneshot-marker && chmod 755 /usr/local/bin/oneshot-marker && sed -i '/^\[daemon\]/a auth_bin = \"/usr/local/bin/oneshot-marker\"' /etc/facelock/config.toml && rm -f /tmp/oneshot-invoked; timeout 30 pamtester facelock-test testuser authenticate < /dev/null; rc=\$?; sed -i '/^auth_bin = /d' /etc/facelock/config.toml; test \$rc -ne 0 && test ! -f /tmp/oneshot-invoked"
+    "printf '#!/bin/bash\ntouch /tmp/oneshot-invoked\nexit 2\n' > /usr/local/bin/oneshot-marker && chmod 755 /usr/local/bin/oneshot-marker && rm -f /tmp/oneshot-invoked && mv /usr/bin/facelock /usr/bin/facelock.orig && install -m 755 /usr/local/bin/oneshot-marker /usr/bin/facelock; timeout 30 pamtester facelock-test testuser authenticate < /dev/null; rc=\$?; mv -f /usr/bin/facelock.orig /usr/bin/facelock; test \$rc -ne 0 && test ! -f /tmp/oneshot-invoked"
 
 run_test "Rate limit: clear seeded attempts" \
     "sqlite3 $FACELOCK_DB \"DELETE FROM rate_limit WHERE user = 'testuser';\""
@@ -270,69 +258,36 @@ check_own_denied() {
 run_test "Unprivileged user cannot own org.facelock.Daemon" \
     "check_own_denied"
 
-# (b) PreviewDetectFrame authz parity — a facelock-group non-root caller may
-# call it for itself, but the reply must not contain raw frame bytes
-# (dbus-send renders non-empty byte arrays as hex; a JPEG starts with ff d8).
-check_preview_detect_frame_stripped() {
-    local out
-    if ! out=$(runuser -u testuser -- dbus-send --system --print-reply \
+# (b) PreviewDetectFrame authz parity — the intent here has always been that a
+# non-root caller obtains no imagery. Under N13 the method became root-only, so
+# the way that holds changed: a facelock-group non-root caller is now denied
+# outright, before the method reaches the camera, rather than receiving a reply
+# with jpeg_data stripped. This asserts the denial AND that the error reply
+# carries no frame bytes (dbus-send renders non-empty byte arrays as hex; a
+# JPEG starts with ff d8).
+check_preview_detect_frame_denied() {
+    local out rc
+    set +e
+    out=$(runuser -u testuser -- dbus-send --system --print-reply \
         --reply-timeout=60000 \
         --dest=org.facelock.Daemon /org/facelock/Daemon \
-        org.facelock.Daemon.PreviewDetectFrame string:testuser 2>&1); then
-        echo "$out"
-        return 1
-    fi
+        org.facelock.Daemon.PreviewDetectFrame string:testuser 2>&1)
+    rc=$?
+    set -e
     echo "$out"
-    echo "$out" | grep -q "method return" || return 1
+    [ "$rc" -ne 0 ] || {
+        echo "PreviewDetectFrame unexpectedly succeeded for a non-root caller"
+        return 1
+    }
+    echo "$out" | grep -qi "AccessDenied" || return 1
     if echo "$out" | grep -qi "ff d8"; then
-        echo "reply contains JPEG frame bytes (ff d8) — should be stripped"
+        echo "denial reply contains JPEG frame bytes (ff d8)"
         return 1
     fi
     return 0
 }
-run_test "PreviewDetectFrame returns no raw frame to non-root caller" \
-    "check_preview_detect_frame_stripped"
-
-# (b2) Packaging contract — the polkit action for frame authorization is
-# installed alongside the D-Bus policy.
-run_test "polkit action policy installed" \
-    "[ -f /usr/share/polkit-1/actions/org.facelock.policy ] && grep -q 'org.facelock.preview-frames' /usr/share/polkit-1/actions/org.facelock.policy"
-
-# (b3) AUTHORIZED PATH: with an explicit polkit rule granting
-# org.facelock.preview-frames, a non-root preview session (one bus
-# connection across frames) receives real frame bytes. The first frame is
-# metadata-only while the daemon's polkit check is in flight; subsequent
-# frames must carry jpeg bytes (jpeg_size > 0).
-check_preview_frames_authorized() {
-    mkdir -p /etc/polkit-1/rules.d
-    cat > /etc/polkit-1/rules.d/90-facelock-test.rules <<'RULES'
-polkit.addRule(function(action, subject) {
-    if (action.id == "org.facelock.preview-frames") {
-        return polkit.Result.YES;
-    }
-});
-RULES
-    sleep 2 # polkitd reloads rules.d via inotify
-    timeout --foreground 30 runuser -u testuser -- \
-        facelock preview --text-only 2>/dev/null | head -15 > /tmp/preview-authz.log || true
-    rm -f /etc/polkit-1/rules.d/90-facelock-test.rules
-    sleep 2 # let polkitd drop the rule before the fail-closed re-check
-    cat /tmp/preview-authz.log
-    grep -q '"jpeg_size":[1-9]' /tmp/preview-authz.log || return 1
-    return 0
-}
-
-if [ -n "$POLKITD_PID" ] && kill -0 "$POLKITD_PID" 2>/dev/null; then
-    run_test "PreviewDetectFrame serves frames to polkit-authorized caller" \
-        "check_preview_frames_authorized"
-
-    # (b4) The grant must not leak: with the rule gone, a fresh caller is
-    # stripped again (fail closed).
-    run_test "PreviewDetectFrame stripped again after polkit rule removal" \
-        "check_preview_detect_frame_stripped"
-else
-    echo "SKIP: polkitd unavailable — polkit-authorized frame path not exercised"
-fi
+run_test "PreviewDetectFrame denies non-root caller (no raw frame)" \
+    "check_preview_detect_frame_denied"
 
 # Release the preview camera session before the concurrency test
 dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon \

@@ -34,9 +34,6 @@ override_dh_auto_install:
 	install -Dm644 dbus/org.facelock.Daemon.conf debian/facelock/usr/share/dbus-1/system.d/org.facelock.Daemon.conf
 	install -Dm644 dbus/org.facelock.Daemon.service debian/facelock/usr/share/dbus-1/system-services/org.facelock.Daemon.service
 
-	# Polkit action (interactive authorization for preview frame bytes)
-	install -Dm644 dbus/org.facelock.policy debian/facelock/usr/share/polkit-1/actions/org.facelock.policy
-
 	# sysusers.d
 	install -Dm644 dist/facelock.sysusers debian/facelock/usr/lib/sysusers.d/facelock.conf
 

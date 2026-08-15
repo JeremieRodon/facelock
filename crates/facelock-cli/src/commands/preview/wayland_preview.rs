@@ -28,7 +28,7 @@ use wayland_client::{
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
-use facelock_core::ipc::{DaemonRequest, DaemonResponse, PreviewFace};
+use facelock_core::ipc::PreviewFace;
 
 use super::render;
 use crate::ipc_client;
@@ -101,7 +101,7 @@ pub fn run(user: &str) -> anyhow::Result<()> {
 
         if state.exit || stop.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::info!("preview closed");
-            let _ = ipc_client::send_request(&DaemonRequest::ReleaseCamera);
+            let _ = ipc_client::release_camera();
             break;
         }
     }
@@ -139,11 +139,11 @@ impl PreviewState {
         let user = self.user.clone();
 
         // Request a frame with detection from the daemon
-        let frame_result = ipc_client::send_request(&DaemonRequest::PreviewDetectFrame { user });
+        let frame_result = ipc_client::preview_detect_frame(&user);
 
         // Update FPS tracking
         let fps = match &frame_result {
-            Ok(DaemonResponse::DetectFrame { .. } | DaemonResponse::Frame { .. }) => {
+            Ok(_) => {
                 self.frame_count += 1;
                 self.fps_frame_count += 1;
                 let now = Instant::now();
@@ -174,19 +174,8 @@ impl PreviewState {
 
         // Render into the canvas
         match frame_result {
-            Ok(DaemonResponse::DetectFrame { jpeg_data, faces }) => {
+            Ok((jpeg_data, faces)) => {
                 render_frame(&jpeg_data, canvas, width, height, fps, &faces);
-            }
-            Ok(DaemonResponse::Frame { jpeg_data }) => {
-                render_frame(&jpeg_data, canvas, width, height, fps, &[]);
-            }
-            Ok(DaemonResponse::Error { message }) => {
-                tracing::warn!("daemon error: {message}");
-                render_error(canvas, width, height, &message);
-            }
-            Ok(_) => {
-                tracing::warn!("unexpected response from daemon");
-                render_error(canvas, width, height, "unexpected daemon response");
             }
             Err(e) => {
                 // The full message (an AccessDenied hint spans several lines)
@@ -228,10 +217,8 @@ fn render_frame(
     let stride = width * 4;
 
     if jpeg_data.is_empty() {
-        // The daemon strips raw frame bytes until the caller is authorized
-        // via polkit (org.facelock.preview-frames); the first frame request
-        // triggers the agent prompt. Show the detection summary without
-        // imagery while unauthorized.
+        // The daemon strips raw frame bytes from any non-root reply. Show
+        // the detection summary without imagery when they are absent.
         render_metadata_only(canvas, width, height, fps, faces);
         return;
     }

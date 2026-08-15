@@ -1,52 +1,46 @@
-use anyhow::Context;
-
 use facelock_core::Config;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse};
 
+use crate::backend::Backend;
 use crate::ipc_client;
+use crate::message::{FaceMessage, Terminal};
 
-pub fn run(model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()> {
-    let config = Config::load().context("failed to load config")?;
+pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()> {
+    // C6: root check must run before the confirmation prompt below — a group
+    // member confirming a destructive action only to then hit AccessDenied
+    // is exactly the bug this ordering fixes. RemoveModel is root-only on the
+    // daemon side too, so this applies regardless of transport.
+    ipc_client::require_root(&format!("sudo facelock remove {model_id}"))?;
+
     let user = ipc_client::resolve_user(user.as_deref());
 
+    // One selection for the whole command (D1), before the unbounded prompt.
+    let backend = Backend::select(config);
+
     if !yes {
-        let confirmed =
-            ipc_client::confirm(&format!("Remove face model #{model_id} for user '{user}'?"))?;
+        let confirmed = Terminal.confirm(&FaceMessage::ConfirmRemoveModel {
+            model_id,
+            user: user.clone(),
+        })?;
         if !confirmed {
-            println!("Cancelled.");
+            Terminal.info(&FaceMessage::Cancelled);
             return Ok(());
         }
     }
 
-    if ipc_client::should_use_direct(&config) {
-        ipc_client::require_root(&format!("sudo facelock remove {model_id}"))?;
-        let store = crate::direct::open_store(&config)?;
-        let removed = store
-            .remove_model(&user, model_id)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if removed {
-            println!("Removed face model #{model_id} for user '{user}'.");
-        } else {
-            println!("Model #{model_id} not found for user '{user}'.");
-        }
-        return Ok(());
+    match backend.remove_model(&user, model_id)? {
+        Some(false) => Terminal.info(&FaceMessage::ModelNotFound {
+            model_id,
+            user: user.clone(),
+        }),
+        // `None`: the daemon reply cannot say whether the model existed
+        // (wire-stable), so a completed request reports as removed — as the
+        // daemon path always has.
+        Some(true) | None => Terminal.info(&FaceMessage::RemovedModel {
+            model_id,
+            user: user.clone(),
+        }),
     }
 
-    let request = DaemonRequest::RemoveModel {
-        user: user.clone(),
-        model_id,
-    };
-
-    let response = ipc_client::send_request(&request)?;
-
-    match response {
-        DaemonResponse::Removed => {
-            println!("Removed face model #{model_id} for user '{user}'.");
-        }
-        other => {
-            anyhow::bail!("unexpected response from daemon: {other:?}");
-        }
-    }
-
+    super::enrollment_marker::refresh(&backend, config, &user);
     Ok(())
 }

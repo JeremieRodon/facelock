@@ -5,13 +5,13 @@ use facelock_core::config::Config;
 
 use crate::commands::TpmCommand;
 
-pub fn run(command: TpmCommand) -> Result<()> {
+pub fn run(config: &Config, command: TpmCommand) -> Result<()> {
     match command {
-        TpmCommand::Status => status(),
-        TpmCommand::SealKey => seal_key(),
-        TpmCommand::UnsealKey => unseal_key(),
-        TpmCommand::UnsealCheck => unseal_check(),
-        TpmCommand::PcrBaseline => pcr_baseline(),
+        TpmCommand::Status => status(config),
+        TpmCommand::SealKey => seal_key(config),
+        TpmCommand::UnsealKey => unseal_key(config),
+        TpmCommand::UnsealCheck => unseal_check(config),
+        TpmCommand::PcrBaseline => pcr_baseline(config),
     }
 }
 
@@ -21,10 +21,9 @@ pub fn run(command: TpmCommand) -> Result<()> {
 /// keys) without writing anything or mutating config. Returns an error (non-zero
 /// exit) when unseal fails — e.g. after a bound PCR changed. Used by operators to
 /// confirm whether `facelock reseal` is needed, and by the TPM E2E suite.
-fn unseal_check() -> Result<()> {
+fn unseal_check(config: &Config) -> Result<()> {
     crate::ipc_client::require_root("sudo facelock tpm unseal-check")?;
 
-    let config = Config::load()?;
     if config.encryption.method != facelock_core::config::EncryptionMethod::Tpm {
         anyhow::bail!(
             "encryption.method is not \"tpm\" (current: {:?}); nothing to unseal.",
@@ -63,9 +62,7 @@ fn unseal_check() -> Result<()> {
     }
 }
 
-fn status() -> Result<()> {
-    let config = Config::load().context("failed to load config (try: sudo facelock tpm status)")?;
-
+fn status(config: &Config) -> Result<()> {
     // Extract device path from TCTI string (e.g., "device:/dev/tpmrm0" -> "/dev/tpmrm0")
     let device_path = config
         .tpm
@@ -130,12 +127,12 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-fn seal_key() -> Result<()> {
+#[cfg_attr(not(feature = "tpm"), allow(unused_variables))]
+fn seal_key(config: &Config) -> Result<()> {
     crate::ipc_client::require_root("sudo facelock tpm seal-key")?;
 
     #[cfg(feature = "tpm")]
     {
-        let config = Config::load()?;
         let key_path = Path::new(&config.encryption.key_path);
         let sealed_path = Path::new(&config.encryption.sealed_key_path);
 
@@ -181,7 +178,7 @@ fn seal_key() -> Result<()> {
         key.zeroize();
 
         // Update config to use tpm method
-        super::setup::update_config_encryption_method("tpm")?;
+        super::setup::update_config_encryption_method(config, "tpm")?;
 
         println!(
             "Key sealed to {} (permissions: 0600).",
@@ -214,12 +211,12 @@ fn seal_key() -> Result<()> {
     }
 }
 
-fn unseal_key() -> Result<()> {
+#[cfg_attr(not(feature = "tpm"), allow(unused_variables))]
+fn unseal_key(config: &Config) -> Result<()> {
     crate::ipc_client::require_root("sudo facelock tpm unseal-key")?;
 
     #[cfg(feature = "tpm")]
     {
-        let config = Config::load()?;
         let key_path = Path::new(&config.encryption.key_path);
         let sealed_path = Path::new(&config.encryption.sealed_key_path);
 
@@ -255,7 +252,7 @@ fn unseal_key() -> Result<()> {
         }
 
         // Update config to use keyfile method
-        super::setup::update_config_encryption_method("keyfile")?;
+        super::setup::update_config_encryption_method(config, "keyfile")?;
 
         println!("Key written to {} (permissions: 0600).", key_path.display());
         println!("Config updated: encryption.method = \"keyfile\"");
@@ -281,10 +278,9 @@ fn unseal_key() -> Result<()> {
 /// the key against the new PCR state. The key is recovered from the existing
 /// sealed blob when PCRs are still valid, otherwise from the plaintext key backup
 /// at `encryption.key_path` if present.
-pub fn run_reseal() -> Result<()> {
+pub fn run_reseal(config: &Config) -> Result<()> {
     crate::ipc_client::require_root("sudo facelock reseal")?;
 
-    let config = Config::load()?;
     if config.encryption.method != facelock_core::config::EncryptionMethod::Tpm {
         anyhow::bail!(
             "`facelock reseal` only applies when encryption.method = \"tpm\" \
@@ -388,9 +384,7 @@ pub fn run_reseal() -> Result<()> {
     }
 }
 
-fn pcr_baseline() -> Result<()> {
-    let config = Config::load()?;
-
+fn pcr_baseline(config: &Config) -> Result<()> {
     println!("PCR Baseline (indices: {:?})", config.tpm.pcr_indices);
     println!("----------");
 

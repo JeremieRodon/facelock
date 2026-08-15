@@ -1,8 +1,28 @@
 use facelock_core::error::Result;
 use facelock_core::traits::CameraSource;
-use facelock_core::types::Frame;
+use facelock_core::types::{CameraCaps, Frame};
 
 use crate::fixtures;
+
+/// The camera-factory box `Handler::new` takes in tests.
+///
+/// Named because it is spelled out at nine call sites across the daemon's
+/// integration tests, where the bare `Box<dyn Fn(..) -> .. + Send + Sync>` is
+/// both noise and a `clippy::type_complexity` error under the workspace's
+/// `--all-targets` lint gate.
+///
+/// Those nine call sites are **not** on this branch: `crates/facelock-daemon`
+/// belongs to a concurrent change, which carries an identically-named local
+/// alias in each of its three test files. This is the definition all three
+/// collapse into once the branches merge, which is why it is exported with no
+/// in-tree caller yet.
+///
+/// `std::result::Result` is spelled out because this module imports
+/// `facelock_core::error::Result`, a one-parameter alias that cannot express
+/// the `String` error type.
+pub type MockCameraFactory = Box<
+    dyn Fn(&facelock_core::config::Config) -> std::result::Result<MockCamera, String> + Send + Sync,
+>;
 
 /// A mock camera that replays pre-built frames.
 pub struct MockCamera {
@@ -10,6 +30,7 @@ pub struct MockCamera {
     index: usize,
     #[allow(dead_code)]
     dark_threshold: f32,
+    caps: CameraCaps,
 }
 
 impl MockCamera {
@@ -22,6 +43,7 @@ impl MockCamera {
             frames,
             index: 0,
             dark_threshold: 0.4,
+            caps: CameraCaps::default(),
         }
     }
 
@@ -34,6 +56,7 @@ impl MockCamera {
             frames,
             index: 0,
             dark_threshold: 0.4,
+            caps: CameraCaps::default(),
         }
     }
 
@@ -43,16 +66,39 @@ impl MockCamera {
             frames,
             index: 0,
             dark_threshold: 0.4,
+            caps: CameraCaps::default(),
         }
+    }
+
+    /// Attach capabilities (defaults to `CameraCaps::default()`: non-IR, no
+    /// identity) — for IR-gating and device-coupling tests.
+    pub fn with_caps(mut self, caps: CameraCaps) -> Self {
+        self.caps = caps;
+        self
     }
 
     /// How many frames have been captured.
     pub fn captures(&self) -> usize {
         self.index
     }
+
+    /// Mock darkness check (fixed thresholds), kept as an inherent method now
+    /// that `is_dark` is no longer part of `CameraSource`.
+    pub fn is_dark(frame: &Frame) -> bool {
+        if frame.gray.is_empty() {
+            return true;
+        }
+        let dark_count = frame.gray.iter().filter(|&&p| p < 10).count();
+        let ratio = dark_count as f32 / frame.gray.len() as f32;
+        ratio > 0.4
+    }
 }
 
 impl CameraSource for MockCamera {
+    fn capabilities(&self) -> &CameraCaps {
+        &self.caps
+    }
+
     fn capture(&mut self) -> Result<Frame> {
         if self.index >= self.frames.len() {
             // Wrap around to allow repeated captures
@@ -67,14 +113,5 @@ impl CameraSource for MockCamera {
         let mut frame = self.capture()?;
         frame.gray = Vec::new();
         Ok(frame)
-    }
-
-    fn is_dark(frame: &Frame) -> bool {
-        if frame.gray.is_empty() {
-            return true;
-        }
-        let dark_count = frame.gray.iter().filter(|&&p| p < 10).count();
-        let ratio = dark_count as f32 / frame.gray.len() as f32;
-        ratio > 0.4
     }
 }

@@ -18,9 +18,17 @@ test:
 test-all:
     cargo test --workspace -- --include-ignored
 
-# Run clippy with warnings as errors
+# Run clippy with warnings as errors.
+#
+# `--all-targets` is load-bearing, not tidiness: without it clippy skips test,
+# bench and example targets entirely, so a deny-by-default lint in test code
+# never reaches this gate. That matters disproportionately here because file
+# modes ARE a security contract in this project (0600 database, 0710 state
+# dir), and `non_octal_unix_permissions` is exactly the lint that catches a
+# `from_mode(600)` — which means 0o1130, not 0o600 — before it ships.
+# Keep in sync with .github/workflows/ci.yml.
 lint:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Format check
 fmt-check:
@@ -36,8 +44,28 @@ fmt:
 audit:
     cargo audit --deny unmaintained --deny unsound
 
-# Run all checks (test + lint + format + audit)
-check: test lint fmt-check audit
+# Verify the PAM module compiles on its OWN and stays off the async-io backend.
+# `cargo build --workspace` unifies zbus features with facelock-cli/-polkit, so it
+# hides an incoherent feature set in pam-facelock; only a standalone build catches
+# it. The dep guard then forbids the async-io runtime backend (async-io/async-signal/
+# polling + the async-executor/async-fs/async-lock trio) while allowing
+# signal-hook-registry, which the correct tokio backend legitimately pulls via
+# tokio's "process" feature. Keep in sync with .github/workflows/ci.yml
+# ("Build pam-facelock in isolation" + "Verify pam-facelock dependency surface").
+check-pam-standalone:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p pam-facelock
+    cargo tree -p pam-facelock --edges normal --prefix none | awk '{print $1}' | sort -u > /tmp/pam-deps
+    echo "pam-facelock crate count: $(wc -l < /tmp/pam-deps)"
+    if grep -Eq '^(async-io|async-signal|async-executor|async-fs|async-lock|polling)$' /tmp/pam-deps; then
+        echo "forbidden async-io backend crates in pam-facelock (expected the tokio backend)" >&2
+        exit 1
+    fi
+    echo "pam-facelock dependency guard passed"
+
+# Run all checks (test + lint + format + audit + PAM standalone surface)
+check: test lint fmt-check audit check-pam-standalone
 
 # Build the PAM test container image (uses host-built release binaries).
 # Keep in sync with .github/workflows/ci.yml, which builds this same image
@@ -48,6 +76,15 @@ _build-test-container: build-release
 # Automated PAM smoke tests (Arch container)
 test-arch-pam: _build-test-container
     podman run --rm facelock-pam-test
+
+# Automated state-layout test (Arch container, camera-free).
+# Asserts the exact modes and ownership of everything under /var/lib/facelock
+# and /var/log/facelock, including that enrolled/ is traversable but not
+# listable for a facelock group member. This is the only test that exercises
+# the packaging wiring (install-files modes + the built-in defaults) end to
+# end — unit tests cannot.
+test-arch-layout: _build-test-container
+    podman run --rm facelock-pam-test /run-layout-tests.sh
 
 # Guard for the camera tiers: the Containerfile bakes models/ into the image
 # with a tolerant `|| true`, so building from a checkout without the ONNX
@@ -69,7 +106,7 @@ _require-models:
         for m in "${missing[@]}"; do echo "         $m" >&2; done
         echo "       They are downloaded, not tracked. Copy them from the install tree" >&2
         echo "       ('sudo facelock setup' downloads them to /var/lib/facelock/models):" >&2
-        echo "         cp /var/lib/facelock/models/*.onnx models/" >&2
+        echo "         sudo cp /var/lib/facelock/models/*.onnx models/" >&2
         echo "       (models/*.onnx is gitignored, so this cannot be committed by accident.)" >&2
         exit 1
     fi
@@ -165,6 +202,13 @@ install-files:
     install -dm755 /usr/share/facelock/quirks.d
     install -Dm644 config/quirks.d/*.toml /usr/share/facelock/quirks.d/
 
+    # Compiled translations (optional; produced by `just mo`, absent otherwise)
+    if [ -d target/locale ]; then
+        (cd target/locale && find . -name '*.mo' | while read -r mo; do
+            install -Dm644 "$mo" "/usr/share/locale/${mo#./}"
+        done)
+    fi
+
     # systemd unit
     install -Dm644 systemd/facelock-daemon.service /usr/lib/systemd/system/facelock-daemon.service
     if [ -f /etc/systemd/system/facelock-daemon.service ] && \
@@ -184,18 +228,22 @@ install-files:
         install -Dm644 dbus/org.facelock.Daemon.service /etc/dbus-1/system-services/org.facelock.Daemon.service
     fi
 
-    # Polkit action (interactive authorization for preview frame bytes)
-    install -Dm644 dbus/org.facelock.policy /usr/share/polkit-1/actions/org.facelock.policy
-
     # Polkit agent binary (optional, do NOT install autostart — agent is not production-ready
     # and will steal polkit auth from the DE's agent, causing all privilege prompts to hang)
     [ -f target/release/facelock-polkit-agent ] && install -Dm755 target/release/facelock-polkit-agent /usr/bin/facelock-polkit-agent || true
 
-    # Directories
-    install -dm750 -o root -g facelock /var/lib/facelock
+    # Directories. Must match dist/facelock.tmpfiles.
+    # State dir 0710 root:facelock: traverse-only for the group, nothing for
+    # anyone else. Models are public, SHA256-verified downloads — the 0710
+    # parent is the gate. enrolled/ 0710 root:facelock: a group member can
+    # open its own 0600 marker by name but cannot list who else is enrolled.
+    # Audit log and snapshots are root-only (per-user auth history and raw
+    # face images).
+    install -dm710 -o root -g facelock /var/lib/facelock
     install -dm755 -o root -g root /var/lib/facelock/models
-    install -dm750 -o root -g facelock /var/log/facelock
-    install -dm750 -o root -g facelock /var/log/facelock/snapshots
+    install -dm710 -o root -g facelock /var/lib/facelock/enrolled
+    install -dm700 -o root -g root /var/log/facelock
+    install -dm700 -o root -g root /var/log/facelock/snapshots
 
     # Enable D-Bus activation (if systemd present)
     if [ -d /run/systemd/system ]; then
@@ -210,14 +258,18 @@ install-files:
     [ -d /etc/facelock ] && chown root:root /etc/facelock && chmod 755 /etc/facelock || true
     [ -f /etc/facelock/config.toml ] && chown root:root /etc/facelock/config.toml && chmod 644 /etc/facelock/config.toml || true
     [ -f /etc/facelock/config.toml.default ] && chown root:root /etc/facelock/config.toml.default && chmod 644 /etc/facelock/config.toml.default || true
-    [ -d /var/lib/facelock ] && chown root:facelock /var/lib/facelock && chmod 750 /var/lib/facelock || true
+    [ -d /var/lib/facelock ] && chown root:facelock /var/lib/facelock && chmod 710 /var/lib/facelock || true
     [ -d /var/lib/facelock/models ] && chown root:root /var/lib/facelock/models && chmod 755 /var/lib/facelock/models || true
-    [ -d /var/log/facelock ] && chown root:facelock /var/log/facelock && chmod 750 /var/log/facelock || true
-    [ -d /var/log/facelock/snapshots ] && chown root:facelock /var/log/facelock/snapshots && chmod 750 /var/log/facelock/snapshots || true
+    [ -d /var/lib/facelock/enrolled ] && chown root:facelock /var/lib/facelock/enrolled && chmod 710 /var/lib/facelock/enrolled || true
+    [ -d /var/log/facelock ] && chown root:root /var/log/facelock && chmod 700 /var/log/facelock || true
+    [ -d /var/log/facelock/snapshots ] && chown root:root /var/log/facelock/snapshots && chmod 700 /var/log/facelock/snapshots || true
+    [ -f /var/log/facelock/audit.jsonl ] && chown root:root /var/log/facelock/audit.jsonl && chmod 600 /var/log/facelock/audit.jsonl || true
     [ -d /var/lib/facelock/models ] && chmod 644 /var/lib/facelock/models/*.onnx 2>/dev/null || true
-    [ -f /var/lib/facelock/facelock.db ] && chown root:facelock /var/lib/facelock/facelock.db && chmod 640 /var/lib/facelock/facelock.db || true
-    [ -f /var/lib/facelock/facelock.db-wal ] && chown root:facelock /var/lib/facelock/facelock.db-wal && chmod 640 /var/lib/facelock/facelock.db-wal || true
-    [ -f /var/lib/facelock/facelock.db-shm ] && chown root:facelock /var/lib/facelock/facelock.db-shm && chmod 640 /var/lib/facelock/facelock.db-shm || true
+    # The database and sidecars are root-only: encrypted biometric templates,
+    # read by the daemon. Tighten if present, never create.
+    [ -f /var/lib/facelock/facelock.db ] && chown root:root /var/lib/facelock/facelock.db && chmod 600 /var/lib/facelock/facelock.db || true
+    [ -f /var/lib/facelock/facelock.db-wal ] && chown root:root /var/lib/facelock/facelock.db-wal && chmod 600 /var/lib/facelock/facelock.db-wal || true
+    [ -f /var/lib/facelock/facelock.db-shm ] && chown root:root /var/lib/facelock/facelock.db-shm && chmod 600 /var/lib/facelock/facelock.db-shm || true
 
     echo ""
     echo ""
@@ -313,7 +365,6 @@ uninstall-files:
     fi
     rm -f /usr/share/dbus-1/system.d/org.facelock.Daemon.conf
     rm -f /usr/share/dbus-1/system-services/org.facelock.Daemon.service
-    rm -f /usr/share/polkit-1/actions/org.facelock.policy
     rm -f /usr/bin/facelock-polkit-agent
     rm -f /etc/xdg/autostart/org.facelock.AuthAgent.desktop
 
@@ -321,6 +372,9 @@ uninstall-files:
     # (these would otherwise collide with a subsequent package install)
     rm -rf /usr/share/facelock
     rm -f /etc/facelock/config.toml.default
+
+    # Remove installed translation catalogs (ours only)
+    rm -f /usr/share/locale/*/LC_MESSAGES/facelock.mo /usr/share/locale/*/LC_MESSAGES/pam_facelock.mo
 
     systemctl daemon-reload 2>/dev/null || true
 
@@ -336,6 +390,109 @@ uninstall-files:
     echo "==> To remove the facelock group (after removing all members):"
     echo "==>   sudo gpasswd -d <username> facelock"
     echo "==>   sudo groupdel facelock"
+
+# ---------------------------------------------------------------------------
+# Localization (optional tooling)
+#
+# gettext is NOT required to build, test, or install facelock — English is
+# compiled in as the fallback. These recipes exist for translators and fail
+# with a clear message when the gettext tools are absent.
+# ---------------------------------------------------------------------------
+
+# Regenerate translation templates (po/*.pot) from source. The CLI catalog
+# extracts every `translate("...")` literal in the message seam
+# (crates/facelock-cli/src/message/ — the one place CLI user-facing English
+# lives, one module per domain); the PAM catalog extracts `gettext("...")`
+# from pam-facelock.
+# xgettext has no Rust mode, but --language=C tokenizes these files correctly
+# because the seam keeps msgids as single-line plain literals (see the
+# "Adding a message" pattern in message/mod.rs). The domain modules are
+# globbed and sorted so a new one is picked up without editing this recipe
+# and the output stays byte-stable.
+pot:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for tool in xgettext msgen msgfmt; do
+        if ! command -v "$tool" >/dev/null; then
+            echo "error: $tool not found — install the gettext package." >&2
+            echo "       (Translations are optional; building facelock does not need this.)" >&2
+            exit 1
+        fi
+    done
+    mapfile -t seam < <(ls crates/facelock-cli/src/message/*.rs | LC_ALL=C sort)
+    xgettext --language=C --keyword=translate --from-code=UTF-8 --no-wrap \
+        --package-name=facelock --copyright-holder="Facelock Contributors" \
+        -o po/facelock.pot "${seam[@]}"
+
+    # Mark the templates that carry `{placeholder}` tokens as brace-format, so
+    # `msgfmt --check` (see the `mo` recipe) rejects a translation that drops,
+    # renames or invents one. Without a format flag msgfmt validates nothing
+    # about the braces: "{pathh}" compiles clean and renders broken at runtime.
+    #
+    # This is done here rather than with `--flag=translate:1:python-brace-format`
+    # because xgettext honours format flags only for the format types its
+    # *scanner language* knows, and --language=C knows only c-format — the flag
+    # is accepted and silently dropped (verified against gettext 1.0). The seam
+    # uses exactly one placeholder syntax (`{lower_snake}`, see `fill` in
+    # message/mod.rs), so matching it here is precise, and the check below
+    # makes gettext itself confirm every flag we wrote is truthful.
+    awk '
+        { buf[NR] = $0 }
+        END {
+            for (i = 2; i <= NR; i++)
+                if (buf[i] ~ /^msgid "/ && buf[i] ~ /\{[a-z_][a-z0-9_]*\}/) {
+                    if (buf[i-1] ~ /^#,/) sub(/$/, ", python-brace-format", buf[i-1])
+                    else buf[i-1] = buf[i-1] "\n#, python-brace-format"
+                }
+            for (i = 1; i <= NR; i++) print buf[i]
+        }
+    ' po/facelock.pot > po/facelock.pot.tmp
+    mv po/facelock.pot.tmp po/facelock.pot
+
+    # Every flagged msgid must itself parse as a brace-format string: fill the
+    # template with English and run the same check translators will hit. A msgid
+    # with an unbalanced brace in prose would fail here rather than in a
+    # translator's catalog.
+    msgen po/facelock.pot | msgfmt --check-format -o /dev/null -
+
+    xgettext --language=C --keyword=gettext --from-code=UTF-8 --no-wrap \
+        --package-name=pam_facelock --copyright-holder="Facelock Contributors" \
+        -o po/pam_facelock.pot crates/pam-facelock/src/lib.rs
+    echo "Regenerated po/facelock.pot and po/pam_facelock.pot"
+
+# Compile translations po/<lang>/{facelock,pam_facelock}.po into
+# target/locale/<lang>/LC_MESSAGES/<domain>.mo. `just install` installs
+# target/locale/ under /usr/share/locale if present. To start a new
+# translation: mkdir -p po/de && msginit -i po/facelock.pot -o po/de/facelock.po -l de
+# To verify a translation manually without installing system-wide:
+#   FACELOCK_LOCALEDIR=$PWD/target/locale LANGUAGE=de facelock list
+#
+# `msgfmt --check` is what enforces the `{placeholder}` contract: paired with the
+# python-brace-format flags `just pot` writes, it rejects a translation that
+# typos, drops or invents a placeholder. Dropping --check would silently turn
+# that back off.
+mo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v msgfmt >/dev/null; then
+        echo "error: msgfmt not found — install the gettext package." >&2
+        echo "       (Translations are optional; building facelock does not need this.)" >&2
+        exit 1
+    fi
+    found=0
+    for po in po/*/*.po; do
+        [ -e "$po" ] || continue
+        found=1
+        lang=$(basename "$(dirname "$po")")
+        domain=$(basename "$po" .po)
+        out="target/locale/$lang/LC_MESSAGES/$domain.mo"
+        mkdir -p "$(dirname "$out")"
+        msgfmt --check -o "$out" "$po"
+        echo "  $po -> $out"
+    done
+    if [ "$found" = 0 ]; then
+        echo "no .po files under po/<lang>/ — nothing to compile"
+    fi
 
 # Bump version and prepare a release commit + tag
 # Usage: just release 0.2.0
@@ -430,7 +587,6 @@ show-paths:
     @echo "Models:   /var/lib/facelock/models/"
     @echo "Database: /var/lib/facelock/facelock.db"
     @echo "D-Bus:    /usr/share/dbus-1/system.d/org.facelock.Daemon.conf"
-    @echo "Polkit:   /usr/share/polkit-1/actions/org.facelock.policy"
     @echo "Service:  /usr/lib/systemd/system/facelock-daemon.service"
     @echo "Logs:     /var/log/facelock/"
 

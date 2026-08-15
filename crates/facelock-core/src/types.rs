@@ -146,6 +146,53 @@ impl DeviceFingerprint {
     }
 }
 
+/// A supported capture pixel format with its available frame sizes, as
+/// enumerated by the device itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatInfo {
+    pub fourcc: String,
+    pub description: String,
+    pub sizes: Vec<(u32, u32)>,
+}
+
+/// Capabilities of a camera device, computed once at construction from device
+/// interrogation (format enumeration, quirks match, sysfs identity) and
+/// carried by the camera itself — so nothing downstream has to thread
+/// `device_is_ir` or a fingerprint as loose parameters (gap D8).
+#[derive(Debug, Clone, Default)]
+pub struct CameraCaps {
+    /// Whether this device is an IR camera, **derived** from queried device
+    /// evidence (mono-only format enumeration, corroborated quirks) — never
+    /// from the free-text device name, which is attacker-controlled on
+    /// virtual devices (#98). `security.require_ir` gates on this field.
+    pub is_ir: bool,
+    /// Hardware identity used for device coupling. All fields are `None`
+    /// when the device exposes no readable USB identity — "unknown" is a
+    /// value inside [`DeviceFingerprint`], not an `Option` around it.
+    pub fingerprint: DeviceFingerprint,
+    /// Human-readable identifiers of the quirks applied to this device, for
+    /// diagnostics ("why did this camera behave oddly").
+    pub applied_quirks: Vec<String>,
+}
+
+impl CameraCaps {
+    /// Caps for a device that could not be interrogated at all — it exists at
+    /// the configured path, but querying it failed.
+    ///
+    /// Fails closed on everything the device did not demonstrate: `is_ir` is
+    /// false, so `security.require_ir` rejects rather than admits, and no
+    /// quirks are recorded as applied. The fingerprint is passed in because
+    /// sysfs identity is readable straight from the path even when the V4L2
+    /// query fails, and dropping it would turn every unqueryable camera into
+    /// a device-coupling mismatch.
+    pub fn unqueryable(fingerprint: DeviceFingerprint) -> Self {
+        Self {
+            fingerprint,
+            ..Default::default()
+        }
+    }
+}
+
 /// Granularity at which a live camera must match a template's enrolling camera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -286,6 +333,19 @@ pub struct MatchResult {
     pub model_id: Option<u32>,
     pub label: Option<String>,
     pub similarity: f32,
+    /// Whether the detector found a face at any point during the attempt.
+    ///
+    /// Carried explicitly because it cannot be inferred from `similarity`: the
+    /// score is redacted to `0.0` for every non-root D-Bus caller, which made
+    /// "a face was seen and did not match" indistinguishable from "the camera
+    /// saw nobody" for user-run lockers. Reaches the wire as the `model_id`
+    /// `-4` sentinel (docs/contracts.md).
+    ///
+    /// This is a *detector* signal, not a matcher signal — it says a face was
+    /// present, never how close it came to an enrolled template — so unlike
+    /// `similarity` it is not a hill-climbing oracle and is not redacted.
+    #[serde(default)]
+    pub face_detected: bool,
     /// Why the attempt failed despite matching frames (internal diagnostics;
     /// not part of the D-Bus wire contract).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -516,9 +576,7 @@ mod tests {
         let mut a = [0.0f32; 512];
         // Create a unit vector
         let val = 1.0 / (512.0f32).sqrt();
-        for x in &mut a {
-            *x = val;
-        }
+        a.fill(val);
         let result = cosine_similarity(&a, &a);
         assert!(
             (result - 1.0).abs() < 1e-5,
@@ -531,12 +589,8 @@ mod tests {
         let mut a = [0.0f32; 512];
         let mut b = [0.0f32; 512];
         // First half nonzero in a, second half nonzero in b
-        for i in 0..256 {
-            a[i] = 1.0 / (256.0f32).sqrt();
-        }
-        for i in 256..512 {
-            b[i] = 1.0 / (256.0f32).sqrt();
-        }
+        a[..256].fill(1.0 / (256.0f32).sqrt());
+        b[256..].fill(1.0 / (256.0f32).sqrt());
         let result = cosine_similarity(&a, &b);
         assert!(
             result.abs() < 1e-5,
@@ -1149,9 +1203,7 @@ mod tests {
     fn cosine_similarity_opposite() {
         let mut a = [0.0f32; 512];
         let val = 1.0 / (512.0f32).sqrt();
-        for x in &mut a {
-            *x = val;
-        }
+        a.fill(val);
         let mut b = a;
         for x in &mut b {
             *x = -*x;

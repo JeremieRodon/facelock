@@ -36,6 +36,14 @@ const LOG_WARNING: libc::c_int = 4;
 const DEFAULT_CONFIG_PATH: &str = "/etc/facelock/config.toml";
 const DEFAULT_TIMEOUT_SECS: u32 = 5;
 
+/// The binary spawned for oneshot authentication. Hardcoded: a configurable
+/// path would let anyone who can influence the config select which binary a
+/// root PAM context executes (E7/N9). It and its ancestors are still checked
+/// for root ownership and non-writability before spawning
+/// ([`verify_binary_trust`]) — the constant says which binary, the check says
+/// whether that binary is still trustworthy.
+const AUTH_BIN: &str = "/usr/bin/facelock";
+
 // D-Bus constants
 const DBUS_BUS_NAME: &str = "org.facelock.Daemon";
 const DBUS_OBJECT_PATH: &str = "/org/facelock/Daemon";
@@ -62,16 +70,14 @@ struct PamDaemonConfig {
     /// "daemon" (default) or "oneshot"
     #[serde(default = "default_mode")]
     mode: String,
-    /// Path to the facelock binary for oneshot mode
-    #[serde(default = "default_auth_bin")]
-    auth_bin: String,
+    // The oneshot binary path is NOT configurable — see `AUTH_BIN`. A leftover
+    // `auth_bin` key in an existing config is silently ignored (serde default).
 }
 
 impl Default for PamDaemonConfig {
     fn default() -> Self {
         Self {
             mode: default_mode(),
-            auth_bin: default_auth_bin(),
         }
     }
 }
@@ -105,24 +111,55 @@ impl Default for PamSecurityConfig {
     }
 }
 
-#[derive(Default, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)] // Variants used via deserialization
 enum PamNotificationMode {
     Off,
+    /// The default mode, named once in [`PamNotificationConfig::default`] and
+    /// nowhere else. It must equal facelock-core's `NotificationMode`
+    /// default.
+    ///
+    /// This enum deliberately has no `Default` impl. It carried a second
+    /// answer to the same question and the two drifted (`Both` here,
+    /// `Terminal` there), undetected because `terminal()` treats Both and
+    /// Terminal identically. Deleting it is not just tidying: with no
+    /// `Default`, re-adding `#[serde(default)]` to the `mode` field does not
+    /// compile, so the drift cannot come back the way it arrived. The one
+    /// remaining route — `#[serde(default = "some_fn")]`, which needs no
+    /// `Default` — is caught by
+    /// `notification_section_present_with_keys_omitted_equals_absent`.
+    ///
+    /// facelock-core's mirror of this enum KEEPS its `Default`, deliberately:
+    /// two sibling enums there (`SnapshotMode`, `EncryptionMethod`) still
+    /// have live field-level defaults, so removing only this one would be a
+    /// locally-invisible asymmetry. The two crates must agree on the default
+    /// *value*, not on how each spells it. Do not "restore" this impl for
+    /// symmetry with core.
     Terminal,
     Desktop,
-    #[default]
     Both,
 }
 
+/// Private mirror of the `[notification]` table in facelock-core's
+/// `NotificationConfig` — the canonical schema. The dependency ceiling
+/// (libc/toml/serde/zbus only) forbids sharing the types; keep field names
+/// and defaults in lockstep by hand. The flags gate the same event
+/// vocabulary as `facelock_core::notify::NotifyEvent`: `notify_prompt` ↔
+/// Scanning, `notify_on_success` ↔ Success. (This module renders them as
+/// PAM conversation text; desktop delivery is the daemon's job.)
+///
+/// `#[serde(default)]` sits on the container, not on the fields: every
+/// omitted key falls back to the [`Default`] impl below, so "section present,
+/// key omitted" and "section absent" produce the same values by construction
+/// instead of by two lists happening to agree. They did not agree once (D9),
+/// and the same shape in facelock-core's `NotificationConfig` shipped the
+/// same class of bug.
 #[derive(Deserialize)]
+#[serde(default)]
 struct PamNotificationConfig {
-    #[serde(default)]
     mode: PamNotificationMode,
-    #[serde(default = "default_true")]
     notify_prompt: bool,
-    #[serde(default = "default_true")]
     notify_on_success: bool,
 }
 
@@ -173,10 +210,6 @@ fn default_timeout() -> u32 {
 
 fn default_mode() -> String {
     "daemon".to_string()
-}
-
-fn default_auth_bin() -> String {
-    "/usr/bin/facelock".to_string()
 }
 
 fn default_true() -> bool {
@@ -421,8 +454,12 @@ enum AuthResponse {
         #[allow(dead_code)]
         similarity: f32,
     },
-    /// Face not matched
+    /// Face not matched, and the daemon gave no face-seen signal — either it
+    /// saw nobody, or it predates the `-4` sentinel.
     NoMatch { similarity: f32 },
+    /// Face not matched, and the daemon explicitly reports that its detector
+    /// did see a face (`model_id == -4`).
+    NoMatchFaceSeen,
     /// No enrolled models and suppress_unknown is enabled.
     /// PAM should return PAM_AUTHINFO_UNAVAIL to let the stack try the next module.
     Suppressed,
@@ -481,6 +518,7 @@ fn classify_fdo_error(prefix: &str, err: &zbus::fdo::Error) -> String {
 /// - `-2`: recoverable daemon error, `label` carries the error message
 ///   (rate limited, IR required, camera/storage failure).
 /// - `-3`: suppressed (no enrolled models + `suppress_unknown`).
+/// - `-4`: no match, and the daemon's detector did see a face.
 fn parse_auth_reply(matched: bool, model_id: i32, label: String, similarity: f64) -> AuthResponse {
     if matched {
         return AuthResponse::Matched {
@@ -490,6 +528,7 @@ fn parse_auth_reply(matched: bool, model_id: i32, label: String, similarity: f64
     match model_id {
         -2 => AuthResponse::Error { message: label },
         -3 => AuthResponse::Suppressed,
+        -4 => AuthResponse::NoMatchFaceSeen,
         _ => AuthResponse::NoMatch {
             similarity: similarity as f32,
         },
@@ -665,31 +704,32 @@ fn read_trusted_config(path: &str) -> Result<String, String> {
     Ok(content)
 }
 
-fn validate_auth_bin(path: &str) -> Result<PathBuf, String> {
-    if path.is_empty() {
-        return Err("auth_bin must not be empty".into());
-    }
-
-    let candidate = Path::new(path);
-    if !candidate.is_absolute() {
-        return Err("auth_bin must be an absolute path".into());
-    }
-
-    let canonical = candidate
+/// Establish that `path` is a binary this module may exec as root.
+///
+/// The trust is entirely in the filesystem checks: resolve symlinks, then
+/// require the target *and every ancestor directory* to be root-owned and not
+/// group- or world-writable. Nothing else about the path is validated —
+/// `AUTH_BIN` is a compiled-in absolute constant (there has been no
+/// configurable `auth_bin` since N9), and `canonicalize` returns an absolute
+/// path regardless, so the walk below establishes trust on its own.
+///
+/// Returns the canonical path to exec, or the reason it is not trusted.
+fn verify_binary_trust(path: &str) -> Result<PathBuf, String> {
+    let canonical = Path::new(path)
         .canonicalize()
-        .map_err(|e| format!("failed to resolve auth_bin: {e}"))?;
+        .map_err(|e| format!("failed to resolve {path}: {e}"))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let metadata = std::fs::metadata(&canonical)
-            .map_err(|e| format!("failed to stat auth_bin {}: {e}", canonical.display()))?;
+            .map_err(|e| format!("failed to stat {}: {e}", canonical.display()))?;
 
         validate_root_owned_nonwritable(
             metadata.uid(),
             metadata.permissions().mode(),
-            &format!("auth_bin {}", canonical.display()),
+            &format!("auth binary {}", canonical.display()),
         )?;
 
         let mut current = canonical.parent();
@@ -750,12 +790,12 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
 
     let timeout_secs = config.recognition.timeout_secs as u64 + 3; // buffer for model load
 
-    let auth_bin = match validate_auth_bin(&config.daemon.auth_bin) {
+    let auth_bin = match verify_binary_trust(AUTH_BIN) {
         Ok(path) => path,
         Err(e) => {
             log_auth(
                 service,
-                &format!("error: unsafe_auth_bin: {e}"),
+                &format!("error: untrusted_auth_binary: {e}"),
                 user,
                 LOG_WARNING,
             );
@@ -860,6 +900,34 @@ fn pam_code_for_daemon_error(message: &str) -> (libc::c_int, &'static str) {
     }
 }
 
+/// Map an unmatched authentication onto a PAM return code.
+///
+/// `face_seen` is the daemon's explicit answer to "did the detector see
+/// anybody?", carried by the `model_id == -4` sentinel. Reading it off
+/// `similarity` instead is what this exists to stop: the score is redacted to
+/// `0.0` for every non-root caller, so for a user-run locker (hyprlock) a
+/// genuine face-seen non-match was indistinguishable from an empty frame and
+/// wrongly abstained (#108's N12, deferred to #109 and never carried).
+///
+/// `similarity` is only consulted when the reply carries no face-seen signal,
+/// which for a current daemon means no face was seen — the same answer. It is
+/// the fallback for a daemon older than the `-4` sentinel, where it reproduces
+/// the previous behavior exactly.
+///
+/// Never PAM_SUCCESS: an unmatched attempt either fails or abstains.
+fn pam_code_for_no_match(face_seen: bool, similarity: f32) -> libc::c_int {
+    if face_seen {
+        // The daemon looked at a face and said no. That is a decision, so
+        // fail rather than abstain.
+        return PAM_AUTH_ERR;
+    }
+    if similarity == 0.0 {
+        PAM_IGNORE
+    } else {
+        PAM_AUTH_ERR
+    }
+}
+
 fn identify(pamh: *mut libc::c_void) -> libc::c_int {
     // 0. Get PAM service name for logging
     let service = unsafe { pam_get_service(pamh) }.unwrap_or_else(|| "unknown".to_string());
@@ -936,8 +1004,10 @@ fn identify(pamh: *mut libc::c_void) -> libc::c_int {
     }
 
     // 6. Daemon mode: connect via D-Bus, fall back to oneshot if unavailable
-    // Desktop notifications are handled by the daemon's auth_attempted D-Bus signal;
-    // PAM only provides terminal feedback via pam_info().
+    // Desktop notifications are sent by the daemon itself (setpriv +
+    // notify-send into the user's session bus); the auth_attempted signal
+    // carries no notification duty. PAM only provides terminal feedback via
+    // pam_info().
     match daemon_authenticate(&config, &user) {
         Ok(AuthResponse::Matched { .. }) => {
             log_auth(&service, "success", &user, LOG_INFO);
@@ -946,13 +1016,13 @@ fn identify(pamh: *mut libc::c_void) -> libc::c_int {
             }
             PAM_SUCCESS
         }
+        Ok(AuthResponse::NoMatchFaceSeen) => {
+            log_auth(&service, "no_match", &user, LOG_INFO);
+            pam_code_for_no_match(true, 0.0)
+        }
         Ok(AuthResponse::NoMatch { similarity }) => {
             log_auth(&service, "no_match", &user, LOG_INFO);
-            if similarity == 0.0 {
-                PAM_IGNORE
-            } else {
-                PAM_AUTH_ERR
-            }
+            pam_code_for_no_match(false, similarity)
         }
         Ok(AuthResponse::Suppressed) => {
             log_auth(&service, "suppressed (no enrolled models)", &user, LOG_INFO);
@@ -1100,6 +1170,44 @@ timeout_secs = 10
         assert_eq!(config.recognition.timeout_secs, DEFAULT_TIMEOUT_SECS);
     }
 
+    /// D9 drift pin: a `[notification]` section present with every key
+    /// omitted (serde field defaults) must parse identically to no section
+    /// at all (`PamNotificationConfig::default()`). The mode enum's
+    /// `#[default]` had drifted to `Both` while the struct default said
+    /// `Terminal` — undetected because `terminal()` treats both identically.
+    #[test]
+    fn notification_section_present_with_keys_omitted_equals_absent() {
+        let present: PamConfig = toml::from_str("[notification]\n").unwrap();
+        let absent: PamConfig = toml::from_str("").unwrap();
+        let default = PamNotificationConfig::default();
+        for config in [&present.notification, &absent.notification] {
+            assert_eq!(config.mode, default.mode);
+            assert_eq!(config.notify_prompt, default.notify_prompt);
+            assert_eq!(config.notify_on_success, default.notify_on_success);
+        }
+    }
+
+    /// Conformance with the canonical schema, in the only form the
+    /// dependency ceiling allows: parse the same shipped template
+    /// facelock-core ships and require the effective notification settings
+    /// to equal our defaults. The template has an active `[notification]`
+    /// header with every key commented — exactly the shape that exposed the
+    /// default drift — and any future template default that this crate does
+    /// not mirror will fail here visibly.
+    #[test]
+    fn shipped_template_notification_settings_equal_defaults() {
+        let template = include_str!("../../../config/facelock.toml");
+        let config: PamConfig = toml::from_str(template).unwrap();
+        let default = PamNotificationConfig::default();
+        assert_eq!(config.notification.mode, default.mode);
+        assert_eq!(config.notification.notify_prompt, default.notify_prompt);
+        assert_eq!(
+            config.notification.notify_on_success,
+            default.notify_on_success
+        );
+        assert!(config.notification.terminal());
+    }
+
     #[test]
     fn test_config_ignores_unknown_sections() {
         // PAM config should silently ignore sections it doesn't know about
@@ -1118,29 +1226,39 @@ db_path = "/tmp/test.db"
     }
 
     #[test]
-    fn validate_auth_bin_rejects_relative_paths() {
-        let err = validate_auth_bin("facelock").unwrap_err();
-        assert!(err.contains("absolute"));
+    fn config_with_removed_auth_bin_key_still_parses() {
+        // N9 removed the `auth_bin` key. Existing installs may still have it
+        // in /etc/facelock/config.toml; it must be ignored, never an error.
+        let toml_str = r#"
+[daemon]
+mode = "oneshot"
+auth_bin = "/usr/local/bin/evil"
+"#;
+        let config: PamConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.daemon.mode, "oneshot");
     }
 
+    /// An absent binary is untrusted, not "assume it's fine": the module
+    /// falls through to the next PAM module rather than exec'ing something
+    /// that appears later at that path.
     #[test]
-    fn validate_auth_bin_rejects_missing_paths() {
-        let err = validate_auth_bin("/definitely/missing/facelock").unwrap_err();
+    fn verify_binary_trust_rejects_missing_paths() {
+        let err = verify_binary_trust("/definitely/missing/facelock").unwrap_err();
         assert!(err.contains("failed to resolve"));
     }
 
     #[cfg(unix)]
     #[test]
     fn validate_root_owned_nonwritable_rejects_group_writable_mode() {
-        let err =
-            validate_root_owned_nonwritable(0, 0o100775, "auth_bin /usr/bin/facelock").unwrap_err();
+        let err = validate_root_owned_nonwritable(0, 0o100775, "auth binary /usr/bin/facelock")
+            .unwrap_err();
         assert!(err.contains("group- or world-writable"));
     }
 
     #[cfg(unix)]
     #[test]
     fn validate_root_owned_nonwritable_rejects_non_root_owner() {
-        let err = validate_root_owned_nonwritable(1000, 0o100755, "auth_bin /usr/bin/facelock")
+        let err = validate_root_owned_nonwritable(1000, 0o100755, "auth binary /usr/bin/facelock")
             .unwrap_err();
         assert!(err.contains("owned by root"));
     }
@@ -1260,6 +1378,66 @@ db_path = "/tmp/test.db"
     }
 
     #[test]
+    fn parse_auth_reply_decodes_face_seen_no_match() {
+        assert!(matches!(
+            parse_auth_reply(false, -4, String::new(), 0.0),
+            AuthResponse::NoMatchFaceSeen
+        ));
+    }
+
+    /// The defect: a non-root caller's score is redacted to 0.0 by the daemon
+    /// (PR #108's N12), so "we saw a face and it did not match" and "the
+    /// camera saw nobody" arrived as the same reply and both abstained. A
+    /// user-run locker (hyprlock) is exactly that caller.
+    ///
+    /// Both replies below carry `similarity == 0.0`, as a redacted caller's
+    /// always do; only the sentinel separates them, and only the sentinel is
+    /// consulted.
+    #[test]
+    fn a_redacted_face_seen_no_match_is_not_read_as_an_empty_frame() {
+        let face_seen = parse_auth_reply(false, -4, String::new(), 0.0);
+        let no_face = parse_auth_reply(false, -1, String::new(), 0.0);
+
+        let code_for = |response: &AuthResponse| match response {
+            AuthResponse::NoMatchFaceSeen => pam_code_for_no_match(true, 0.0),
+            AuthResponse::NoMatch { similarity } => pam_code_for_no_match(false, *similarity),
+            _ => panic!("expected a non-match reply"),
+        };
+
+        assert_eq!(
+            code_for(&face_seen),
+            PAM_AUTH_ERR,
+            "the daemon looked at a face and said no — that is a decision"
+        );
+        assert_eq!(
+            code_for(&no_face),
+            PAM_IGNORE,
+            "the camera saw nobody — abstain"
+        );
+    }
+
+    /// The pre-`-4` fallback, which a daemon older than the sentinel still
+    /// exercises: `-1` plus an unredacted (root-caller) score reproduces the
+    /// previous behavior exactly, so an upgrade window cannot change any
+    /// existing decision.
+    #[test]
+    fn no_match_without_a_face_seen_signal_falls_back_to_the_score() {
+        assert_eq!(pam_code_for_no_match(false, 0.0), PAM_IGNORE);
+        assert_eq!(pam_code_for_no_match(false, 0.31), PAM_AUTH_ERR);
+    }
+
+    #[test]
+    fn no_match_never_maps_to_success() {
+        for (face_seen, similarity) in [(true, 0.0), (true, 0.9), (false, 0.0), (false, 0.42)] {
+            assert_ne!(
+                pam_code_for_no_match(face_seen, similarity),
+                PAM_SUCCESS,
+                "fail-open for face_seen={face_seen} similarity={similarity}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_auth_reply_error_sentinel_requires_unmatched() {
         // A matched=true reply always wins over sentinel model ids: the
         // daemon never sends this, but decoding must not invent an error.
@@ -1333,5 +1511,40 @@ db_path = "/tmp/test.db"
             "refused",
         )));
         assert!(!is_timeout_zbus_error(&io_err));
+    }
+
+    // --- E2: shared-schema conformance (domain-object-map.md §1) ---
+
+    /// The shipped config template is parsed by two independent, deliberately
+    /// unmerged schemas: facelock-core's `Config` (see
+    /// `crates/facelock-core/tests/config_template_test.rs`) and this
+    /// crate's private `PamConfig`, kept minimal by the PAM dependency
+    /// ceiling. This is PAM's half of that contract: if a future key drifts
+    /// so one side gains a key the other rejects (a `deny_unknown_fields`
+    /// creeping onto either schema, or a new required field with no
+    /// `#[serde(default)]`), this fails loudly in CI instead of surfacing as
+    /// a silent config parse error at `pam_sm_authenticate` time on a real
+    /// system.
+    #[test]
+    fn shipped_config_template_parses_as_pam_config() {
+        const TEMPLATE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/facelock.toml"
+        ));
+        let config: PamConfig = toml::from_str(TEMPLATE)
+            .expect("PamConfig must parse the same shipped template facelock-core parses");
+
+        // Every key this template documents for PAM is shipped commented out
+        // (illustrating syntax, not overriding anything), so parsing it must
+        // be indistinguishable from parsing an empty document.
+        assert_eq!(config.daemon.mode, "daemon");
+        assert!(!config.security.disabled);
+        assert!(config.security.abort_if_ssh);
+        assert!(config.security.abort_if_lid_closed);
+        assert!(config.security.pam_policy.is_none());
+        assert_eq!(config.recognition.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert!(config.notification.terminal());
+        assert!(config.notification.notify_prompt);
+        assert!(config.notification.notify_on_success);
     }
 }

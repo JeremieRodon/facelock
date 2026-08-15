@@ -1286,7 +1286,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let key_path = dir.join("bad.key");
-        std::fs::write(&key_path, &[0u8; 16]).unwrap(); // 16 bytes instead of 32
+        std::fs::write(&key_path, [0u8; 16]).unwrap(); // 16 bytes instead of 32
 
         let result = SoftwareSealer::from_key_file(&key_path);
         assert!(result.is_err());

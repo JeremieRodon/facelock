@@ -1,11 +1,13 @@
-use anyhow::{Context, bail};
+use anyhow::Context;
 use nix::unistd::Uid;
-use zbus::blocking::Connection;
 use zbus::blocking::Proxy;
 
 use facelock_core::dbus_interface::*;
-use facelock_core::ipc::{DaemonRequest, DaemonResponse, IpcDeviceInfo, PreviewFace};
+use facelock_core::ipc::{IpcDeviceInfo, PreviewFace};
 use facelock_core::types::{FaceModelInfo, MatchResult};
+use facelock_daemon::auth::{AuthOutcome, ErrorKind};
+
+use crate::message::{AccessMessage, explain};
 
 /// Check if running as root; if not, offer to re-exec via sudo.
 ///
@@ -13,6 +15,8 @@ use facelock_core::types::{FaceModelInfo, MatchResult};
 /// If stdin is a TTY, prompts the user and re-execs. Otherwise bails
 /// with an actionable error message.
 pub fn require_root(hint: &str) -> anyhow::Result<()> {
+    use crate::message::{Terminal, fail};
+
     if Uid::current().is_root() {
         return Ok(());
     }
@@ -21,18 +25,20 @@ pub fn require_root(hint: &str) -> anyhow::Result<()> {
 
     // Non-interactive: just bail with instructions
     if !is_tty {
-        bail!("Root required.\n  Run: {hint}");
+        return Err(fail(AccessMessage::RootRequired {
+            hint: hint.to_string(),
+        }));
     }
 
-    // Interactive: offer to re-exec with sudo
-    eprint!("Root required. Re-run with sudo? [Y/n] ");
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("failed to read input")?;
-    let answer = input.trim().to_lowercase();
-    if answer == "n" || answer == "no" {
-        bail!("Root required.\n  Run: {hint}");
+    // Interactive: offer to re-exec with sudo. The prompt defaults to yes,
+    // and the hint that says so is appended by the sink — answer tokens and
+    // their advertised spelling are one English contract and never enter a
+    // catalog, or a translator could localize a hint the parser will not
+    // honour.
+    if !Terminal.confirm_default_yes(&AccessMessage::SudoReexecPrompt)? {
+        return Err(fail(AccessMessage::RootRequired {
+            hint: hint.to_string(),
+        }));
     }
 
     // Re-exec with sudo, preserving all arguments
@@ -45,27 +51,22 @@ pub fn require_root(hint: &str) -> anyhow::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Check whether we should use direct (daemonless) mode.
-/// Returns true if config says "oneshot" OR if the D-Bus service isn't available.
-/// When falling back from daemon mode, logs a warning.
-pub fn should_use_direct(config: &facelock_core::Config) -> bool {
-    if config.daemon.mode == facelock_core::DaemonMode::Oneshot {
-        return true;
+/// Like [`require_root`], but never offers an interactive re-exec prompt.
+///
+/// For commands that are typically invoked non-interactively or scripted
+/// (`facelock audit`; `facelock daemon` has its own equivalent check) — a
+/// "Re-run with sudo? [Y/n]" prompt would just hang a script instead of
+/// failing loudly.
+pub fn require_root_scripted(hint: &str) -> anyhow::Result<()> {
+    if Uid::current().is_root() {
+        return Ok(());
     }
-    // Daemon mode -- check if D-Bus service is available
-    match Connection::system() {
-        Ok(conn) => {
-            let proxy = zbus::blocking::fdo::DBusProxy::new(&conn);
-            match proxy {
-                Ok(p) => match BUS_NAME.try_into() {
-                    Ok(name) => !p.name_has_owner(name).unwrap_or(false),
-                    Err(_) => true,
-                },
-                Err(_) => true,
-            }
-        }
-        Err(_) => true,
-    }
+
+    Err(crate::message::fail(
+        crate::message::AccessMessage::RootRequired {
+            hint: hint.to_string(),
+        },
+    ))
 }
 
 /// Process-wide daemon proxy, built once and reused for every request.
@@ -73,11 +74,10 @@ static PROXY: std::sync::OnceLock<Proxy<'static>> = std::sync::OnceLock::new();
 
 /// Get the blocking D-Bus proxy to the daemon (15-second method timeout).
 ///
-/// The underlying connection is created once per process and reused: the
-/// daemon keys its polkit frame authorization (`org.facelock.preview-frames`)
-/// on the caller's unique bus name, so a preview session must keep a single
-/// connection for its grant to apply across frames. Failures are not cached —
-/// the next call retries the connection.
+/// The underlying connection is created once per process and reused, so a
+/// multi-request session (a preview streaming frames) does not pay a bus
+/// handshake per call. Failures are not cached — the next call retries the
+/// connection.
 fn create_proxy() -> anyhow::Result<Proxy<'static>> {
     if let Some(proxy) = PROXY.get() {
         return Ok(proxy.clone());
@@ -114,7 +114,7 @@ pub fn send_enroll(
     user: &str,
     label: &str,
     config: &facelock_core::Config,
-) -> anyhow::Result<DaemonResponse> {
+) -> anyhow::Result<(u32, u32)> {
     let timeout =
         std::time::Duration::from_secs(config.enroll_timeout_secs()) + ENROLL_TIMEOUT_MARGIN;
     let connection = zbus::blocking::connection::Builder::system()
@@ -130,18 +130,12 @@ pub fn send_enroll(
     // into a duplicate label.
     let result: (u32, u32) = proxy.call("Enroll", &(user, label)).map_err(|e| {
         if is_timeout_error(&e) {
-            anyhow::Error::new(e).context(
-                "enrollment timed out client-side; the daemon may have completed it — \
-                 run `facelock list` before retrying",
-            )
+            anyhow::Error::new(e).context(explain(&AccessMessage::EnrollTimedOutClientSide))
         } else {
             anyhow::Error::new(e).context("D-Bus Enroll call failed")
         }
     })?;
-    Ok(DaemonResponse::Enrolled {
-        model_id: result.0,
-        embedding_count: result.1,
-    })
+    Ok(result)
 }
 
 /// True for the client-side method-timeout shape: `method_timeout` expiring
@@ -173,177 +167,233 @@ pub fn is_access_denied(err: &anyhow::Error) -> bool {
     })
 }
 
+/// True if the D-Bus error chain carries the daemon's own "requires root"
+/// denial (`require_root` in `facelock_daemon::server`'s `authorize_method`), as
+/// opposed to a bus-policy rejection for a caller outside the `facelock`
+/// group. Matched on the rendered message rather than the `zbus::Error`
+/// shape, since the daemon's denial text is the only thing the wire
+/// preserves distinctly from a bus-policy AccessDenied.
+fn is_root_required_denial(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("requires root"))
+}
+
 /// Append an actionable hint to AccessDenied errors.
 ///
-/// The system bus policy (dbus/org.facelock.Daemon.conf) denies callers that
-/// are neither root nor in the `facelock` group *before* the request reaches
-/// the daemon, so without this a normal user's first `facelock preview` after
-/// setup fails with a bare AccessDenied and no explanation (issue #89). The
-/// daemon itself also returns AccessDenied for root-only methods and
-/// cross-user requests, so the hint stays neutral and leaves the specific
-/// reason to the wrapped error.
-fn add_group_hint(err: anyhow::Error) -> anyhow::Error {
-    if is_access_denied(&err) {
-        err.context(
-            "Access denied. If you are not in the 'facelock' group, add yourself:\n  \
-             sudo usermod -aG facelock $USER\nthen log out and back in (or re-run: \
-             sudo facelock setup). Note: some operations require root regardless of \
-             group membership.",
-        )
+/// Under DEC-6 (root-by-default CLI), most D-Bus methods are root-only, so
+/// most AccessDenied errors are the daemon's own `require_root` rejection —
+/// those get a root-specific hint (Wave-1 cross-PR note, issue #108: telling
+/// a root-only rejection to "join the facelock group" is actively wrong).
+/// The remaining case is the system bus policy (dbus/org.facelock.Daemon.conf)
+/// denying a caller that is neither root nor in the `facelock` group *before*
+/// the request reaches the daemon — without a hint there, a first `facelock
+/// preview`-style call after setup fails with a bare AccessDenied and no
+/// explanation (issue #89).
+fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
+    if !is_access_denied(&err) {
+        return err;
+    }
+    // Context strings render on stderr for a human, so they localize (D10);
+    // `explain` also emits the machine line the sinks emit, so the hint stays
+    // visible in the debug event stream.
+    if is_root_required_denial(&err) {
+        err.context(explain(&AccessMessage::AccessDeniedRootHint))
     } else {
-        err
+        err.context(explain(&AccessMessage::AccessDeniedGroupHint))
     }
 }
 
-/// Send a request to the daemon via D-Bus, translating to/from the old
-/// DaemonRequest/DaemonResponse types used by the command layer.
-pub fn send_request(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    send_request_inner(request).map_err(add_group_hint)
+/// The typed daemon transport (D5): one function per D-Bus method, returning
+/// domain values. The handler's own request/response enums are internal to
+/// `facelock-daemon`; nothing here (or in any caller) names them. Every call
+/// gets the AccessDenied hint treatment via [`hinted`].
+fn hinted<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    result.map_err(add_access_denied_hint)
 }
 
-fn send_request_inner(request: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
-    let proxy = create_proxy()?;
+/// Call the daemon's root-only `TestAuthenticate` and decode the reply.
+///
+/// This is deliberately the CLI's *only* authentication transport. The
+/// always-charging `Authenticate` method belongs to the real authenticators
+/// — PAM, the polkit agent — and has no CLI caller: `facelock test` is a
+/// diagnostic, and routing it through `Authenticate` is what once let a
+/// failed face auth at a `sudo` prompt (setuid-root, UID 0 at the daemon)
+/// escape the rate limiter, because the daemon had to guess from the
+/// caller's privilege which of the two it was serving.
+pub fn test_authenticate(user: &str) -> anyhow::Result<AuthOutcome> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let result: AuthResult = proxy
+            .call("TestAuthenticate", &(user,))
+            .context("D-Bus TestAuthenticate call failed")?;
+        Ok(decode_auth_result(result))
+    })())
+}
 
-    match request {
-        DaemonRequest::Authenticate { user } => {
-            let result: AuthResult = proxy
-                .call("Authenticate", &(user.as_str(),))
-                .context("D-Bus Authenticate call failed")?;
-            // Sentinel model_id values (see docs/contracts.md):
-            // -2 = recoverable daemon error (label carries the message),
-            // -3 = suppressed (no enrolled models + suppress_unknown).
-            if !result.matched && result.model_id == -2 {
-                return Ok(DaemonResponse::Error {
-                    message: result.label,
-                });
-            }
-            if !result.matched && result.model_id == -3 {
-                return Ok(DaemonResponse::Suppressed);
-            }
-            Ok(DaemonResponse::AuthResult(MatchResult {
-                matched: result.matched,
-                model_id: if result.model_id >= 0 {
-                    Some(result.model_id as u32)
-                } else {
-                    None
-                },
-                label: if result.label.is_empty() {
-                    None
-                } else {
-                    Some(result.label)
-                },
-                similarity: result.similarity as f32,
-                // Not part of the D-Bus AuthResult contract; derived client-side
-                // where needed (see test_cmd).
-                failure_reason: None,
-            }))
-        }
-        // Enrollment needs a method timeout derived from the daemon's
-        // config-dependent deadline, which this shared proxy cannot provide.
-        DaemonRequest::Enroll { .. } => {
-            bail!("Enroll must use send_enroll (needs a config-derived timeout)")
-        }
-        DaemonRequest::ListModels { user } => {
-            let models: Vec<ModelInfo> = proxy
-                .call("ListModels", &(user.as_str(),))
-                .context("D-Bus ListModels call failed")?;
-            Ok(DaemonResponse::Models(
-                models
-                    .into_iter()
-                    .map(|m| FaceModelInfo {
-                        id: m.id,
-                        user: m.user,
-                        label: m.label,
-                        created_at: m.created_at,
-                        embedder_model: m.embedder_model,
-                        // Empty string sentinel (D-Bus) maps back to NULL.
-                        device_id: Some(m.device_id).filter(|s| !s.is_empty()),
-                    })
-                    .collect(),
-            ))
-        }
-        DaemonRequest::RemoveModel { user, model_id } => {
-            let _: () = proxy
-                .call("RemoveModel", &(user.as_str(), *model_id))
-                .context("D-Bus RemoveModel call failed")?;
-            Ok(DaemonResponse::Removed)
-        }
-        DaemonRequest::ClearModels { user } => {
-            let _: () = proxy
-                .call("ClearModels", &(user.as_str(),))
-                .context("D-Bus ClearModels call failed")?;
-            Ok(DaemonResponse::Removed)
-        }
-        DaemonRequest::PreviewFrame => {
-            let jpeg_data: Vec<u8> = proxy
-                .call("PreviewFrame", &())
-                .context("D-Bus PreviewFrame call failed")?;
-            Ok(DaemonResponse::Frame { jpeg_data })
-        }
-        DaemonRequest::PreviewDetectFrame { user } => {
-            let result: (Vec<u8>, Vec<PreviewFaceInfo>) = proxy
-                .call("PreviewDetectFrame", &(user.as_str(),))
-                .context("D-Bus PreviewDetectFrame call failed")?;
-            let (jpeg_data, face_infos) = result;
-            let faces = face_infos
-                .into_iter()
-                .map(|f| PreviewFace {
-                    x: f.x as f32,
-                    y: f.y as f32,
-                    width: f.width as f32,
-                    height: f.height as f32,
-                    confidence: f.confidence as f32,
-                    similarity: f.similarity as f32,
-                    recognized: f.recognized,
-                })
-                .collect();
-            Ok(DaemonResponse::DetectFrame { jpeg_data, faces })
-        }
-        DaemonRequest::ListDevices => {
-            let devices: Vec<DeviceInfo> = proxy
-                .call("ListDevices", &())
-                .context("D-Bus ListDevices call failed")?;
-            Ok(DaemonResponse::Devices(
-                devices
-                    .into_iter()
-                    .map(|d| IpcDeviceInfo {
-                        path: d.path,
-                        name: d.name,
-                        driver: d.driver,
-                        is_ir: d.is_ir,
-                        formats: vec![],
-                    })
-                    .collect(),
-            ))
-        }
-        DaemonRequest::ReleaseCamera => {
-            let _: () = proxy
-                .call("ReleaseCamera", &())
-                .context("D-Bus ReleaseCamera call failed")?;
-            Ok(DaemonResponse::Ok)
-        }
-        DaemonRequest::Ping => {
-            let _: String = proxy.call("Ping", &()).context("D-Bus Ping call failed")?;
-            Ok(DaemonResponse::Ok)
-        }
-        DaemonRequest::Shutdown => {
-            let _: () = proxy
-                .call("Shutdown", &())
-                .context("D-Bus Shutdown call failed")?;
-            Ok(DaemonResponse::Ok)
-        }
+/// Decode the in-band sentinels of an `AuthResult` (see docs/contracts.md
+/// "Authenticate error encoding"): `model_id == -2` is a recoverable daemon
+/// error travelling as data (label carries the message, byte-identical —
+/// PAM string-matches "rate limited"), `-3` is the `suppress_unknown`
+/// short-circuit, `-4` is a no-match in which the detector did see a face.
+/// Split from the transport so the sentinel decoding is testable without a
+/// bus, and so any future method replying with an `AuthResult` decodes it
+/// identically.
+///
+/// The wire has no field for the rejection's class, so `-2` is re-classified
+/// from its message here. [`ErrorKind::classify`] is the inverse of the
+/// daemon's renderer and the one place that match lives on this side.
+fn decode_auth_result(result: AuthResult) -> AuthOutcome {
+    if !result.matched && result.model_id == -2 {
+        return AuthOutcome::Error {
+            kind: ErrorKind::classify(&result.label),
+            message: result.label,
+        };
     }
+    if !result.matched && result.model_id == -3 {
+        return AuthOutcome::Suppressed;
+    }
+    AuthOutcome::AuthResult(MatchResult {
+        matched: result.matched,
+        model_id: if result.model_id >= 0 {
+            Some(result.model_id as u32)
+        } else {
+            None
+        },
+        label: if result.label.is_empty() {
+            None
+        } else {
+            Some(result.label)
+        },
+        similarity: result.similarity as f32,
+        face_detected: result.matched || result.model_id == -4,
+        // Not part of the D-Bus AuthResult contract; derived client-side
+        // where needed (see test_cmd).
+        failure_reason: None,
+    })
+}
+
+pub fn list_models(user: &str) -> anyhow::Result<Vec<FaceModelInfo>> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let models: Vec<ModelInfo> = proxy
+            .call("ListModels", &(user,))
+            .context("D-Bus ListModels call failed")?;
+        Ok(models
+            .into_iter()
+            .map(|m| FaceModelInfo {
+                id: m.id,
+                user: m.user,
+                label: m.label,
+                created_at: m.created_at,
+                embedder_model: m.embedder_model,
+                // Empty string sentinel (D-Bus) maps back to NULL.
+                device_id: Some(m.device_id).filter(|s| !s.is_empty()),
+            })
+            .collect())
+    })())
+}
+
+pub fn remove_model(user: &str, model_id: u32) -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        proxy
+            .call("RemoveModel", &(user, model_id))
+            .context("D-Bus RemoveModel call failed")
+    })())
+}
+
+pub fn clear_models(user: &str) -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        proxy
+            .call("ClearModels", &(user,))
+            .context("D-Bus ClearModels call failed")
+    })())
+}
+
+pub fn preview_detect_frame(user: &str) -> anyhow::Result<(Vec<u8>, Vec<PreviewFace>)> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let (jpeg_data, face_infos): (Vec<u8>, Vec<PreviewFaceInfo>) = proxy
+            .call("PreviewDetectFrame", &(user,))
+            .context("D-Bus PreviewDetectFrame call failed")?;
+        let faces = face_infos
+            .into_iter()
+            .map(|f| PreviewFace {
+                x: f.x as f32,
+                y: f.y as f32,
+                width: f.width as f32,
+                height: f.height as f32,
+                confidence: f.confidence as f32,
+                similarity: f.similarity as f32,
+                recognized: f.recognized,
+            })
+            .collect();
+        Ok((jpeg_data, faces))
+    })())
+}
+
+pub fn list_devices() -> anyhow::Result<Vec<IpcDeviceInfo>> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let devices: Vec<DeviceInfo> = proxy
+            .call("ListDevices", &())
+            .context("D-Bus ListDevices call failed")?;
+        Ok(devices
+            .into_iter()
+            .map(|d| IpcDeviceInfo {
+                path: d.path,
+                name: d.name,
+                driver: d.driver,
+                is_ir: d.is_ir,
+                // The D-Bus DeviceInfo type carries no formats (C9, Phase E);
+                // `BackendCaps::device_formats` states this up front.
+                formats: vec![],
+            })
+            .collect())
+    })())
+}
+
+pub fn release_camera() -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        proxy
+            .call("ReleaseCamera", &())
+            .context("D-Bus ReleaseCamera call failed")
+    })())
+}
+
+pub fn ping() -> anyhow::Result<()> {
+    hinted((|| {
+        let proxy = create_proxy()?;
+        let _: String = proxy.call("Ping", &()).context("D-Bus Ping call failed")?;
+        Ok(())
+    })())
 }
 
 /// Resolve the target user for commands.
 ///
 /// Priority: explicit --user flag > SUDO_USER > DOAS_USER > current user.
 pub fn resolve_user(flag: Option<&str>) -> String {
+    resolve_user_from_env(flag, |key| std::env::var(key).ok())
+}
+
+/// The resolution order itself, with the environment supplied by the caller.
+///
+/// Split out so the precedence can be tested without `set_var`: mutating the
+/// process environment is global to the whole test binary, which cargo runs
+/// multi-threaded, so a test that does it can only be kept safe by a promise
+/// that no concurrent test reads the same variable — a promise nothing
+/// enforces and any later test may quietly break.
+pub(crate) fn resolve_user_from_env(
+    flag: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> String {
     flag.map(String::from)
-        .or_else(|| std::env::var("SUDO_USER").ok())
-        .or_else(|| std::env::var("DOAS_USER").ok())
+        .or_else(|| env("SUDO_USER"))
+        .or_else(|| env("DOAS_USER"))
         .unwrap_or_else(|| {
-            std::env::var("USER").ok().unwrap_or_else(|| {
+            env("USER").unwrap_or_else(|| {
                 // Fall back to getpwuid if $USER is not set (e.g. in containers)
                 let uid = unsafe { libc::getuid() };
                 let pw = unsafe { libc::getpwuid(uid) };
@@ -355,16 +405,6 @@ pub fn resolve_user(flag: Option<&str>) -> String {
                 }
             })
         })
-}
-
-/// Read a yes/no confirmation from stdin. Returns true if user confirms.
-pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
-    eprint!("{prompt} [y/N] ");
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("failed to read input")?;
-    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 #[cfg(test)]
@@ -390,16 +430,38 @@ mod tests {
     // Covers the locally constructed FDO variant, not the wire path: a denial
     // from the bus or the daemon arrives as `zbus::Error::MethodError`, whose
     // name is checked by `is_access_denied_name` above.
+    //
+    // "rejected by policy" deliberately does not contain "requires root", so
+    // this pins the bus-policy (non-root-specific) denial case.
     #[test]
     fn access_denied_fdo_error_gets_group_hint() {
         let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
             "rejected by policy".into(),
         ))))
         .context("D-Bus PreviewFrame call failed");
-        let hinted = add_group_hint(err);
+        let hinted = add_access_denied_hint(err);
         let msg = format!("{hinted:#}");
         assert!(msg.contains("usermod -aG facelock"), "got: {msg}");
         assert!(msg.contains("log out"), "got: {msg}");
+    }
+
+    // The daemon's `authorize_method` -> `require_root` denial (issue #108,
+    // Wave-1 cross-PR note): under DEC-6 this is now the common case, and it
+    // must say root is required rather than suggesting group membership,
+    // which would not fix anything.
+    #[test]
+    fn access_denied_root_required_gets_root_hint() {
+        let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "ListModels requires root (caller: 'alice', UID 1000)".into(),
+        ))))
+        .context("D-Bus ListModels call failed");
+        let hinted = add_access_denied_hint(err);
+        let msg = format!("{hinted:#}");
+        assert!(msg.contains("requires root"), "got: {msg}");
+        assert!(
+            !msg.contains("usermod -aG facelock"),
+            "a root-only denial must not suggest joining the group, got: {msg}"
+        );
     }
 
     #[test]
@@ -407,8 +469,83 @@ mod tests {
         let err = anyhow::Error::new(zbus::Error::Failure("connection refused".into()))
             .context("D-Bus Ping call failed");
         let msg_before = format!("{err:#}");
-        let hinted = add_group_hint(err);
+        let hinted = add_access_denied_hint(err);
         assert_eq!(format!("{hinted:#}"), msg_before);
+    }
+
+    #[test]
+    fn require_root_scripted_passes_when_root() {
+        if Uid::current().is_root() {
+            assert!(require_root_scripted("sudo facelock audit").is_ok());
+        }
+    }
+
+    #[test]
+    fn require_root_scripted_never_prompts_non_root() {
+        // Can't simulate an attached TTY here, but the important property is
+        // structural: unlike `require_root`, this function has no branch that
+        // reads stdin or writes a prompt — it only checks the UID and bails.
+        if !Uid::current().is_root() {
+            let err = require_root_scripted("sudo facelock audit").unwrap_err();
+            assert!(format!("{err:#}").contains("Root required"));
+        }
+    }
+
+    fn reply(matched: bool, model_id: i32, label: &str) -> AuthResult {
+        AuthResult {
+            matched,
+            model_id,
+            label: label.to_string(),
+            similarity: 0.9,
+        }
+    }
+
+    /// The `-2` sentinel is a recoverable daemon decision carried as data,
+    /// and the message must survive byte-identical: PAM substring-matches
+    /// "rate limited" and "IR camera required" on the same encoding.
+    #[test]
+    fn recoverable_error_sentinel_decodes_with_the_message_intact() {
+        match decode_auth_result(reply(false, -2, "rate limited")) {
+            AuthOutcome::Error { kind, message } => {
+                assert_eq!(message, "rate limited");
+                // ...and the class is recovered from it, so nothing
+                // downstream has to match the text again.
+                assert_eq!(kind, ErrorKind::RateLimited);
+            }
+            other => panic!("expected a recoverable error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suppressed_sentinel_decodes_to_suppressed() {
+        assert!(matches!(
+            decode_auth_result(reply(false, -3, "")),
+            AuthOutcome::Suppressed
+        ));
+    }
+
+    #[test]
+    fn no_match_decodes_without_a_model() {
+        match decode_auth_result(reply(false, -1, "")) {
+            AuthOutcome::AuthResult(result) => {
+                assert!(!result.matched);
+                assert_eq!(result.model_id, None);
+                assert_eq!(result.label, None);
+            }
+            other => panic!("expected an ordinary non-match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_decodes_with_its_model_and_label() {
+        match decode_auth_result(reply(true, 4, "front")) {
+            AuthOutcome::AuthResult(result) => {
+                assert!(result.matched);
+                assert_eq!(result.model_id, Some(4));
+                assert_eq!(result.label.as_deref(), Some("front"));
+            }
+            other => panic!("expected a match, got {other:?}"),
+        }
     }
 
     #[test]

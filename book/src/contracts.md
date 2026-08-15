@@ -57,9 +57,13 @@ The CLI silently falls back to direct mode when the daemon is not available on D
 | Path | Owner | Mode | Purpose |
 |------|-------|------|---------|
 | `/etc/facelock/config.toml` | root:root | 644 | Configuration |
-| `/var/lib/facelock/facelock.db` | root:facelock | 640 | Face embeddings |
-| `/var/lib/facelock/models/` | root:root | 755 | ONNX models |
-| `/var/log/facelock/snapshots/` | root:facelock | 750 | Auth snapshots |
+| `/var/lib/facelock/` | root:facelock | 710 | State dir. Traverse-only for the `facelock` group; nothing for anyone else |
+| `/var/lib/facelock/facelock.db` | root:root | 600 | Face embeddings; read by the daemon (root) only |
+| `/var/lib/facelock/models/` | root:root | 755 | ONNX models — public, SHA256-verified; the 710 parent is the gate |
+| `/var/lib/facelock/enrolled/` | root:facelock | 710 | Enrollment markers for `is-enrolled`; group-traversable, not listable |
+| `/var/lib/facelock/enrolled/<user>` | \<user\>:\<user\> | 600 | A hint for `is-enrolled`, never authoritative |
+| `/var/log/facelock/` | root:root | 700 | Audit log and snapshots — root-only |
+| `/var/log/facelock/snapshots/` | root:root | 700 | Auth snapshots |
 | `/usr/bin/facelock` | root:root | 755 | CLI binary |
 | `/lib/security/pam_facelock.so` | root:root | 755 | PAM module |
 
@@ -89,7 +93,7 @@ TOML format. All keys optional -- camera auto-detected, sensible defaults for ev
 When `device.path` is omitted:
 1. Enumerate `/dev/video0` through `/dev/video63`
 2. Filter to VIDEO_CAPTURE devices
-3. Prefer IR cameras (name contains "ir"/"infrared", or supports GREY/Y16 format)
+3. Classify IR from queried evidence: a node whose formats are mono-only/IR-typical (GREY/Y8/Y10/Y12/Y16, no color format mixed in), or a quirks `force_ir` match (authoritative by USB vendor:product ID; a name-only match only when corroborated by a real USB identity or the node's own mono-format evidence). The device name is never used to classify a node — only as an auto-detection tiebreak among nodes that already qualify
 4. Fall back to first available device
 
 ## Database Schema
@@ -127,7 +131,7 @@ D-Bus system bus (`org.facelock.Daemon`). Only used in daemon mode. The daemon e
 ### Methods
 `Authenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`
 
-Raw camera frames require privilege. `PreviewFrame` remains root-only. `PreviewDetectFrame` returns the `jpeg_data` frame bytes to root unconditionally; a non-root caller receives them only after an interactive polkit authorization for the action `org.facelock.preview-frames` (checked via `org.freedesktop.PolicyKit1.Authority.CheckAuthorization`, `AllowUserInteraction=true`). While unauthorized — denied, prompt pending, polkit unreachable, or any D-Bus error — the daemon fails closed: `jpeg_data` is empty and the caller receives detection and recognition metadata only.
+Raw camera frames require privilege. Both `PreviewFrame` and `PreviewDetectFrame` are root-only: a non-root caller is denied with `AccessDenied` before either method touches the camera, and the daemon additionally strips `jpeg_data` from any non-root reply so raw camera/IR imagery cannot leak even if the authorization table were ever to regress.
 
 Capture concurrency: `Authenticate`, `Enroll`, `PreviewFrame`, and `PreviewDetectFrame` fail immediately with a `daemon busy` error while another capture is in flight. Clients treat this like any other daemon error and degrade to password auth.
 

@@ -33,12 +33,23 @@
    ```bash
    facelock devices
    ```
-2. IR detection looks for keywords like "ir" or "infrared" in the device name and checks for grayscale formats (GREY, Y16). Some cameras do not advertise IR in their name.
-3. If you are certain your camera is IR, check its V4L2 capabilities:
+2. IR detection is derived from the pixel formats the camera reports, **not** its name. A node classifies as IR only when it enumerates *exclusively* IR-typical mono formats (GREY, Y8, Y10, Y12, Y16) with no color format (YUYV/MJPG) mixed in, or when a hardware quirk matches it. The device name is never used to classify a camera as IR (it is only a tiebreak during auto-detection), so a genuine IR camera whose single node also advertises a color format will **not** auto-classify.
+3. Inspect the formats your camera actually reports:
    ```bash
    v4l2-ctl -d /dev/video2 --list-formats-ext
    ```
-4. As a workaround, you can set `security.require_ir = false` -- but understand this weakens spoofing resistance. Only do this for testing.
+   If your IR sensor is a separate `/dev/video*` node that reports only a mono format (e.g. GREY or Y16), point `device.path` at that node (or let auto-detect find it). If IR and color share one node (a mixed format set), it will not classify by evidence alone — use a quirk (next step).
+4. For a genuine IR camera that format evidence alone does not catch, add a quirk in `/etc/facelock/quirks.d/` keyed by **USB vendor:product ID** (find yours with `lsusb`), which is the authoritative override:
+   ```toml
+   [[quirk]]
+   vendor_id = "046d"
+   product_id = "085e"
+   force_ir = true
+   format_preference = "GREY"   # the IR node's native format, for multi-node cameras
+   notes = "My IR camera"
+   ```
+   Prefer a USB-ID quirk over a `name_pattern` one: a name-only `force_ir` is trusted only when corroborated by the device's own mono-format evidence or a real USB identity, so it will not, by itself, force a color-only device to IR.
+5. As a last resort you can set `security.require_ir = false` -- but understand this weakens spoofing resistance. Only do this for testing.
 
 ## Auth too slow
 
@@ -183,10 +194,13 @@ sudo usermod -aG facelock $USER
 
 The SQLite database requires specific permissions:
 ```bash
-sudo chown root:facelock /var/lib/facelock/facelock.db
-sudo chmod 640 /var/lib/facelock/facelock.db
-# The directory needs group write for SQLite WAL files:
-sudo chmod 770 /var/lib/facelock
+sudo chown root:root /var/lib/facelock/facelock.db
+sudo chmod 600 /var/lib/facelock/facelock.db
+# The daemon (root) writes the -wal/-shm sidecars next to the database; the
+# state directory itself ships at 710 root:facelock (traverse-only for the
+# group, nothing for anyone else):
+sudo chown root:facelock /var/lib/facelock
+sudo chmod 710 /var/lib/facelock
 ```
 
 ### PAM module cannot reach daemon

@@ -1,6 +1,24 @@
-use facelock_core::error::{FacelockError, Result};
+use std::path::Path;
 
-pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
+use crate::error::{Result, StoreError};
+
+/// Any failure while bringing the schema forward is a
+/// [`StoreError::Migration`]: whatever the underlying SQLite code, the
+/// database is on a schema this build cannot use, and no caller policy
+/// distinguishes further.
+fn migration_err(path: &Path, e: rusqlite::Error) -> StoreError {
+    StoreError::Migration {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    }
+}
+
+/// Bring `conn`'s schema forward to the current version.
+///
+/// `path` is passed in rather than recovered from `conn.path()` because both
+/// callers already hold it, and the recovered form has no answer for an
+/// in-memory connection — it would have to invent one.
+pub(crate) fn run_migrations(path: &Path, conn: &rusqlite::Connection) -> Result<()> {
     // V1: initial schema
     conn.execute_batch(
         "
@@ -15,7 +33,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_face_models_user ON face_models(user);
     ",
     )
-    .map_err(|e| FacelockError::Storage(e.to_string()))?;
+    .map_err(|e| migration_err(path, e))?;
 
     // Check current schema version
     let version: i64 = conn
@@ -24,7 +42,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
             [],
             |row| row.get(0),
         )
-        .map_err(|e| FacelockError::Storage(e.to_string()))?;
+        .map_err(|e| migration_err(path, e))?;
 
     if version < 2 {
         // V2: face_embeddings allows multiple embeddings per model (no UNIQUE on model_id)
@@ -41,7 +59,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
             INSERT OR REPLACE INTO schema_version (version) VALUES (2);
         ",
         )
-        .map_err(|e| FacelockError::Storage(e.to_string()))?;
+        .map_err(|e| migration_err(path, e))?;
     }
 
     if version < 3 {
@@ -52,7 +70,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
             INSERT OR REPLACE INTO schema_version (version) VALUES (3);
         ",
         )
-        .map_err(|e| FacelockError::Storage(e.to_string()))?;
+        .map_err(|e| migration_err(path, e))?;
     }
 
     if version < 4 {
@@ -69,7 +87,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
             INSERT OR REPLACE INTO schema_version (version) VALUES (4);
         ",
         )
-        .map_err(|e| FacelockError::Storage(e.to_string()))?;
+        .map_err(|e| migration_err(path, e))?;
     }
 
     if version < 5 {
@@ -81,7 +99,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
             INSERT OR REPLACE INTO schema_version (version) VALUES (5);
         ",
         )
-        .map_err(|e| FacelockError::Storage(e.to_string()))?;
+        .map_err(|e| migration_err(path, e))?;
     }
 
     if version < 6 {
@@ -95,7 +113,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
             INSERT OR REPLACE INTO schema_version (version) VALUES (6);
         ",
         )
-        .map_err(|e| FacelockError::Storage(e.to_string()))?;
+        .map_err(|e| migration_err(path, e))?;
     }
 
     Ok(())

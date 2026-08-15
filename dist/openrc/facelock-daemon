@@ -1,5 +1,10 @@
 #!/sbin/openrc-run
 # OpenRC init script for facelock face authentication daemon
+#
+# The paths and modes below MUST match dist/facelock.tmpfiles, which is the
+# reference for every other packaging fragment. OpenRC has no post-install
+# hook, so this is also the only place the repo controls that can carry an
+# OpenRC install across a layout change.
 
 description="Facelock Face Authentication Daemon"
 command="/usr/bin/facelock"
@@ -13,7 +18,32 @@ depend() {
 }
 
 start_pre() {
-    checkpath --directory --owner root:facelock --mode 0750 /run/facelock
-    checkpath --directory --owner root:facelock --mode 0750 /var/lib/facelock
-    checkpath --directory --owner root:root --mode 0750 /var/log/facelock
+    checkpath --directory --owner root:facelock --mode 0755 /run/facelock
+
+    # checkpath does not create parents, so the state dir comes first.
+    # 0710 root:facelock: traverse-only for the facelock group, nothing for
+    # anyone else.
+    checkpath --directory --owner root:facelock --mode 0710 /var/lib/facelock
+    # Models are public, SHA256-verified downloads; the 0710 parent is the gate.
+    checkpath --directory --owner root:root --mode 0755 /var/lib/facelock/models
+    # `facelock is-enrolled` markers: group-traversable, not listable.
+    checkpath --directory --owner root:facelock --mode 0710 /var/lib/facelock/enrolled
+
+    # Database and sidecars hold encrypted biometric templates: root-only.
+    # Tighten if present, never create.
+    for f in /var/lib/facelock/facelock.db /var/lib/facelock/facelock.db-wal /var/lib/facelock/facelock.db-shm; do
+        if [ -f "$f" ]; then
+            chown root:root "$f"
+            chmod 0600 "$f"
+        fi
+    done
+
+    # Audit log (per-user auth history) and snapshots (raw face images):
+    # root-only.
+    checkpath --directory --owner root:root --mode 0700 /var/log/facelock
+    checkpath --directory --owner root:root --mode 0700 /var/log/facelock/snapshots
+    if [ -f /var/log/facelock/audit.jsonl ]; then
+        chown root:root /var/log/facelock/audit.jsonl
+        chmod 0600 /var/log/facelock/audit.jsonl
+    fi
 }

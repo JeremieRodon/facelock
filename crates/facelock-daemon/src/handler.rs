@@ -1,17 +1,163 @@
 use std::time::{Duration, Instant};
 
 use facelock_core::config::{Config, EncryptionMethod};
-use facelock_core::ipc::{DaemonRequest, DaemonResponse, PreviewFace};
+use facelock_core::ipc::PreviewFace;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::best_match;
 use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
 
-use crate::audit::{self, AuditEntry, AuditSource};
-use crate::auth;
-use crate::enroll;
+use crate::audit::AuditSource;
+use crate::auth::{self, AuthOutcome, PreCheckContext};
+use crate::enroll::{self, EnrollOutcome};
 use crate::rate_limit::RateLimiter;
+
+/// Why an authentication is being run.
+///
+/// This is the *declared purpose of the call*, never an inference from the
+/// caller's privilege. The daemon used to infer it — a root D-Bus caller was
+/// assumed to be root-only `facelock test` and had its failed attempts
+/// exempted from the rate limit — but "caller is root" is not a proxy for
+/// "this is a test run": `sudo` is setuid-root, and `login`, `su` and
+/// root-run display-manager greeters run their PAM stack as root too. Real
+/// failed authentications therefore reached the daemon as UID 0 and were
+/// never charged, leaving the documented 5-attempts/user/60s limit inert on
+/// the project's primary documented PAM target. The intent now travels with
+/// the request: the `Authenticate` D-Bus method is always
+/// [`AuthIntent::Authenticate`], and the root-only `TestAuthenticate` method
+/// is the only producer of [`AuthIntent::Test`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthIntent {
+    /// A real authentication — every PAM stack (sudo, login, screen
+    /// lockers), the polkit agent, `facelock auth`. Fully enforced, and a
+    /// failed attempt charges the shared rate-limit budget.
+    Authenticate,
+    /// A diagnostic run of root-only `facelock test` (N11, issue #96).
+    /// Skips only the SSH/lid physical-presence gates, and never charges the
+    /// budget — a handful of test runs must not lock the user out of real
+    /// authentication.
+    Test,
+}
+
+impl AuthIntent {
+    /// Does a failed attempt consume the shared (SQLite-backed) rate-limit
+    /// budget? Only real authentication does.
+    pub fn charges_rate_limit(self) -> bool {
+        matches!(self, AuthIntent::Authenticate)
+    }
+
+    /// Which of `pre_check`'s environment gates this intent may skip. Every
+    /// other gate — `disabled`, enrollment/`suppress_unknown`, the
+    /// rate-limit *check*, `require_ir` — applies to both intents.
+    pub fn pre_check_context(self) -> PreCheckContext {
+        match self {
+            AuthIntent::Authenticate => PreCheckContext::enforced(),
+            AuthIntent::Test => PreCheckContext::test(),
+        }
+    }
+
+    /// The audit `source` stamped on the entries this intent produces. The
+    /// field records the enforcement path, so a diagnostic run that skipped
+    /// the SSH/lid gates and charged nothing must not be logged as an
+    /// ordinary daemon authentication.
+    pub fn audit_source(self) -> AuditSource {
+        match self {
+            AuthIntent::Authenticate => AuditSource::Daemon,
+            AuthIntent::Test => AuditSource::Test,
+        }
+    }
+}
+
+/// The handler's input vocabulary — one variant per operation the daemon can
+/// perform. Internal to this crate (D5): the D-Bus server (`crate::server`)
+/// builds these from decoded method calls, and the CLI talks through typed
+/// clients and the [`AuthOutcome`]/[`EnrollOutcome`] vocabulary instead. The
+/// request/wire double translation is deliberate — it is what keeps this
+/// handler transport-agnostic and mock-testable.
+#[derive(Debug, Clone)]
+pub enum DaemonRequest {
+    Authenticate {
+        user: String,
+    },
+    Enroll {
+        user: String,
+        label: String,
+    },
+    ListModels {
+        user: String,
+    },
+    RemoveModel {
+        user: String,
+        model_id: u32,
+    },
+    ClearModels {
+        user: String,
+    },
+    PreviewFrame,
+    /// Preview with face detection + recognition against the given user's models.
+    PreviewDetectFrame {
+        user: String,
+    },
+    ListDevices,
+    ReleaseCamera,
+    Ping,
+    Shutdown,
+}
+
+/// The handler's output vocabulary, mirroring [`DaemonRequest`]. Internal to
+/// this crate (D5); `crate::server` maps it onto the D-Bus reply types.
+#[derive(Debug, Clone)]
+pub enum DaemonResponse {
+    AuthResult(facelock_core::types::MatchResult),
+    Enrolled {
+        model_id: u32,
+        embedding_count: u32,
+    },
+    Models(Vec<facelock_core::types::FaceModelInfo>),
+    Removed,
+    Frame {
+        jpeg_data: Vec<u8>,
+    },
+    /// Preview frame with face detection results.
+    DetectFrame {
+        jpeg_data: Vec<u8>,
+        faces: Vec<PreviewFace>,
+    },
+    Devices(Vec<facelock_core::ipc::IpcDeviceInfo>),
+    Ok,
+    /// User has no enrolled models and `suppress_unknown` is enabled.
+    /// PAM should map this to `PAM_AUTHINFO_UNAVAIL` to let the stack fall through.
+    Suppressed,
+    Error {
+        message: String,
+    },
+}
+
+impl From<AuthOutcome> for DaemonResponse {
+    fn from(outcome: AuthOutcome) -> Self {
+        match outcome {
+            AuthOutcome::AuthResult(result) => DaemonResponse::AuthResult(result),
+            AuthOutcome::Suppressed => DaemonResponse::Suppressed,
+            AuthOutcome::Error { message, .. } => DaemonResponse::Error { message },
+        }
+    }
+}
+
+impl From<EnrollOutcome> for DaemonResponse {
+    fn from(outcome: EnrollOutcome) -> Self {
+        match outcome {
+            EnrollOutcome::Enrolled {
+                model_id,
+                embedding_count,
+            } => DaemonResponse::Enrolled {
+                model_id,
+                embedding_count,
+            },
+            EnrollOutcome::Error { message } => DaemonResponse::Error { message },
+        }
+    }
+}
 
 /// Type alias for the camera factory closure.
 type CameraFactory<C> = Box<dyn Fn(&Config) -> Result<C, String> + Send + Sync>;
@@ -25,10 +171,11 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
     pub engine: E,
     pub store: FaceStore,
     pub rate_limiter: RateLimiter,
-    pub device_is_ir: bool,
-    /// Live camera fingerprint used to couple templates to their enrolling
-    /// camera (Plan 02). Computed once at handler build from the resolved device.
-    pub device_fingerprint: facelock_core::types::DeviceFingerprint,
+    /// Capabilities of the resolved (not necessarily open) camera device,
+    /// computed once at handler build. `pre_check` gates `require_ir` on
+    /// `device_caps.is_ir` *before* any camera is opened; once a camera is
+    /// open, its own `capabilities()` are authoritative.
+    pub device_caps: facelock_core::types::CameraCaps,
     pub shutdown_requested: bool,
     camera: Option<C>,
     camera_factory: Option<CameraFactory<C>>,
@@ -36,7 +183,9 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
     jpeg_buf: Vec<u8>,
     /// Quirk-overridden warmup frames (takes precedence over config if `Some`).
     warmup_frames_override: Option<u32>,
-    #[cfg(feature = "tpm")]
+    /// Held TPM sealer for `tpm.seal_database` stores. Without the `tpm`
+    /// feature this is the passthrough sealer, whose per-row unseal reports a
+    /// clear "compile with tpm" error instead of misreading sealed blobs.
     tpm_sealer: Option<facelock_tpm::TpmSealer>,
     software_sealer: Option<facelock_tpm::SoftwareSealer>,
     /// Why the software sealer could not be initialized for a configured
@@ -52,12 +201,10 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         engine: E,
         store: FaceStore,
         rate_limiter: RateLimiter,
-        device_is_ir: bool,
-        device_fingerprint: facelock_core::types::DeviceFingerprint,
+        device_caps: facelock_core::types::CameraCaps,
         camera_factory: Option<CameraFactory<C>>,
         warmup_frames_override: Option<u32>,
     ) -> Result<Self, String> {
-        #[cfg(feature = "tpm")]
         let tpm_sealer = if config.tpm.seal_database {
             match facelock_tpm::TpmSealer::new(&config.tpm.tcti) {
                 Ok(sealer) => {
@@ -157,15 +304,13 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             engine,
             store,
             rate_limiter,
-            device_is_ir,
-            device_fingerprint,
+            device_caps,
             shutdown_requested: false,
             camera: None,
             camera_factory,
             camera_last_used: Instant::now(),
             jpeg_buf: Vec::with_capacity(JPEG_BUF_CAPACITY),
             warmup_frames_override,
-            #[cfg(feature = "tpm")]
             tpm_sealer,
             software_sealer,
             sealer_init_error,
@@ -220,18 +365,15 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         }
     }
 
-    /// Load user embeddings, decrypting TPM-sealed or software-encrypted blobs.
-    /// Falls back to the standard `get_user_embeddings` path when no encryption is active.
+    /// Load user embeddings, decrypting TPM-sealed or software-encrypted blobs
+    /// through the shared per-row implementation (`crate::embeddings`, N10).
+    /// Falls back to the standard `get_user_embeddings` path when nothing could
+    /// have written an encrypted row.
     fn load_user_embeddings(
         &mut self,
         user: &str,
     ) -> Result<Vec<(u32, facelock_core::types::FaceEmbedding)>, DaemonResponse> {
-        // Check if any encryption is configured that requires raw blob handling
-        let needs_raw = self.software_sealer.is_some();
-        #[cfg(feature = "tpm")]
-        let needs_raw = needs_raw || self.tpm_sealer.is_some();
-
-        if !needs_raw {
+        if !crate::embeddings::needs_raw_rows(&self.config, self.software_sealer.is_some()) {
             // Fast path: no encryption, use standard method (no overhead)
             return self
                 .store
@@ -250,70 +392,13 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 message: format!("storage error: {e}"),
             })?;
 
-        let mut results = Vec::with_capacity(raw_rows.len());
-        for (id, blob, sealed, device_id) in &raw_rows {
-            let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
-                // Software-encrypted (version byte 0x02)
-                let sealer =
-                    self.software_sealer
-                        .as_ref()
-                        .ok_or_else(|| DaemonResponse::Error {
-                            message: format!(
-                                "embedding {id} is software-encrypted but no key is configured"
-                            ),
-                        })?;
-                // Hard device binding (opt-in): derive AAD from this template's
-                // own device id. `None` when disabled — matching enroll.
-                let aad = self.config.security.device_aad(device_id.as_deref());
-                sealer
-                    .unseal_embedding_with_aad(blob, aad.as_deref())
-                    .map_err(|e| DaemonResponse::Error {
-                        message: format!("software decryption failed for embedding {id}: {e}"),
-                    })?
-            } else if *sealed {
-                // TPM-sealed (version byte 0x01)
-                #[cfg(feature = "tpm")]
-                {
-                    let sealer = self
-                        .tpm_sealer
-                        .as_mut()
-                        .ok_or_else(|| DaemonResponse::Error {
-                            message: "TPM-sealed embeddings exist but TPM is not available".into(),
-                        })?;
-                    sealer
-                        .unseal_embedding(blob)
-                        .map_err(|e| DaemonResponse::Error {
-                            message: format!("TPM unseal failed for embedding {id}: {e}"),
-                        })?
-                }
-                #[cfg(not(feature = "tpm"))]
-                {
-                    return Err(DaemonResponse::Error {
-                        message: format!(
-                            "embedding {id} is TPM-sealed but TPM support is not compiled in"
-                        ),
-                    });
-                }
-            } else {
-                // Plaintext raw embedding
-                if blob.len() != 512 * 4 {
-                    return Err(DaemonResponse::Error {
-                        message: format!(
-                            "invalid raw embedding size for id {id}: expected {} bytes, got {}",
-                            512 * 4,
-                            blob.len()
-                        ),
-                    });
-                }
-                let floats: &[f32] = bytemuck::cast_slice(blob);
-                let mut emb = [0f32; 512];
-                emb.copy_from_slice(floats);
-                emb
-            };
-
-            results.push((*id, embedding));
-        }
-        Ok(results)
+        crate::embeddings::decrypt_user_embeddings(
+            &raw_rows,
+            &self.config,
+            self.software_sealer.as_ref(),
+            crate::embeddings::TpmAccess::Held(self.tpm_sealer.as_mut()),
+        )
+        .map_err(|message| DaemonResponse::Error { message })
     }
 
     pub fn handle(&mut self, request: DaemonRequest) -> DaemonResponse {
@@ -334,79 +419,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             }
 
             DaemonRequest::Authenticate { user } => {
-                if let Some(resp) = auth::pre_check(
-                    &self.config,
-                    &self.store,
-                    &user,
-                    &self.rate_limiter,
-                    self.device_is_ir,
-                ) {
-                    let (result, error) = match &resp {
-                        DaemonResponse::Error { message } if message.contains("rate limited") => {
-                            ("rate_limited".to_string(), Some(message.clone()))
-                        }
-                        DaemonResponse::Error { message } => {
-                            ("error".to_string(), Some(message.clone()))
-                        }
-                        DaemonResponse::AuthResult(mr) if !mr.matched => {
-                            ("failure".to_string(), None)
-                        }
-                        DaemonResponse::Suppressed => ("suppressed".to_string(), None),
-                        _ => ("error".to_string(), None),
-                    };
-                    audit::write_audit_entry(
-                        &self.config.audit,
-                        &AuditEntry {
-                            timestamp: audit::now_iso8601(),
-                            user: user.clone(),
-                            result,
-                            source: Some(AuditSource::Daemon),
-                            similarity: None,
-                            frame_count: None,
-                            duration_ms: None,
-                            device: self.config.device.path.clone(),
-                            model_label: None,
-                            error,
-                        },
-                    );
-                    return resp;
-                }
-
-                if let Err(resp) = self.acquire_camera() {
-                    return resp;
-                }
-
-                // Pre-load and decrypt embeddings (handles TPM + software encryption)
-                let stored = match self.load_user_embeddings(&user) {
-                    Ok(s) => s,
-                    Err(resp) => return resp,
-                };
-
-                // Split borrows: take camera out, run auth, put it back
-                let mut camera = self.camera.take().unwrap();
-                let models = self.store.list_models(&user).unwrap_or_default();
-                let result = auth::authenticate_with_embeddings(
-                    &mut camera,
-                    &mut self.engine,
-                    &stored,
-                    &models,
-                    &self.config,
-                    &user,
-                    self.device_is_ir,
-                    &self.device_fingerprint,
-                    AuditSource::Daemon,
-                );
-                self.camera = Some(camera);
-                self.camera_last_used = Instant::now();
-                // Only failed auths count against the rate limit
-                if let DaemonResponse::AuthResult(ref mr) = result {
-                    if !mr.matched {
-                        if let Err(e) = self.rate_limiter.record_failure(&self.store, &user) {
-                            warn!(user, error = %e, "failed to record auth failure");
-                        }
-                    }
-                }
-                result
+                self.handle_authenticate(user, AuthIntent::Authenticate)
             }
 
             DaemonRequest::Enroll { user, label } => {
@@ -442,7 +455,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
 
                 let mut camera = self.camera.take().unwrap();
-                let device_id = self.device_fingerprint.canonical_for_storage();
+                // The enrolling camera's own identity — asked of the camera
+                // actually recording the template, not a handler-level copy.
+                let device_id = camera.capabilities().fingerprint.canonical_for_storage();
                 let result = enroll::enroll(
                     &mut camera,
                     &mut self.engine,
@@ -455,7 +470,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 );
                 self.camera = Some(camera);
                 self.camera_last_used = Instant::now();
-                result
+                result.into()
             }
 
             DaemonRequest::ListModels { user } => match self.store.list_models(&user) {
@@ -567,6 +582,84 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         }
     }
 
+    /// Run an authentication, enforced and audited according to `intent`.
+    ///
+    /// [`AuthIntent::Authenticate`] — every real authentication, whatever the
+    /// caller's privilege — runs every gate and charges the shared
+    /// (SQLite-backed) rate-limit budget on a failed attempt.
+    /// [`AuthIntent::Test`] is reached only from the root-only
+    /// `TestAuthenticate` D-Bus method: it skips the SSH/lid gates and
+    /// charges nothing.
+    ///
+    /// The rate-limit *check* (whether `user` is already over budget) is
+    /// unaffected by the intent: an already-limited user still sees "rate
+    /// limited" from `test`, because that decision is made before this
+    /// function knows whether the attempt itself will fail.
+    pub fn handle_authenticate(&mut self, user: String, intent: AuthIntent) -> DaemonResponse {
+        if let Some(resp) = auth::pre_check_audited_with_context(
+            &self.config,
+            &self.store,
+            &user,
+            &self.rate_limiter,
+            &self.device_caps,
+            intent.audit_source(),
+            intent.pre_check_context(),
+        ) {
+            return resp.into();
+        }
+
+        // A storage failure here must surface as an error, never fold into an
+        // empty model list (C3, issue #105): empty `models` means an empty
+        // device-allowed set, a guaranteed "no match", and a rate-limit charge
+        // for an attempt the user never got to make — retries then walk
+        // straight into a lockout. Matches what `pre_check` already returns
+        // for the same failure class, and runs before the camera is touched.
+        let models = match self.store.list_models(&user) {
+            Ok(m) => m,
+            Err(e) => {
+                return DaemonResponse::Error {
+                    message: format!("storage error: {e}"),
+                };
+            }
+        };
+
+        if let Err(resp) = self.acquire_camera() {
+            return resp;
+        }
+
+        // Pre-load and decrypt embeddings (handles TPM + software encryption)
+        let mut stored = match self.load_user_embeddings(&user) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+
+        // Split borrows: take camera out, run auth, put it back
+        let mut camera = self.camera.take().unwrap();
+        // `stored` is wiped by the callee (D11) — this plaintext set must not
+        // be read again below.
+        let result = auth::authenticate_with_embeddings(
+            &mut camera,
+            &mut self.engine,
+            &mut stored,
+            &models,
+            &self.config,
+            &user,
+            intent.audit_source(),
+        );
+        self.camera = Some(camera);
+        self.camera_last_used = Instant::now();
+        // Only failed auths count against the rate limit, and only for the
+        // real-authentication intent (see [`AuthIntent`]).
+        if let AuthOutcome::AuthResult(ref mr) = result {
+            if !mr.matched && intent.charges_rate_limit() {
+                if let Err(e) = self.rate_limiter.record_failure(&self.store, &user) {
+                    warn!(user, error = %e, "failed to record auth failure");
+                }
+            }
+        }
+        result.into()
+    }
+
     fn encode_frame_response(&mut self, rgb: &[u8], width: u32, height: u32) -> DaemonResponse {
         self.jpeg_buf.clear();
         let mut encoder = JpegEncoder::new_with_quality(&mut self.jpeg_buf, 60);
@@ -611,5 +704,42 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one table that decides what an authentication costs and how it is
+    /// enforced. Real authentication charges the rate limit; the diagnostic
+    /// intent does not. Nothing here consults the caller's UID — that
+    /// inference is exactly what let a failed face auth at a `sudo` prompt
+    /// (setuid-root, so UID 0 at the daemon) escape the limiter.
+    #[test]
+    fn only_real_authentication_charges_the_rate_limit() {
+        assert!(AuthIntent::Authenticate.charges_rate_limit());
+        assert!(!AuthIntent::Test.charges_rate_limit());
+    }
+
+    /// The SSH/lid physical-presence gates are skippable for the diagnostic
+    /// intent only (N11); every other gate applies to both.
+    #[test]
+    fn only_the_test_intent_skips_the_ssh_and_lid_gates() {
+        let real = AuthIntent::Authenticate.pre_check_context();
+        assert!(!real.skip_ssh_gate);
+        assert!(!real.skip_lid_gate);
+
+        let test = AuthIntent::Test.pre_check_context();
+        assert!(test.skip_ssh_gate);
+        assert!(test.skip_lid_gate);
+    }
+
+    /// The audit `source` names the enforcement path that ran, so the two
+    /// intents must never share a stamp.
+    #[test]
+    fn each_intent_stamps_its_own_audit_source() {
+        assert_eq!(AuthIntent::Authenticate.audit_source(), AuditSource::Daemon);
+        assert_eq!(AuthIntent::Test.audit_source(), AuditSource::Test);
     }
 }

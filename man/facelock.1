@@ -1,4 +1,4 @@
-.TH FACELOCK 1 "2026-03-11" "facelock" "User Commands"
+.TH FACELOCK 1 "2026-08-12" "facelock" "User Commands"
 .SH NAME
 facelock \- Linux face authentication
 .SH SYNOPSIS
@@ -24,28 +24,125 @@ detection and ArcFace for embedding). No cloud services are contacted.
 .B setup
 Download models and create directories. An interactive wizard guides initial
 configuration.
+.IP
+Three rules govern the flags below. Supplying a value answers that question and
+therefore replaces the corresponding prompt \(em there is no
+\fB\-\-skip\-\fIx\fB\-prompt\fR family, because on the steps that change the
+system "skip" would have to mean "apply the default", which is the opposite of
+what an integrator asking to skip PAM wants. A \fB\-\-no\-\fIaction\fR flag
+declines an action outright; declining is not the same as defaulting. And
+\fBauto\fR means re-derive from the hardware, not "use the default" \(em
+omitting the flag already gives the default.
 .RS
+.TP
+.B \-\-non\-interactive
+Run in non-interactive mode (skip wizard). Performs the base setup only:
+directories, model download and verification, encryption, group membership and
+path permissions. No PAM, no systemd, and no enrollment unless explicitly
+requested.
+.TP
+.B \-y\fR, \fB\-\-yes
+Skip confirmation prompts, and unlock the gate that otherwise refuses to modify
+a sensitive PAM service file (\fBsystem\-auth\fR, \fBlogin\fR, \fBsshd\fR).
+\fB\-\-non\-interactive\fR suppresses the per-file confirmation on its own but
+does \fInot\fR unlock that gate. Also accepted as \fB\-\-no\-confirm\fR.
+.TP
+.B \-\-pam
+Install or manage PAM module configuration. On its own, configures one service
+(see \fB\-\-service\fR) and touches nothing else.
+.TP
+.B \-\-no\-pam
+Decline PAM configuration entirely. No file under
+.I /etc/pam.d
+is read, backed up or written.
 .TP
 .B \-\-systemd
 Install and enable systemd units for the facelock daemon.
 .TP
-.B \-\-disable
-Used with \fB\-\-systemd\fR: disable and stop systemd units instead.
+.B \-\-no\-systemd
+Decline systemd configuration. No unit files are written and
+.BR systemctl (1)
+is not invoked.
 .TP
-.B \-\-pam
-Install or manage PAM module configuration.
+.B \-\-enroll
+Enroll a face during setup, without the confirmation prompt.
+.TP
+.B \-\-no\-enroll
+Do not enroll a face during setup. The recognition test that depends on it is
+skipped as well.
+.TP
+.B \-\-disable
+Used with \fB\-\-systemd\fR: disable and stop systemd units instead. Requires
+\fB\-\-systemd\fR.
 .TP
 .B \-\-service \fIname\fR
-Target PAM service (default: sudo).
+Used with \fB\-\-pam\fR: target PAM service (default: sudo). Requires
+\fB\-\-pam\fR.
 .TP
 .B \-\-remove
-Remove the PAM line instead of adding it.
+Used with \fB\-\-pam\fR: remove the facelock PAM line instead of adding it.
+Requires \fB\-\-pam\fR.
 .TP
-.B \-y\fR, \fB\-\-yes
-Skip confirmation for sensitive services.
+.B \-\-camera \fIpath\fR|\fBauto\fR
+Camera device path, or \fBauto\fR to re-detect the IR camera from the attached
+hardware. \fBauto\fR fails if zero or more than one IR-capable device is found;
+an explicit path that does not exist is also an error.
 .TP
-.B \-\-non\-interactive
-Run in non-interactive mode (skip wizard).
+.B \-\-models \fBstandard\fR|\fBbalanced\fR|\fBhigh\fR
+Model quality preset. Selects the detector/embedder pair to configure and
+download.
+.TP
+.B \-\-execution\-provider \fBcpu\fR|\fBcuda\fR|\fBrocm\fR|\fBopenvino\fR|\fBauto\fR
+ONNX Runtime execution provider. \fBauto\fR asks the installed ONNX Runtime
+which providers it was built with and selects cuda, rocm, openvino or cpu in
+that order of preference, printing what it found. Availability is a property of
+the ONNX Runtime build, not of the hardware: a CPU-only runtime reports no GPU
+providers even on a machine with a GPU. If the runtime cannot be queried at
+all, \fBauto\fR warns and selects cpu rather than failing the setup.
+.TP
+.B \-\-encryption \fBtpm\fR|\fBkeyfile\fR|\fBnone\fR|\fBauto\fR
+Embedding encryption method. \fBauto\fR uses the TPM when a working TPM 2.0 is
+present and a software keyfile otherwise. \fBtpm\fR fails rather than falling
+back.
+.RE
+.IP
+Flags compose. \fB\-\-pam\fR and/or \fB\-\-systemd\fR on their own perform just
+that action; any flag that only makes sense while the base setup runs
+(\fB\-\-non\-interactive\fR, a choice flag, or any of \fB\-\-no\-pam\fR,
+\fB\-\-no\-systemd\fR, \fB\-\-enroll\fR, \fB\-\-no\-enroll\fR) forces the base
+setup, and the requested actions run in addition to it. For an action pair, the
+later flag on the command line wins.
+.TP
+.B is\-enrolled
+Report whether a user has a usable face enrollment. The exit status is the
+contract: 0 if enrolled, 1 if not, 2 on error; stdout is the state word
+.B enrolled
+or
+.BR not\-enrolled ,
+after the fashion of
+.BR "systemctl is\-active" .
+See
+.B EXIT STATUS
+below. It reads only the per-user marker file under
+.IR /var/lib/facelock/enrolled/ ;
+it does not activate the daemon over D-Bus, does not open a camera, does not
+read the face database, and does not require membership of the
+.B facelock
+group. The marker is a hint for deciding whether to offer a face-auth
+affordance \(em PAM at authentication time remains authoritative.
+.RS
+.TP
+.B \-u\fR, \fB\-\-user \fIusername\fR
+Username (default: current user).
+.TP
+.B \-\-json
+Output a JSON object with the keys \fBenrolled\fR (boolean), \fBmodels\fR
+(integer) and \fBupdated\fR (ISO 8601 timestamp, or null) instead of
+\fByes\fR/\fBno\fR. Does not change the exit status.
+.TP
+.B \-\-quiet
+Suppress stdout and report only via the exit status. Errors are still written
+to stderr.
 .RE
 .TP
 .B enroll
@@ -121,7 +218,12 @@ Open config file in editor.
 .TP
 .B status
 Check system status including daemon connectivity, enrolled faces, camera
-availability, and model integrity.
+availability, and model integrity. Also reports whether the PAM module's
+oneshot fallback could authenticate with the daemon unreachable, and whether
+the target user's
+.B is\-enrolled
+marker agrees with the database. Requires root. A check that cannot be
+performed is reported as such; the report never substitutes a guessed value.
 .TP
 .B devices
 List available camera devices.
@@ -212,7 +314,7 @@ View the structured audit log.
 .B \-f\fR, \fB\-\-follow
 Follow mode: watch for new log entries.
 .TP
-.B \-n\fR, \fB\-\-lines \fIcount\fR
+.B \-l\fR, \fB\-\-lines \fIcount\fR
 Number of recent entries to show (default: 20).
 .RE
 .SH ENVIRONMENT
@@ -229,13 +331,45 @@ Override path to the configuration file.
 Main configuration file. Controls camera device, recognition thresholds,
 daemon settings, security policy, and TPM options.
 .TP
+.I /var/lib/facelock/
+State directory. Permissions should be 710, owned by root:facelock:
+traverse-only for the
+.B facelock
+group, nothing for anyone else. A group member can open a path it knows by
+name \(em its own enrollment marker, a model file \(em but cannot list the
+directory, and users outside the group cannot reach anything below it. The
+group is a D-Bus access grant, not a file-read grant.
+.TP
 .I /var/lib/facelock/facelock.db
-SQLite database storing face embeddings. Permissions should be 640, owned
-by root:facelock.
+SQLite database storing face embeddings. Permissions should be 600, owned
+by root:root: the daemon reads it as root, and
+.B facelock
+group members request authentication through the daemon rather than reading
+templates.
 .TP
 .I /var/lib/facelock/models/
 Directory containing ONNX model files (SCRFD and ArcFace). SHA256-verified
-at load time. Permissions should be 644, owned by root:facelock.
+at load time. Public downloads, so permissions are 755 root:root with the
+model files themselves 644; the 710 state directory above is what keeps
+non-group users away. Overridable via
+.I daemon.model_dir
+in the configuration file; an explicitly configured directory is honored
+verbatim and is never rewritten.
+.TP
+.I /var/lib/facelock/enrolled/
+Enrollment markers read by
+.BR "facelock is\-enrolled" .
+Permissions should be 710, owned by root:facelock: group-traversable to a
+known filename but not listable. The ownership is part of the contract \(em
+the group-execute bit only works because the
+.B facelock
+group owns the directory.
+.TP
+.I /var/lib/facelock/enrolled/<user>
+One user's marker, 600 and owned by that user. Contains the model count and
+the time it last changed. A hint for
+.BR "facelock is\-enrolled" ,
+never consulted during authentication.
 .TP
 .I /usr/share/dbus-1/system.d/org.facelock.Daemon.conf
 D-Bus system bus policy file. Enforces deny-all default, allowing access only
@@ -253,6 +387,25 @@ Success (authentication passed, command completed).
 .TP
 .B non\-zero
 Failure (authentication failed, error occurred).
+.PP
+.B facelock is\-enrolled
+defines its exit status as its interface, so integrations branch on the status
+rather than parsing stdout:
+.TP
+.B 0
+The user has a usable enrollment.
+.TP
+.B 1
+Not enrolled, or the enrollment is not usable. A missing marker and an
+unreadable one are both reported this way.
+.TP
+.B 2
+Error: an invalid
+.BR \-\-user ,
+or a marker that exists but cannot be parsed.
+.PP
+.B facelock auth
+exits 0 when the face matched, 1 when it did not, and 2 on error.
 .SH SECURITY
 The default configuration requires an IR camera
 .RB ( security.require_ir=true ).

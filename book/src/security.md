@@ -16,7 +16,7 @@ Facelock is designed to keep biometric data under the user's exclusive control:
 - **Local-only inference**: All face detection and recognition runs on-device via ONNX Runtime. No images, embeddings, or metadata are ever transmitted over the network.
 - **No telemetry**: Facelock contains zero analytics, tracking, or phone-home code. After the one-time model download during `facelock setup`, it never contacts any server.
 - **No cloud dependencies**: Authentication works fully offline. No account registration, no API keys, no external services.
-- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (640, root:facelock). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
+- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (600, root:root). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
 - **Open source**: All code is MIT/Apache-2.0 licensed. No proprietary blobs or obfuscated network calls. Privacy claims are verifiable by reading the source.
 
 ## Attack Vectors & Mitigations
@@ -90,8 +90,8 @@ chmod 644 /var/lib/facelock/models/*.onnx
 
 ```bash
 # Database owned by root, readable only by root and facelock group
-chown root:facelock /var/lib/facelock/facelock.db
-chmod 640 /var/lib/facelock/facelock.db
+chown root:root /var/lib/facelock/facelock.db
+chmod 600 /var/lib/facelock/facelock.db
 ```
 
 #### B. Embedding Sensitivity Warning
@@ -112,7 +112,7 @@ For high-security deployments, embeddings can be encrypted with AES-256-GCM usin
 
 The D-Bus system bus policy (`/usr/share/dbus-1/system.d/org.facelock.Daemon.conf`) restricts which users and groups can own the bus name and invoke methods. Only root and members of the `facelock` group are granted access. (`/etc/dbus-1/system.d/` is the admin-override location for local customization.)
 
-Beyond bus-level access, the daemon enforces per-method UID authorization. Before executing any method, the daemon calls `GetConnectionUnixUser` to verify the caller's UID. `Authenticate` allows the caller's own UID. `Enroll` and `Shutdown` are restricted to root (UID 0) only. This prevents a `facelock` group member from enrolling faces or shutting down the daemon without root privileges.
+Beyond bus-level access, the daemon enforces per-method UID authorization. Before executing any method, the daemon calls `GetConnectionUnixUser` to verify the caller's UID. `Authenticate` allows the caller's own UID — a user must be able to request authentication for themselves, since screen lockers run their PAM stack as that user. Every other method, including `Enroll`, `Shutdown`, and the preview methods, is restricted to root (UID 0). This prevents a `facelock` group member from enrolling faces, pulling camera frames, or shutting down the daemon without root privileges.
 
 #### B. D-Bus Message Size Limits (Required)
 
