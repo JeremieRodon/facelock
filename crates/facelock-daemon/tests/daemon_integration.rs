@@ -5,6 +5,7 @@ use facelock_core::config::Config;
 use facelock_core::types::MatchResult;
 use facelock_daemon::audit::AuditSource;
 use facelock_daemon::auth::AuthOutcome;
+use facelock_daemon::cancel::CancelToken;
 use facelock_daemon::handler::{AuthIntent, DaemonRequest, DaemonResponse};
 use facelock_store::FaceStore;
 use facelock_test_support::fixtures;
@@ -225,6 +226,7 @@ fn device_mismatch_never_reaches_success() {
         &config,
         "u",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     match resp {
         AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
@@ -258,6 +260,7 @@ fn device_mismatch_never_reaches_success() {
         &config,
         "u",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     match resp2 {
         AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
@@ -310,6 +313,7 @@ fn legacy_null_device_id_still_authenticates() {
         &config,
         "u",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     match resp {
         AuthOutcome::AuthResult(MatchResult { matched, .. }) => {
@@ -451,6 +455,7 @@ fn static_matching_frames_report_variance_reason() {
         &config,
         "testuser",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
 
     match resp {
@@ -502,6 +507,7 @@ fn still_then_moving_frames_recover_and_authenticate() {
         &config,
         "testuser",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
 
     match resp {
@@ -551,6 +557,7 @@ fn failed_auth_writes_audit_entry() {
         &config,
         "testuser",
         AuditSource::Daemon,
+        &CancelToken::new(),
     );
     assert!(
         matches!(resp, AuthOutcome::AuthResult(ref r) if !r.matched),
@@ -570,6 +577,7 @@ fn failed_auth_writes_audit_entry() {
         &config,
         "testuser",
         AuditSource::Test,
+        &CancelToken::new(),
     );
 
     let written = std::fs::read_to_string(&log_path).expect("audit log must exist");
@@ -934,6 +942,7 @@ fn auth_loop_wipes_the_callers_embeddings() {
         &config,
         "alice",
         AuditSource::Test,
+        &CancelToken::new(),
     );
 
     assert!(
@@ -975,6 +984,7 @@ fn auth_loop_wipes_the_callers_embeddings_on_failure() {
         &config,
         "alice",
         AuditSource::Test,
+        &CancelToken::new(),
     );
 
     assert!(

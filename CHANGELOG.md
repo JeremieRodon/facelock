@@ -77,6 +77,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An authentication whose caller has gone away now ends within one frame**
+  (ADR 008 §5). Nothing could shorten the scan loop before: when a screen
+  locker aborted PAM because the password was typed first, or a `sudo` was
+  killed, or a client crashed, the daemon kept capturing — and kept the IR
+  emitter lit — until `recognition.timeout_secs`. Every in-flight request now
+  carries a cancel token, checked once per iteration by the auth loop, the
+  enroll loop and both frame-discard loops. It is set when the caller's D-Bus
+  connection disappears (a per-request `NameOwnerChanged` watch on the
+  caller's bus name), on suspend, on `ReleaseCamera`, and on shutdown — all
+  without taking the handler lock, which is what the request being cancelled
+  is holding. A cancelled attempt releases the camera immediately, is audited
+  as `cancelled` rather than `failure`, and **charges no rate-limit budget**:
+  the user never got to make an attempt. On the wire it reuses the
+  recoverable-error encoding with the frozen message `cancelled`, which the
+  PAM module maps to `PAM_IGNORE` — the stack falls through to the password
+  the user was already typing. No new D-Bus method, no signature change. The
+  suspend path in particular no longer gives up with a "handler busy" warning
+  and leaves the camera streaming into sleep.
 - **The daemon holds the camera open only after a failed authentication**
   (ADR 008). Previously every request — success included — left the V4L2 stream
   live for `device.camera_release_secs`, which on IR hardware is a visible

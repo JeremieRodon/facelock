@@ -24,6 +24,7 @@ use nix::unistd::{Uid, User};
 use tracing::{error, info, warn};
 use zbus::{fdo, interface, object_server::SignalEmitter};
 
+use crate::cancel::CancelToken;
 use crate::handler::{AuthIntent, CAMERA_POLL_INTERVAL, DaemonRequest, DaemonResponse, Handler};
 
 /// Production type alias for the handler with real Camera and FaceEngine.
@@ -51,6 +52,12 @@ pub enum ServerError {
 /// This prevents D-Bus clients from hanging indefinitely if a previous auth
 /// call is stuck (e.g., camera blocking on DQBUF).
 const HANDLER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the suspend path waits for the handler mutex after cancelling.
+/// A cancelled request exits within one frame, so this is generous; when it
+/// runs out the camera is left to close on the request's own return rather
+/// than blocking the suspend transition any longer.
+const SUSPEND_RELEASE_WAIT: Duration = Duration::from_secs(1);
 
 /// Try to acquire the handler mutex with a timeout.
 /// Uses try_lock in a polling loop to avoid blocking the thread indefinitely.
@@ -135,6 +142,98 @@ impl Drop for CaptureGuard {
     fn drop(&mut self) {
         self.0.busy.store(false, Ordering::Release);
     }
+}
+
+/// A running watch on the caller's bus name, aborted when the request that
+/// registered it ends.
+///
+/// The guard matters as much as the watch: without it a watch would outlive
+/// its request and cancel *the next one* when the previous caller finally
+/// exited.
+struct CallerWatch(tokio::task::JoinHandle<()>);
+
+impl Drop for CallerWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Cancel the in-flight request when the caller's D-Bus connection
+/// disappears.
+///
+/// This is what makes an abandoned authentication *visible* to the daemon
+/// (ADR 008 §5). A screen locker that aborts PAM because the password was
+/// typed first, a killed `sudo`, a crashed client — all of them drop their
+/// bus connection, and the bus broadcasts `NameOwnerChanged` with an empty
+/// new owner. Without this, the daemon cannot tell that from a slow user and
+/// keeps the camera (and the IR emitter) running to `timeout_secs`.
+///
+/// Best-effort by design: if the subscription cannot be set up, this logs and
+/// returns `None`, and that request is bounded by its timeout exactly as
+/// every request was before. A client that dies *before* the subscription is
+/// established is missed the same way — accepted, since the alternative is
+/// synchronizing every method call with the bus.
+async fn watch_caller_departure(
+    connection: &zbus::Connection,
+    sender: Option<&zbus::names::UniqueName<'_>>,
+    cancel: CancelToken,
+) -> Option<CallerWatch> {
+    let sender = sender?.to_string();
+
+    let proxy = match fdo::DBusProxy::new(connection).await {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            warn!(
+                sender,
+                "cannot watch caller for departure ({e}); request is timeout-bounded"
+            );
+            return None;
+        }
+    };
+    // Arg-0 match: the bus filters to this name, so every event on the
+    // stream is about our caller and nothing else.
+    let mut stream = match proxy
+        .receive_name_owner_changed_with_args(&[(0, sender.as_str())])
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!(
+                sender,
+                "cannot watch caller for departure ({e}); request is timeout-bounded"
+            );
+            return None;
+        }
+    };
+
+    let watched = sender.clone();
+    Some(CallerWatch(tokio::spawn(async move {
+        while let Some(signal) = stream.next().await {
+            let Ok(args) = signal.args() else { continue };
+            let name = args.name().to_string();
+            let new_owner = args.new_owner().as_ref().map(|owner| owner.to_string());
+            if caller_departed(&watched, &name, new_owner.as_deref()) {
+                info!(
+                    sender = watched,
+                    "caller disconnected, cancelling in-flight request"
+                );
+                cancel.cancel();
+                return;
+            }
+        }
+    })))
+}
+
+/// Does this `NameOwnerChanged` event mean the watched caller is gone?
+///
+/// Two conditions, both required. The name must be the one we registered
+/// for — the bus's arg-0 match already guarantees that, and checking it again
+/// here is what makes "one request's watch never cancels another's" a
+/// property of this crate rather than of a match rule. And the new owner must
+/// be absent: an empty new owner is a departure, a different one is a
+/// handover of a well-known name, which is not our caller leaving.
+fn caller_departed(watched: &str, name: &str, new_owner: Option<&str>) -> bool {
+    name == watched && new_owner.is_none_or(str::is_empty)
 }
 
 /// Raw camera frames require privilege: only root gets them. When frames are
@@ -427,6 +526,12 @@ where
     config_mtime: Arc<Mutex<Option<std::time::SystemTime>>>,
     /// In-flight guard for camera-capture operations (DoS control).
     capture_slot: Arc<CaptureSlot>,
+    /// The daemon's cancel token, installed on the handler (and re-installed
+    /// on every rebuilt handler) so that suspend, `ReleaseCamera`, shutdown
+    /// and the per-request caller watch can stop an in-flight capture
+    /// **without taking the handler mutex** — which is exactly what the
+    /// request being cancelled is holding (ADR 008 §5).
+    cancel: CancelToken,
     /// Builds per-user notifiers for auth outcomes. Injected from `main` so
     /// the server never names the delivery implementation (D9) — a
     /// prerequisite for moving this server out of facelock-cli.
@@ -444,19 +549,31 @@ where
     /// Construct the service around a built handler. [`run_dbus_server`]
     /// does this with production types; integration tests with mocks.
     pub fn new(
-        handler: Handler<C, E>,
+        mut handler: Handler<C, E>,
         startup_config_mtime: Option<std::time::SystemTime>,
         rebuild: Option<HandlerRebuild<C, E>>,
         notifier_factory: NotifierFactory,
     ) -> Self {
+        // One token for the daemon's lifetime. Minted here rather than read
+        // off the handler because a config reload builds a *new* handler, and
+        // every watcher already holding a clone must keep working across that
+        // swap — so the service owns it and the handler adopts it.
+        let cancel = CancelToken::new();
+        handler.set_cancel_token(cancel.clone());
         Self {
             handler: Arc::new(Mutex::new(handler)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
             capture_slot: Arc::new(CaptureSlot::default()),
+            cancel,
             notifier_factory,
             rebuild,
         }
+    }
+
+    /// The daemon's cancel token, for the watchers `run_dbus_server` spawns.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     /// Check if the config file has been modified since the handler was built.
@@ -486,13 +603,17 @@ where
 
         info!("config file changed, reloading");
 
-        let new_handler = match rebuild() {
+        let mut new_handler = match rebuild() {
             Ok(handler) => handler,
             Err(e) => {
                 warn!("failed to reload config: {e} — continuing with old config");
                 return;
             }
         };
+        // The rebuilt handler starts with a token of its own; replace it with
+        // the service's, so the watchers already holding clones keep reaching
+        // whatever is in flight after the swap.
+        new_handler.set_cancel_token(self.cancel.clone());
 
         // Swap in the new handler
         if let Ok(mut guard) = self.handler.lock() {
@@ -860,6 +981,11 @@ where
     pub async fn release_camera_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::ReleaseCamera, None)?;
+        // Set the token before queuing for the handler mutex. If a capture is
+        // in flight it holds that mutex, so the store below is the only thing
+        // that reaches it — and it is what lets the lock be acquired at all,
+        // within one frame instead of at `timeout_secs`.
+        self.cancel.cancel();
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -886,6 +1012,9 @@ where
     pub async fn shutdown_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::Shutdown, None)?;
+        // Same reason as `ReleaseCamera`: stop the capture before waiting on
+        // the mutex it is holding.
+        self.cancel.cancel();
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -912,6 +1041,10 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         user: &str,
     ) -> fdo::Result<AuthResult> {
         let caller = resolve_caller_identity(&hdr, connection).await?;
+        // Arm first, then subscribe: a cancellation that arrives after the
+        // subscription can never be erased by a later reset (ADR 008 §5).
+        self.cancel.arm();
+        let _watch = watch_caller_departure(connection, hdr.sender(), self.cancel_token()).await;
         let result = self.authenticate_as(caller, user).await;
 
         // Emit auth_attempted signal (best-effort, don't fail auth if signal
@@ -938,6 +1071,8 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         user: &str,
     ) -> fdo::Result<AuthResult> {
         let caller = resolve_caller_identity(&hdr, connection).await?;
+        self.cancel.arm();
+        let _watch = watch_caller_departure(connection, hdr.sender(), self.cancel_token()).await;
         let result = self.test_authenticate_as(caller, user).await;
 
         // Emitted for the same reason and with the same payload as
@@ -957,6 +1092,11 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         label: &str,
     ) -> fdo::Result<(u32, u32)> {
         let caller = resolve_caller_identity(&hdr, connection).await?;
+        // `facelock enroll` is a long capture loop; Ctrl-C on the CLI drops
+        // its bus connection and must end it, not leave the camera running
+        // to the enrollment deadline.
+        self.cancel.arm();
+        let _watch = watch_caller_departure(connection, hdr.sender(), self.cancel_token()).await;
         self.enroll_as(caller, user, label).await
     }
 
@@ -1217,6 +1357,7 @@ async fn run_dbus_server(
     let service = FacelockService::new(handler, startup_config_mtime, rebuild, notifier_factory);
     let handler = service.handler.clone();
     let last_activity = service.last_activity.clone();
+    let service_cancel = service.cancel_token();
 
     let _connection = zbus::connection::Builder::system()?
         .name(BUS_NAME)?
@@ -1238,8 +1379,9 @@ async fn run_dbus_server(
     // Spawn a background task to release the camera on system suspend.
     // Best-effort: if logind is unavailable, log a warning and continue.
     let handler_for_sleep = handler.clone();
+    let cancel_for_sleep = service_cancel.clone();
     tokio::spawn(async move {
-        if let Err(e) = watch_sleep_signals(handler_for_sleep).await {
+        if let Err(e) = watch_sleep_signals(handler_for_sleep, cancel_for_sleep).await {
             tracing::warn!("failed to watch logind sleep signals: {e}");
         }
     });
@@ -1274,7 +1416,10 @@ async fn run_dbus_server(
 /// sudo systemctl suspend
 /// # After resume, check: journalctl -u facelock-daemon --since "5 min ago"
 /// ```
-async fn watch_sleep_signals(handler: Arc<Mutex<ProductionHandler>>) -> zbus::Result<()> {
+async fn watch_sleep_signals(
+    handler: Arc<Mutex<ProductionHandler>>,
+    cancel: CancelToken,
+) -> zbus::Result<()> {
     let connection = zbus::Connection::system().await?;
     let proxy = zbus::Proxy::new(
         &connection,
@@ -1290,14 +1435,40 @@ async fn watch_sleep_signals(handler: Arc<Mutex<ProductionHandler>>) -> zbus::Re
     while let Some(signal) = stream.next().await {
         let suspending: bool = signal.body().deserialize().unwrap_or(false);
         if suspending {
+            // Lock-free and first: a capture in flight is holding the handler
+            // mutex, so the token is the only thing that reaches it. This
+            // replaces the old single `try_lock` that gave up with a "handler
+            // busy" warning and left the camera streaming into suspend.
+            cancel.cancel();
             let handler = handler.clone();
-            let _ = tokio::task::spawn_blocking(move || match handler.try_lock() {
-                Ok(mut h) => {
-                    h.handle(DaemonRequest::ReleaseCamera);
-                    info!("released camera for suspend");
-                }
-                Err(_) => {
-                    warn!("could not release camera for suspend: handler busy");
+            let _ = tokio::task::spawn_blocking(move || {
+                // The cancelled request exits within one frame and drops the
+                // lock; wait about that long for it rather than giving up
+                // immediately (ADR 008 §8).
+                let deadline = Instant::now() + SUSPEND_RELEASE_WAIT;
+                loop {
+                    match handler.try_lock() {
+                        Ok(mut h) => {
+                            h.handle(DaemonRequest::ReleaseCamera);
+                            info!("released camera for suspend");
+                            return;
+                        }
+                        Err(TryLockError::Poisoned(e)) => {
+                            e.into_inner().handle(DaemonRequest::ReleaseCamera);
+                            info!("released camera for suspend (recovered poisoned lock)");
+                            return;
+                        }
+                        Err(TryLockError::WouldBlock) => {
+                            if Instant::now() >= deadline {
+                                warn!(
+                                    "could not release camera for suspend within {SUSPEND_RELEASE_WAIT:?}: \
+                                     handler still busy (the camera closes when the request returns)"
+                                );
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                    }
                 }
             })
             .await;
@@ -1661,6 +1832,48 @@ mod tests {
     fn preview_jpeg_kept_when_frames_allowed() {
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
         assert_eq!(sanitize_preview_jpeg(jpeg.clone(), true), jpeg);
+    }
+
+    // --- ADR 008 §5: caller departure ---
+
+    /// The event that means "cancel": our caller's name lost its owner.
+    #[test]
+    fn an_empty_new_owner_for_the_watched_name_is_a_departure() {
+        assert!(caller_departed(":1.42", ":1.42", None));
+        assert!(caller_departed(":1.42", ":1.42", Some("")));
+    }
+
+    /// The one thing a per-request watch must never do: cancel somebody
+    /// else's request. A `NameOwnerChanged` for any other name is ignored
+    /// even if it reaches this stream.
+    #[test]
+    fn a_departure_of_another_name_cancels_nothing() {
+        assert!(!caller_departed(":1.42", ":1.43", None));
+        assert!(!caller_departed(":1.42", "org.freedesktop.login1", None));
+    }
+
+    /// A well-known name changing hands is not our caller leaving.
+    #[test]
+    fn a_handover_to_a_new_owner_is_not_a_departure() {
+        assert!(!caller_departed(":1.42", ":1.42", Some(":1.99")));
+    }
+
+    /// End to end over the decision the watch task runs, with the token it
+    /// would set: only the registered sender's departure cancels.
+    #[test]
+    fn only_the_registered_senders_departure_sets_the_token() {
+        let cancel = CancelToken::new();
+        for (name, new_owner) in [(":1.43", None), (":1.42", Some(":1.99"))] {
+            if caller_departed(":1.42", name, new_owner) {
+                cancel.cancel();
+            }
+        }
+        assert!(!cancel.is_cancelled(), "an unrelated event cancelled us");
+
+        if caller_departed(":1.42", ":1.42", None) {
+            cancel.cancel();
+        }
+        assert!(cancel.is_cancelled());
     }
 
     #[test]

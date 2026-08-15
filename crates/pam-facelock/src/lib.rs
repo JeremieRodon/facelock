@@ -895,6 +895,15 @@ fn pam_code_for_daemon_error(message: &str) -> (libc::c_int, &'static str) {
         (PAM_AUTH_ERR, "rate_limited")
     } else if message.contains("IR camera required") || message.contains("ir_required") {
         (PAM_IGNORE, "ir_required")
+    } else if message == "cancelled" {
+        // The attempt was abandoned, not refused: the caller's connection
+        // went away, the system is suspending, or `ReleaseCamera` arrived.
+        // The daemon has no opinion about this face, so abstain and let the
+        // password modules run — which is what the user who just typed a
+        // password expects. Matched exactly (not `contains`) so an arbitrary
+        // error message that happens to mention cancelling cannot claim it.
+        // The string is frozen protocol; see docs/contracts.md.
+        (PAM_IGNORE, "cancelled")
     } else {
         (PAM_IGNORE, "error: internal")
     }
@@ -1464,6 +1473,29 @@ auth_bin = "/usr/local/bin/evil"
         assert_eq!(reason, "ir_required");
     }
 
+    /// A cancelled attempt is an abstention, never a failure: the daemon
+    /// stopped looking, it did not look and say no.
+    #[test]
+    fn daemon_error_cancelled_maps_to_ignore() {
+        let (code, reason) = pam_code_for_daemon_error("cancelled");
+        assert_eq!(code, PAM_IGNORE);
+        assert_eq!(reason, "cancelled");
+    }
+
+    /// The cancellation row matches the frozen string exactly, so an error
+    /// that merely mentions cancelling still lands on the generic branch.
+    #[test]
+    fn only_the_exact_cancelled_string_claims_the_cancelled_row() {
+        for message in [
+            "camera error: capture cancelled by driver",
+            "storage error: transaction cancelled",
+        ] {
+            let (code, reason) = pam_code_for_daemon_error(message);
+            assert_eq!(code, PAM_IGNORE);
+            assert_eq!(reason, "error: internal", "message: {message}");
+        }
+    }
+
     #[test]
     fn daemon_error_never_maps_to_success() {
         for message in [
@@ -1471,6 +1503,7 @@ auth_bin = "/usr/local/bin/evil"
             "IR camera required",
             "camera error: device busy",
             "storage error: disk io",
+            "cancelled",
             "",
         ] {
             let (code, _) = pam_code_for_daemon_error(message);

@@ -12,6 +12,7 @@ use facelock_core::types::MatchResult;
 use facelock_daemon::audit::{self, AuditEntry, AuditSource};
 use facelock_daemon::auth;
 use facelock_daemon::auth::{AuthOutcome, ErrorKind};
+use facelock_daemon::cancel::CancelToken;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
@@ -186,6 +187,8 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         &config,
         &user,
         AuditSource::Oneshot,
+        // Commit 4 replaces this with a token wired to SIGTERM/SIGINT/SIGHUP.
+        &CancelToken::new(),
     );
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -226,6 +229,13 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
                 "no match"
             );
             1
+        }
+        AuthOutcome::Cancelled => {
+            // Already audited as `cancelled` by the auth loop. Exit 2 is the
+            // existing "no opinion" code, which PAM maps to PAM_IGNORE — the
+            // contract is unchanged, nothing new is added to it.
+            info!(user = %user, duration_ms, "cancelled");
+            2
         }
         AuthOutcome::Error {
             kind: ErrorKind::AllFramesDark,

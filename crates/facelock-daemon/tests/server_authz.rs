@@ -528,6 +528,38 @@ async fn root_failed_authenticate_charges_the_rate_limit() {
     cleanup_db(&db_path);
 }
 
+/// A cancelled attempt is an abstention, not a failed attempt: the user
+/// never got to make one, so it must cost no rate-limit budget (ADR 008 §5).
+/// Otherwise a screen locker that aborts PAM on every unlock would walk the
+/// user into a lockout.
+#[tokio::test]
+async fn a_cancelled_authenticate_charges_no_rate_limit() {
+    let db_path = temp_db_path("cancel-charges-nothing");
+    cleanup_db(&db_path);
+    // Budget of one failed attempt — three cancelled runs must not reach it.
+    let svc = failing_service_at(&db_path, "alice", 1);
+
+    for _ in 0..3 {
+        // What `ReleaseCamera`, suspend and the caller-departure watch all do.
+        svc.cancel_token().cancel();
+        let reply = svc.authenticate_as(root(), "alice").await.unwrap();
+        assert!(!reply.matched);
+        assert_eq!(
+            reply.model_id, -2,
+            "a cancellation travels as a recoverable error: {reply:?}"
+        );
+        assert_eq!(reply.label, "cancelled", "frozen wire string");
+    }
+
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect.check_rate_limit("alice", 1, 60).unwrap(),
+        "cancelled attempts must leave the budget untouched"
+    );
+
+    cleanup_db(&db_path);
+}
+
 /// The other half: a non-root user's own failed attempts are charged, as
 /// they always were.
 #[tokio::test]

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use facelock_camera::MMAP_BUFFERS;
@@ -12,7 +10,8 @@ use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
 
 use crate::audit::AuditSource;
-use crate::auth::{self, AuthOutcome, PreCheckContext};
+use crate::auth::{self, AuthOutcome, CANCELLED_MESSAGE, PreCheckContext};
+use crate::cancel::CancelToken;
 use crate::enroll::{self, EnrollOutcome};
 use crate::rate_limit::RateLimiter;
 
@@ -143,6 +142,14 @@ impl From<AuthOutcome> for DaemonResponse {
             AuthOutcome::AuthResult(result) => DaemonResponse::AuthResult(result),
             AuthOutcome::Suppressed => DaemonResponse::Suppressed,
             AuthOutcome::Error { message, .. } => DaemonResponse::Error { message },
+            // The wire has no cancellation shape of its own, so a cancelled
+            // attempt travels as a recoverable error whose message is the
+            // frozen `cancelled` string. PAM maps it to PAM_IGNORE — the
+            // stack falls through to password, which is what the user who
+            // just typed one expects (docs/contracts.md).
+            AuthOutcome::Cancelled => DaemonResponse::Error {
+                message: CANCELLED_MESSAGE.to_string(),
+            },
         }
     }
 }
@@ -158,6 +165,9 @@ impl From<EnrollOutcome> for DaemonResponse {
                 embedding_count,
             },
             EnrollOutcome::Error { message } => DaemonResponse::Error { message },
+            EnrollOutcome::Cancelled => DaemonResponse::Error {
+                message: CANCELLED_MESSAGE.to_string(),
+            },
         }
     }
 }
@@ -239,6 +249,7 @@ impl From<&AuthOutcome> for Outcome {
             // Every `ErrorKind`, including `AllFramesDark` and the camera and
             // capture failures.
             AuthOutcome::Error { .. } => Outcome::Error,
+            AuthOutcome::Cancelled => Outcome::Cancelled,
         }
     }
 }
@@ -252,6 +263,7 @@ impl From<&EnrollOutcome> for Outcome {
         match outcome {
             EnrollOutcome::Enrolled { .. } => Outcome::Success,
             EnrollOutcome::Error { .. } => Outcome::Error,
+            EnrollOutcome::Cancelled => Outcome::Cancelled,
         }
     }
 }
@@ -263,12 +275,23 @@ impl From<&EnrollOutcome> for Outcome {
 /// MMAP buffers V4L2 left filled after the previous request. Sharing it is
 /// what keeps "the frames a warm stream hands back first are not analyzed"
 /// true by construction rather than by two similar loops agreeing.
-fn discard_frames<C: CameraSource>(camera: &mut C, count: u32, reason: &str) -> Result<(), String> {
+fn discard_frames<C: CameraSource>(
+    camera: &mut C,
+    count: u32,
+    reason: &str,
+    cancel: &CancelToken,
+) -> Result<(), String> {
     if count == 0 {
         return Ok(());
     }
     debug!(count, reason, "discarding frames");
     for _ in 0..count {
+        // A discard is a blocking capture like any other, so it honors the
+        // token too: cancelling during warmup must not wait out the whole
+        // ring before the camera closes (ADR 008 §8).
+        if cancel.is_cancelled() {
+            return Err(CANCELLED_MESSAGE.to_string());
+        }
         camera.capture().map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -289,7 +312,7 @@ pub(crate) struct CameraLease<C: CameraSource> {
     /// Set to abort the in-flight request within one frame. Shared with the
     /// request itself, so suspend/shutdown/`ReleaseCamera` can set it without
     /// taking the handler lock.
-    cancel: Arc<AtomicBool>,
+    cancel: CancelToken,
     factory: Option<CameraFactory<C>>,
     /// Quirk-overridden warmup frames (takes precedence over config).
     warmup_frames_override: Option<u32>,
@@ -300,28 +323,42 @@ impl<C: CameraSource> CameraLease<C> {
         Self {
             camera: None,
             deadline: None,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: CancelToken::new(),
             factory,
             warmup_frames_override,
         }
     }
 
-    /// The token an in-flight request checks. Cloneable so a watcher can set
-    /// it without the handler lock.
-    #[allow(dead_code)]
-    pub(crate) fn cancel_token(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
+    /// The token an in-flight request checks. Cloned, not borrowed, so a
+    /// watcher can set it without the handler lock — the whole point (§5).
+    pub(crate) fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
+    }
+
+    /// Adopt a token minted elsewhere. The D-Bus server owns one for the
+    /// daemon's whole life and re-installs it after a config reload rebuilds
+    /// the handler, so the watchers it handed out keep working.
+    pub(crate) fn set_cancel_token(&mut self, token: CancelToken) {
+        self.cancel = token;
     }
 
     /// Open the camera (or reuse a warm one) for a request that is about to
-    /// run. Clears any warm-hold deadline and resets the cancel token: from
-    /// here until `finish`, the stream belongs to this request.
+    /// run. Clears any warm-hold deadline: from here until `finish`, the
+    /// stream belongs to this request. A request that was already cancelled
+    /// never opens the camera at all.
     ///
     /// The returned borrow is tied to the lease, not to `config`, so a caller
     /// can still reach the handler's other fields while holding the camera.
     fn acquire<'a>(&'a mut self, config: &Config) -> Result<&'a mut C, String> {
         self.deadline = None;
-        self.cancel.store(false, Ordering::SeqCst);
+        // The token is *not* reset here. Arming is the caller's job (see
+        // `CancelToken::arm`) and happens before the watchers subscribe, so a
+        // cancellation that lands between subscribing and the first frame
+        // cannot be erased by the request it is meant to stop.
+        if self.cancel.is_cancelled() {
+            self.close("cancelled before the camera was needed");
+            return Err(CANCELLED_MESSAGE.to_string());
+        }
 
         if self.camera.is_some() {
             // Warm reuse. The stream never stopped, so its buffers still hold
@@ -329,7 +366,7 @@ impl<C: CameraSource> CameraLease<C> {
             // those would let a fresh attempt match on the tail of the last
             // one. AE is already settled, so no warmup discard is needed.
             let stale = match self.camera.as_mut() {
-                Some(camera) => discard_frames(camera, MMAP_BUFFERS - 1, "stale"),
+                Some(camera) => discard_frames(camera, MMAP_BUFFERS - 1, "stale", &self.cancel),
                 None => Ok(()),
             };
             if let Err(e) = stale {
@@ -351,8 +388,13 @@ impl<C: CameraSource> CameraLease<C> {
                 .unwrap_or(config.device.warmup_frames);
             // A cold warmup discard is advisory (AGC/AE settling); a failure
             // here is left for the scan loop to surface, as it always was.
-            if let Err(e) = discard_frames(&mut camera, warmup, "warmup") {
+            if let Err(e) = discard_frames(&mut camera, warmup, "warmup", &self.cancel) {
                 debug!("warmup discard failed: {e}");
+                // A cancellation during warmup aborts the acquire outright:
+                // the request is over before it started (ADR 008 §8).
+                if self.cancel.is_cancelled() {
+                    return Err(CANCELLED_MESSAGE.to_string());
+                }
             }
             self.camera = Some(camera);
         }
@@ -404,13 +446,23 @@ impl<C: CameraSource> CameraLease<C> {
         }
     }
 
-    /// Cancel whatever is in flight and close the camera now — suspend,
-    /// `ReleaseCamera`, shutdown. Setting the token needs no handler lock, so
-    /// this is safe to reach even while a request holds one.
+    /// Close the camera now — the `ReleaseCamera`, shutdown and suspend
+    /// paths.
+    ///
+    /// Cancelling the request that may be holding the camera is *not* done
+    /// here, because it cannot be: this method needs the handler mutex, and a
+    /// capture in flight is holding it. The token is set first, lock-free, by
+    /// whoever is asking (see `FacelockService::release_camera_as` and the
+    /// suspend watcher); by the time this runs, that request has already
+    /// returned.
+    ///
+    /// Which is also why it re-arms the token on the way out: holding the
+    /// mutex proves nothing is in flight, so leaving the flag latched would
+    /// only cancel the *next* request, which nobody asked for.
     fn release(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
         self.deadline = None;
         self.close("camera release requested");
+        self.cancel.arm();
     }
 
     /// Drop the stream (`Drop` runs STREAMOFF and disables the IR emitter).
@@ -575,6 +627,21 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         self.lease.expire(now);
     }
 
+    /// The token every camera loop in this handler checks. Cloned, so the
+    /// D-Bus server can hand it to a per-request caller watch, to the
+    /// suspend watcher, and to `ReleaseCamera` without ever taking the
+    /// handler mutex — which the request being cancelled is holding.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.lease.cancel_token()
+    }
+
+    /// Adopt a token minted elsewhere. The server owns one for the daemon's
+    /// whole life and re-installs it on the handler a config reload rebuilds,
+    /// so watchers registered against the old handler keep working.
+    pub fn set_cancel_token(&mut self, token: CancelToken) {
+        self.lease.set_cancel_token(token);
+    }
+
     /// Load user embeddings, decrypting TPM-sealed or software-encrypted blobs
     /// through the shared per-row implementation (`crate::embeddings`, N10).
     /// Falls back to the standard `get_user_embeddings` path when nothing could
@@ -660,6 +727,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     warn!(user, "enroll refused (encryption unavailable): {message}");
                     return DaemonResponse::Error { message };
                 }
+                let cancel = self.lease.cancel_token();
                 let camera = match self.lease.acquire(&self.config) {
                     Ok(camera) => camera,
                     Err(message) => return DaemonResponse::Error { message },
@@ -676,6 +744,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     &label,
                     self.software_sealer.as_ref(),
                     device_id.as_deref(),
+                    &cancel,
                 );
                 self.lease.finish(Outcome::from(&result), &self.config);
                 result.into()
@@ -848,6 +917,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             Err(resp) => return resp,
         };
 
+        let cancel = self.lease.cancel_token();
         let camera = match self.lease.acquire(&self.config) {
             Ok(camera) => camera,
             Err(message) => {
@@ -867,6 +937,7 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             &self.config,
             &user,
             intent.audit_source(),
+            &cancel,
         );
         self.lease.finish(Outcome::from(&result), &self.config);
         // Only failed auths count against the rate limit, and only for the
@@ -1167,20 +1238,43 @@ mod tests {
         assert!(deadline >= before + Duration::from_secs(10));
     }
 
-    /// `ReleaseCamera`, suspend and shutdown all land here: the in-flight
-    /// request is told to stop and the stream closes without waiting for it.
+    /// `ReleaseCamera`, suspend and shutdown all land here. The camera goes
+    /// at once — and the token is left *ready*, not latched: whoever asked
+    /// already set it lock-free to stop the request in flight, and by the
+    /// time this runs that request has returned. Latching it would cancel the
+    /// next request instead, which is how a `ReleaseCamera` used to be able
+    /// to wedge every later preview frame.
     #[test]
-    fn release_sets_the_cancel_token_and_closes_the_camera() {
+    fn release_closes_the_camera_and_leaves_the_token_ready() {
         let config = lease_config(3);
         let mut lease = lease();
         let token = lease.cancel_token();
         lease.acquire(&config).expect("mock camera opens");
-        assert!(!token.load(Ordering::SeqCst), "acquire resets the token");
 
+        token.cancel();
         lease.release();
-        assert!(token.load(Ordering::SeqCst));
         assert!(lease.camera.is_none());
         assert!(lease.deadline.is_none());
+        assert!(!token.is_cancelled(), "release must not latch the token");
+
+        // ...and the next request still works.
+        lease.acquire(&config).expect("a later request still opens");
+        assert!(lease.camera.is_some());
+    }
+
+    /// The other half of the token contract: a request that finds it set
+    /// never opens the camera at all (ADR 008 §8).
+    #[test]
+    fn a_cancelled_request_never_opens_the_camera() {
+        let config = lease_config(3);
+        let mut lease = lease();
+        lease.cancel_token().cancel();
+        let err = match lease.acquire(&config) {
+            Ok(_) => panic!("a cancelled request must not get a camera"),
+            Err(e) => e,
+        };
+        assert_eq!(err, crate::auth::CANCELLED_MESSAGE);
+        assert!(lease.camera.is_none());
     }
 
     /// A camera factory that cannot open is an error, never a warm state.

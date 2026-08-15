@@ -16,6 +16,7 @@ use nix::unistd::Uid;
 use tracing::{debug, info, warn};
 
 use crate::audit::{self, AuditEntry, AuditSource};
+use crate::cancel::CancelToken;
 use crate::liveness::LandmarkTracker;
 use crate::rate_limit::RateLimiter;
 
@@ -173,7 +174,25 @@ pub enum AuthOutcome {
     /// alongside because it is what crosses the D-Bus wire and what the user
     /// sees; nothing on this side of the wire may re-derive `kind` from it.
     Error { kind: ErrorKind, message: String },
+    /// The caller went away, the system is suspending, or the process was
+    /// signalled: the attempt was abandoned, not answered (ADR 008 §5).
+    ///
+    /// Deliberately **not** an [`ErrorKind`]. A rejection class is a
+    /// statement about this user's face; a cancellation is the absence of
+    /// one. It charges no rate limit, audits as `cancelled`, and reaches the
+    /// wire through the recoverable-error encoding as
+    /// [`CANCELLED_MESSAGE`].
+    Cancelled,
 }
+
+/// The wire and log rendering of [`AuthOutcome::Cancelled`]. **Frozen
+/// protocol**: the PAM module substring-matches it to choose `PAM_IGNORE`
+/// (`crates/pam-facelock/src/lib.rs`), exactly as it does for the two frozen
+/// [`ErrorKind`] strings, and it cannot link this crate to share the
+/// constant (its dependency ceiling is libc/toml/serde/zbus). It is also the
+/// audit log's `result` label for an abandoned attempt. Documented in
+/// docs/contracts.md.
+pub const CANCELLED_MESSAGE: &str = "cancelled";
 
 impl AuthOutcome {
     /// A rejection of a class whose message is fixed.
@@ -483,6 +502,7 @@ where
 /// fingerprint (restricting the compare set to templates enrolled on this
 /// camera) are asked of `camera.capabilities()` — the camera in use, not a
 /// parameter a caller could get out of sync with it (gap D8).
+#[allow(clippy::too_many_arguments)]
 pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     camera: &mut C,
     engine: &mut E,
@@ -491,6 +511,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     config: &Config,
     user: &str,
     source: AuditSource,
+    cancel: &CancelToken,
 ) -> AuthOutcome {
     let stored = Wiped(stored);
     let device_is_ir = camera.capabilities().is_ir;
@@ -570,6 +591,11 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     let mut last_frame: Option<Frame> = None;
 
     while Instant::now() < deadline {
+        // Checked before the blocking capture, so the attempt ends within one
+        // frame of the token being set — not at `timeout_secs` (ADR 008 §5).
+        if cancel.is_cancelled() {
+            return cancelled(config, user, source, start, frame_count);
+        }
         let frame = match camera.capture() {
             Ok(f) => f,
             Err(e) => {
@@ -872,6 +898,44 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     })
 }
 
+/// End an attempt that was abandoned rather than answered.
+///
+/// Audited (as `cancelled`, so the trail distinguishes "we stopped looking"
+/// from "we looked and said no") and logged, but never a `MatchResult`: the
+/// rate limiter charges failed *attempts*, and the user never got to make
+/// one.
+fn cancelled(
+    config: &Config,
+    user: &str,
+    source: AuditSource,
+    start: Instant,
+    frame_count: u32,
+) -> AuthOutcome {
+    let duration = start.elapsed();
+    info!(
+        user,
+        frames = frame_count,
+        duration_ms = duration.as_millis() as u64,
+        "authentication cancelled"
+    );
+    audit::write_audit_entry(
+        &config.audit,
+        &AuditEntry {
+            timestamp: audit::now_iso8601(),
+            user: user.to_string(),
+            result: CANCELLED_MESSAGE.into(),
+            source: Some(source),
+            similarity: None,
+            frame_count: Some(frame_count),
+            duration_ms: Some(duration.as_millis() as u64),
+            device: config.device.path.clone(),
+            model_label: None,
+            error: None,
+        },
+    );
+    AuthOutcome::Cancelled
+}
+
 fn is_ssh_session() -> bool {
     std::env::var("SSH_CONNECTION").is_ok() || std::env::var("SSH_TTY").is_ok()
 }
@@ -962,6 +1026,153 @@ mod tests {
             ErrorKind::classify("a message from a daemon of another version"),
             ErrorKind::Internal
         );
+    }
+
+    /// The third frozen string. PAM matches `cancelled` exactly to choose
+    /// `PAM_IGNORE`, so no rejection class may render it — otherwise a
+    /// genuine refusal would be reported as an abandoned attempt.
+    #[test]
+    fn no_rejection_class_renders_the_cancelled_string() {
+        assert_eq!(CANCELLED_MESSAGE, "cancelled");
+        for kind in ErrorKind::ALL {
+            if *kind == ErrorKind::Internal {
+                // Renders arbitrary text from elsewhere; unconstrainable.
+                continue;
+            }
+            assert_ne!(
+                kind.render("boom"),
+                CANCELLED_MESSAGE,
+                "{kind:?} renders the frozen cancellation string"
+            );
+        }
+    }
+
+    /// A camera whose k-th capture cancels the attempt, so the loop's
+    /// response to the token can be observed exactly.
+    struct CancellingCamera {
+        captures: u32,
+        cancel_at: u32,
+        token: CancelToken,
+        caps: CameraCaps,
+    }
+
+    impl CameraSource for CancellingCamera {
+        fn capabilities(&self) -> &CameraCaps {
+            &self.caps
+        }
+
+        fn capture(&mut self) -> facelock_core::error::Result<Frame> {
+            self.captures += 1;
+            if self.captures == self.cancel_at {
+                self.token.cancel();
+            }
+            Ok(Frame {
+                rgb: vec![200u8; 64 * 64 * 3],
+                gray: vec![200u8; 64 * 64],
+                width: 64,
+                height: 64,
+            })
+        }
+
+        fn capture_rgb_only(&mut self) -> facelock_core::error::Result<Frame> {
+            self.capture()
+        }
+    }
+
+    /// An engine that never finds a face, so nothing but the token can end
+    /// the loop before its deadline.
+    struct BlindEngine;
+
+    impl FaceProcessor for BlindEngine {
+        fn process(
+            &mut self,
+            _frame: &Frame,
+        ) -> facelock_core::error::Result<Vec<(facelock_core::types::Detection, FaceEmbedding)>>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn cancellable_config() -> Config {
+        Config::parse(
+            r#"
+[recognition]
+timeout_secs = 30
+
+[security]
+require_ir = false
+require_frame_variance = false
+require_landmark_liveness = false
+
+[audit]
+enabled = false
+"#,
+        )
+        .unwrap_or_default()
+    }
+
+    /// The rule of ADR 008 §5: the attempt ends within *one* frame of the
+    /// token being set — not at `timeout_secs`, which with a 30 s deadline
+    /// is what this test would otherwise sit through.
+    #[test]
+    fn a_token_set_at_frame_k_ends_the_attempt_before_frame_k_plus_one() {
+        let token = CancelToken::new();
+        let mut camera = CancellingCamera {
+            captures: 0,
+            cancel_at: 3,
+            token: token.clone(),
+            caps: CameraCaps::default(),
+        };
+        let config = cancellable_config();
+        let started = Instant::now();
+        let outcome = authenticate_with_embeddings(
+            &mut camera,
+            &mut BlindEngine,
+            &mut [],
+            &[],
+            &config,
+            "alice",
+            AuditSource::Daemon,
+            &token,
+        );
+
+        assert!(
+            matches!(outcome, AuthOutcome::Cancelled),
+            "expected Cancelled, got {outcome:?}"
+        );
+        assert_eq!(
+            camera.captures, 3,
+            "the loop must stop before capturing frame k+1"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the attempt waited out its timeout instead of cancelling"
+        );
+    }
+
+    /// A token already set when the loop starts costs zero frames.
+    #[test]
+    fn a_token_set_before_the_first_frame_captures_nothing() {
+        let token = CancelToken::new();
+        token.cancel();
+        let mut camera = CancellingCamera {
+            captures: 0,
+            cancel_at: u32::MAX,
+            token: token.clone(),
+            caps: CameraCaps::default(),
+        };
+        let outcome = authenticate_with_embeddings(
+            &mut camera,
+            &mut BlindEngine,
+            &mut [],
+            &[],
+            &cancellable_config(),
+            "alice",
+            AuditSource::Daemon,
+            &token,
+        );
+        assert!(matches!(outcome, AuthOutcome::Cancelled));
+        assert_eq!(camera.captures, 0);
     }
 
     /// A rate-limit *check* that fails is a storage fault, not a lockout.

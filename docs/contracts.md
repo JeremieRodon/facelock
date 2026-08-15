@@ -278,7 +278,9 @@ binary; none of it touches the data itself.
 
 ### Audit Log Entries
 
-`audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
+`audit.jsonl` is JSONL; each line carries `timestamp`, `user`, `result` (`success`, `failure`, `error`, `rate_limited`, `suppressed`, `cancelled`) and, when known, `similarity`, `frame_count`, `duration_ms`, `device`, `model_label`, `error`.
+
+`cancelled` (ADR 008 §5) is an attempt that was **abandoned, not answered**: the caller's bus connection went away, the system suspended, `ReleaseCamera` arrived, or a one-shot process was signalled. It is deliberately not a `failure` — no comparison reached a verdict, so it charges no rate-limit budget. The entry carries `frame_count` and `duration_ms` (how far the attempt got) and no `similarity`.
 
 `source` names the code path that produced the entry — `daemon` (the `Authenticate` D-Bus method), `oneshot` (the `facelock auth` helper PAM spawns), or `test` (`facelock test`, on either transport: the daemon's `TestAuthenticate` method or the in-process direct loop). It records the **enforcement path, not the caller's identity**: `daemon` and `oneshot` are fully-enforced authentications whose failures count against the rate limit, while `test` skips the SSH/lid physical-presence gates and charges nothing. So a `success` stamped `test` is a recognition result, not a policy-approved authentication — and a real authentication is never stamped `test`, whatever privilege its caller holds. The field is absent on entries written before it existed.
 
@@ -528,17 +530,34 @@ it; `ErrorKind::render` is the only place any of these sentences is written.
 The wire has no field for the class, so the CLI's D-Bus client reconstructs it
 with `ErrorKind::classify`, the exact inverse of `render`.
 
-Two rendered messages are **frozen protocol** because the PAM module
-substring-matches them to choose its return code, and it cannot link the daemon
+Three rendered messages are **frozen protocol** because the PAM module
+matches them to choose its return code, and it cannot link the daemon
 crate to share the type (its dependency ceiling is libc/toml/serde/zbus):
 
 | Substring PAM matches | Class | PAM code |
 |---|---|---|
 | `rate limited` | `RateLimited` | `PAM_AUTH_ERR` |
 | `IR camera required` | `IrRequired` | `PAM_IGNORE` |
+| `cancelled` (matched **exactly**) | `AuthOutcome::Cancelled` | `PAM_IGNORE` |
 
-Changing either string is a protocol break. They are pinned byte-exactly in
-`crates/facelock-daemon/src/auth.rs` (renderer) and
+Changing any of these strings is a protocol break.
+
+`cancelled` is not an `ErrorKind`. A rejection class is a statement about this
+user's face; a cancellation is the absence of one, so it is its own
+`AuthOutcome` variant (`facelock_daemon::auth::CANCELLED_MESSAGE`) that reuses
+the recoverable-error encoding to cross a wire with no field for it. PAM
+abstains on it: the attempt was abandoned, so the daemon has no opinion and the
+password modules run. It is matched exactly rather than as a substring, so an
+arbitrary error message that happens to mention cancelling cannot claim the row.
+
+**`auth_attempted` and a cancelled attempt.** The signal carries only `user` and
+`matched`, and its signature is frozen; a cancelled attempt therefore emits
+`auth_attempted(user, false)`, indistinguishable on the signal from a non-match.
+The audit log is where the two are told apart (`cancelled` vs `failure`).
+
+They are pinned byte-exactly in
+`crates/facelock-daemon/src/auth.rs` (renderer, including the frozen
+cancellation string) and
 `crates/facelock-daemon/tests/server_authz.rs` (wire), and every class's
 message, audit label and exit code are pinned together in
 `crates/facelock-cli/src/commands/auth.rs`.
