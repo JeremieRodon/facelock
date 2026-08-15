@@ -169,6 +169,65 @@ jobs:
           TCTI: swtpm:host=localhost,port=2321
         run: cargo test --workspace --features tpm
 
+  catalog-check:
+    name: Translation Catalog Freshness
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm \
+            git \
+            gettext \
+            just
+
+      - uses: actions/checkout@v7
+
+      # This is the only job that runs git against the checkout itself (the
+      # others only run cargo/just), and inside a container git refuses it:
+      # the steps run as root while /__w is owned by the runner uid, which
+      # trips the dubious-ownership check. actions/checkout does add a
+      # safe.directory entry, but only under a temporary HOME it discards when
+      # the action finishes ("Temporarily overriding HOME=... before making
+      # global git config changes" in its log), so later steps never see it.
+      #
+      # The symptom is not the usual "detected dubious ownership" fatal:
+      # `git diff` supports --no-index, so it sets up the repository gently
+      # and degrades a rejected repo to "not a git repository" — printing
+      # "warning: Not a git repository. Use --no-index ..." plus its usage and
+      # exiting 129 without ever comparing anything.
+      - name: Trust the workspace checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # po/*.pot are GENERATED from source by `just pot`. Nothing else
+      # verifies the committed copies still match the code: `msgfmt
+      # --check-format` (see the `mo` recipe) only validates the
+      # `{placeholder}` contract of an existing translation against its own
+      # msgid — it says nothing about whether msgids still correspond to
+      # strings the code actually contains. A stale catalog (e.g. from a bad
+      # merge/rerere resolution — this has already happened once, see
+      # po/facelock.pot's history) passes every other gate silently.
+      # Regenerate and diff: any drift fails the build.
+      #
+      # Deliberately NOT part of `just check`: PR #130 made the pot/mo
+      # recipes opt-in and tolerant specifically so building, testing, and
+      # `just check` never require gettext. Wiring `just pot` into `just
+      # check` would silently reverse that and make xgettext a hard
+      # dependency for every contributor just to catch one class of bug.
+      # This job is CI-only for exactly that reason.
+      #
+      # POT-Creation-Date is excluded from the comparison because it is not
+      # reproducible here. gettext 1.0's xgettext stamps it with the commit
+      # timestamp of the newest input file when it can read the file's git
+      # history, and falls back to the file's mtime when it cannot — and CI
+      # checks out with fetch-depth 1, so it always takes the mtime path and
+      # stamps the moment the runner cloned. Every other line (msgids, source
+      # references, flags) is reproducible and is what this gate is about.
+      - name: Verify translation catalogs are up to date
+        run: |
+          just pot
+          git diff --exit-code -I '^"POT-Creation-Date: ' po/
+
   container-pam-test:
     name: Container PAM Smoke Test
     runs-on: ubuntu-latest
