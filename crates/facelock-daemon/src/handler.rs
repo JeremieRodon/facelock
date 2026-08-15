@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use facelock_camera::MMAP_BUFFERS;
-use facelock_core::config::{Config, EncryptionMethod};
+use facelock_core::config::{Config, DeviceConfig, EncryptionMethod};
 use facelock_core::ipc::PreviewFace;
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::best_match;
@@ -202,7 +202,9 @@ const PREVIEW_MIN_HOLD: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
     /// Matched (or enrolled). The interaction is over — the session is
-    /// unlocked, the sudo command is running.
+    /// unlocked, the sudo command is running — so this releases the camera
+    /// unless the operator opted into a hold with
+    /// `device.camera_release_after_success_secs` (default `0`).
     Success,
     /// No match, including the timeout that follows a face the daemon saw but
     /// could not match. The one outcome a retry plausibly follows.
@@ -225,10 +227,31 @@ impl Outcome {
         Outcome::Error,
     ];
 
-    /// Does this outcome keep the stream open for a warm retry? The whole
-    /// policy, in one predicate.
-    pub fn holds_camera(self) -> bool {
-        matches!(self, Outcome::Failure)
+    /// How many seconds this ending keeps the stream open for a warm retry —
+    /// `0` closes it now. The whole policy, in one function, so
+    /// [`CameraLease::finish`] has no rule of its own to drift from it.
+    ///
+    /// Only two endings can hold, and both are the operator's call by value.
+    /// A failure holds for `camera_release_secs` (default 3) because a retry
+    /// plausibly follows it. A success holds only for
+    /// `camera_release_after_success_secs`, which is `0` by default: a
+    /// success ends the interaction, and on IR hardware a hold past it is an
+    /// emitter LED burning after the screen has already unlocked. It exists
+    /// for the one shape that does retry immediately — privileged actions
+    /// repeated with no auth caching in front of them, `sudo` with
+    /// `timestamp_timeout=0` — and was added on maintainer request as the
+    /// opt-in ADR 008 §3 had deferred.
+    ///
+    /// A cancellation or an error never holds, whatever either key says:
+    /// nobody abandons an attempt in order to retry it a moment later, and a
+    /// stream that just failed must never be handed to the next request
+    /// (ADR 008 §8).
+    pub fn hold_secs(self, device: &DeviceConfig) -> u32 {
+        match self {
+            Outcome::Failure => device.camera_release_secs,
+            Outcome::Success => device.camera_release_after_success_secs,
+            Outcome::Cancelled | Outcome::Error => 0,
+        }
     }
 }
 
@@ -407,27 +430,40 @@ impl<C: CameraSource> CameraLease<C> {
 
     /// End the request that `acquire` started. Either sets a deadline or
     /// drops the camera — never neither.
+    ///
+    /// What the outcome is worth in seconds is [`Outcome::hold_secs`]; all
+    /// that happens here is spending it.
     fn finish(&mut self, outcome: Outcome, config: &Config) {
-        if !outcome.holds_camera() {
+        let hold_secs = outcome.hold_secs(&config.device);
+        if hold_secs == 0 {
             self.close(match outcome {
+                // The default for a success: the interaction is over, so the
+                // stream goes out with the reply.
                 Outcome::Success => "authentication succeeded",
+                // `camera_release_secs = 0` used to be silently substituted
+                // with 5 seconds. It now means what it says.
+                Outcome::Failure => "camera hold disabled (device.camera_release_secs = 0)",
                 Outcome::Cancelled => "request cancelled",
-                _ => "request ended without an answer",
+                Outcome::Error => "request ended without an answer",
             });
             return;
         }
-        let hold_secs = config.device.camera_release_secs;
-        if hold_secs == 0 {
-            // `0` used to be silently substituted with 5 seconds. It now means
-            // what it says.
-            self.close("camera hold disabled (device.camera_release_secs = 0)");
-            return;
-        }
         self.deadline = Some(Instant::now() + Duration::from_secs(hold_secs as u64));
-        debug!(
-            hold_secs,
-            "holding camera warm after a failed attempt (retry expected)"
-        );
+        // Only the two holding outcomes reach here, and they hold for
+        // opposite reasons — one because a retry is likely, one because the
+        // operator said so — so the log says which, and by which key.
+        if outcome == Outcome::Success {
+            debug!(
+                hold_secs,
+                "holding camera warm after a successful attempt \
+                 (device.camera_release_after_success_secs)"
+            );
+        } else {
+            debug!(
+                hold_secs,
+                "holding camera warm after a failed attempt (retry expected)"
+            );
+        }
     }
 
     /// Extend the hold for a preview stream, which is a sequence of
@@ -1086,10 +1122,24 @@ mod tests {
     const MOCK_FRAMES: usize = 256;
 
     fn lease_config(release_secs: u32) -> Config {
+        lease_config_with_success_hold(release_secs, 0)
+    }
+
+    /// The same, plus the opt-in success hold — `0` in every test that does
+    /// not name it, which is both the shipped default and the behavior every
+    /// pre-existing test here was written against.
+    fn lease_config_with_success_hold(release_secs: u32, success_secs: u32) -> Config {
         let mut config = Config::default();
         config.device.camera_release_secs = release_secs;
+        config.device.camera_release_after_success_secs = success_secs;
         config
     }
+
+    /// The hold pairs worth running a whole outcome table against:
+    /// `(camera_release_secs, camera_release_after_success_secs)` — the
+    /// shipped default, the maintainer's opt-in, the opt-in with the failure
+    /// hold turned off, and both off.
+    const HOLD_PAIRS: &[(u32, u32)] = &[(3, 0), (3, 2), (0, 2), (0, 0)];
 
     fn lease() -> CameraLease<MockCamera> {
         CameraLease::new(
@@ -1165,15 +1215,107 @@ mod tests {
         assert_eq!(Outcome::from(&EnrollOutcome::Cancelled), Outcome::Cancelled);
     }
 
-    /// Only a failed attempt keeps the stream open — the whole policy.
+    /// The whole policy, over every outcome and every combination of the two
+    /// hold keys: a failure holds for `camera_release_secs`, a success for
+    /// `camera_release_after_success_secs` (`0` unless asked for), and
+    /// nothing makes a cancellation or an error hold.
     #[test]
-    fn only_failure_holds_the_camera() {
-        for outcome in Outcome::ALL {
-            assert_eq!(
-                outcome.holds_camera(),
-                *outcome == Outcome::Failure,
-                "{outcome:?}"
+    fn hold_secs_is_the_whole_camera_policy() {
+        for (failure_secs, success_secs) in HOLD_PAIRS {
+            let config = lease_config_with_success_hold(*failure_secs, *success_secs);
+            for outcome in Outcome::ALL {
+                let expected = match outcome {
+                    Outcome::Failure => *failure_secs,
+                    Outcome::Success => *success_secs,
+                    Outcome::Cancelled | Outcome::Error => 0,
+                };
+                assert_eq!(
+                    outcome.hold_secs(&config.device),
+                    expected,
+                    "{outcome:?} with camera_release_secs = {failure_secs}, \
+                     camera_release_after_success_secs = {success_secs}"
+                );
+            }
+        }
+    }
+
+    /// The default an install that never touches the key gets: a success
+    /// closes the stream as the reply goes out, exactly as it did before the
+    /// key existed.
+    #[test]
+    fn success_closes_the_camera_by_default() {
+        let config = lease_config(3);
+        assert_eq!(config.device.camera_release_after_success_secs, 0);
+        let mut lease = lease();
+        lease.acquire(&config, &live()).expect("mock camera opens");
+        lease.finish(Outcome::Success, &config);
+        assert!(lease.camera.is_none(), "a success must release the camera");
+        assert!(lease.deadline.is_none());
+    }
+
+    /// Opted in, a success holds on the same machinery a failure does: an
+    /// absolute deadline, a stream the next request reuses warm, and an
+    /// `expire` that closes it once the deadline passes.
+    #[test]
+    fn a_configured_success_hold_keeps_the_camera_warm_and_then_expires() {
+        let config = lease_config_with_success_hold(3, 2);
+        let warmup = config.device.warmup_frames;
+        let mut lease = lease();
+        lease.acquire(&config, &live()).expect("mock camera opens");
+
+        let at_finish = Instant::now();
+        lease.finish(Outcome::Success, &config);
+        let deadline = lease.deadline.expect("the success hold must set one");
+        assert!(
+            deadline >= at_finish + Duration::from_secs(2),
+            "the hold must run the configured 2 s"
+        );
+        assert!(
+            deadline < at_finish + Duration::from_secs(3),
+            "and must not borrow the failure key's 3 s"
+        );
+        assert!(
+            lease.camera.is_some(),
+            "the stream stays open for the retry"
+        );
+
+        // And it is a real warm stream: the next request reuses it, paying
+        // the stale-buffer discard and no second warmup.
+        lease
+            .acquire(&config, &live())
+            .expect("the next request reuses the warm camera");
+        assert_eq!(
+            lease.camera.as_ref().map(|c| c.captures()),
+            Some((warmup + MMAP_BUFFERS - 1) as usize),
+            "a warm success hold must not reopen the camera"
+        );
+
+        // Then it ends, on its deadline, like any other hold.
+        let at_second_finish = Instant::now();
+        lease.finish(Outcome::Success, &config);
+        lease.expire(at_second_finish + Duration::from_secs(2) - CAMERA_POLL_INTERVAL);
+        assert!(lease.camera.is_some(), "released a full tick early");
+        lease.expire(at_second_finish + Duration::from_secs(2) + CAMERA_POLL_INTERVAL);
+        assert!(lease.camera.is_none());
+        assert!(lease.deadline.is_none());
+    }
+
+    /// The success hold holds successes and nothing else: an abandoned
+    /// attempt and a broken stream still close immediately with it set, so
+    /// the key can never become a way to leave the IR emitter lit after a
+    /// cancel (ADR 008 §1, §8).
+    #[test]
+    fn a_success_hold_never_leaks_into_a_cancellation_or_an_error() {
+        let config = lease_config_with_success_hold(3, 30);
+        for outcome in [Outcome::Cancelled, Outcome::Error] {
+            let mut lease = lease();
+            lease.acquire(&config, &live()).expect("mock camera opens");
+            lease.finish(outcome, &config);
+            assert!(
+                lease.camera.is_none(),
+                "{outcome:?} must close the stream even with a success hold set"
             );
+            assert!(lease.deadline.is_none(), "{outcome:?}");
         }
     }
 
@@ -1181,17 +1323,23 @@ mod tests {
     /// sets a deadline or drops the camera — never neither, never both.
     #[test]
     fn finish_either_sets_a_deadline_or_drops_the_camera() {
-        let config = lease_config(3);
-        for outcome in Outcome::ALL {
-            let mut lease = lease();
-            lease.acquire(&config, &live()).expect("mock camera opens");
-            lease.finish(*outcome, &config);
-            if outcome.holds_camera() {
-                assert!(lease.camera.is_some(), "{outcome:?} must keep the stream");
-                assert!(lease.deadline.is_some(), "{outcome:?} must set a deadline");
-            } else {
-                assert!(lease.camera.is_none(), "{outcome:?} must close the stream");
-                assert!(lease.deadline.is_none(), "{outcome:?} must clear the hold");
+        for (failure_secs, success_secs) in HOLD_PAIRS {
+            let config = lease_config_with_success_hold(*failure_secs, *success_secs);
+            for outcome in Outcome::ALL {
+                let mut lease = lease();
+                lease.acquire(&config, &live()).expect("mock camera opens");
+                lease.finish(*outcome, &config);
+                let case = format!(
+                    "{outcome:?} with camera_release_secs = {failure_secs}, \
+                     camera_release_after_success_secs = {success_secs}"
+                );
+                if outcome.hold_secs(&config.device) > 0 {
+                    assert!(lease.camera.is_some(), "{case} must keep the stream");
+                    assert!(lease.deadline.is_some(), "{case} must set a deadline");
+                } else {
+                    assert!(lease.camera.is_none(), "{case} must close the stream");
+                    assert!(lease.deadline.is_none(), "{case} must clear the hold");
+                }
             }
         }
     }

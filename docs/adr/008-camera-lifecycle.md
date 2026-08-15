@@ -37,7 +37,7 @@ Success, cancel, and error end the interaction → release now. No-match/timeout
 
 | | Today | After |
 |---|---|---|
-| Hold | live V4L2 stream for `camera_release_secs` (5) after *every* request; `0` silently = 5; released by a 1 s `try_lock` poll (`server.rs:1320-1350`, `handler.rs:320-329`) | stream held **only after a failed attempt**, `camera_release_secs` = **3**, `0` = no hold, 250 ms poll |
+| Hold | live V4L2 stream for `camera_release_secs` (5) after *every* request; `0` silently = 5; released by a 1 s `try_lock` poll (`server.rs:1320-1350`, `handler.rs:320-329`) | stream held **only after a failed attempt**, `camera_release_secs` = **3**, `0` = no hold, 250 ms poll; a success holds only if `camera_release_after_success_secs` is set (default `0`, §3) |
 | Warm reuse | dequeues up to 3 stale frames from the hold (`handler.rs:332-359`) | discards `MMAP_BUFFERS − 1` frames first (same helper as cold warmup) |
 | Cancel | none — scan runs to `timeout_secs` after the client is gone (`auth.rs:543-572`); polkit agent's cancel only drops its future (`facelock-polkit/src/main.rs:52-102`) | per-request cancel token; set when the caller's bus connection vanishes, on suspend/shutdown, or (one-shot) on SIGTERM |
 | One-shot | opens camera before loading the engine (`cli/commands/auth.rs:130-160`); PAM SIGKILLs a slow child (`pam-facelock/src/lib.rs:836-870`); child can outlive its PAM host | engine first; SIGTERM handled → clean `Drop`; `PR_SET_PDEATHSIG` |
@@ -49,9 +49,12 @@ Success, cancel, and error end the interaction → release now. No-match/timeout
 ```toml
 [device]
 # Daemon only. Seconds to keep the camera streaming after a FAILED attempt so a
-# retry skips reopen (~0.4 s). Success, cancel and errors always release at once.
+# retry skips reopen (~0.4 s). Cancel and errors always release at once.
 # 0 = never hold.
 camera_release_secs = 3
+
+# Opt-in: hold after a SUCCESSFUL attempt too. 0 = release at once (default).
+camera_release_after_success_secs = 0
 
 [recognition]
 # End an attempt after this many seconds if no face at all has been seen.
@@ -65,7 +68,9 @@ no_face_timeout_secs = 2
 - `no_face_timeout_secs` is additive with a serde default. Effective value is `min(no_face_timeout_secs, timeout_secs)`, `0` disables; it never rejects an existing config (a user with `timeout_secs = 2` sees identical behavior). PAM's private schema ignores it (no `deny_unknown_fields`; template parity test unaffected because the template key ships commented).
 - Everything else — success/cancel release, stale discard, cancel token, no-face not charging the limiter, one-shot ordering/signals — is behavior with no config surface.
 
-Deliberately not offered: a success-hold key. sudo `timestamp_timeout` and polkit `auth_admin_keep` already cache successes; add `camera_release_after_success_secs` later only if a real user asks. Docs touched: template comment, `docs/configuration.md`, `docs/contracts.md` wording, CHANGELOG "Changed", one upgrade-notes line ("no action required").
+Docs touched: template comment, `docs/configuration.md`, `docs/contracts.md` wording, CHANGELOG, one upgrade-notes line ("no action required").
+
+**`camera_release_after_success_secs`, added after the fact.** This key was deferred here — sudo `timestamp_timeout` and polkit `auth_admin_keep` already cache successes, so on most setups a hold after a success only lights the IR emitter for a retry nobody makes — and was then added on maintainer request as an opt-in, default **0**, which is byte for byte the behavior described above. Non-zero keeps the stream warm after a success for that many seconds, for the flows those caches are turned off in (`timestamp_timeout=0`, no `auth_admin_keep`), where every privileged action is a fresh authentication that pays a reopen. Additive with a serde default, so it rejects no existing config and needs no migration, and the daemon reads it per request like its sibling. Failures still use `camera_release_secs`; cancel and error still release at once regardless of either key.
 
 ## 4. Daemon lifecycle
 
@@ -74,8 +79,9 @@ stateDiagram-v2
     [*] --> Closed
     Closed --> Active: request — open, warmup
     Warm --> Active: request — discard stale
-    Active --> Closed: Success · Cancelled · Error
+    Active --> Closed: Success (default) · Cancelled · Error
     Active --> Warm: Failure · Timeout
+    Active --> Warm: Success — only with camera_release_after_success_secs
     Warm --> Closed: deadline · ReleaseCamera · suspend · reload · shutdown
 ```
 
@@ -83,7 +89,7 @@ stateDiagram-v2
 
 ```rust
 fn acquire(&mut self, cfg, cancel) -> Result<&mut C>   // Closed: open + discard(warmup)  |  Warm: discard(MMAP_BUFFERS-1); clears deadline
-fn finish(&mut self, outcome: Outcome)         // Success|Cancelled|Error → drop camera; Failure → deadline = now + release_secs (or drop if 0)
+fn finish(&mut self, outcome: Outcome)         // Cancelled|Error → drop camera; Failure → deadline = now + release_secs; Success → drop, or deadline = now + release_after_success_secs when that is set (both: drop if 0)
 fn touch_preview(&mut self)                    // deadline = now + max(release_secs, PREVIEW_MIN_HOLD=2s)
 fn expire(&mut self, now)                      // deadline passed → drop camera   (called from the 250 ms poll)
 ```

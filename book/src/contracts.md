@@ -77,7 +77,7 @@ TOML format. All keys optional -- camera auto-detected, sensible defaults for ev
 
 | Section | Key fields |
 |---------|-----------|
-| `[device]` | `path` (Option), `max_height`, `rotation`, `warmup_frames`, `dark_threshold`, `dark_pixel_value`, `ir_emitter`, `camera_release_secs` |
+| `[device]` | `path` (Option), `max_height`, `rotation`, `warmup_frames`, `dark_threshold`, `dark_pixel_value`, `ir_emitter`, `camera_release_secs`, `camera_release_after_success_secs` |
 | `[recognition]` | `threshold`, `timeout_secs`, `detector_model`, `embedder_model`, `threads`, `execution_provider` |
 | `[daemon]` | `mode` (DaemonMode enum), `model_dir`, `idle_timeout_secs` |
 | `[storage]` | `db_path` |

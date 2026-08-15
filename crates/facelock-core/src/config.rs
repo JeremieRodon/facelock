@@ -77,6 +77,24 @@ pub struct DeviceConfig {
     /// Default: 3.
     #[serde(default = "default_camera_release_secs")]
     pub camera_release_secs: u32,
+    /// Daemon only. Seconds to keep the camera streaming after a
+    /// **successful** authentication as well. `0` — the default, and the
+    /// right answer for almost every setup — releases at once: a success ends
+    /// the interaction, so a hold after one keeps the camera, and on IR
+    /// hardware its emitter LED, lit for a retry nobody is going to make.
+    ///
+    /// Raise it only where privileged actions repeat with no authentication
+    /// caching in front of them — `sudo` with `timestamp_timeout=0`, a polkit
+    /// action without `auth_admin_keep` — so that each action is a fresh
+    /// authentication that would otherwise pay a camera reopen. Added on
+    /// maintainer request as the opt-in ADR 008 §3 had deferred.
+    ///
+    /// Failed attempts are unaffected: they hold for
+    /// [`DeviceConfig::camera_release_secs`]. Cancellations and errors
+    /// release immediately whatever either key says.
+    /// Default: 0.
+    #[serde(default)]
+    pub camera_release_after_success_secs: u32,
 }
 
 impl Default for DeviceConfig {
@@ -90,6 +108,9 @@ impl Default for DeviceConfig {
             dark_pixel_value: default_dark_pixel_value(),
             ir_emitter: false,
             camera_release_secs: default_camera_release_secs(),
+            // No `default_*` function: this key's default is the type's, so
+            // `#[serde(default)]` and this line cannot drift apart.
+            camera_release_after_success_secs: 0,
         }
     }
 }
@@ -966,6 +987,43 @@ path = "/dev/video0"
             Config::default().recognition.no_face_timeout_secs,
             2,
             "the documented default"
+        );
+    }
+
+    /// ADR 008 §3, added on maintainer request. The key is purely opt-in:
+    /// absent it is `0`, which is the behavior every install already has —
+    /// a success releases the camera with the reply. Table-driven over the
+    /// ways a config can decline to mention it, plus the one that asks.
+    #[test]
+    fn the_success_hold_is_off_unless_a_config_asks_for_it() {
+        // (toml, expected success hold, expected failure hold) — the second
+        // column is here because the two are separate budgets: writing one
+        // must never move the other.
+        let cases: &[(&str, u32, u32)] = &[
+            ("", 0, 3),
+            ("[device]\n", 0, 3),
+            ("[device]\ncamera_release_secs = 10\n", 0, 10),
+            ("[device]\ncamera_release_after_success_secs = 5\n", 5, 3),
+            // `0` written out means the same as omitting it.
+            ("[device]\ncamera_release_after_success_secs = 0\n", 0, 3),
+        ];
+        for (toml, success_secs, failure_secs) in cases {
+            let config = Config::parse(toml)
+                .unwrap_or_else(|e| panic!("{toml:?} must load — this key never rejects: {e}"));
+            assert_eq!(
+                config.device.camera_release_after_success_secs, *success_secs,
+                "wrong success hold for {toml:?}"
+            );
+            assert_eq!(
+                config.device.camera_release_secs, *failure_secs,
+                "wrong failure hold for {toml:?}"
+            );
+        }
+
+        assert_eq!(
+            Config::default().device.camera_release_after_success_secs,
+            0,
+            "the documented default: a success ends the interaction"
         );
     }
 

@@ -471,6 +471,7 @@ mod tests {
             dark_pixel_value: 10,
             ir_emitter: false,
             camera_release_secs: 5,
+            camera_release_after_success_secs: 0,
         };
         let mut cam = Camera::open(&config, &QuirksDb::load()).expect("failed to open camera");
         let frame = cam.capture().expect("failed to capture frame");

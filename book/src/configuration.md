@@ -17,7 +17,8 @@ Camera settings.
 | `dark_threshold` | f32 | `0.6` | Fraction of pixels that must be darker than `dark_pixel_value` before the frame is treated as unusably dark. |
 | `dark_pixel_value` | u8 | `10` | Pixel brightness cutoff used by the dark-frame check. |
 | `ir_emitter` | bool | `false` | Attempt to enable a controllable IR emitter when the camera opens. Only needed for hardware that does not auto-enable its IR LED. |
-| `camera_release_secs` | u32 | `3` | Daemon only. Seconds to keep the camera streaming after a **failed** authentication so an immediate retry skips the reopen cost. Success, cancellation and errors release the camera at once. `0` disables the hold entirely (it used to be silently substituted with 5). |
+| `camera_release_secs` | u32 | `3` | Daemon only. Seconds to keep the camera streaming after a **failed** authentication so an immediate retry skips the reopen cost. Cancellation and errors release the camera at once, and so does a success unless `camera_release_after_success_secs` is set. `0` disables the hold entirely (it used to be silently substituted with 5). |
+| `camera_release_after_success_secs` | u32 | `0` | Daemon only. Seconds to keep the camera streaming after a **successful** authentication too. `0` (the default) releases it immediately — the interaction is over, and on IR hardware the emitter LED goes out with it. Set it only where privileged actions repeat with no authentication caching in front of them (`sudo` with a zero `timestamp_timeout`, a polkit action without `auth_admin_keep`), so each one is a fresh authentication that would otherwise pay a camera reopen. Failures still use `camera_release_secs`; cancellations and errors always release at once. |
 
 ## [recognition]
 

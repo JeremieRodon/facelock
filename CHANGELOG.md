@@ -74,6 +74,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compares the target user's marker against the database and prints a
   diagnostic when they disagree (or when the marker is unreadable), pointing
   at `sudo facelock setup` to reconcile. `is-enrolled` itself is unchanged.
+- **Opt-in camera hold after a successful authentication**: a new
+  `device.camera_release_after_success_secs` (default **0**) keeps the camera
+  streaming for that many seconds after a success, the way
+  `camera_release_secs` already does after a failure. At its default — which is
+  the recommended value and what every install gets without touching the file —
+  nothing changes: a success ends the interaction, so the stream (and on IR
+  hardware the emitter LED) goes out with the reply. It exists for the one
+  shape that really does re-authenticate immediately: privileged actions
+  repeated with no authentication caching in front of them, `sudo` with a zero
+  `timestamp_timeout` or a polkit action without `auth_admin_keep`, where each
+  action is a fresh authentication that would otherwise pay a camera reopen.
+  Failed attempts keep using `camera_release_secs`; cancellations and errors
+  release the camera at once whatever both keys say. Additive with a serde
+  default: no existing config is rejected, and the daemon reads it per request,
+  so no restart is needed.
 - **`facelock bench camera-reopen`**: measures what it actually costs to go
   from a closed camera to the first frame an authentication can analyze, split
   into device open + format negotiation, `STREAMON` + first frame, warmup

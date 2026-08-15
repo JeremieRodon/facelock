@@ -44,12 +44,24 @@
 # ir_emitter = false
 
 # Daemon only. Seconds to keep the camera streaming after a FAILED
-# authentication so an immediate retry skips the reopen cost. Success,
-# cancellation and errors always release the camera at once — the
-# interaction is over, so the IR LED goes out with it.
+# authentication so an immediate retry skips the reopen cost. Cancellation
+# and errors always release the camera at once — the interaction is over,
+# so the IR LED goes out with it — and so does a success, unless the key
+# below says otherwise.
 # Set it to zero to never hold: every attempt reopens, no LED after a miss.
 # Default: 3
 # camera_release_secs = 3
+
+# Daemon only. Seconds to keep the camera streaming after a SUCCESSFUL
+# authentication as well. Zero, the default, releases it at once: the
+# interaction is over, so holding on only keeps the camera (and on IR
+# hardware its emitter LED) lit for a retry nobody is going to make.
+# Raise it only if you repeat privileged actions with no authentication
+# caching in front of them (sudo with a zero timestamp_timeout, a polkit
+# action without auth_admin_keep), so each one is a fresh authentication
+# that would otherwise pay a camera reopen.
+# Default: 0
+# camera_release_after_success_secs = 0
 
 
 # ── Face Recognition ────────────────────────────────────────────────

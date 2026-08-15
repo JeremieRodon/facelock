@@ -1113,3 +1113,86 @@ fn a_cancellation_before_the_camera_opens_is_still_audited() {
     let _ = std::fs::remove_dir_all(&dir);
     cleanup_db(&db_path);
 }
+
+/// ADR 008 §3/§4 end to end, through the real `Authenticate` request path:
+/// what `device.camera_release_after_success_secs` buys is that the *next*
+/// authentication does not reopen the camera. The factory is the observable —
+/// it is called exactly once per cold open — so this pins the feature by its
+/// only user-visible effect rather than by the lease's private fields.
+///
+/// Both columns matter: with the key at its default `0` a success closes the
+/// stream, so the second authentication pays a second open. That is the
+/// behavior of every install that never sets the key.
+#[test]
+fn a_success_hold_is_what_lets_the_next_authentication_skip_the_reopen() {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // (camera_release_after_success_secs, expected camera opens for two
+    // consecutive successful authentications)
+    for (success_secs, expected_opens) in [(0, 2), (5, 1)] {
+        let db_path = temp_db_path(&format!("success-hold-{success_secs}"));
+        cleanup_db(&db_path);
+
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let mut config = Config::parse(&fixtures::test_config_toml(&db_path_str)).unwrap();
+        config.device.camera_release_after_success_secs = success_secs;
+        // Isolate the camera policy from the liveness gates: this test is
+        // about what happens *after* a match, not about earning one.
+        config.security.require_frame_variance = false;
+        config.security.require_landmark_liveness = false;
+
+        let face = unit_at_angle(0.0);
+        {
+            let store = FaceStore::create(&db_path).unwrap();
+            store.add_model("testuser", "front", &face, "").unwrap();
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let counter = opens.clone();
+        let factory: MockCameraFactory = Box::new(move |_cfg| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(MockCamera::bright(64, 64, 64))
+        });
+
+        let mut handler = Handler::new(
+            config.clone(),
+            MockFaceEngine::one_face(face),
+            FaceStore::create(&db_path).unwrap(),
+            RateLimiter::new(
+                config.security.rate_limit.max_attempts,
+                config.security.rate_limit.window_secs,
+            ),
+            facelock_core::types::CameraCaps::default(),
+            Some(factory),
+            None,
+        )
+        .unwrap();
+
+        for attempt in 0..2 {
+            let resp = handler.handle(DaemonRequest::Authenticate {
+                user: "testuser".into(),
+            });
+            assert!(
+                matches!(
+                    resp,
+                    DaemonResponse::AuthResult(MatchResult { matched: true, .. })
+                ),
+                "attempt {attempt} with camera_release_after_success_secs = \
+                 {success_secs} must match: {resp:?}"
+            );
+        }
+
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            expected_opens,
+            "two successful authentications with \
+             camera_release_after_success_secs = {success_secs} must open the \
+             camera {expected_opens} time(s)"
+        );
+
+        cleanup_db(&db_path);
+    }
+}
