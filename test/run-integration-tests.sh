@@ -57,6 +57,43 @@ run_test_contains() {
     return 1
 }
 
+# ADR 008 §9: like run_test, but a check may report that there was nothing to
+# observe (exit 3) instead of passing or failing. The camera-lifecycle
+# assertions below depend on a live face being in front of the camera; when one
+# is not, "no successful authentication happened" is not a lifecycle bug and
+# must not be reported as one. Anything the check printed is echoed either way,
+# so a SKIP always says which precondition was missing.
+run_test_or_skip() {
+    local name="$1"
+    local cmd="$2"
+
+    echo -n "TEST: $name ... "
+    local result=0
+    set +o pipefail
+    # `|| result=$?` rather than `set +e`: errexit stays exactly as the script
+    # set it, so a check that returns non-zero reports a FAIL here instead of
+    # aborting the run.
+    eval "$cmd" > /tmp/test-output 2>&1 || result=$?
+    set -o pipefail
+
+    case "$result" in
+        0)
+            echo "PASS"
+            PASS=$((PASS + 1))
+            sed 's/^/      /' /tmp/test-output
+            ;;
+        3)
+            echo "SKIP"
+            sed 's/^/      /' /tmp/test-output
+            ;;
+        *)
+            echo "FAIL (exit=$result)"
+            cat /tmp/test-output
+            FAIL=$((FAIL + 1))
+            ;;
+    esac
+}
+
 wait_for_daemon() {
     local deadline=$((SECONDS + 30))
     local output=""
@@ -85,17 +122,30 @@ mkdir -p /run/dbus
 dbus-uuidgen --ensure=/etc/machine-id >/dev/null 2>&1 || true
 dbus-daemon --system --fork --nopidfile
 
+# ADR 008 §9: the camera-lifecycle assertions at the end of this script read
+# the daemon's own log, so it goes to a file instead of the console — and at
+# debug level on the facelock_daemon target, because `releasing camera`, the
+# warm-hold line and the frame discards are debug events. The file is dumped
+# from `cleanup` when anything failed, so redirecting it costs no diagnostics.
+DAEMON_LOG="/tmp/facelock-daemon.log"
+: > "$DAEMON_LOG"
+
 cleanup() {
     if [ -n "${DAEMON_PID:-}" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
+    fi
+    if [ "$FAIL" -gt 0 ] && [ -s "$DAEMON_LOG" ]; then
+        echo ""
+        echo "--- daemon log (last 200 lines) ---"
+        tail -n 200 "$DAEMON_LOG" || true
     fi
     pkill dbus-daemon 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # Start daemon in background
-facelock daemon &
+RUST_LOG="${RUST_LOG:-facelock=info,facelock_daemon=debug}" facelock daemon > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 sleep 2
 
@@ -372,6 +422,207 @@ check_sequential_auth_not_starved() {
 }
 run_test "Sequential auth not starved after busy rejection" \
     "check_sequential_auth_not_starved"
+
+# --- ADR 008: camera lifecycle (outcome-based hold, cancellation) ---
+#
+# The invariant these assertions pin is §1: the camera is on only while an
+# authentication is in progress or a retry is plausibly imminent. Success and
+# cancellation end the interaction, so the stream closes at once; only a failed
+# attempt keeps it warm, and only for device.camera_release_secs. Everything is
+# read from the daemon's own log, whose strings live in
+# crates/facelock-daemon/src/handler.rs (`releasing camera`, `holding camera
+# warm after a failed attempt`), src/auth.rs (`authentication cancelled`) and
+# src/server.rs (`caller disconnected, cancelling in-flight request`).
+
+# Milliseconds since the epoch.
+now_ms() {
+    echo $(( $(date +%s%N) / 1000000 ))
+}
+
+# Lines currently in the daemon log — the "from here on" marker every
+# assertion takes before it provokes the daemon.
+daemon_log_lines() {
+    wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0
+}
+
+# ADR 008 §9: wait for a daemon log line that contains EVERY pattern given,
+# looking only at lines added after line $1, for at most $2 milliseconds.
+# Echoes how long the wait took, in milliseconds; returns 1 on timeout.
+#
+# The patterns are applied one at a time to the same line rather than as a
+# single string because tracing writes ANSI styling between a field's name and
+# its value, so `reason="warm hold expired"` is not contiguous in the file.
+wait_for_daemon_log() {
+    local from_line="$1"
+    local timeout_ms="$2"
+    shift 2
+    local start deadline matched pat
+    start=$(now_ms)
+    deadline=$((start + timeout_ms))
+    while :; do
+        matched="$(tail -n "+$((from_line + 1))" "$DAEMON_LOG" 2>/dev/null || true)"
+        for pat in "$@"; do
+            matched="$(printf '%s\n' "$matched" | grep -F -- "$pat" || true)"
+        done
+        if [ -n "$matched" ]; then
+            echo $(( $(now_ms) - start ))
+            return 0
+        fi
+        [ "$(now_ms)" -lt "$deadline" ] || return 1
+        sleep 0.05
+    done
+}
+
+# ADR 008 §9, acceptance (1): a successful authentication ends the interaction,
+# so `finish(Success)` drops the camera before the reply is even sent. The
+# release line must therefore already be in the log by the time the client has
+# its answer; the 500 ms budget is for the log write, not for the daemon.
+#
+# The precondition reads the daemon's own log rather than the client's output.
+# `facelock test` prints "Matched ..." through gettext and exits 0 whether it
+# matched or not, so the CLI offers this check neither a stable string nor a
+# usable exit code; the daemon's `tracing` lines are never translated.
+adr008_success_releases_camera() {
+    local from elapsed
+    from=$(daemon_log_lines)
+    timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser \
+        > /tmp/adr008-success.log 2>&1 || true
+    if ! wait_for_daemon_log "$from" 500 "authentication succeeded" > /dev/null; then
+        cat /tmp/adr008-success.log
+        echo "no successful authentication to observe (needs a live enrolled face)"
+        return 3
+    fi
+    if ! elapsed=$(wait_for_daemon_log "$from" 500 "releasing camera" "authentication succeeded"); then
+        echo "camera not released within 500ms of a successful reply"
+        tail -n "+$((from + 1))" "$DAEMON_LOG"
+        return 1
+    fi
+    echo "camera released ${elapsed}ms after the successful reply"
+}
+
+# ADR 008 §9, acceptance (2): a failed attempt is the one outcome that predicts
+# a retry, so the stream stays open for device.camera_release_secs and then
+# closes. Runs inside the forged-device_id window below, which is what makes
+# the failure certain rather than dependent on who is in front of the camera.
+adr008_failure_holds_then_releases() {
+    local secs from after elapsed lo hi
+    secs="$({ grep -E '^[[:space:]]*camera_release_secs[[:space:]]*=' /etc/facelock/config.toml \
+        || true; } | tail -1 | sed -E 's/[^0-9]//g')"
+    [ -n "$secs" ] || secs=3
+    if [ "$secs" -eq 0 ]; then
+        echo "camera_release_secs = 0: the daemon never holds, nothing to time"
+        return 3
+    fi
+
+    from=$(daemon_log_lines)
+    timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser \
+        > /tmp/adr008-failure.log 2>&1 || true
+    after=$(daemon_log_lines)
+
+    if ! wait_for_daemon_log "$from" 0 "holding camera warm after a failed attempt" > /dev/null; then
+        cat /tmp/adr008-failure.log
+        echo "the attempt did not end in a failure the daemon holds the camera for"
+        return 3
+    fi
+    if ! elapsed=$(wait_for_daemon_log "$after" $(( secs * 1000 + 1500 )) "releasing camera" "warm hold expired"); then
+        echo "warm hold never expired (camera still open ${secs}s + 1.5s after the failed attempt)"
+        tail -n "+$((from + 1))" "$DAEMON_LOG"
+        return 1
+    fi
+    lo=$(( secs * 1000 - 500 ))
+    hi=$(( secs * 1000 + 500 ))
+    if [ "$elapsed" -lt "$lo" ] || [ "$elapsed" -gt "$hi" ]; then
+        echo "warm hold expired ${elapsed}ms after the reply, expected ${secs}000ms +/-500ms"
+        return 1
+    fi
+    echo "warm hold expired ${elapsed}ms after the failed reply (camera_release_secs=${secs})"
+}
+
+# Has the daemon reached the per-frame scan loop since line $1? Any of these
+# three debug lines carries a frame number, so seeing one means the camera is
+# open, the warmup discard is done, and the request is somewhere it can be
+# cancelled per frame.
+daemon_is_scanning() {
+    tail -n "+$(($1 + 1))" "$DAEMON_LOG" 2>/dev/null \
+        | grep -qE "face comparison|no faces detected|dark frame"
+}
+
+# ADR 008 §9, acceptance (1) and §5: a caller that goes away is not a slow
+# user. SIGKILLing the client drops its bus connection, the daemon's name-owner
+# watch fires, and the request ends within one frame instead of running to
+# recognition.timeout_secs with the emitter lit.
+#
+# The kill waits for the scan rather than firing at a fixed offset: a client
+# that dies during the camera open aborts the acquire instead (ADR 008 §8),
+# which is a different path with different log lines, so a fixed offset would
+# be timing the camera open on whatever hardware happens to be mounted.
+adr008_caller_departure_cancels() {
+    local from client deadline cancel_ms auth_ms release_ms
+    from=$(daemon_log_lines)
+    facelock test --user testuser > /tmp/adr008-cancel.log 2>&1 &
+    client=$!
+    deadline=$(( $(now_ms) + 20000 ))
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        daemon_is_scanning "$from" && break
+        kill -0 "$client" 2>/dev/null || break
+        sleep 0.05
+    done
+    if ! daemon_is_scanning "$from"; then
+        kill -9 "$client" 2>/dev/null || true
+        wait "$client" 2>/dev/null || true
+        cat /tmp/adr008-cancel.log
+        echo "the daemon never reached the scan loop; nothing was in flight to cancel"
+        return 3
+    fi
+    kill -9 "$client" 2>/dev/null || true
+    wait "$client" 2>/dev/null || true
+    if ! cancel_ms=$(wait_for_daemon_log "$from" 500 "caller disconnected, cancelling in-flight request"); then
+        echo "daemon did not notice the caller's departure within 500ms"
+        tail -n "+$((from + 1))" "$DAEMON_LOG"
+        return 1
+    fi
+    if ! auth_ms=$(wait_for_daemon_log "$from" 500 "authentication cancelled"); then
+        echo "request did not end as cancelled within 500ms of the kill"
+        tail -n "+$((from + 1))" "$DAEMON_LOG"
+        return 1
+    fi
+    if ! release_ms=$(wait_for_daemon_log "$from" 500 "releasing camera" "request cancelled"); then
+        echo "camera not released within 500ms of the cancellation"
+        tail -n "+$((from + 1))" "$DAEMON_LOG"
+        return 1
+    fi
+    echo "caller departure seen at ${cancel_ms}ms, attempt cancelled at ${auth_ms}ms, camera released at ${release_ms}ms"
+}
+
+run_test_or_skip "ADR 008: success releases the camera immediately" \
+    "adr008_success_releases_camera"
+
+# The two checks below need an attempt that does NOT match: one to observe the
+# warm hold a failure earns, one to have something still in flight to cancel.
+# A forged device_id makes every enrolled template ineligible, so the attempt
+# sees a face and matches nothing, and the scan runs to recognition
+# .timeout_secs instead of ending on the first frame. `facelock test` charges
+# no rate-limit budget (AuthIntent::Test) and a cancelled attempt charges none
+# either, so neither costs the later tests an attempt.
+#
+# Captured as a SQL literal so the window really is a window: `quote()` renders
+# a real fingerprint as a quoted string and a legacy row as the bare token
+# NULL, which is the one distinction a plain SELECT loses — and writing NULL
+# back unconditionally would silently un-couple the template from its camera
+# for every test after this point.
+ADR008_DEVID="$(sqlite3 "$DB" "PRAGMA busy_timeout=8000; SELECT quote(device_id) FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo 'NULL')"
+[ -n "$ADR008_DEVID" ] || ADR008_DEVID='NULL'
+sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id='ffff:ffff:forged' WHERE user='testuser'" || true
+
+run_test_or_skip "ADR 008: a failed attempt holds the camera, then releases it at camera_release_secs" \
+    "adr008_failure_holds_then_releases"
+
+run_test_or_skip "ADR 008: a departed caller cancels the request and closes the camera" \
+    "adr008_caller_departure_cancels"
+
+sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id=$ADR008_DEVID WHERE user='testuser'" || true
+
+# --- End ADR 008 camera lifecycle ---
 
 # Clean up
 run_test "Clear enrolled models" \

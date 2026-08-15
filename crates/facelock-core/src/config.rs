@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::paths;
 
@@ -68,10 +69,32 @@ pub struct DeviceConfig {
     /// only if your camera requires explicit control.
     #[serde(default)]
     pub ir_emitter: bool,
-    /// Seconds to keep the camera open after auth before releasing it.
-    /// Avoids warmup frame cost on consecutive auths. Default: 5.
+    /// Daemon only. Seconds to keep the camera streaming after a **failed**
+    /// authentication, so the retry a failure invites skips the reopen cost.
+    /// Success, cancellation and errors always release immediately — the
+    /// interaction is over and the IR LED must go out with it (ADR 008).
+    /// `0` means never hold; it used to be silently substituted with 5.
+    /// Default: 3.
     #[serde(default = "default_camera_release_secs")]
     pub camera_release_secs: u32,
+    /// Daemon only. Seconds to keep the camera streaming after a
+    /// **successful** authentication as well. `0` — the default, and the
+    /// right answer for almost every setup — releases at once: a success ends
+    /// the interaction, so a hold after one keeps the camera, and on IR
+    /// hardware its emitter LED, lit for a retry nobody is going to make.
+    ///
+    /// Raise it only where privileged actions repeat with no authentication
+    /// caching in front of them — `sudo` with `timestamp_timeout=0`, a polkit
+    /// action without `auth_admin_keep` — so that each action is a fresh
+    /// authentication that would otherwise pay a camera reopen. Added on
+    /// maintainer request as the opt-in ADR 008 §3 had deferred.
+    ///
+    /// Failed attempts are unaffected: they hold for
+    /// [`DeviceConfig::camera_release_secs`]. Cancellations and errors
+    /// release immediately whatever either key says.
+    /// Default: 0.
+    #[serde(default)]
+    pub camera_release_after_success_secs: u32,
 }
 
 impl Default for DeviceConfig {
@@ -85,6 +108,9 @@ impl Default for DeviceConfig {
             dark_pixel_value: default_dark_pixel_value(),
             ir_emitter: false,
             camera_release_secs: default_camera_release_secs(),
+            // No `default_*` function: this key's default is the type's, so
+            // `#[serde(default)]` and this line cannot drift apart.
+            camera_release_after_success_secs: 0,
         }
     }
 }
@@ -95,6 +121,19 @@ pub struct RecognitionConfig {
     pub threshold: f32,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u32,
+    /// End an attempt early once this many seconds have passed with **no face
+    /// at all** detected. `timeout_secs` still bounds the other, slower case —
+    /// a face was seen and has not matched yet — which is the one worth
+    /// waiting out. Scanning an empty chair for the full timeout only keeps
+    /// the camera (and on IR hardware its emitter LED) lit for nothing, and
+    /// such an attempt is not a guess, so it also charges no rate-limit
+    /// budget (ADR 008 §3/§4).
+    ///
+    /// `0` disables the early exit. The effective value is clamped to
+    /// `timeout_secs` — see [`RecognitionConfig::effective_no_face_timeout`].
+    /// Default: 2.
+    #[serde(default = "default_no_face_timeout")]
+    pub no_face_timeout_secs: u32,
     #[serde(default = "default_confidence")]
     pub detection_confidence: f32,
     #[serde(default = "default_nms")]
@@ -124,6 +163,7 @@ impl Default for RecognitionConfig {
         Self {
             threshold: default_threshold(),
             timeout_secs: default_timeout(),
+            no_face_timeout_secs: default_no_face_timeout(),
             detection_confidence: default_confidence(),
             nms_threshold: default_nms(),
             detector_model: default_detector_model(),
@@ -133,6 +173,22 @@ impl Default for RecognitionConfig {
             execution_provider: default_execution_provider(),
             threads: default_threads(),
         }
+    }
+}
+
+impl RecognitionConfig {
+    /// How long an attempt may run before "nobody is there" ends it, or
+    /// `None` when the early exit is switched off (`no_face_timeout_secs = 0`).
+    ///
+    /// Clamped to `timeout_secs` rather than validated against it, on purpose
+    /// (ADR 008 §3, "no migration"): an existing `/etc/facelock/config.toml`
+    /// with a short `timeout_secs` — say 1 — predates this key and must keep
+    /// loading, and a no-face deadline past the overall deadline could never
+    /// fire anyway. So the pair can never be an invalid combination, only a
+    /// redundant one.
+    pub fn effective_no_face_timeout(&self) -> Option<Duration> {
+        (self.no_face_timeout_secs > 0)
+            .then(|| Duration::from_secs(self.no_face_timeout_secs.min(self.timeout_secs) as u64))
     }
 }
 
@@ -538,7 +594,7 @@ fn default_dark_threshold() -> f32 {
     0.6
 }
 fn default_camera_release_secs() -> u32 {
-    5
+    3
 }
 fn default_dark_pixel_value() -> u8 {
     10
@@ -548,6 +604,9 @@ fn default_threshold() -> f32 {
 }
 fn default_timeout() -> u32 {
     5
+}
+fn default_no_face_timeout() -> u32 {
+    2
 }
 fn default_confidence() -> f32 {
     0.5
@@ -888,6 +947,84 @@ path = "/dev/video0"
         // Values below the 5s floor still yield the 15s minimum deadline.
         let config = Config::parse("[recognition]\ntimeout_secs = 2\n").unwrap();
         assert_eq!(config.enroll_timeout_secs(), 15);
+    }
+
+    /// ADR 008 §3. Table-driven over the three cases the key has: the
+    /// default, a value that outruns `timeout_secs`, and the off switch.
+    #[test]
+    fn no_face_timeout_defaults_to_two_and_clamps_to_the_overall_timeout() {
+        // (toml, expected effective no-face timeout in seconds)
+        let cases: &[(&str, Option<u64>)] = &[
+            // Default: 2s of an empty chair, well inside the 5s default timeout.
+            ("", Some(2)),
+            // Clamped, not rejected: a config written before this key existed
+            // may already carry a timeout shorter than the new default.
+            ("[recognition]\ntimeout_secs = 1\n", Some(1)),
+            (
+                "[recognition]\ntimeout_secs = 3\nno_face_timeout_secs = 10\n",
+                Some(3),
+            ),
+            // Under the timeout, the value is used as written.
+            (
+                "[recognition]\ntimeout_secs = 30\nno_face_timeout_secs = 4\n",
+                Some(4),
+            ),
+            // 0 disables the early exit entirely.
+            ("[recognition]\nno_face_timeout_secs = 0\n", None),
+        ];
+
+        for (toml, expected) in cases {
+            let config = Config::parse(toml)
+                .unwrap_or_else(|e| panic!("{toml:?} must load — this key never rejects: {e}"));
+            assert_eq!(
+                config.recognition.effective_no_face_timeout(),
+                expected.map(Duration::from_secs),
+                "wrong effective no-face timeout for {toml:?}"
+            );
+        }
+
+        assert_eq!(
+            Config::default().recognition.no_face_timeout_secs,
+            2,
+            "the documented default"
+        );
+    }
+
+    /// ADR 008 §3, added on maintainer request. The key is purely opt-in:
+    /// absent it is `0`, which is the behavior every install already has —
+    /// a success releases the camera with the reply. Table-driven over the
+    /// ways a config can decline to mention it, plus the one that asks.
+    #[test]
+    fn the_success_hold_is_off_unless_a_config_asks_for_it() {
+        // (toml, expected success hold, expected failure hold) — the second
+        // column is here because the two are separate budgets: writing one
+        // must never move the other.
+        let cases: &[(&str, u32, u32)] = &[
+            ("", 0, 3),
+            ("[device]\n", 0, 3),
+            ("[device]\ncamera_release_secs = 10\n", 0, 10),
+            ("[device]\ncamera_release_after_success_secs = 5\n", 5, 3),
+            // `0` written out means the same as omitting it.
+            ("[device]\ncamera_release_after_success_secs = 0\n", 0, 3),
+        ];
+        for (toml, success_secs, failure_secs) in cases {
+            let config = Config::parse(toml)
+                .unwrap_or_else(|e| panic!("{toml:?} must load — this key never rejects: {e}"));
+            assert_eq!(
+                config.device.camera_release_after_success_secs, *success_secs,
+                "wrong success hold for {toml:?}"
+            );
+            assert_eq!(
+                config.device.camera_release_secs, *failure_secs,
+                "wrong failure hold for {toml:?}"
+            );
+        }
+
+        assert_eq!(
+            Config::default().device.camera_release_after_success_secs,
+            0,
+            "the documented default: a success ends the interaction"
+        );
     }
 
     #[test]

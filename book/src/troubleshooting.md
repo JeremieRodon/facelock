@@ -55,7 +55,7 @@
 
 ### First-start latency (~700ms -- 2s)
 
-The first authentication after boot (or after the daemon starts) is slow because ONNX models must be loaded into memory. This is normal. Subsequent auths in daemon mode typically take ~600ms (or ~150ms if the camera is still warm from a recent auth).
+The first authentication after boot (or after the daemon starts) is slow because ONNX models must be loaded into memory. This is normal. Subsequent auths in daemon mode never reload the models; a cold one additionally pays a camera reopen, a warm one does not. What that reopen costs is a property of your camera and driver -- measure it with `sudo facelock bench camera-reopen` (it prints the open / STREAMON / warmup split) rather than comparing against someone else's figure.
 
 ### Consistently slow (~700ms+ every time)
 

@@ -329,8 +329,20 @@ uninstall-files:
     systemctl stop facelock-daemon.service 2>/dev/null || true
     systemctl disable facelock-daemon.service 2>/dev/null || true
 
-    # Remove PAM lines from all known services (match on module name, not exact spacing)
-    for PAM_FILE in /etc/pam.d/sudo /etc/pam.d/polkit-1 /etc/pam.d/hyprlock; do
+    # Every PAM service `facelock setup` can write to: the services offered by
+    # the setup multi-select (PAM_CANDIDATES in
+    # crates/facelock-cli/src/commands/setup.rs) plus the ones it gates behind a
+    # confirmation (SENSITIVE_SERVICES). `--service` accepts an arbitrary name,
+    # so this list can never be exhaustive; it covers everything facelock itself
+    # offers or gates. Missing files are skipped, so naming a service this host
+    # does not have is inert. A drift test in setup.rs
+    # (`packaging_uninstall_covers_every_pam_candidate`) fails if a new candidate
+    # is added without being listed here.
+    FACELOCK_PAM_SERVICES="sudo polkit-1 hyprlock swaylock kscreenlocker_greet gdm-password sddm lightdm omarchy-lock-face system-auth login sshd"
+
+    # Remove PAM lines (match on module name, not exact spacing)
+    for service in $FACELOCK_PAM_SERVICES; do
+        PAM_FILE="/etc/pam.d/$service"
         if [ -f "$PAM_FILE" ] && grep -q 'pam_facelock\.so' "$PAM_FILE"; then
             sed -i '/pam_facelock\.so/d' "$PAM_FILE"
             echo "Removed face auth from $PAM_FILE"
@@ -338,7 +350,8 @@ uninstall-files:
     done
 
     # Remove PAM safety backups created by `facelock setup`
-    for backup in /etc/pam.d/sudo.facelock-backup /etc/pam.d/polkit-1.facelock-backup /etc/pam.d/hyprlock.facelock-backup; do
+    for service in $FACELOCK_PAM_SERVICES; do
+        backup="/etc/pam.d/$service.facelock-backup"
         [ -f "$backup" ] && rm -f "$backup" && echo "Removed $backup"
     done
 

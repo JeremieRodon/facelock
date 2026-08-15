@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod auth;
+pub mod cancel;
 pub mod embeddings;
 pub mod enroll;
 pub mod handler;

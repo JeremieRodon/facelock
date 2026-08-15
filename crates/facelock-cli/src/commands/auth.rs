@@ -12,6 +12,7 @@ use facelock_core::types::MatchResult;
 use facelock_daemon::audit::{self, AuditEntry, AuditSource};
 use facelock_daemon::auth;
 use facelock_daemon::auth::{AuthOutcome, ErrorKind};
+use facelock_daemon::cancel::CancelToken;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
@@ -128,22 +129,84 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         };
     }
 
+    // The user's model list, read before anything opens the camera. The
+    // attempt needs it (labels, and the device-coupling allow-set), the
+    // convergence below is derived from its length, and reading it here rather
+    // than after the camera opens is the ordering the daemon handler already
+    // uses for ADR 008 §1 — every millisecond between the camera open and the
+    // first analyzed frame is LED-on time the user reads as a strobe.
+    //
+    // Metadata only (ids, labels, device ids): no embeddings cross the camera
+    // bring-up because of this line. `load_user_embeddings`, which does carry
+    // plaintext biometric material, deliberately stays below.
+    let listed = store.list_models(&user);
+
+    // Converge this user's enrollment marker from the list we just read (#137).
+    // Free: the count is already in hand. This is the daemonless install's only
+    // convergence point — the daemon's startup reconcile never runs there.
+    //
+    // Below `pre_check_audited` and not above it: hoisting it would put a
+    // marker rewrite (temp file, chown, rename) behind every rate-limited
+    // attempt — filesystem work an attacker can drive from the wrong side of
+    // the rate limiter. The cost is that a pre-flight rejection does not
+    // converge; the next attempt that passes the gates does.
+    //
+    // Above the camera bring-up and not below it. Everything past this point
+    // can end the attempt early for reasons that say nothing about whether the
+    // user is enrolled: a cancel token set by SIGTERM/SIGINT/SIGHUP, a failed
+    // model load, a camera another process is holding, an embedding that will
+    // not decrypt, `recognition.no_face_timeout_secs` on an empty chair. None
+    // of those are pre-flight rejections and none of them are evidence about
+    // enrollment, so none of them may decide whether `is-enrolled` tells the
+    // truth. Placing the call at the `list_models` line — where it sat before
+    // the camera-lifecycle work moved that line below the camera open — would
+    // have handed every one of them a veto.
+    converge_enrollment_marker(&config, &user, listed.as_ref().ok().map(|m| m.len() as u32));
+    let models = listed.unwrap_or_default();
+
+    // Signals, before anything that turns the camera on. `facelock auth` is a
+    // one-shot: exit *is* the release, so the job of a signal is to end the
+    // scan loop and let `Camera::drop` run (STREAMOFF, IR emitter off).
+    // Killing the process outright would skip that and, on hardware with an
+    // XU-controlled emitter, leave the LED lit (ADR 008 §7).
+    let cancel = CancelToken::new();
+    register_cancel_signals(&cancel);
+
     // Quirk override takes precedence over the config's warmup value.
     let warmup = resolved
         .as_ref()
         .and_then(|r| r.quirk.as_ref())
         .and_then(|q| q.warmup_frames)
         .unwrap_or(config.device.warmup_frames);
-    let camera = match resolved {
-        // The camera carries the caps the pre-flight gates just checked.
-        Some(resolved) => resolved.open(&config.device),
-        // Unqueryable at resolution time: attempt a fresh resolve-and-open so
-        // the failure surfaces as the camera error it is.
-        None => Camera::open(&config.device, &quirks),
-    };
-    let mut camera = match camera {
-        Ok(c) => c,
-        Err(e) => {
+
+    let (mut engine, mut camera) = match start_engine_then_camera(
+        &cancel,
+        || {
+            FaceEngine::load(&config.recognition, Path::new(&config.daemon.model_dir))
+                .map_err(|e| e.to_string())
+        },
+        || {
+            match resolved {
+                // The camera carries the caps the pre-flight gates just checked.
+                Some(resolved) => resolved.open(&config.device),
+                // Unqueryable at resolution time: attempt a fresh
+                // resolve-and-open so the failure surfaces as the camera
+                // error it is.
+                None => Camera::open(&config.device, &quirks),
+            }
+            .map_err(|e| e.to_string())
+        },
+    ) {
+        Ok(pair) => pair,
+        Err(StartupAbort::Cancelled) => {
+            info!(user = %user, "cancelled");
+            return 2;
+        }
+        Err(StartupAbort::Engine(e)) => {
+            error!("models: {e}");
+            return 2;
+        }
+        Err(StartupAbort::Camera(e)) => {
             error!("camera: {e}");
             return 2;
         }
@@ -151,17 +214,12 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
 
     // Discard warmup frames for AGC/AE stabilization.
     for _ in 0..warmup {
+        if cancel.is_cancelled() {
+            info!(user = %user, "cancelled");
+            return 2;
+        }
         let _ = camera.capture();
     }
-
-    let mut engine =
-        match FaceEngine::load(&config.recognition, Path::new(&config.daemon.model_dir)) {
-            Ok(e) => e,
-            Err(e) => {
-                error!("models: {e}");
-                return 2;
-            }
-        };
 
     // Load embeddings through the decryption-aware path so the oneshot binary
     // handles encrypted templates (encrypt-by-default, Plan 04) — the bare
@@ -174,19 +232,6 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
             return 1;
         }
     };
-    let listed = store.list_models(&user);
-    // Converge this user's enrollment marker from the list we just read (#137),
-    // before the authentication decides anything. Free: the count is already in
-    // hand. This is the daemonless install's only convergence point — the
-    // daemon's startup reconcile never runs there.
-    //
-    // Here and not above `pre_check_audited`: hoisting it would put a marker
-    // rewrite (temp file, chown, rename) behind every rate-limited attempt —
-    // filesystem work an attacker can drive from the wrong side of the rate
-    // limiter. The cost is that a pre-flight rejection does not converge; the
-    // next attempt that reaches this line does.
-    converge_enrollment_marker(&config, &user, listed.as_ref().ok().map(|m| m.len() as u32));
-    let models = listed.unwrap_or_default();
 
     let start = std::time::Instant::now();
     // Wipes `stored` (D11): nothing below may read the plaintext set again.
@@ -198,6 +243,7 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         &config,
         &user,
         AuditSource::Oneshot,
+        &cancel,
     );
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -205,9 +251,17 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
     // camera-based auth loop. The oneshot path relies on those entries, so no
     // additional audit logging is needed here for the auth result itself.
 
+    // The same rule the daemon handler applies: a failed attempt charges the
+    // shared budget, but only if a face was actually seen. An attempt at an
+    // empty chair is not a guess (ADR 008 §4), and both transports write to
+    // the same `rate_limit` table, so they must agree on what counts.
     if matches!(
         response,
-        AuthOutcome::AuthResult(MatchResult { matched: false, .. })
+        AuthOutcome::AuthResult(MatchResult {
+            matched: false,
+            face_detected: true,
+            ..
+        })
     ) {
         if let Err(e) = rate_limiter.record_failure(&store, &user) {
             error!("rate limit record: {e}");
@@ -238,6 +292,13 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
                 "no match"
             );
             1
+        }
+        AuthOutcome::Cancelled => {
+            // Already audited as `cancelled` by the auth loop. Exit 2 is the
+            // existing "no opinion" code, which PAM maps to PAM_IGNORE — the
+            // contract is unchanged, nothing new is added to it.
+            info!(user = %user, duration_ms, "cancelled");
+            2
         }
         AuthOutcome::Error {
             kind: ErrorKind::AllFramesDark,
@@ -285,14 +346,83 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
 /// [`crate::commands::enrollment_marker::refresh`] follows. A count of zero is
 /// a real answer ("no models") and does delete the marker.
 ///
-/// Called unconditionally, before the authentication attempt and regardless of
-/// its outcome: an upgraded user whose face is not recognised today still needs
-/// `is-enrolled` to tell the truth. Best-effort throughout — `set` logs its own
-/// failures and never propagates, so nothing here can fail an authentication.
+/// Called unconditionally, before the camera is opened and before the
+/// authentication attempt, so nothing the attempt goes on to do or fail to do
+/// can decide whether it runs: an upgraded user whose face is not recognised
+/// today — or whose camera is busy today — still needs `is-enrolled` to tell
+/// the truth. Best-effort throughout — `set` logs its own failures and never
+/// propagates, so nothing here can fail an authentication.
 fn converge_enrollment_marker(config: &Config, user: &str, models: Option<u32>) {
     match models {
         Some(models) => super::enrollment_marker::set(config, user, models),
         None => debug!(user = %user, "model list unavailable; enrollment marker left unchanged"),
+    }
+}
+
+/// Why the one-shot never got both of its resources up.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupAbort {
+    /// A signal arrived first. The camera was never opened.
+    Cancelled,
+    /// The ONNX models could not be loaded.
+    Engine(String),
+    /// The camera could not be opened.
+    Camera(String),
+}
+
+/// Bring up the one-shot's two expensive resources **in this order**: models
+/// first, camera second, with a cancellation check in between.
+///
+/// The order is the point. Loading ONNX takes a large fraction of a
+/// one-shot's wall time; opening the camera first meant the IR emitter was
+/// lit for all of it, which the user reads as a strobe that has nothing to do
+/// with being looked at. Opening it last makes LED-on time equal to scan time
+/// (ADR 008 §7). The check between them is what makes a SIGTERM during the
+/// model load exit without ever touching the camera (§8).
+///
+/// Generic over the two resources purely so the ordering — the part that is
+/// policy — is testable without ONNX models or a V4L2 device.
+fn start_engine_then_camera<E, C>(
+    cancel: &CancelToken,
+    load_engine: impl FnOnce() -> Result<E, String>,
+    open_camera: impl FnOnce() -> Result<C, String>,
+) -> Result<(E, C), StartupAbort> {
+    if cancel.is_cancelled() {
+        return Err(StartupAbort::Cancelled);
+    }
+    let engine = load_engine().map_err(StartupAbort::Engine)?;
+    if cancel.is_cancelled() {
+        return Err(StartupAbort::Cancelled);
+    }
+    let camera = open_camera().map_err(StartupAbort::Camera)?;
+    Ok((engine, camera))
+}
+
+/// Wire SIGTERM, SIGINT and SIGHUP to `cancel`.
+///
+/// `signal_hook::flag::register` writes into an `Arc<AtomicBool>` from the
+/// handler — which is why [`CancelToken`] is one. The scan loop reads it once
+/// per frame, unwinds normally, and `Camera::drop` runs STREAMOFF and turns
+/// the IR emitter off. That is the whole point: the default disposition for
+/// all three signals is to die immediately, skipping `Drop` and leaving an
+/// XU-controlled emitter lit.
+///
+/// The three signals are the three ways a PAM host lets go: SIGTERM from the
+/// module's own timeout (and from `PR_SET_PDEATHSIG` when the host is killed),
+/// SIGINT from Ctrl-C at a `sudo` prompt, SIGHUP when the terminal goes away.
+///
+/// Best-effort: a registration failure is logged and the process keeps its
+/// default disposition for that signal, which is exactly today's behavior.
+fn register_cancel_signals(cancel: &CancelToken) {
+    for signal in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ] {
+        if let Err(e) = signal_hook::flag::register(signal, cancel.flag()) {
+            // Not fatal: this only costs the clean shutdown, never the auth.
+            debug!(signal, "could not register cancel signal handler: {e}");
+        }
     }
 }
 
@@ -329,11 +459,107 @@ fn oneshot_exit_code(kind: ErrorKind) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::oneshot_exit_code;
+    use super::{StartupAbort, oneshot_exit_code, start_engine_then_camera};
     use facelock_core::config::Config;
     use facelock_core::types::MatchResult;
     use facelock_daemon::audit::AuditSource;
     use facelock_daemon::auth::pre_check_audited;
+    use facelock_daemon::cancel::CancelToken;
+
+    /// The ordering of ADR 008 §7, observed rather than asserted from the
+    /// source: models load before the camera opens, so the IR emitter is lit
+    /// for the scan and not for the model load.
+    #[test]
+    fn the_engine_loads_before_the_camera_opens() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let started = start_engine_then_camera(
+            &CancelToken::new(),
+            || {
+                order.borrow_mut().push("engine");
+                Ok::<_, String>(())
+            },
+            || {
+                order.borrow_mut().push("camera");
+                Ok::<_, String>(())
+            },
+        );
+        assert!(started.is_ok());
+        assert_eq!(order.into_inner(), vec!["engine", "camera"]);
+    }
+
+    /// A signal that arrives before start-up costs nothing: neither resource
+    /// is touched, and the camera in particular is never opened, so there is
+    /// no LED to turn back off.
+    #[test]
+    fn a_token_set_before_startup_opens_nothing() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let order = std::cell::RefCell::new(Vec::new());
+        let started = start_engine_then_camera(
+            &cancel,
+            || {
+                order.borrow_mut().push("engine");
+                Ok::<_, String>(())
+            },
+            || {
+                order.borrow_mut().push("camera");
+                Ok::<_, String>(())
+            },
+        );
+        assert_eq!(started.unwrap_err(), StartupAbort::Cancelled);
+        assert!(
+            order.into_inner().is_empty(),
+            "a cancelled start-up must not load models or open the camera"
+        );
+    }
+
+    /// The check between the two steps: a signal during the model load
+    /// (which is the long one) stops the start-up before the camera factory
+    /// is ever called — ADR 008 §8's "SIGTERM during model load".
+    #[test]
+    fn a_signal_during_the_model_load_never_opens_the_camera() {
+        let cancel = CancelToken::new();
+        let opened = std::cell::Cell::new(false);
+        let started = start_engine_then_camera(
+            &cancel,
+            || {
+                // Stands in for a SIGTERM arriving mid-load.
+                cancel.cancel();
+                Ok::<_, String>(())
+            },
+            || {
+                opened.set(true);
+                Ok::<_, String>(())
+            },
+        );
+        assert_eq!(started.unwrap_err(), StartupAbort::Cancelled);
+        assert!(!opened.get(), "the camera factory must never have run");
+    }
+
+    /// Each resource's failure keeps its own identity, so the log line names
+    /// the thing that actually broke.
+    #[test]
+    fn each_startup_failure_reports_its_own_resource() {
+        let engine_failed = start_engine_then_camera::<(), ()>(
+            &CancelToken::new(),
+            || Err("no models".into()),
+            || panic!("the camera must not open after a failed model load"),
+        );
+        assert_eq!(
+            engine_failed.unwrap_err(),
+            StartupAbort::Engine("no models".into())
+        );
+
+        let camera_failed = start_engine_then_camera::<(), ()>(
+            &CancelToken::new(),
+            || Ok(()),
+            || Err("device busy".into()),
+        );
+        assert_eq!(
+            camera_failed.unwrap_err(),
+            StartupAbort::Camera("device busy".into())
+        );
+    }
     use facelock_daemon::auth::{AuthOutcome, ErrorKind};
 
     /// The coupling, in one place.
@@ -655,26 +881,75 @@ path = "{audit_path}"
         );
     }
 
-    /// Structural pin, in the style of `resolved.rs`: the convergence call sits
-    /// ahead of the authentication attempt in `run`'s straight-line code. That
-    /// ordering is the whole of "regardless of whether authentication succeeds"
-    /// — move the call below the result and convergence silently becomes
-    /// conditional on a face being recognised, which is exactly the population
-    /// #137 is about.
+    /// Structural pin, in the style of `resolved.rs`: where the convergence
+    /// call sits in `run`'s straight-line code *is* its contract, and the
+    /// window it has to sit in is bounded on both sides.
+    ///
+    /// **Below `pre_check_audited`.** Above it, a marker rewrite — temp file,
+    /// `chown`, `rename` — would be reachable by an attempt the pre-flight
+    /// gates reject, including a rate-limited one. That is attacker-drivable
+    /// filesystem work from the wrong side of the rate limiter, and the whole
+    /// reason the call is not simply hoisted to the top of `run`.
+    ///
+    /// **Above `start_engine_then_camera`.** Below it, convergence inherits
+    /// every way the camera bring-up and the scan can end an attempt early —
+    /// a cancel token set by a signal, a failed model load, a camera another
+    /// process is holding, an embedding that will not decrypt, the no-face
+    /// timeout on an empty chair. None of those are evidence about enrollment,
+    /// so none of them may decide whether `is-enrolled` tells the truth. This
+    /// is the half the camera-lifecycle work (ADR 008) silently broke: it moved
+    /// the `list_models` line this call used to sit on to *below* the camera
+    /// open, so a textual merge left convergence there.
+    ///
+    /// The authentication attempt itself is the outer bound, restated because
+    /// it is the property #137 is about: convergence must not become
+    /// conditional on a face being recognised.
     #[test]
-    fn marker_convergence_precedes_the_authentication_attempt() {
+    fn marker_convergence_sits_between_the_gates_and_the_camera() {
         let src = include_str!("auth.rs");
-        // First occurrence is the call in `run`; the definition and this test
-        // both live further down the file.
+        // First occurrence of each is the one in `run`; the definitions and the
+        // tests all live further down the file.
+        let pre_check = src
+            .find("pre_check_audited(")
+            .expect("run() must run the pre-flight gates");
         let converge = src
             .find("converge_enrollment_marker(")
             .expect("run() must converge the marker");
+        let camera = src
+            .find("start_engine_then_camera(")
+            .expect("run() must bring up the engine and camera");
         let authenticate = src
             .find("::authenticate_with_embeddings(")
             .expect("run() must attempt an authentication");
+
+        assert!(
+            pre_check < converge,
+            "marker convergence must run *after* the pre-flight gates — no \
+             filesystem work from the wrong side of the rate limiter"
+        );
+        assert!(
+            converge < camera,
+            "marker convergence must run *before* the camera bring-up — every \
+             early exit below it is unrelated to whether the user is enrolled"
+        );
         assert!(
             converge < authenticate,
             "marker convergence must run before the authentication attempt"
+        );
+
+        // Exactly one call site, so no path converges twice (a second write
+        // would be harmless but would mean the placement above is no longer
+        // the whole story). Everything before the definition is `run` and its
+        // doc comment.
+        let definition = src
+            .find("fn converge_enrollment_marker(")
+            .expect("the helper must be defined in this file");
+        assert_eq!(
+            src[..definition]
+                .matches("converge_enrollment_marker(")
+                .count(),
+            1,
+            "run() must converge exactly once"
         );
     }
 }

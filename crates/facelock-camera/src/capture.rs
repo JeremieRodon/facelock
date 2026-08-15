@@ -15,6 +15,16 @@ use v4l::video::Capture;
 /// within this time, capture returns an error instead of blocking forever.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Number of MMAP buffers the capture stream is created with.
+///
+/// Public because it is not a private tuning knob: a consumer that keeps a
+/// stream open between requests (the daemon's warm camera hold, ADR 008 §4)
+/// must discard `MMAP_BUFFERS - 1` frames before analyzing anything, since
+/// V4L2 leaves exactly that many buffers filled with the frames captured
+/// right after the previous request. Reading the count from here is what
+/// keeps that discard correct if the buffer depth ever changes.
+pub const MMAP_BUFFERS: u32 = 4;
+
 use crate::ir_emitter;
 use crate::ir_emitter::EmitterXuInfo;
 use crate::preprocess;
@@ -137,8 +147,8 @@ impl<'a> Camera<'a> {
             "camera format negotiated"
         );
 
-        // Create MMAP stream with 4 buffers and a capture timeout
-        let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        // Create MMAP stream with `MMAP_BUFFERS` buffers and a capture timeout
+        let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
             .map_err(|e| FacelockError::Camera(format!("failed to create stream: {e}")))?;
         stream.set_timeout(CAPTURE_TIMEOUT);
 
@@ -461,6 +471,7 @@ mod tests {
             dark_pixel_value: 10,
             ir_emitter: false,
             camera_release_secs: 5,
+            camera_release_after_success_secs: 0,
         };
         let mut cam = Camera::open(&config, &QuirksDb::load()).expect("failed to open camera");
         let frame = cam.capture().expect("failed to capture frame");
