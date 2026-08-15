@@ -667,8 +667,11 @@ startup (§6.B, #137), a failed drop would leave the daemon serving every authen
 `chown(2)` in reach and only a journal line to say so. Refusing is not a lockout: PAM degrades to
 the password exactly as it does when the daemon is not running at all — the same trade
 `ensure_state_layout` already makes earlier in startup, and the same fail-closed convention as
-the model SHA-256 check. `Restart=on-failure` will retry, and systemd's start rate limiting stops
-the loop.
+the model SHA-256 check. `Restart=on-failure` will retry it every `RestartSec=3`, which is the
+same restart loop a failed `ensure_state_layout` already produces (the unit sets no
+`StartLimit*`, so systemd's defaults may not trip on a 3-second interval). Each attempt logs the
+capability mask that survived, so the journal says exactly what is wrong rather than only that
+something is.
 
 #### B. systemd Hardening (Implemented)
 
