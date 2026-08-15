@@ -2,6 +2,8 @@
 //! both directions (preview faces, device enumeration). The daemon handler's
 //! own request/response enums are internal to `facelock-daemon` (D5).
 
+use serde::Serialize;
+
 /// A detected face in a preview frame with its recognition status.
 #[derive(Debug, Clone)]
 pub struct PreviewFace {
@@ -19,7 +21,10 @@ pub struct PreviewFace {
 }
 
 /// Information about a V4L2 video device, returned via IPC.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` backs `facelock devices --json` (serde-derived, unlike the
+/// hand-rolled `format!` JSON `list --json` used to build — see E10).
+#[derive(Debug, Clone, Serialize)]
 pub struct IpcDeviceInfo {
     pub path: String,
     pub name: String,
@@ -29,7 +34,7 @@ pub struct IpcDeviceInfo {
 }
 
 /// A supported pixel format with available resolutions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IpcFormatInfo {
     pub fourcc: String,
     pub description: String,

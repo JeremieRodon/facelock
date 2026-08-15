@@ -1,9 +1,10 @@
 use facelock_core::Config;
+use facelock_core::ipc::IpcDeviceInfo;
 
 use crate::backend::Backend;
 use crate::ipc_client;
 
-pub fn run(config: &Config) -> anyhow::Result<()> {
+pub fn run(config: &Config, json: bool) -> anyhow::Result<()> {
     // DEC-6/N13: `ListDevices` is root-only now (was facelock-group).
     ipc_client::require_root("sudo facelock devices")?;
 
@@ -12,6 +13,11 @@ pub fn run(config: &Config) -> anyhow::Result<()> {
     // its own loop.
     let backend = Backend::select(config);
     let devices = backend.list_devices()?;
+
+    if json {
+        print_json(&devices);
+        return Ok(());
+    }
 
     if devices.is_empty() {
         println!("No video devices found.");
@@ -54,8 +60,73 @@ pub fn run(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `facelock devices --json`: serde-derived output (see
+/// `facelock_core::ipc::IpcDeviceInfo`), so a consumer parses a stable typed
+/// schema instead of the human-readable renderer above — the renderer's
+/// layout (columns, the `[IR]` tag, indentation) is free to change without
+/// breaking anything that reads `--json`.
+fn print_json(devices: &[IpcDeviceInfo]) {
+    let json = serde_json::to_string(devices).unwrap_or_else(|_| "[]".to_string());
+    println!("{json}");
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use facelock_core::ipc::IpcFormatInfo;
+
+    fn sample_devices() -> Vec<IpcDeviceInfo> {
+        vec![
+            IpcDeviceInfo {
+                path: "/dev/video0".to_string(),
+                name: "Logitech BRIO".to_string(),
+                driver: "uvcvideo".to_string(),
+                is_ir: false,
+                formats: vec![IpcFormatInfo {
+                    fourcc: "YUYV".to_string(),
+                    description: "YUYV 4:2:2".to_string(),
+                    sizes: vec![(1920, 1080), (640, 480)],
+                }],
+            },
+            IpcDeviceInfo {
+                path: "/dev/video2".to_string(),
+                name: "Logitech BRIO IR".to_string(),
+                driver: "uvcvideo".to_string(),
+                is_ir: true,
+                formats: vec![IpcFormatInfo {
+                    fourcc: "GREY".to_string(),
+                    description: "8-bit Greyscale".to_string(),
+                    sizes: vec![(640, 480)],
+                }],
+            },
+        ]
+    }
+
     // Device listing requires hardware or a running daemon; the transport
-    // fork and its failure policy are pinned in `crate::backend`.
+    // fork and its failure policy are pinned in `crate::backend`. What is
+    // pure and testable here is the JSON shape itself.
+
+    #[test]
+    fn json_output_is_a_parseable_array_with_the_documented_fields() {
+        let rendered = serde_json::to_string(&sample_devices()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let arr = parsed.as_array().expect("top level must be a JSON array");
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr[0]["path"], "/dev/video0");
+        assert_eq!(arr[0]["is_ir"], false);
+        assert_eq!(arr[0]["formats"][0]["fourcc"], "YUYV");
+        assert_eq!(arr[0]["formats"][0]["sizes"][0][0], 1920);
+        assert_eq!(arr[0]["formats"][0]["sizes"][0][1], 1080);
+
+        assert_eq!(arr[1]["path"], "/dev/video2");
+        assert_eq!(arr[1]["is_ir"], true);
+        assert_eq!(arr[1]["formats"][0]["fourcc"], "GREY");
+    }
+
+    #[test]
+    fn json_output_is_an_empty_array_when_no_devices() {
+        let rendered = serde_json::to_string(&Vec::<IpcDeviceInfo>::new()).unwrap();
+        assert_eq!(rendered, "[]");
+    }
 }
