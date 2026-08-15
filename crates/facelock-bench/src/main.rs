@@ -7,6 +7,7 @@ use tracing::{info, warn};
 
 use facelock_camera::capture::Camera;
 use facelock_camera::device::{is_ir_camera, validate_device};
+use facelock_camera::{QuirksDb, ResolvedCamera};
 use facelock_core::Config;
 use facelock_core::types::{FaceEmbedding, cosine_similarity};
 use facelock_face::FaceEngine;
@@ -24,6 +25,9 @@ const WARM_ITERATIONS: u32 = 10;
 
 /// Number of snapshots for enrollment benchmark.
 const ENROLLMENT_SNAPSHOTS: u32 = 5;
+
+/// Default number of reopen cycles for `camera-reopen`.
+const REOPEN_ITERATIONS: u32 = 5;
 
 /// Fallback `EnvFilter` directive used when `RUST_LOG` is unset (gap E9).
 ///
@@ -69,6 +73,12 @@ enum Command {
     ModelLoad,
     /// Sweep thresholds and measure FAR/FRR
     Calibrate,
+    /// Measure what reopening the camera costs (open, STREAMON, warmup)
+    CameraReopen {
+        /// Number of close→open→first-usable-frame cycles to time
+        #[arg(long, default_value_t = REOPEN_ITERATIONS)]
+        iterations: u32,
+    },
     /// Generate a benchmark report
     Report,
 }
@@ -87,6 +97,7 @@ fn main() -> Result<()> {
         Command::Enrollment => cmd_enrollment(),
         Command::ModelLoad => cmd_model_load(),
         Command::Calibrate => cmd_calibrate(),
+        Command::CameraReopen { iterations } => cmd_camera_reopen(iterations),
         Command::Report => cmd_report(),
     }
 }
@@ -510,6 +521,134 @@ fn cmd_calibrate() -> Result<()> {
 
         conf += 0.10;
     }
+
+    Ok(())
+}
+
+/// Time what it costs to go from no camera to the first frame an
+/// authentication can analyze — the cost `device.camera_release_secs` trades
+/// LED-on time against (ADR 008 §9).
+///
+/// The canonical implementation is `facelock bench camera-reopen`; this is the
+/// same measurement for the standalone tool. Unlike the other subcommands
+/// here, it loads the real quirks DB: a quirk's `warmup_frames` and
+/// `format_preference` overrides are a large part of what a reopen costs on
+/// the devices that have one, and a number measured without them would not be
+/// the number the daemon pays.
+fn cmd_camera_reopen(iterations: u32) -> Result<()> {
+    let config = load_config()?;
+    if iterations == 0 {
+        bail!("--iterations must be at least 1");
+    }
+
+    println!("=== Camera Reopen Benchmark ===");
+    println!(
+        "Measuring: open + format negotiation, STREAMON + first frame, warmup discard, \
+         first usable frame ({} iterations)",
+        iterations
+    );
+    println!();
+
+    let quirks = QuirksDb::load();
+    let mut opens = Vec::with_capacity(iterations as usize);
+    let mut firsts = Vec::with_capacity(iterations as usize);
+    let mut warmups = Vec::with_capacity(iterations as usize);
+    let mut usables = Vec::with_capacity(iterations as usize);
+    let mut totals = Vec::with_capacity(iterations as usize);
+    let mut device_path = String::new();
+    let mut format = String::new();
+    let mut warmup_frames = 0u32;
+
+    for i in 0..iterations {
+        // Each iteration starts closed: the previous camera was dropped before
+        // this timer started, so its STREAMOFF and IR-emitter shutdown are not
+        // billed to this open.
+        let open_start = Instant::now();
+        let resolved = ResolvedCamera::resolve(&config.device, &quirks)
+            .context("Failed to resolve camera device")?;
+        let warmup = resolved
+            .quirk
+            .as_ref()
+            .and_then(|q| q.warmup_frames)
+            .unwrap_or(config.device.warmup_frames);
+        let path = resolved.info.path.clone();
+        let mut camera = resolved
+            .open(&config.device)
+            .context("Failed to open camera")?;
+        let open_ms = open_start.elapsed().as_millis() as u64;
+
+        // The first capture is what issues STREAMON: the V4L2 stream starts
+        // lazily on the first dequeue.
+        let first_start = Instant::now();
+        camera
+            .capture()
+            .context("Failed to capture the first frame")?;
+        let first_ms = first_start.elapsed().as_millis() as u64;
+
+        // `1..warmup`: the capture above already spent the first warmup frame.
+        let warmup_start = Instant::now();
+        for _ in 1..warmup {
+            camera.capture().context("Failed to capture warmup frame")?;
+        }
+        let warmup_ms = warmup_start.elapsed().as_millis() as u64;
+
+        // With no warmup configured, the frame above is already the one an
+        // authentication would analyze.
+        let usable_ms = if warmup > 0 {
+            let usable_start = Instant::now();
+            camera
+                .capture()
+                .context("Failed to capture the first usable frame")?;
+            usable_start.elapsed().as_millis() as u64
+        } else {
+            0
+        };
+
+        let total_ms = open_ms + first_ms + warmup_ms + usable_ms;
+        device_path = path;
+        format = camera.format().trim().to_string();
+        warmup_frames = warmup;
+
+        println!(
+            "iteration {:<2} open {:>5}ms  first_frame {:>5}ms  warmup {:>5}ms  \
+             usable {:>5}ms  total {:>5}ms",
+            i + 1,
+            open_ms,
+            first_ms,
+            warmup_ms,
+            usable_ms,
+            total_ms
+        );
+        info!(
+            iteration = i + 1,
+            open_ms, first_ms, warmup_ms, usable_ms, total_ms, "camera reopen iteration"
+        );
+
+        // Load-bearing: the drop runs STREAMOFF and disables the IR emitter,
+        // which is what makes the next iteration a cold open.
+        drop(camera);
+        opens.push(open_ms);
+        firsts.push(first_ms);
+        warmups.push(warmup_ms);
+        usables.push(usable_ms);
+        totals.push(total_ms);
+    }
+
+    println!();
+    println!("Device:         {}", device_path);
+    println!("Format:         {}", format);
+    println!("Warmup frames:  {}", warmup_frames);
+    println!();
+    println!("Median split ({} iterations):", iterations);
+    println!("  open:         {}ms", percentile(&mut opens, 50));
+    println!("  first_frame:  {}ms", percentile(&mut firsts, 50));
+    println!("  warmup:       {}ms", percentile(&mut warmups, 50));
+    println!("  usable:       {}ms", percentile(&mut usables, 50));
+    println!("  total:        {}ms", percentile(&mut totals, 50));
+    println!();
+    println!(
+        "camera_release_secs trades this reopen cost against LED-on time after a failed attempt (ADR 008)"
+    );
 
     Ok(())
 }

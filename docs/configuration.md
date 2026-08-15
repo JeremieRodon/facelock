@@ -19,7 +19,8 @@ Camera settings.
 | `dark_threshold` | f32 | `0.6` | Fraction of pixels that must be darker than `dark_pixel_value` before the frame is treated as unusably dark. |
 | `dark_pixel_value` | u8 | `10` | Pixel brightness cutoff used by the dark-frame check. |
 | `ir_emitter` | bool | `false` | Attempt to enable a controllable IR emitter when the camera opens. Only needed for hardware that does not auto-enable its IR LED. |
-| `camera_release_secs` | u32 | `5` | Seconds to keep the camera open after daemon-mode auth before releasing it, to avoid repeated warmup cost on back-to-back requests. |
+| `camera_release_secs` | u32 | `3` | Daemon only. Seconds to keep the camera streaming after a **failed** authentication so an immediate retry skips the reopen cost. Cancellation and errors release the camera at once, and so does a success unless `camera_release_after_success_secs` is set. `0` disables the hold entirely (it used to be silently substituted with 5). |
+| `camera_release_after_success_secs` | u32 | `0` | Daemon only. Seconds to keep the camera streaming after a **successful** authentication too. `0` (the default) releases it immediately — the interaction is over, and on IR hardware the emitter LED goes out with it. Set it only where privileged actions repeat with no authentication caching in front of them (`sudo` with a zero `timestamp_timeout`, a polkit action without `auth_admin_keep`), so each one is a fresh authentication that would otherwise pay a camera reopen. Failures still use `camera_release_secs`; cancellations and errors always release at once. |
 
 ## [recognition]
 
@@ -29,6 +30,7 @@ Face detection and embedding parameters.
 |-----|------|---------|-------------|
 | `threshold` | f32 | `0.80` | Cosine similarity threshold for accepting a face match. Must be between 0.0 and 1.0. Higher values are stricter. See the range guide below. |
 | `timeout_secs` | u32 | `5` | Maximum seconds to attempt recognition before giving up. Must be > 0. |
+| `no_face_timeout_secs` | u32 | `2` | Seconds to keep scanning when **no face at all** has been detected. Once a face is seen, `timeout_secs` takes over — "seen, not matched yet" is the case worth waiting out. An empty-chair attempt ends early and charges no rate-limit budget. Clamped to `timeout_secs` (never an error); `0` disables the early exit. |
 | `detection_confidence` | f32 | `0.5` | Minimum confidence for the face detector to report a detection. Lower values detect more faces but increase false positives. |
 | `nms_threshold` | f32 | `0.4` | Non-maximum suppression threshold for overlapping detections. |
 | `detector_model` | string | `"scrfd_2.5g_bnkps.onnx"` | ONNX detector model filename. Must exist in `daemon.model_dir`. Bundled models are verified against the manifest; custom models require `detector_sha256`. |
@@ -67,7 +69,7 @@ Controls how the PAM module reaches the face engine.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | string | `"daemon"` | `"daemon"` connects to a persistent daemon via D-Bus system bus (~200ms warm, ~600ms cold). `"oneshot"` spawns `facelock auth` per PAM call (slower, ~600ms+, no background process). |
+| `mode` | string | `"daemon"` | `"daemon"` connects to a persistent daemon via D-Bus system bus (models stay loaded; only a cold attempt pays a camera reopen — measure it with `facelock bench camera-reopen`). `"oneshot"` spawns `facelock auth` per PAM call (slower: model load on every call, no background process). |
 | `model_dir` | string | `"/var/lib/facelock/models"` | Directory containing ONNX model files. An explicitly configured value is honored verbatim and never rewritten. |
 | `idle_timeout_secs` | u64 | `0` | Shut down the daemon after this many idle seconds. `0` means never. Useful with D-Bus activation. |
 

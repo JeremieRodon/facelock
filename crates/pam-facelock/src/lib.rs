@@ -783,9 +783,122 @@ fn oneshot_child_env(
     env
 }
 
+/// How long an overrunning one-shot child gets to exit on SIGTERM before it
+/// is killed. Generous: the child's own cancel check runs once per captured
+/// frame, so it normally exits in well under one frame time.
+const ONESHOT_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Poll interval while waiting out [`ONESHOT_TERM_GRACE`].
+const ONESHOT_TERM_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long a SIGKILLed child is polled for before the blocking reap.
+///
+/// SIGKILL is uncatchable, so a child that received one is already dying and
+/// this normally expires after a single poll; the bound exists so the reap
+/// below is never the first thing that waits.
+const ONESHOT_KILL_REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The three things the termination sequence needs from a child process.
+///
+/// A trait rather than a `std::process::Child` in the signature purely so the
+/// sequence itself — the part that is auth-adjacent policy, not mechanism —
+/// can be unit-tested without spawning anything.
+trait Terminable {
+    /// Send a signal to the child.
+    fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()>;
+    /// Has it exited yet? Non-blocking.
+    fn has_exited(&mut self) -> std::io::Result<bool>;
+    /// Block until it is reaped. Only ever called after a SIGKILL that the
+    /// kernel accepted, so the wait is bounded by the kernel, not by us.
+    fn reap(&mut self) -> std::io::Result<()>;
+}
+
+impl Terminable for std::process::Child {
+    fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: `kill` with a pid we own and a valid signal number. A dead
+        // child yields ESRCH, which is reported as an error, never UB.
+        let rc = unsafe { libc::kill(self.id() as libc::pid_t, signal) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn has_exited(&mut self) -> std::io::Result<bool> {
+        self.try_wait().map(|status| status.is_some())
+    }
+
+    fn reap(&mut self) -> std::io::Result<()> {
+        // `wait` returns the cached status immediately if a `try_wait` above
+        // already reaped it, so calling this after the poll loop is free.
+        self.wait().map(|_| ())
+    }
+}
+
+/// Stop an overrunning one-shot child: **SIGTERM, wait, then SIGKILL**.
+///
+/// The module used to send SIGKILL straight away. A killed `facelock auth`
+/// never runs `Drop`, so the camera is closed by the kernel without a
+/// STREAMOFF and, on hardware whose IR emitter is under explicit XU control,
+/// the LED stays on. SIGTERM gives the child the chance to end its scan and
+/// clean up; SIGKILL is the backstop for a child wedged in a driver call,
+/// where leaking the emitter beats hanging the PAM stack.
+///
+/// Returns the signals actually sent, in order — which is what the tests
+/// assert on.
+fn terminate_oneshot_child<T: Terminable>(
+    child: &mut T,
+    grace: std::time::Duration,
+) -> Vec<libc::c_int> {
+    let mut sent = Vec::with_capacity(2);
+    if child.signal(libc::SIGTERM).is_ok() {
+        sent.push(libc::SIGTERM);
+    }
+
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        // An error here means we cannot tell whether it exited, which is
+        // treated as "not yet" — the grace period still bounds the wait, and
+        // the SIGKILL below is harmless against a dead child.
+        if child.has_exited().unwrap_or(false) {
+            return sent;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(ONESHOT_TERM_POLL.min(grace));
+    }
+
+    if child.signal(libc::SIGKILL).is_ok() {
+        sent.push(libc::SIGKILL);
+        // Reap it. A child killed here is dead within microseconds, but until
+        // somebody waits on it, it is a zombie occupying a PID slot for as
+        // long as this PAM host lives — and the host may be a long-running
+        // screen locker, not a `sudo` that exits a second later. The old
+        // single non-blocking `try_wait` at the call site was a coin flip on
+        // whether the child had been scheduled off yet.
+        //
+        // Blocking is safe *only* because SIGKILL was accepted: it cannot be
+        // caught, blocked or ignored, so the kernel bounds this wait. When the
+        // signal could not be delivered at all this branch is skipped and
+        // nothing blocks — the case the original comment was worried about.
+        let deadline = std::time::Instant::now() + ONESHOT_KILL_REAP_WAIT;
+        while !child.has_exited().unwrap_or(false) {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(ONESHOT_TERM_POLL.min(ONESHOT_KILL_REAP_WAIT));
+        }
+        let _ = child.reap();
+    }
+    sent
+}
+
 /// Run facelock auth as a subprocess for daemonless authentication.
 /// Exit codes: 0 = matched, 1 = no match, 2+ = error.
 fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_int {
+    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     let timeout_secs = config.recognition.timeout_secs as u64 + 3; // buffer for model load
@@ -803,7 +916,8 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
         }
     };
 
-    let result = Command::new(&auth_bin)
+    let mut command = Command::new(&auth_bin);
+    command
         .arg("auth")
         .arg("--user")
         .arg(user)
@@ -817,8 +931,52 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
         .envs(oneshot_child_env(std::env::vars_os()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
+
+    // Tie the child's life to this PAM host's. If the host is killed — a
+    // screen locker's PAM helper torn down on unlock, a killed `sudo` — the
+    // kernel sends the child SIGTERM, which `facelock auth` handles by
+    // ending its scan and running `Drop` (STREAMOFF, IR emitter off). Without
+    // it the child is reparented to init and keeps the camera on, alone, for
+    // the rest of its timeout: the one-shot analogue of the daemon's caller
+    // watch (ADR 008 §7).
+    //
+    // Read before the fork so the closure has something to compare against.
+    //
+    // SAFETY: `getpid` is a plain syscall with no preconditions.
+    let expected_parent_pid = unsafe { libc::getpid() };
+
+    // SAFETY: `pre_exec` runs in the forked child between fork and exec,
+    // where only async-signal-safe work is allowed. `prctl`, `getppid` and
+    // `raise` are single syscalls with no allocation, no locks and no libc
+    // state — they are the operations `pre_exec` exists for, and the closure
+    // captures only a `pid_t` by copy, so it allocates nothing either.
+    // PDEATHSIG is cleared by exec only for setuid binaries; `facelock` is not
+    // one (its trust is verified above), so it survives into the execed image.
+    unsafe {
+        command.pre_exec(move || {
+            // The result is deliberately ignored: losing the parent-death
+            // signal costs the promptness, never the authentication — the
+            // child still exits on its own timeout, and the kill sequence
+            // below still applies.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            // PDEATHSIG fires on the parent's death, not on already being an
+            // orphan — so a host that died in the window between `fork` and
+            // the `prctl` above has already been mourned and nothing will
+            // ever arrive. That leaves exactly what PDEATHSIG exists to
+            // prevent: a `facelock auth` reparented to init, holding the
+            // camera and the IR emitter alone for the rest of its timeout,
+            // with no PAM host left to run the kill sequence. Closing the
+            // window means asking once, after the fact, whether we are still
+            // the child we thought we were.
+            if libc::getppid() != expected_parent_pid {
+                libc::raise(libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+
+    let result = command.spawn();
 
     let mut child = match result {
         Ok(c) => c,
@@ -862,7 +1020,15 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
+                    // SIGTERM first, SIGKILL only if it will not go. A
+                    // SIGKILL skips the child's `Drop`, so the V4L2 stream is
+                    // torn down by the kernel with no STREAMOFF and an
+                    // XU-controlled IR emitter is left lit until something
+                    // else turns it off (ADR 008 §7).
+                    // Reaps the child itself: a child that exits on SIGTERM is
+                    // reaped by the poll, and one that had to be killed is
+                    // waited for there (both bounded — see the function).
+                    terminate_oneshot_child(&mut child, ONESHOT_TERM_GRACE);
                     log_auth(service, "timeout (oneshot)", user, LOG_WARNING);
                     return PAM_AUTH_ERR;
                 }
@@ -895,6 +1061,15 @@ fn pam_code_for_daemon_error(message: &str) -> (libc::c_int, &'static str) {
         (PAM_AUTH_ERR, "rate_limited")
     } else if message.contains("IR camera required") || message.contains("ir_required") {
         (PAM_IGNORE, "ir_required")
+    } else if message == "cancelled" {
+        // The attempt was abandoned, not refused: the caller's connection
+        // went away, the system is suspending, or `ReleaseCamera` arrived.
+        // The daemon has no opinion about this face, so abstain and let the
+        // password modules run — which is what the user who just typed a
+        // password expects. Matched exactly (not `contains`) so an arbitrary
+        // error message that happens to mention cancelling cannot claim it.
+        // The string is frozen protocol; see docs/contracts.md.
+        (PAM_IGNORE, "cancelled")
     } else {
         (PAM_IGNORE, "error: internal")
     }
@@ -1464,6 +1639,159 @@ auth_bin = "/usr/local/bin/evil"
         assert_eq!(reason, "ir_required");
     }
 
+    /// A child that records what it was sent and exits when told to.
+    struct FakeChild {
+        sent: Vec<libc::c_int>,
+        exits_on_term: bool,
+        /// Whether the sequence blocked on a wait — the difference between
+        /// reaping the child and leaving a zombie behind.
+        reaped: bool,
+        /// Delivery failure, for the child that cannot be signalled at all.
+        signals_fail: bool,
+    }
+
+    impl FakeChild {
+        fn new(exits_on_term: bool) -> Self {
+            Self {
+                sent: Vec::new(),
+                exits_on_term,
+                reaped: false,
+                signals_fail: false,
+            }
+        }
+    }
+
+    impl Terminable for FakeChild {
+        fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()> {
+            if self.signals_fail {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            self.sent.push(signal);
+            Ok(())
+        }
+
+        fn has_exited(&mut self) -> std::io::Result<bool> {
+            // A SIGKILLed child is gone by the next poll; a SIGTERMed one only
+            // if it is the well-behaved kind.
+            if self.sent.contains(&libc::SIGKILL) {
+                return Ok(true);
+            }
+            Ok(self.exits_on_term && self.sent.contains(&libc::SIGTERM))
+        }
+
+        fn reap(&mut self) -> std::io::Result<()> {
+            self.reaped = true;
+            Ok(())
+        }
+    }
+
+    /// The ordering that matters: a well-behaved child is asked to stop, not
+    /// killed. A SIGKILL skips `Drop`, so the V4L2 stream is never told to
+    /// STREAMOFF and an XU-controlled IR emitter is left lit.
+    #[test]
+    fn a_child_that_exits_on_sigterm_is_never_killed() {
+        let mut child = FakeChild::new(true);
+        let sent = terminate_oneshot_child(&mut child, std::time::Duration::from_millis(50));
+        assert_eq!(sent, vec![libc::SIGTERM]);
+        assert!(
+            !sent.contains(&libc::SIGKILL),
+            "a child that exited on SIGTERM must not be killed"
+        );
+    }
+
+    /// The backstop: a child wedged in a driver call is killed after the
+    /// grace period. Leaking the emitter beats hanging the PAM stack.
+    #[test]
+    fn a_wedged_child_is_killed_after_the_grace_period() {
+        let grace = std::time::Duration::from_millis(60);
+        let mut child = FakeChild::new(false);
+        let started = std::time::Instant::now();
+        let sent = terminate_oneshot_child(&mut child, grace);
+        assert_eq!(
+            sent,
+            vec![libc::SIGTERM, libc::SIGKILL],
+            "SIGTERM must come first, and SIGKILL only after it"
+        );
+        assert!(
+            started.elapsed() >= grace,
+            "the child was killed before its grace period ran out"
+        );
+    }
+
+    /// ...and it is *reaped*, not merely killed.
+    ///
+    /// A single non-blocking `try_wait` after the kill was a coin flip on
+    /// whether the child had been scheduled off yet; when it lost, the PAM
+    /// host held a zombie for the rest of its own life — and that host can be
+    /// a screen locker that lives for days, not a `sudo` that exits in a
+    /// second. Blocking here is safe because SIGKILL cannot be caught, so the
+    /// kernel bounds the wait.
+    #[test]
+    fn a_killed_child_is_reaped_rather_than_left_a_zombie() {
+        let mut child = FakeChild::new(false);
+        let sent = terminate_oneshot_child(&mut child, std::time::Duration::from_millis(20));
+        assert!(sent.contains(&libc::SIGKILL));
+        assert!(child.reaped, "the killed child was never waited for");
+    }
+
+    /// The child that exits on its own is reaped by the grace-period poll —
+    /// `try_wait` reaps as it reports — so the sequence must not go on to
+    /// block on a wait it does not need.
+    #[test]
+    fn a_child_that_exits_on_sigterm_is_not_waited_on_again() {
+        let mut child = FakeChild::new(true);
+        terminate_oneshot_child(&mut child, std::time::Duration::from_millis(50));
+        assert!(
+            !child.reaped,
+            "a child already reaped by the poll must not be waited on again"
+        );
+    }
+
+    /// The case the blocking wait must never be reached in: signals that
+    /// cannot be delivered at all. Waiting on a child we could not signal is
+    /// how the whole PAM stack would hang, so no signal means no wait.
+    #[test]
+    fn a_child_that_cannot_be_signalled_is_never_waited_on() {
+        let mut child = FakeChild::new(false);
+        child.signals_fail = true;
+        let sent = terminate_oneshot_child(&mut child, std::time::Duration::from_millis(20));
+        assert!(sent.is_empty(), "nothing was delivered: {sent:?}");
+        assert!(
+            !child.reaped,
+            "blocked on a child that could not be signalled"
+        );
+    }
+
+    /// The grace period is the documented one: half a second, matching the
+    /// container assertion that the child exits within it.
+    #[test]
+    fn the_sigterm_grace_period_is_half_a_second() {
+        assert_eq!(ONESHOT_TERM_GRACE, std::time::Duration::from_millis(500));
+    }
+
+    /// A cancelled attempt is an abstention, never a failure: the daemon
+    /// stopped looking, it did not look and say no.
+    #[test]
+    fn daemon_error_cancelled_maps_to_ignore() {
+        let (code, reason) = pam_code_for_daemon_error("cancelled");
+        assert_eq!(code, PAM_IGNORE);
+        assert_eq!(reason, "cancelled");
+    }
+
+    /// The cancellation row matches the frozen string exactly, so an error
+    /// that merely mentions cancelling still lands on the generic branch.
+    #[test]
+    fn only_the_exact_cancelled_string_claims_the_cancelled_row() {
+        for message in [
+            "camera error: capture cancelled by driver",
+            "storage error: transaction cancelled",
+        ] {
+            let (code, reason) = pam_code_for_daemon_error(message);
+            assert_eq!(code, PAM_IGNORE);
+            assert_eq!(reason, "error: internal", "message: {message}");
+        }
+    }
+
     #[test]
     fn daemon_error_never_maps_to_success() {
         for message in [
@@ -1471,6 +1799,7 @@ auth_bin = "/usr/local/bin/evil"
             "IR camera required",
             "camera error: device busy",
             "storage error: disk io",
+            "cancelled",
             "",
         ] {
             let (code, _) = pam_code_for_daemon_error(message);

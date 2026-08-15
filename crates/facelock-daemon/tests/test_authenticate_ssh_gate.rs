@@ -21,6 +21,7 @@ use std::sync::Arc;
 use facelock_core::config::Config;
 use facelock_core::notify::{Notifier, NullNotifier};
 use facelock_core::types::CameraCaps;
+use facelock_daemon::cancel::CancelToken;
 use facelock_daemon::handler::Handler;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_daemon::server::{CallerIdentity, FacelockService};
@@ -93,13 +94,19 @@ enabled = false
     unsafe { std::env::set_var("SSH_CONNECTION", "1.2.3.4 5678 10.0.0.1 22") };
 
     // Real authentication: the gate fires, in-band, before the camera runs.
-    let real = svc.authenticate_as(root.clone(), "alice").await.unwrap();
+    let real = svc
+        .authenticate_as(root.clone(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!real.matched);
     assert_eq!(real.model_id, -2, "recoverable error sentinel: {real:?}");
     assert_eq!(real.label, "SSH session detected");
 
     // The diagnostic entry point runs the comparison anyway.
-    let diagnostic = svc.test_authenticate_as(root, "alice").await.unwrap();
+    let diagnostic = svc
+        .test_authenticate_as(root, "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(
         diagnostic.matched,
         "TestAuthenticate must skip the SSH gate and reach the comparison \

@@ -57,8 +57,19 @@ impl PolkitAgent {
         }
 
         // Race the face auth call against the cancellation signal.
+        //
+        // The face-auth branch owns a **dedicated** system-bus connection
+        // (see `try_face_auth`), so when the select drops that future on
+        // cancel it drops the connection with it. That is the whole
+        // mechanism: the daemon watches the caller's bus name and cancels
+        // the in-flight authentication when it disappears, so dropping this
+        // connection turns "the user pressed Cancel in the dialog" into a
+        // camera that goes dark within one frame instead of one that keeps
+        // scanning to `timeout_secs` (ADR 008 §5). No new D-Bus API is
+        // needed for it, which is why this agent does not have — and should
+        // not grow — a `Cancel` method of its own.
         let face_result = tokio::select! {
-            result = try_face_auth(&self.system_conn, &user) => Some(result),
+            result = try_face_auth(&user) => Some(result),
             _ = cancel_rx => {
                 tracing::info!(cookie, user = %user, "auth cancelled by polkit");
                 None
@@ -136,9 +147,26 @@ fn current_username() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Attempt face authentication via the facelock D-Bus daemon.
-async fn try_face_auth(system_conn: &Connection, user: &str) -> anyhow::Result<bool> {
-    let proxy = zbus::Proxy::new(system_conn, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+/// Attempt face authentication via the facelock D-Bus daemon, on a
+/// connection opened for this one call.
+///
+/// The agent already holds a long-lived `system_conn` and this could have
+/// borrowed it — but then a cancelled dialog would drop only the *future*,
+/// leaving the connection (and therefore the daemon's view of the caller)
+/// alive, and the daemon would keep scanning until it timed out. Because the
+/// connection is created inside this future and moved nowhere else, dropping
+/// the future closes it, the bus broadcasts `NameOwnerChanged` with an empty
+/// new owner, and the daemon's per-request watch ends the authentication
+/// (ADR 008 §5).
+///
+/// The cost is one bus connection per `BeginAuthentication`, which is
+/// human-paced. `respond_to_polkit` still uses the agent's long-lived
+/// connection: that call happens after the race is over.
+async fn try_face_auth(user: &str) -> anyhow::Result<bool> {
+    let connection = Connection::system()
+        .await
+        .context("failed to open a dedicated system bus connection for face auth")?;
+    let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
         .await
         .context("failed to build facelock D-Bus proxy")?;
 

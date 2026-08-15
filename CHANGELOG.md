@@ -74,9 +74,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compares the target user's marker against the database and prints a
   diagnostic when they disagree (or when the marker is unreadable), pointing
   at `sudo facelock setup` to reconcile. `is-enrolled` itself is unchanged.
+- **Opt-in camera hold after a successful authentication**: a new
+  `device.camera_release_after_success_secs` (default **0**) keeps the camera
+  streaming for that many seconds after a success, the way
+  `camera_release_secs` already does after a failure. At its default — which is
+  the recommended value and what every install gets without touching the file —
+  nothing changes: a success ends the interaction, so the stream (and on IR
+  hardware the emitter LED) goes out with the reply. It exists for the one
+  shape that really does re-authenticate immediately: privileged actions
+  repeated with no authentication caching in front of them, `sudo` with a zero
+  `timestamp_timeout` or a polkit action without `auth_admin_keep`, where each
+  action is a fresh authentication that would otherwise pay a camera reopen.
+  Failed attempts keep using `camera_release_secs`; cancellations and errors
+  release the camera at once whatever both keys say. Additive with a serde
+  default: no existing config is rejected, and the daemon reads it per request,
+  so no restart is needed.
+- **`facelock bench camera-reopen`**: measures what it actually costs to go
+  from a closed camera to the first frame an authentication can analyze, split
+  into device open + format negotiation, `STREAMON` + first frame, warmup
+  discard, and first usable frame, over `--iterations` cycles (default 5). This
+  is the number `device.camera_release_secs` trades LED-on time against —
+  holding the stream warm after a failed attempt buys a retry exactly this
+  much (ADR 008) — and it had never been measured: the docs asserted "~400 ms"
+  and "~600 ms cold" from nobody's hardware in particular. Those figures are
+  gone from the docs in favor of pointing at this subcommand, since the answer
+  is a property of the camera and its driver, not of facelock. Needs no
+  enrolled face and loads no models.
 
 ### Changed
 
+- **An authentication at an empty chair ends early and costs no rate-limit
+  budget** (ADR 008 §3/§4). A new `recognition.no_face_timeout_secs` (default
+  **2**) ends an attempt once that many seconds have passed with no face
+  detected at all; `recognition.timeout_secs` still bounds the slower case a
+  timeout is actually for — a face was seen and has not matched yet. A laptop
+  opened in front of nobody therefore lights its IR emitter for 2 seconds
+  instead of 5. The key is additive with a serde default, is clamped to
+  `timeout_secs` rather than validated against it, and `0` disables the early
+  exit, so no existing `/etc/facelock/config.toml` needs to change. Separately,
+  and regardless of that timeout, a failed attempt in which the camera never
+  saw a face no longer calls the rate limiter on either the daemon or the
+  one-shot path: an empty chair is not a guess, and charging it let a locker
+  that starts face auth on every wake spend the user's whole 5-attempt budget
+  before they sat down — the real attempt then met a lockout. A face that
+  *was* seen and did not match is charged exactly as before. The early ending
+  reports the same outcome the full timeout reports, so no client, sentinel or
+  audit result gains a case.
+- **One-shot `facelock auth` no longer outlives its PAM host or lights the
+  camera during the model load** (ADR 008 §7). Three changes, no new exit
+  code and no change to the existing one: the ONNX engine now loads *before*
+  the camera opens, so the IR LED is lit for the scan rather than for the
+  model load as well; SIGTERM, SIGINT and SIGHUP end the scan through the same
+  cancel token, which lets `Drop` run STREAMOFF and turn the emitter off
+  before exiting 2 with a `cancelled` log line; and the PAM module sets
+  `PR_SET_PDEATHSIG = SIGTERM` on the child, so a killed PAM host (an aborted
+  locker helper, a killed `sudo`) takes the helper with it instead of leaving
+  it scanning, reparented to init, with the camera on. The PAM module's own
+  timeout now sends SIGTERM and waits up to 500 ms before SIGKILL; it used to
+  SIGKILL immediately, which skips `Drop` and can leave an XU-controlled IR
+  emitter lit.
+- **An authentication whose caller has gone away now ends within one frame**
+  (ADR 008 §5). Nothing could shorten the scan loop before: when a screen
+  locker aborted PAM because the password was typed first, or a `sudo` was
+  killed, or a client crashed, the daemon kept capturing — and kept the IR
+  emitter lit — until `recognition.timeout_secs`. Every in-flight request now
+  carries a cancel token, checked once per iteration by the auth loop, the
+  enroll loop and both frame-discard loops. It is set when the caller's D-Bus
+  connection disappears (a per-request `NameOwnerChanged` watch on the
+  caller's bus name), on suspend, on `ReleaseCamera`, and on shutdown — all
+  without taking the handler lock, which is what the request being cancelled
+  is holding. A cancelled attempt releases the camera immediately, is audited
+  as `cancelled` rather than `failure`, and **charges no rate-limit budget**:
+  the user never got to make an attempt. On the wire it reuses the
+  recoverable-error encoding with the frozen message `cancelled`, which the
+  PAM module maps to `PAM_IGNORE` — the stack falls through to the password
+  the user was already typing. No new D-Bus method, no signature change. The
+  suspend path in particular no longer gives up with a "handler busy" warning
+  and leaves the camera streaming into sleep.
+- **The daemon holds the camera open only after a failed authentication**
+  (ADR 008). Previously every request — success included — left the V4L2 stream
+  live for `device.camera_release_secs`, which on IR hardware is a visible
+  emitter LED burning for five seconds after the screen had already unlocked.
+  Success, cancellation and every error class now release the camera as the
+  request returns; only a no-match or timeout keeps it warm, because that is
+  the one ending a retry plausibly follows. The default drops from **5 to 3
+  seconds**, `0` now means *never hold* instead of being silently substituted
+  with 5, and the release is polled every 250 ms against an absolute deadline
+  rather than once a second. A warm reuse discards the stale V4L2 buffers
+  before analyzing anything, so a fresh attempt can never match on the tail of
+  the previous one. Preview frames keep their own floor of
+  `max(camera_release_secs, 2s)` so a live preview never reopens per frame.
+  **No action required on upgrade**: the key is unchanged in name and type, the
+  shipped config template has it commented out, and the daemon re-reads it per
+  request.
 - **`facelock status` says "cannot determine" instead of guessing**: a section
   whose probe failed — an unreadable database, a config that did not parse —
   now reports exactly that, and a daemon that is unreachable can never render

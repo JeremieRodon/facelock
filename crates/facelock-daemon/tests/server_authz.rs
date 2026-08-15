@@ -8,8 +8,8 @@
 //! root-only catch-all), the in-band `-2`/`-3`/`-4` sentinel encoding with its
 //! byte-exact protocol strings, similarity redaction for non-root callers
 //! (and the `-4` sentinel that keeps a redacted caller able to tell a
-//! face-seen non-match from an empty frame), and which entry point charges
-//! the rate limit (N11).
+//! face-seen non-match from an empty frame), and which entry point — and
+//! which kind of failure — charges the rate limit (N11, ADR 008 §4).
 //!
 //! NOT covered here, deliberately: the zbus wiring — caller-identity
 //! resolution from message headers (`GetConnectionUnixUser`), signal
@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use facelock_core::config::Config;
 use facelock_core::notify::{Notifier, NullNotifier};
 use facelock_core::types::CameraCaps;
+use facelock_daemon::cancel::CancelToken;
 use facelock_daemon::handler::Handler;
 use facelock_daemon::rate_limit::RateLimiter;
 use facelock_daemon::server::{CallerIdentity, FacelockService};
@@ -139,9 +140,36 @@ fn cleanup_db(path: &Path) {
 }
 
 /// A service whose store lives at `db_path` and holds one enrolled model for
-/// `user`, with an engine that never sees a face — so every attempt fails and
-/// the only question is what it costs. `max_attempts` sets the budget.
+/// `user`, with an engine that sees a face on every frame and matches none of
+/// them — so every attempt is a real failed attempt (a guess, and a wrong
+/// one) and the only question is what it costs. `max_attempts` sets the
+/// budget.
+///
+/// Deliberately not `MockFaceEngine::no_faces()`: since ADR 008 §4 an attempt
+/// where the camera saw nobody charges nothing, so a blind engine would make
+/// every "this failure is charged" test below pass vacuously. That case has
+/// its own helper, [`unseen_service_at`].
 fn failing_service_at(db_path: &Path, user: &str, max_attempts: u32) -> MockService {
+    service_at(
+        db_path,
+        user,
+        max_attempts,
+        MockFaceEngine::one_face(unrelated_embedding()),
+    )
+}
+
+/// The counterpart: an engine that never sees a face, for the attempts that
+/// must cost nothing.
+fn unseen_service_at(db_path: &Path, user: &str, max_attempts: u32) -> MockService {
+    service_at(db_path, user, max_attempts, MockFaceEngine::no_faces())
+}
+
+fn service_at(
+    db_path: &Path,
+    user: &str,
+    max_attempts: u32,
+    engine: MockFaceEngine,
+) -> MockService {
     let store = FaceStore::create(db_path).unwrap();
     store
         .add_model(
@@ -151,11 +179,88 @@ fn failing_service_at(db_path: &Path, user: &str, max_attempts: u32) -> MockServ
             "test-embedder",
         )
         .unwrap();
-    service(handler_with(
-        test_config(max_attempts, 1),
-        MockFaceEngine::no_faces(),
-        store,
-    ))
+    service(handler_with(test_config(max_attempts, 1), engine, store))
+}
+
+/// A rendezvous with a request that is inside its camera factory.
+///
+/// The factory runs after authorization and after the capture slot is claimed,
+/// so a request parked there is unambiguously *the* request in flight — which
+/// is what the concurrency tests below need to state as a fact rather than
+/// win as a race. Two flags, no channel: the factory runs on the blocking
+/// pool, where a plain sleep loop is the cheapest correct thing.
+#[derive(Debug, Default)]
+struct CameraGate {
+    opening: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl CameraGate {
+    /// Called from the camera factory: announce arrival, then park.
+    fn park(&self) {
+        use std::sync::atomic::Ordering;
+        self.opening.store(true, Ordering::SeqCst);
+        while !self.released.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Resolves once a request has reached the factory.
+    async fn wait_until_opening(&self) {
+        use std::sync::atomic::Ordering;
+        for _ in 0..2_000 {
+            if self.opening.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("no request reached the camera factory");
+    }
+
+    fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Re-arm for a second request through the same service.
+    fn reopen(&self) {
+        use std::sync::atomic::Ordering;
+        self.opening.store(false, Ordering::SeqCst);
+        self.released.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A service whose camera factory parks on `gate`, holding one enrolled model
+/// for `user` and an engine that matches it — so a released request succeeds
+/// and only the cancellation under test can make it end otherwise.
+fn gated_service_at(db_path: &Path, user: &str, gate: Arc<CameraGate>) -> MockService {
+    let emb = fixtures::known_embedding(1);
+    let store = FaceStore::create(db_path).unwrap();
+    store
+        .add_model(user, "front", &emb, "test-embedder")
+        .unwrap();
+
+    let config = test_config(5, 2);
+    let rate_limiter = RateLimiter::new(
+        config.security.rate_limit.max_attempts,
+        config.security.rate_limit.window_secs,
+    );
+    let factory: MockCameraFactory = Box::new(move |_| {
+        gate.park();
+        Ok(MockCamera::bright(64, 64, 60))
+    });
+    service(
+        Handler::new(
+            config,
+            MockFaceEngine::one_face(emb),
+            store,
+            rate_limiter,
+            CameraCaps::default(),
+            Some(factory),
+            None,
+        )
+        .unwrap(),
+    )
 }
 
 fn caller(uid: u32, username: Option<&str>) -> CallerIdentity {
@@ -199,10 +304,15 @@ async fn every_entry_point_except_authenticate_denies_non_root() {
     let a = alice();
 
     assert_denied(
-        svc.test_authenticate_as(a.clone(), "alice").await,
+        svc.test_authenticate_as(a.clone(), "alice", CancelToken::new())
+            .await,
         "TestAuthenticate",
     );
-    assert_denied(svc.enroll_as(a.clone(), "alice", "front").await, "Enroll");
+    assert_denied(
+        svc.enroll_as(a.clone(), "alice", "front", CancelToken::new())
+            .await,
+        "Enroll",
+    );
     assert_denied(svc.list_models_as(a.clone(), "alice").await, "ListModels");
     assert_denied(
         svc.remove_model_as(a.clone(), "alice", 1).await,
@@ -231,7 +341,7 @@ async fn root_passes_authorization_on_every_entry_point() {
 
     assert_eq!(svc.ping_as(r.clone()).await.unwrap(), "pong");
     assert!(
-        svc.test_authenticate_as(r.clone(), "alice")
+        svc.test_authenticate_as(r.clone(), "alice", CancelToken::new())
             .await
             .unwrap()
             .matched
@@ -252,7 +362,11 @@ async fn root_passes_authorization_on_every_entry_point() {
     assert_not_denied(svc.list_devices_as(r.clone()).await, "ListDevices");
     // `method = "none"` without allow_plaintext: enroll refuses fast, but as
     // a handler error — authorization must already have passed.
-    assert_not_denied(svc.enroll_as(r.clone(), "alice", "front").await, "Enroll");
+    assert_not_denied(
+        svc.enroll_as(r.clone(), "alice", "front", CancelToken::new())
+            .await,
+        "Enroll",
+    );
     svc.shutdown_as(r).await.unwrap();
 }
 
@@ -263,21 +377,28 @@ async fn root_passes_authorization_on_every_entry_point() {
 async fn authenticate_is_scoped_to_the_caller_own_user() {
     let svc = matching_service_for("alice");
 
-    let own = svc.authenticate_as(alice(), "alice").await.unwrap();
+    let own = svc
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(own.matched, "self-request must run the real comparison");
 
     assert_denied(
-        svc.authenticate_as(alice(), "bob").await,
+        svc.authenticate_as(alice(), "bob", CancelToken::new())
+            .await,
         "Authenticate (cross-user)",
     );
     assert!(
-        svc.authenticate_as(caller(1000, None), "alice")
+        svc.authenticate_as(caller(1000, None), "alice", CancelToken::new())
             .await
             .is_err(),
         "an unresolvable caller username must fail closed"
     );
 
-    let as_root = svc.authenticate_as(root(), "alice").await.unwrap();
+    let as_root = svc
+        .authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(as_root.matched, "root may authenticate any user");
 }
 
@@ -288,7 +409,10 @@ async fn authenticate_is_scoped_to_the_caller_own_user() {
 async fn similarity_is_redacted_for_non_root_callers() {
     let svc = matching_service_for("alice");
 
-    let unredacted = svc.authenticate_as(root(), "alice").await.unwrap();
+    let unredacted = svc
+        .authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(unredacted.matched);
     assert!(
         unredacted.similarity > 0.9,
@@ -296,7 +420,10 @@ async fn similarity_is_redacted_for_non_root_callers() {
         unredacted.similarity
     );
 
-    let redacted = svc.authenticate_as(alice(), "alice").await.unwrap();
+    let redacted = svc
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(redacted.matched, "redaction must not change the outcome");
     assert_eq!(redacted.model_id, unredacted.model_id);
     assert_eq!(
@@ -326,7 +453,10 @@ async fn rate_limited_flows_in_band_with_the_exact_protocol_string() {
         store,
     ));
 
-    let result = svc.authenticate_as(alice(), "alice").await.unwrap();
+    let result = svc
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!result.matched);
     assert_eq!(result.model_id, -2, "recoverable error sentinel");
     assert_eq!(
@@ -348,7 +478,10 @@ async fn require_ir_flows_in_band_with_the_exact_protocol_string() {
     // CameraCaps::default() is non-IR, so the gate must reject in-band.
     let svc = service(handler_with(config, MockFaceEngine::one_face(emb), store));
 
-    let result = svc.authenticate_as(alice(), "alice").await.unwrap();
+    let result = svc
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!result.matched);
     assert_eq!(result.model_id, -2);
     assert!(
@@ -371,7 +504,10 @@ async fn suppress_unknown_maps_to_the_minus_three_sentinel() {
         FaceStore::open_memory().unwrap(),
     ));
 
-    let result = svc.authenticate_as(alice(), "alice").await.unwrap();
+    let result = svc
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!result.matched);
     assert_eq!(result.model_id, -3, "suppressed sentinel");
     assert!(result.label.is_empty());
@@ -419,7 +555,10 @@ async fn a_redacted_caller_can_tell_a_seen_face_from_an_empty_frame() {
         store,
     ));
 
-    let seen = saw_someone.authenticate_as(alice(), "alice").await.unwrap();
+    let seen = saw_someone
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!seen.matched, "an unrelated face must not authenticate");
     assert_eq!(
         seen.similarity, 0.0,
@@ -446,7 +585,10 @@ async fn a_redacted_caller_can_tell_a_seen_face_from_an_empty_frame() {
         empty_store,
     ));
 
-    let unseen = saw_nobody.authenticate_as(alice(), "alice").await.unwrap();
+    let unseen = saw_nobody
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!unseen.matched);
     assert_eq!(unseen.similarity, 0.0);
     assert_eq!(unseen.model_id, -1, "no face was detected: {unseen:?}");
@@ -476,7 +618,10 @@ async fn a_match_still_reports_its_model_id_and_score_to_root() {
         store,
     ));
 
-    let result = svc.authenticate_as(root(), "alice").await.unwrap();
+    let result = svc
+        .authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(result.matched);
     assert_eq!(result.model_id, model_id as i32);
     assert!(
@@ -508,9 +653,15 @@ async fn root_failed_authenticate_charges_the_rate_limit() {
     // Budget of one failed attempt.
     let svc = failing_service_at(&db_path, "alice", 1);
 
-    let first = svc.authenticate_as(root(), "alice").await.unwrap();
+    let first = svc
+        .authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!first.matched);
-    assert_eq!(first.model_id, -1, "an ordinary non-match: {first:?}");
+    assert_eq!(
+        first.model_id, -4,
+        "a face was seen and did not match — the failure that is charged: {first:?}"
+    );
 
     let inspect = FaceStore::create(&db_path).unwrap();
     assert!(
@@ -521,9 +672,85 @@ async fn root_failed_authenticate_charges_the_rate_limit() {
 
     // And the charge is enforced: the next attempt is rejected in-band
     // before the camera runs, root or not.
-    let limited = svc.authenticate_as(root(), "alice").await.unwrap();
+    let limited = svc
+        .authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert_eq!(limited.model_id, -2);
     assert_eq!(limited.label, "rate limited");
+
+    cleanup_db(&db_path);
+}
+
+/// A cancelled attempt is an abstention, not a failed attempt: the user
+/// never got to make one, so it must cost no rate-limit budget (ADR 008 §5).
+/// Otherwise a screen locker that aborts PAM on every unlock would walk the
+/// user into a lockout.
+#[tokio::test]
+async fn a_cancelled_authenticate_charges_no_rate_limit() {
+    let db_path = temp_db_path("cancel-charges-nothing");
+    cleanup_db(&db_path);
+    // Budget of one failed attempt — three cancelled runs must not reach it.
+    let svc = failing_service_at(&db_path, "alice", 1);
+
+    for _ in 0..3 {
+        // A request whose token is already set — what `ReleaseCamera`,
+        // suspend and the caller-departure watch each do to the one request
+        // they are aimed at.
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let reply = svc.authenticate_as(root(), "alice", cancel).await.unwrap();
+        assert!(!reply.matched);
+        assert_eq!(
+            reply.model_id, -2,
+            "a cancellation travels as a recoverable error: {reply:?}"
+        );
+        assert_eq!(reply.label, "cancelled", "frozen wire string");
+    }
+
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect.check_rate_limit("alice", 1, 60).unwrap(),
+        "cancelled attempts must leave the budget untouched"
+    );
+
+    cleanup_db(&db_path);
+}
+
+/// The complement of the pin above: a failure where the camera never saw a
+/// face costs no budget (ADR 008 §4). It is not a guess — nobody was there —
+/// and charging it means a laptop opened in front of an empty desk, or a
+/// locker that starts face auth on every wake, burns the user's whole
+/// allowance before they sit down and meets them with a lockout.
+///
+/// Asserted twice over: through the reply of a *second* attempt (which would
+/// be the `-2` rate-limit rejection if the first had charged) and directly
+/// against the on-disk `rate_limit` table.
+#[tokio::test]
+async fn a_no_face_authenticate_charges_no_rate_limit() {
+    let db_path = temp_db_path("no-face-charges-nothing");
+    cleanup_db(&db_path);
+    // Budget of one failed attempt — neither no-face run may reach it.
+    let svc = unseen_service_at(&db_path, "alice", 1);
+
+    for attempt in 0..2 {
+        let reply = svc
+            .authenticate_as(root(), "alice", CancelToken::new())
+            .await
+            .unwrap();
+        assert!(!reply.matched);
+        assert_eq!(
+            reply.model_id, -1,
+            "attempt {attempt} must stay an ordinary no-face non-match, never \
+             a rate-limit rejection: {reply:?}"
+        );
+    }
+
+    let inspect = FaceStore::create(&db_path).unwrap();
+    assert!(
+        inspect.check_rate_limit("alice", 1, 60).unwrap(),
+        "an attempt at an empty chair must leave the budget untouched"
+    );
 
     cleanup_db(&db_path);
 }
@@ -536,11 +763,17 @@ async fn user_failed_authenticate_charges_the_rate_limit() {
     cleanup_db(&db_path);
     let svc = failing_service_at(&db_path, "alice", 1);
 
-    let charged = svc.authenticate_as(alice(), "alice").await.unwrap();
+    let charged = svc
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(!charged.matched);
-    assert_eq!(charged.model_id, -1);
+    assert_eq!(charged.model_id, -4, "a face was seen and did not match");
 
-    let limited = svc.authenticate_as(alice(), "alice").await.unwrap();
+    let limited = svc
+        .authenticate_as(alice(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert_eq!(limited.model_id, -2);
     assert_eq!(limited.label, "rate limited");
 
@@ -560,12 +793,15 @@ async fn test_authenticate_does_not_charge_the_rate_limit() {
     let svc = failing_service_at(&db_path, "alice", 1);
 
     for attempt in 0..3 {
-        let result = svc.test_authenticate_as(root(), "alice").await.unwrap();
+        let result = svc
+            .test_authenticate_as(root(), "alice", CancelToken::new())
+            .await
+            .unwrap();
         assert!(!result.matched);
         assert_eq!(
-            result.model_id, -1,
-            "test attempt {attempt} must be an ordinary non-match, not a \
-             rate-limit rejection: {result:?}"
+            result.model_id, -4,
+            "test attempt {attempt} must be an ordinary face-seen non-match, \
+             not a rate-limit rejection: {result:?}"
         );
     }
 
@@ -577,8 +813,13 @@ async fn test_authenticate_does_not_charge_the_rate_limit() {
 
     // The *check* is not exempted: an already-limited user still sees it.
     // (Charge through the real method, then test again.)
-    svc.authenticate_as(root(), "alice").await.unwrap();
-    let limited = svc.test_authenticate_as(root(), "alice").await.unwrap();
+    svc.authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
+    let limited = svc
+        .test_authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert_eq!(limited.model_id, -2);
     assert_eq!(
         limited.label, "rate limited",
@@ -596,16 +837,21 @@ async fn test_authenticate_denies_a_non_root_caller() {
     let svc = matching_service_for("alice");
 
     assert_denied(
-        svc.test_authenticate_as(alice(), "alice").await,
+        svc.test_authenticate_as(alice(), "alice", CancelToken::new())
+            .await,
         "TestAuthenticate (own user)",
     );
     assert_denied(
-        svc.test_authenticate_as(alice(), "bob").await,
+        svc.test_authenticate_as(alice(), "bob", CancelToken::new())
+            .await,
         "TestAuthenticate (cross-user)",
     );
 
     // Root runs the real comparison through it.
-    let as_root = svc.test_authenticate_as(root(), "alice").await.unwrap();
+    let as_root = svc
+        .test_authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
     assert!(as_root.matched, "root must reach the comparison loop");
 }
 
@@ -624,5 +870,139 @@ async fn preview_detect_frame_for_root_returns_frames_and_scores() {
         faces[0].similarity > 0.9,
         "root sees the unredacted score, got {}",
         faces[0].similarity
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-request cancellation (ADR 008 §5)
+//
+// zbus dispatches every method call in its own task, so "concurrent" is the
+// normal case, not an exotic one. These pin that a request's cancel token is
+// reachable by exactly one request: the one that owns it.
+// ---------------------------------------------------------------------------
+
+/// Nothing another call does can disturb an in-flight request's cancellation.
+///
+/// With a single service-owned token this was false three ways over: a second
+/// call re-armed the flag (clearing a cancellation the running request had not
+/// read yet), a rejected call re-armed it just the same because the reset ran
+/// *before* authorization and before the capture slot, and the rejected
+/// caller's departure watch — subscribed against that same shared flag — could
+/// cancel the request it had just been rejected in favour of.
+///
+/// The concurrency is real rather than simulated, and deterministic rather
+/// than timed: the first request parks inside its camera factory — which runs
+/// after authorization and after the capture slot is claimed — until this test
+/// lets it go, so "while the first request is in flight" is a fact here, not a
+/// race the test hopes to win.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_request_cannot_disturb_the_one_in_flight() {
+    let db_path = temp_db_path("concurrent-token-isolation");
+    cleanup_db(&db_path);
+    let gate = Arc::new(CameraGate::default());
+    let svc = Arc::new(gated_service_at(&db_path, "alice", gate.clone()));
+
+    let in_flight = CancelToken::new();
+    let running = {
+        let svc = svc.clone();
+        let token = in_flight.clone();
+        tokio::spawn(async move { svc.authenticate_as(root(), "alice", token).await })
+    };
+    gate.wait_until_opening().await;
+
+    // A second caller, arriving while the first holds the capture slot. It is
+    // rejected — and the rejection must cost the running request nothing.
+    let second = svc
+        .authenticate_as(root(), "alice", CancelToken::new())
+        .await;
+    assert!(
+        matches!(second, Err(fdo::Error::Failed(ref m)) if m.contains("daemon busy")),
+        "expected a busy rejection while a capture was in flight, got {second:?}"
+    );
+    assert!(
+        !in_flight.is_cancelled(),
+        "a busy-rejected request reached the in-flight request's token"
+    );
+
+    // ...and so is a call that authorization turns away before it can get
+    // anywhere near the capture slot.
+    assert_denied(
+        svc.test_authenticate_as(alice(), "alice", CancelToken::new())
+            .await,
+        "TestAuthenticate",
+    );
+    assert!(
+        !in_flight.is_cancelled(),
+        "a denied request reached the in-flight request's token"
+    );
+
+    // The slot still names the running request, so suspend / ReleaseCamera /
+    // shutdown reach it and nothing else — the rejected calls above did not
+    // displace it with a token of their own.
+    svc.current_request().cancel();
+    assert!(
+        in_flight.is_cancelled(),
+        "the in-flight request was not reachable through the current-request slot"
+    );
+
+    gate.release();
+    let reply = running.await.unwrap().unwrap();
+    assert_eq!(reply.label, "cancelled", "frozen wire string: {reply:?}");
+
+    // And the slot is empty again: a `ReleaseCamera` arriving with nothing in
+    // flight must not leave a set flag behind for whoever comes next.
+    svc.current_request().cancel();
+    let next = CancelToken::new();
+    gate.reopen();
+    let following = {
+        let svc = svc.clone();
+        let token = next.clone();
+        tokio::spawn(async move { svc.authenticate_as(root(), "alice", token).await })
+    };
+    gate.wait_until_opening().await;
+    assert!(
+        !next.is_cancelled(),
+        "a cancel aimed at a finished request landed on its successor"
+    );
+    gate.release();
+    let reply = following.await.unwrap().unwrap();
+    assert_ne!(
+        reply.label, "cancelled",
+        "the request after a cancelled one must run normally: {reply:?}"
+    );
+
+    cleanup_db(&db_path);
+}
+
+/// Each request is born with a fresh token, so a cancellation never outlives
+/// the request it was aimed at.
+///
+/// The wedge this replaces: `CameraLease::finish` did not clear the shared
+/// flag, so after any cancelled authentication every later request — a preview
+/// frame most visibly, since a preview issues ten a second — found the flag
+/// already set and failed with `cancelled` forever.
+#[tokio::test]
+async fn a_cancelled_request_does_not_wedge_the_next_one() {
+    let svc = matching_service_for("alice");
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let cancelled = svc.authenticate_as(root(), "alice", cancel).await.unwrap();
+    assert!(!cancelled.matched);
+    assert_eq!(cancelled.label, "cancelled", "{cancelled:?}");
+
+    let frame = svc
+        .preview_frame_as(root())
+        .await
+        .expect("a preview frame after a cancelled authentication");
+    assert!(!frame.is_empty(), "the preview was wedged by the cancel");
+
+    let after = svc
+        .authenticate_as(root(), "alice", CancelToken::new())
+        .await
+        .unwrap();
+    assert!(
+        after.matched,
+        "the authentication after a cancelled one must run normally: {after:?}"
     );
 }
