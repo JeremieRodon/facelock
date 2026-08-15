@@ -791,7 +791,14 @@ const ONESHOT_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// Poll interval while waiting out [`ONESHOT_TERM_GRACE`].
 const ONESHOT_TERM_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// The two things the termination sequence needs from a child process.
+/// How long a SIGKILLed child is polled for before the blocking reap.
+///
+/// SIGKILL is uncatchable, so a child that received one is already dying and
+/// this normally expires after a single poll; the bound exists so the reap
+/// below is never the first thing that waits.
+const ONESHOT_KILL_REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The three things the termination sequence needs from a child process.
 ///
 /// A trait rather than a `std::process::Child` in the signature purely so the
 /// sequence itself — the part that is auth-adjacent policy, not mechanism —
@@ -801,6 +808,9 @@ trait Terminable {
     fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()>;
     /// Has it exited yet? Non-blocking.
     fn has_exited(&mut self) -> std::io::Result<bool>;
+    /// Block until it is reaped. Only ever called after a SIGKILL that the
+    /// kernel accepted, so the wait is bounded by the kernel, not by us.
+    fn reap(&mut self) -> std::io::Result<()>;
 }
 
 impl Terminable for std::process::Child {
@@ -817,6 +827,12 @@ impl Terminable for std::process::Child {
 
     fn has_exited(&mut self) -> std::io::Result<bool> {
         self.try_wait().map(|status| status.is_some())
+    }
+
+    fn reap(&mut self) -> std::io::Result<()> {
+        // `wait` returns the cached status immediately if a `try_wait` above
+        // already reaped it, so calling this after the poll loop is free.
+        self.wait().map(|_| ())
     }
 }
 
@@ -856,6 +872,25 @@ fn terminate_oneshot_child<T: Terminable>(
 
     if child.signal(libc::SIGKILL).is_ok() {
         sent.push(libc::SIGKILL);
+        // Reap it. A child killed here is dead within microseconds, but until
+        // somebody waits on it, it is a zombie occupying a PID slot for as
+        // long as this PAM host lives — and the host may be a long-running
+        // screen locker, not a `sudo` that exits a second later. The old
+        // single non-blocking `try_wait` at the call site was a coin flip on
+        // whether the child had been scheduled off yet.
+        //
+        // Blocking is safe *only* because SIGKILL was accepted: it cannot be
+        // caught, blocked or ignored, so the kernel bounds this wait. When the
+        // signal could not be delivered at all this branch is skipped and
+        // nothing blocks — the case the original comment was worried about.
+        let deadline = std::time::Instant::now() + ONESHOT_KILL_REAP_WAIT;
+        while !child.has_exited().unwrap_or(false) {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(ONESHOT_TERM_POLL.min(ONESHOT_KILL_REAP_WAIT));
+        }
+        let _ = child.reap();
     }
     sent
 }
@@ -906,19 +941,37 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
     // the rest of its timeout: the one-shot analogue of the daemon's caller
     // watch (ADR 008 §7).
     //
+    // Read before the fork so the closure has something to compare against.
+    //
+    // SAFETY: `getpid` is a plain syscall with no preconditions.
+    let expected_parent_pid = unsafe { libc::getpid() };
+
     // SAFETY: `pre_exec` runs in the forked child between fork and exec,
-    // where only async-signal-safe work is allowed. `prctl` is a single
-    // syscall with no allocation, no locks and no libc state — it is one of
-    // the operations `pre_exec` exists for. PDEATHSIG is cleared by exec only
-    // for setuid binaries; `facelock` is not one (its trust is verified
-    // above), so it survives into the execed image.
+    // where only async-signal-safe work is allowed. `prctl`, `getppid` and
+    // `raise` are single syscalls with no allocation, no locks and no libc
+    // state — they are the operations `pre_exec` exists for, and the closure
+    // captures only a `pid_t` by copy, so it allocates nothing either.
+    // PDEATHSIG is cleared by exec only for setuid binaries; `facelock` is not
+    // one (its trust is verified above), so it survives into the execed image.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             // The result is deliberately ignored: losing the parent-death
             // signal costs the promptness, never the authentication — the
             // child still exits on its own timeout, and the kill sequence
             // below still applies.
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            // PDEATHSIG fires on the parent's death, not on already being an
+            // orphan — so a host that died in the window between `fork` and
+            // the `prctl` above has already been mourned and nothing will
+            // ever arrive. That leaves exactly what PDEATHSIG exists to
+            // prevent: a `facelock auth` reparented to init, holding the
+            // camera and the IR emitter alone for the rest of its timeout,
+            // with no PAM host left to run the kill sequence. Closing the
+            // window means asking once, after the fact, whether we are still
+            // the child we thought we were.
+            if libc::getppid() != expected_parent_pid {
+                libc::raise(libc::SIGTERM);
+            }
             Ok(())
         });
     }
@@ -972,11 +1025,10 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
                     // torn down by the kernel with no STREAMOFF and an
                     // XU-controlled IR emitter is left lit until something
                     // else turns it off (ADR 008 §7).
+                    // Reaps the child itself: a child that exits on SIGTERM is
+                    // reaped by the poll, and one that had to be killed is
+                    // waited for there (both bounded — see the function).
                     terminate_oneshot_child(&mut child, ONESHOT_TERM_GRACE);
-                    // Non-blocking reap of the now-dead child. Deliberately
-                    // not `wait()`: if the signals could not be delivered,
-                    // blocking here would hang the whole PAM stack.
-                    let _ = child.try_wait();
                     log_auth(service, "timeout (oneshot)", user, LOG_WARNING);
                     return PAM_AUTH_ERR;
                 }
@@ -1591,16 +1643,45 @@ auth_bin = "/usr/local/bin/evil"
     struct FakeChild {
         sent: Vec<libc::c_int>,
         exits_on_term: bool,
+        /// Whether the sequence blocked on a wait — the difference between
+        /// reaping the child and leaving a zombie behind.
+        reaped: bool,
+        /// Delivery failure, for the child that cannot be signalled at all.
+        signals_fail: bool,
+    }
+
+    impl FakeChild {
+        fn new(exits_on_term: bool) -> Self {
+            Self {
+                sent: Vec::new(),
+                exits_on_term,
+                reaped: false,
+                signals_fail: false,
+            }
+        }
     }
 
     impl Terminable for FakeChild {
         fn signal(&mut self, signal: libc::c_int) -> std::io::Result<()> {
+            if self.signals_fail {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
             self.sent.push(signal);
             Ok(())
         }
 
         fn has_exited(&mut self) -> std::io::Result<bool> {
+            // A SIGKILLed child is gone by the next poll; a SIGTERMed one only
+            // if it is the well-behaved kind.
+            if self.sent.contains(&libc::SIGKILL) {
+                return Ok(true);
+            }
             Ok(self.exits_on_term && self.sent.contains(&libc::SIGTERM))
+        }
+
+        fn reap(&mut self) -> std::io::Result<()> {
+            self.reaped = true;
+            Ok(())
         }
     }
 
@@ -1609,10 +1690,7 @@ auth_bin = "/usr/local/bin/evil"
     /// STREAMOFF and an XU-controlled IR emitter is left lit.
     #[test]
     fn a_child_that_exits_on_sigterm_is_never_killed() {
-        let mut child = FakeChild {
-            sent: Vec::new(),
-            exits_on_term: true,
-        };
+        let mut child = FakeChild::new(true);
         let sent = terminate_oneshot_child(&mut child, std::time::Duration::from_millis(50));
         assert_eq!(sent, vec![libc::SIGTERM]);
         assert!(
@@ -1626,10 +1704,7 @@ auth_bin = "/usr/local/bin/evil"
     #[test]
     fn a_wedged_child_is_killed_after_the_grace_period() {
         let grace = std::time::Duration::from_millis(60);
-        let mut child = FakeChild {
-            sent: Vec::new(),
-            exits_on_term: false,
-        };
+        let mut child = FakeChild::new(false);
         let started = std::time::Instant::now();
         let sent = terminate_oneshot_child(&mut child, grace);
         assert_eq!(
@@ -1640,6 +1715,50 @@ auth_bin = "/usr/local/bin/evil"
         assert!(
             started.elapsed() >= grace,
             "the child was killed before its grace period ran out"
+        );
+    }
+
+    /// ...and it is *reaped*, not merely killed.
+    ///
+    /// A single non-blocking `try_wait` after the kill was a coin flip on
+    /// whether the child had been scheduled off yet; when it lost, the PAM
+    /// host held a zombie for the rest of its own life — and that host can be
+    /// a screen locker that lives for days, not a `sudo` that exits in a
+    /// second. Blocking here is safe because SIGKILL cannot be caught, so the
+    /// kernel bounds the wait.
+    #[test]
+    fn a_killed_child_is_reaped_rather_than_left_a_zombie() {
+        let mut child = FakeChild::new(false);
+        let sent = terminate_oneshot_child(&mut child, std::time::Duration::from_millis(20));
+        assert!(sent.contains(&libc::SIGKILL));
+        assert!(child.reaped, "the killed child was never waited for");
+    }
+
+    /// The child that exits on its own is reaped by the grace-period poll —
+    /// `try_wait` reaps as it reports — so the sequence must not go on to
+    /// block on a wait it does not need.
+    #[test]
+    fn a_child_that_exits_on_sigterm_is_not_waited_on_again() {
+        let mut child = FakeChild::new(true);
+        terminate_oneshot_child(&mut child, std::time::Duration::from_millis(50));
+        assert!(
+            !child.reaped,
+            "a child already reaped by the poll must not be waited on again"
+        );
+    }
+
+    /// The case the blocking wait must never be reached in: signals that
+    /// cannot be delivered at all. Waiting on a child we could not signal is
+    /// how the whole PAM stack would hang, so no signal means no wait.
+    #[test]
+    fn a_child_that_cannot_be_signalled_is_never_waited_on() {
+        let mut child = FakeChild::new(false);
+        child.signals_fail = true;
+        let sent = terminate_oneshot_child(&mut child, std::time::Duration::from_millis(20));
+        assert!(sent.is_empty(), "nothing was delivered: {sent:?}");
+        assert!(
+            !child.reaped,
+            "blocked on a child that could not be signalled"
         );
     }
 

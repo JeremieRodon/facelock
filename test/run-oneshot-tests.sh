@@ -532,6 +532,13 @@ adr008_oneshot_dies_with_pam_host() {
 # to recognition.timeout_secs instead of matching on the first frame and
 # exiting before there is anything to signal. Neither attempt charges the rate
 # limiter: a cancelled attempt is not a guess (ADR 008 §5).
+# Captured as a SQL literal so the window really is a window: `quote()` renders
+# a real fingerprint as a quoted string and a legacy row as the bare token
+# NULL, which is the one distinction a plain SELECT loses — and writing NULL
+# back unconditionally would silently un-couple the template from its camera
+# for every test after this point.
+ADR008_DEVID="$(sqlite3 "$DB" "SELECT quote(device_id) FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo 'NULL')"
+[ -n "$ADR008_DEVID" ] || ADR008_DEVID='NULL'
 sqlite3 "$DB" "UPDATE face_models SET device_id='ffff:ffff:forged' WHERE user='testuser'" || true
 
 run_test_or_skip "ADR 008: SIGTERM ends facelock auth cleanly (exit 2, not 143)" \
@@ -540,7 +547,7 @@ run_test_or_skip "ADR 008: SIGTERM ends facelock auth cleanly (exit 2, not 143)"
 run_test_or_skip "ADR 008: facelock auth dies with its PAM host (PDEATHSIG)" \
     "adr008_oneshot_dies_with_pam_host"
 
-sqlite3 "$DB" "UPDATE face_models SET device_id=NULL WHERE user='testuser'" || true
+sqlite3 "$DB" "UPDATE face_models SET device_id=$ADR008_DEVID WHERE user='testuser'" || true
 
 # --- End ADR 008 one-shot lifecycle ---
 

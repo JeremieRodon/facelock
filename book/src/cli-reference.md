@@ -423,13 +423,16 @@ facelock bench camera-reopen            # cost of reopening the camera: open / S
 facelock bench report                   # full benchmark report
 ```
 
-`cold-auth`, `warm-auth`, `calibrate`, and `report` require enrolled faces. When encryption method is `tpm`, these subcommands require root.
+**Every `bench` subcommand requires root** (DEC-6): direct-mode access needs the
+`0600` root:root database whatever the subcommand, and the auth benchmarks may
+need TPM access besides. `cold-auth`, `warm-auth`, `calibrate`, and `report`
+additionally require enrolled faces.
 
-`camera-reopen` needs no enrolled face and loads no models (it is still root,
-like every `bench` subcommand): it closes and reopens the camera
-`--iterations` times (default 5) and reports the per-phase median. That total is what `device.camera_release_secs` trades LED-on time
-against -- holding the stream warm after a failed attempt buys a retry exactly
-this much (ADR 008).
+`camera-reopen` needs no enrolled face and loads no models -- but is root like
+the rest: it closes and reopens the camera `--iterations` times (default 5) and
+reports the per-phase median. That total is what `device.camera_release_secs`
+trades LED-on time against -- holding the stream warm after a failed attempt
+buys a retry exactly this much (ADR 008).
 
 ## facelock encrypt
 

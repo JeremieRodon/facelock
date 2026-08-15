@@ -477,12 +477,17 @@ wait_for_daemon_log() {
 # so `finish(Success)` drops the camera before the reply is even sent. The
 # release line must therefore already be in the log by the time the client has
 # its answer; the 500 ms budget is for the log write, not for the daemon.
+#
+# The precondition reads the daemon's own log rather than the client's output.
+# `facelock test` prints "Matched ..." through gettext and exits 0 whether it
+# matched or not, so the CLI offers this check neither a stable string nor a
+# usable exit code; the daemon's `tracing` lines are never translated.
 adr008_success_releases_camera() {
     local from elapsed
     from=$(daemon_log_lines)
     timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser \
         > /tmp/adr008-success.log 2>&1 || true
-    if ! grep -q "Matched" /tmp/adr008-success.log; then
+    if ! wait_for_daemon_log "$from" 500 "authentication succeeded" > /dev/null; then
         cat /tmp/adr008-success.log
         echo "no successful authentication to observe (needs a live enrolled face)"
         return 3
@@ -599,6 +604,14 @@ run_test_or_skip "ADR 008: success releases the camera immediately" \
 # .timeout_secs instead of ending on the first frame. `facelock test` charges
 # no rate-limit budget (AuthIntent::Test) and a cancelled attempt charges none
 # either, so neither costs the later tests an attempt.
+#
+# Captured as a SQL literal so the window really is a window: `quote()` renders
+# a real fingerprint as a quoted string and a legacy row as the bare token
+# NULL, which is the one distinction a plain SELECT loses — and writing NULL
+# back unconditionally would silently un-couple the template from its camera
+# for every test after this point.
+ADR008_DEVID="$(sqlite3 "$DB" "PRAGMA busy_timeout=8000; SELECT quote(device_id) FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo 'NULL')"
+[ -n "$ADR008_DEVID" ] || ADR008_DEVID='NULL'
 sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id='ffff:ffff:forged' WHERE user='testuser'" || true
 
 run_test_or_skip "ADR 008: a failed attempt holds the camera, then releases it at camera_release_secs" \
@@ -607,7 +620,7 @@ run_test_or_skip "ADR 008: a failed attempt holds the camera, then releases it a
 run_test_or_skip "ADR 008: a departed caller cancels the request and closes the camera" \
     "adr008_caller_departure_cancels"
 
-sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id=NULL WHERE user='testuser'" || true
+sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id=$ADR008_DEVID WHERE user='testuser'" || true
 
 # --- End ADR 008 camera lifecycle ---
 

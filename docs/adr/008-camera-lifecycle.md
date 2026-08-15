@@ -165,7 +165,7 @@ Invariant (tested): **every exit from `Active` either sets a deadline or drops t
 | Name-owner watch fails to subscribe | warn; that request is timeout-bounded as today |
 | Poll tick lands while a request holds the lock | `try_lock` fails, retried 250 ms later; deadline is absolute so nothing is lost |
 | Daemon crash while streaming | kernel closes fd (implicit `STREAMOFF`); if `ir_emitter = true`, daemon start runs `disable_emitter` once (idempotent) |
-| Suspend while a request is stuck in the driver | token set; if not exited in 1 s, drop the camera anyway (`Camera` drop is safe from any state) |
+| Suspend while a request is stuck in the driver | token set (lock-free), then the handler mutex is polled for 1 s and the camera dropped as soon as it is free — the cancelled request exits within one frame, so this is the normal path. It cannot be dropped *out from under* a request still holding that mutex, so if the second still has not freed it, the suspend path warns and returns: the token is set, so the camera closes when the request returns, one frame later at worst. |
 | Config reload while `Warm` | old handler dropped → closed; new value applies next request (reload only runs between requests) |
 | PAM D-Bus timeout before the daemon answers | `PAM_AUTH_ERR`, no one-shot fallback (unchanged); daemon ends via its own deadline or the connection drop |
 | One-shot SIGTERM during model load | token checked before open → exit 2, camera never touched |
