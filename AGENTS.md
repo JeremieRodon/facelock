@@ -28,9 +28,9 @@ Supported providers: `cpu` (default), `cuda` (NVIDIA), `rocm` (AMD), `openvino` 
 ## Core Rules
 
 - Do not change binary names, paths, config keys, database schema, or auth semantics without updating `docs/contracts.md`.
+- Keep the PAM module free of heavy dependencies (no ort, no v4l, no facelock-core). `pam_facelock.so` loads into every PAM-using process, `sshd` and `login` included. Full ceiling in `.claude/rules/pam-boundary.md`.
 - Keep all inference local. No cloud services, no runtime model downloads in the auth path.
 - Prefer minimal dependencies and clear crate boundaries.
-- PAM module dependency ceiling: `.claude/rules/pam-boundary.md`.
 
 ## Security Rules
 
