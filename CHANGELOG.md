@@ -271,6 +271,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guards the *writer* by asserting no other file in the crate touches
   `tracing_subscriber` at all. Also: a `RUST_LOG` that cannot be parsed is now
   reported at WARN instead of being silently discarded.
+- **One-shot `facelock auth` could not clear a stale enrollment marker**: the
+  enrollment pre-flight gate short-circuits above the marker convergence point,
+  so on a daemonless install — where daemon startup's `reconcile_all` never runs
+  — a marker left behind by a database restored from a pre-enrollment backup (or
+  a row removed out of band) was permanent: every later attempt was rejected at
+  the gate and returned before converging, and `facelock is-enrolled` reported
+  enrolled forever. The one-shot now deletes a marker the database
+  authoritatively contradicts, at the gate that observes the contradiction. The
+  marker *write* stays below the pre-flight gates exactly as before — this is a
+  removal only (one `unlink`, no temp file, no `chown`, no `rename`, no
+  directory created), it is idempotent, and it is reachable only when the marker
+  is already false, so no attacker-drivable filesystem work is added on the
+  wrong side of the rate limiter. `docs/contracts.md` no longer implies the
+  one-shot path re-derives every marker; it converges exactly one user's.
 - **`setup --systemd --pam` silently dropped `--pam`**: the dispatch was an
   `if systemd {} else if pam {}` chain, so asking for both ran only systemd and
   said nothing about it. It now runs both, systemd first, matching the order the

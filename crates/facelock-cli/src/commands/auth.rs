@@ -119,6 +119,13 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         // change anything today: no pre-flight gate produces the one class
         // that maps to 1 (the camera is not open yet).
         debug!(?resp, "pre-check short-circuit");
+
+        // The only marker work a *rejected* attempt performs, and the reason
+        // the daemonless install can converge downward at all (#137 review).
+        // See the helper for why this specific operation is admissible on this
+        // side of the rate limiter when a marker *write* is not.
+        clear_marker_the_store_contradicts(&config, &store, &user);
+
         return match resp {
             AuthOutcome::Error { kind, .. } => oneshot_exit_code(kind),
             _ => 2,
@@ -339,19 +346,94 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
 ///
 /// `models` is `None` when the store could not be listed — leave the existing
 /// marker alone rather than guessing it away, the same rule
-/// [`crate::commands::enrollment_marker::refresh`] follows. A count of zero is
-/// a real answer ("no models") and does delete the marker.
+/// [`crate::commands::enrollment_marker::refresh`] follows.
 ///
-/// Called unconditionally, before the camera is opened and before the
-/// authentication attempt, so nothing the attempt goes on to do or fail to do
-/// can decide whether it runs: an upgraded user whose face is not recognised
-/// today — or whose camera is busy today — still needs `is-enrolled` to tell
-/// the truth. Best-effort throughout — `set` logs its own failures and never
-/// propagates, so nothing here can fail an authentication.
+/// Called after the pre-flight gates pass, before the camera is opened and
+/// before the authentication attempt, so nothing the attempt goes on to do or
+/// fail to do can decide whether it runs: an upgraded user whose face is not
+/// recognised today — or whose camera is busy today — still needs
+/// `is-enrolled` to tell the truth. Best-effort throughout — `set` logs its own
+/// failures and never propagates, so nothing here can fail an authentication.
+///
+/// **This call converges upward only.** Reaching it means the enrollment gate
+/// passed, i.e. `has_models` was true, so the count is ≥ 1 barring a
+/// concurrent `remove` between the two reads. Clearing a marker the database
+/// contradicts is [`clear_marker_the_store_contradicts`]'s job, on the
+/// rejection path where that evidence actually arrives. `set` is still used
+/// (rather than `write_marker_in`) so the racing-zero case does the right
+/// thing instead of writing `{"models":0}`.
 fn converge_enrollment_marker(config: &Config, user: &str, models: Option<u32>) {
     match models {
         Some(models) => super::enrollment_marker::set(config, user, models),
         None => debug!(user = %user, "model list unavailable; enrollment marker left unchanged"),
+    }
+}
+
+/// Delete `user`'s enrollment marker when the authoritative store says they
+/// have no models — the downward half of #137's convergence, and the only
+/// marker work a pre-flight **rejection** is allowed to do.
+///
+/// # Why the one-shot path needs this at all
+///
+/// [`auth::pre_check_with_context`] short-circuits when `has_models` is false,
+/// which is *above* [`converge_enrollment_marker`] in `run`. So on a daemonless
+/// install — no daemon start, therefore no `reconcile_all`/`prune_markers_in`
+/// — a marker that outlives its database rows can never be cleared: every
+/// subsequent attempt hits the not-enrolled gate and returns before
+/// convergence, and `facelock is-enrolled` reports enrolled forever. The
+/// database being restored from a backup that predates the enrollment, or a row
+/// removed out of band, is enough to get there. That is exactly #137's drift,
+/// running in the opposite direction.
+///
+/// # Why this is admissible here when a marker *write* is not
+///
+/// The placement of [`converge_enrollment_marker`] below `pre_check_audited` is
+/// load-bearing and is not disturbed: it keeps a marker **write** — temp file,
+/// `chown`, `rename`, and a `mkdir` of the marker directory — off the path an
+/// attempt rejected at a pre-flight gate can reach, because that is
+/// attacker-drivable filesystem work from the wrong side of the rate limiter.
+///
+/// What happens here is a different operation with different properties:
+///
+/// - **It only ever removes.** One `unlink(2)` on a path that is a single,
+///   validated component under the marker directory ([`marker_path`] rejects
+///   `..`, `/` and empty names). Nothing is created, nothing is `chown`ed, no
+///   directory is materialized — `remove_marker_in` does not call
+///   `ensure_private_dir`.
+/// - **It is bounded.** The first rejection removes the marker; every
+///   subsequent one finds `ENOENT` and does nothing. Repetition buys an
+///   attacker one failed `unlink` per attempt — nothing accumulates, on disk or
+///   anywhere else. Said plainly, because the ordering matters: the enrollment
+///   gate fires *before* the rate-limit check, so on that path this really does
+///   run unmetered. What makes that acceptable is the bound above and the
+///   property below, not the rate limiter.
+/// - **It cannot be driven to a wrong answer.** It fires only when the
+///   database — the authority — reports zero models for the user, in which case
+///   any marker claiming otherwise is already false. There is no state an
+///   attacker can steer it into: it can delete a stale marker, never a correct
+///   one, so it is not a denial-of-face-unlock primitive either.
+///
+/// The `has_models` read here repeats the one the enrollment gate just did.
+/// That is deliberate: asking the store directly keeps this independent of
+/// which [`AuthOutcome`] variant a gate happens to return, so a future
+/// rejection class cannot silently start or stop clearing markers. The cost is
+/// one indexed `COUNT` on the rejection path only.
+///
+/// Best-effort like every other marker write: `forget` logs its own failures
+/// and never propagates, so nothing here can fail an authentication.
+///
+/// [`marker_path`]: crate::commands::enrollment_marker::marker_path
+fn clear_marker_the_store_contradicts(config: &Config, store: &FaceStore, user: &str) {
+    match store.has_models(user) {
+        // Authoritative "no": the marker, if any, is stale.
+        Ok(false) => super::enrollment_marker::forget(config, user),
+        Ok(true) => {}
+        // An unreadable store is not evidence of anything — the same rule
+        // `converge_enrollment_marker` applies to a `None` count. Guessing
+        // "zero" from a transient database error would delete a correct marker.
+        Err(e) => {
+            debug!(user = %user, error = %e, "enrollment state unreadable; enrollment marker left unchanged")
+        }
     }
 }
 
@@ -809,8 +891,10 @@ path = "{audit_path}"
     // Enrollment marker convergence (#137)
     // -----------------------------------------------------------------------
 
-    use super::converge_enrollment_marker;
-    use crate::commands::enrollment_marker::{MarkerState, marker_dir, read_marker_in};
+    use super::{clear_marker_the_store_contradicts, converge_enrollment_marker};
+    use crate::commands::enrollment_marker::{
+        MarkerState, marker_dir, read_marker_in, write_marker_in,
+    };
 
     /// A config pointing an entire installation at `dir`: the marker directory
     /// is derived from `storage.db_path`. "alice" has no passwd entry, so the
@@ -845,18 +929,82 @@ path = "{audit_path}"
         ));
     }
 
-    /// A count of zero is a real answer from the store: the user has no models,
-    /// so the marker must go.
+    /// The downward half of #137 on a daemonless install, and the case the
+    /// helper this replaces could never actually reach.
+    ///
+    /// The predecessor test called `converge_enrollment_marker(.., Some(0))`
+    /// and asserted the marker went away. It did — but `run` cannot produce
+    /// `Some(0)`: the enrollment gate in `pre_check_audited` short-circuits
+    /// above that call whenever the store has no models, so the zero branch was
+    /// dead on the one-shot path and the test read as coverage of a fix that
+    /// was not there. The real evidence arrives on the *rejection* path, which
+    /// is where this exercises it: a store that genuinely holds nothing for the
+    /// user, and a marker on disk claiming otherwise.
     #[test]
-    fn oneshot_convergence_clears_the_marker_at_zero_models() {
+    fn oneshot_rejection_clears_a_marker_the_store_contradicts() {
         let tmp = tempfile::tempdir().unwrap();
         let config = marker_config(tmp.path());
         let base = marker_dir(&config);
+        let store = FaceStore::open_memory().unwrap();
 
-        converge_enrollment_marker(&config, "alice", Some(1));
-        converge_enrollment_marker(&config, "alice", Some(0));
+        // What a database restored from a pre-enrollment backup leaves behind:
+        // a marker with no rows behind it.
+        write_marker_in(&base, "alice", 1, None).unwrap();
 
+        clear_marker_the_store_contradicts(&config, &store, "alice");
+
+        assert_eq!(
+            read_marker_in(&base, "alice"),
+            MarkerState::Absent,
+            "a marker the database contradicts must not survive the attempt \
+             that observed the contradiction"
+        );
+
+        // Idempotent, and the repeat costs one failed unlink — the bound the
+        // helper's doc comment claims.
+        clear_marker_the_store_contradicts(&config, &store, "alice");
         assert_eq!(read_marker_in(&base, "alice"), MarkerState::Absent);
+    }
+
+    /// The other side of the same gate: a rejection for any *other* reason
+    /// (rate limited, non-IR, lid closed) must leave an enrolled user's marker
+    /// exactly where it is. The store, not the rejection, is the authority.
+    #[test]
+    fn oneshot_rejection_leaves_an_enrolled_users_marker_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = marker_config(tmp.path());
+        let base = marker_dir(&config);
+        let store = FaceStore::open_memory().unwrap();
+        store
+            .add_model("alice", "front", &[0.5f32; 512], "test-embedder")
+            .unwrap();
+
+        write_marker_in(&base, "alice", 1, None).unwrap();
+
+        clear_marker_the_store_contradicts(&config, &store, "alice");
+
+        assert!(
+            matches!(read_marker_in(&base, "alice"), MarkerState::Enrolled(m) if m.models == 1),
+            "an enrolled user's marker must survive a rejected attempt"
+        );
+    }
+
+    /// The rejection path writes nothing — no marker, no marker directory. The
+    /// whole reason it is allowed to run on this side of the rate limiter is
+    /// that removal is all it can do.
+    #[test]
+    fn oneshot_rejection_never_creates_a_marker_or_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = marker_config(tmp.path());
+        let base = marker_dir(&config);
+        let store = FaceStore::open_memory().unwrap();
+
+        clear_marker_the_store_contradicts(&config, &store, "alice");
+
+        assert!(
+            !base.exists(),
+            "a rejected attempt must not materialize the marker directory"
+        );
     }
 
     /// An unreadable store is not evidence of anything. Guessing "zero" from a
@@ -946,6 +1094,51 @@ path = "{audit_path}"
                 .count(),
             1,
             "run() must converge exactly once"
+        );
+    }
+
+    /// The companion pin for the downward half. The clearing call has one legal
+    /// home: **inside** the pre-flight short-circuit, between the gates and the
+    /// `return` that ends the rejected attempt.
+    ///
+    /// Above `pre_check_audited` it would be a store read (and a marker unlink)
+    /// on every attempt regardless of the gates, which is the hoist the #144
+    /// review rejected. Below the short-circuit's `return` it would be
+    /// unreachable on exactly the path that has the evidence — the not-enrolled
+    /// rejection — which is the dead-code shape this change exists to fix.
+    #[test]
+    fn the_clearing_call_sits_inside_the_pre_flight_short_circuit() {
+        let src = include_str!("auth.rs");
+        let pre_check = src
+            .find("pre_check_audited(")
+            .expect("run() must run the pre-flight gates");
+        let clear = src
+            .find("clear_marker_the_store_contradicts(")
+            .expect("run() must clear a marker the store contradicts");
+        let converge = src
+            .find("converge_enrollment_marker(")
+            .expect("run() must converge the marker");
+
+        assert!(
+            pre_check < clear,
+            "the clearing call must run *after* the gates, not before them"
+        );
+        assert!(
+            clear < converge,
+            "the clearing call belongs inside the short-circuit block, which \
+             returns before the upward convergence below it"
+        );
+
+        // Exactly one call site, for the same reason convergence has one.
+        let definition = src
+            .find("fn clear_marker_the_store_contradicts(")
+            .expect("the helper must be defined in this file");
+        assert_eq!(
+            src[..definition]
+                .matches("clear_marker_the_store_contradicts(")
+                .count(),
+            1,
+            "run() must clear at most once, on the rejection path"
         );
     }
 }

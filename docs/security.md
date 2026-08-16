@@ -402,6 +402,25 @@ the indicator appears, the PAM attempt fails, and the password context was
 running in parallel the whole time. **PAM at auth time remains authoritative.**
 Nothing in the authentication path may consult the marker.
 
+**No marker write is reachable from a rejected attempt.** On the one-shot path
+the marker convergence sits *below* `pre_check_audited`, deliberately: a write
+means a temp file, a `chown`, a `rename` and possibly a `mkdir`, and putting
+that above the gates would let an attempt rejected as disabled / SSH / lid /
+rate-limited / non-IR drive filesystem work from the wrong side of the rate
+limiter.
+
+There is exactly one operation on the rejection side, and it is a **removal**:
+when the database authoritatively reports zero models for the user, the
+one-shot unlinks a marker that claims otherwise (it must, because a daemonless
+install has no `reconcile_all` to prune with, so the marker would otherwise be
+permanent). It creates nothing, `chown`s nothing, and touches one validated
+path component under `enrolled/`. It is idempotent — a repeat attempt finds
+`ENOENT` — and it fires only when the marker is already false, so it can delete
+a stale marker and never a correct one. Note that the enrollment gate runs
+*before* the rate-limit check, so this genuinely runs unmetered; the bound (one
+`unlink` per attempt, nothing accumulating) and the "cannot delete a correct
+marker" property are what make that acceptable, not the rate limiter.
+
 #### B. Embedding Sensitivity Warning (Required)
 
 Face embeddings are **biometric data**. Unlike passwords, they cannot be changed. Document this:
