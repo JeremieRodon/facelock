@@ -1,5 +1,37 @@
 use facelock_core::types::BoundingBox;
 
+/// BT.601 chroma coefficients in fixed point (multiplied by 1024).
+///
+/// One copy, shared by every YUV converter here. They were duplicated per
+/// converter once, with a test asserting the two produced identical output —
+/// which is the test you write when the math has been copied rather than
+/// shared. That test now guards this.
+const C_RV: i32 = 1436; // 1.402 * 1024
+const C_GU: i32 = 352; // 0.344136 * 1024
+const C_GV: i32 = 731; // 0.714136 * 1024
+const C_BU: i32 = 1814; // 1.772 * 1024
+
+/// The R/G/B chroma contributions of one (u, v) pair, centered and scaled to
+/// Q10. A 4:2:2 or 4:2:0 converter computes this once per chroma sample and
+/// reuses it for every luma sample the pair covers.
+#[inline]
+fn chroma_q10(u: u8, v: u8) -> (i32, i32, i32) {
+    let u = u as i32 - 128;
+    let v = v as i32 - 128;
+    (C_RV * v, -(C_GU * u + C_GV * v), C_BU * u)
+}
+
+/// One YUV pixel to RGB, given the chroma contributions from [`chroma_q10`].
+#[inline]
+fn yuv_to_rgb_px(y: u8, (cr, cg, cb): (i32, i32, i32)) -> [u8; 3] {
+    let y = (y as i32) << 10; // scale Y to Q10
+    [
+        ((y + cr) >> 10).clamp(0, 255) as u8,
+        ((y + cg) >> 10).clamp(0, 255) as u8,
+        ((y + cb) >> 10).clamp(0, 255) as u8,
+    ]
+}
+
 /// Convert YUYV (YUV 4:2:2) packed data to RGB.
 /// Each 4-byte YUYV group produces 2 RGB pixels.
 /// Uses fixed-point integer math (Q10) to avoid per-pixel float conversion.
@@ -7,30 +39,11 @@ pub fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Vec<u8> {
     let pixel_count = (width * height) as usize;
     let mut rgb = Vec::with_capacity(pixel_count * 3);
 
-    // Fixed-point coefficients (multiplied by 1024)
-    const C_RV: i32 = 1436; // 1.402 * 1024
-    const C_GU: i32 = 352; // 0.344136 * 1024
-    const C_GV: i32 = 731; // 0.714136 * 1024
-    const C_BU: i32 = 1814; // 1.772 * 1024
-
-    // Process 4 bytes at a time (2 pixels)
+    // Process 4 bytes at a time (2 pixels), which share one chroma pair.
     for chunk in data.chunks_exact(4) {
-        let u = chunk[1] as i32 - 128;
-        let v = chunk[3] as i32 - 128;
-
-        // Pre-compute chrominance contributions (shared by both pixels)
-        let cr = C_RV * v;
-        let cg = -(C_GU * u + C_GV * v);
-        let cb = C_BU * u;
-
+        let chroma = chroma_q10(chunk[1], chunk[3]);
         for &y_val in &[chunk[0], chunk[2]] {
-            let y = (y_val as i32) << 10; // scale Y to Q10
-            let r = ((y + cr) >> 10).clamp(0, 255) as u8;
-            let g = ((y + cg) >> 10).clamp(0, 255) as u8;
-            let b = ((y + cb) >> 10).clamp(0, 255) as u8;
-            rgb.push(r);
-            rgb.push(g);
-            rgb.push(b);
+            rgb.extend_from_slice(&yuv_to_rgb_px(y_val, chroma));
         }
     }
 
@@ -53,25 +66,13 @@ pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
         return None;
     }
 
-    const C_RV: i32 = 1436; // 1.402 * 1024
-    const C_GU: i32 = 352; // 0.344136 * 1024
-    const C_GV: i32 = 731; // 0.714136 * 1024
-    const C_BU: i32 = 1814; // 1.772 * 1024
-
     let uv_plane = &data[y_len..];
     let mut rgb = Vec::with_capacity(y_len * 3);
     for row in 0..h {
         let uv_row = &uv_plane[(row / 2) * uv_stride..];
         for col in 0..w {
-            let u = uv_row[(col / 2) * 2] as i32 - 128;
-            let v = uv_row[(col / 2) * 2 + 1] as i32 - 128;
-            let y = (data[row * w + col] as i32) << 10;
-            let r = ((y + C_RV * v) >> 10).clamp(0, 255) as u8;
-            let g = ((y - (C_GU * u + C_GV * v)) >> 10).clamp(0, 255) as u8;
-            let b = ((y + C_BU * u) >> 10).clamp(0, 255) as u8;
-            rgb.push(r);
-            rgb.push(g);
-            rgb.push(b);
+            let chroma = chroma_q10(uv_row[(col / 2) * 2], uv_row[(col / 2) * 2 + 1]);
+            rgb.extend_from_slice(&yuv_to_rgb_px(data[row * w + col], chroma));
         }
     }
     Some(rgb)
@@ -79,9 +80,12 @@ pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 
 /// Brightest 16-bit sample in a Y16 buffer (little-endian).
 ///
-/// Callers accumulate this across a burst of calibration frames: the peak is a
-/// lower bound on the sensor's full scale, so taking the maximum over several
-/// frames can only move the estimate toward the true bit depth, never past it.
+/// Callers accumulate this across a burst of calibration frames, which raises
+/// the estimate toward the sensor's full scale. It does not bound it from
+/// above: this is an unbounded max over every pixel, so a single stuck pixel
+/// or specular IR glint sets it alone and pins a shift that is too large for
+/// the rest of the scene. See `calibrate_y16_shift` for what that costs and
+/// why a quirk's `y16_bit_depth` is the way out.
 pub fn y16_peak(data: &[u8]) -> u16 {
     data.chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
