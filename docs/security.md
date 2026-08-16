@@ -638,12 +638,31 @@ denied_services = ["login", "sshd", "su"]
 
 #### A. Capability Dropping (Implemented — verified, and fatal if it did not happen)
 
-Once initialization is complete — camera fd open, models loaded, database open, bus name
-claimed — the daemon narrows its own capability set to
-[`retained_capability_mask()`](../crates/facelock-daemon/src/server.rs): `CAP_SETUID` +
-`CAP_SETGID` and nothing else (`capset` on all three of effective/permitted/inheritable, plus
-`PR_SET_NO_NEW_PRIVS`). Those two are the notification privilege-drop's, and only its; see
-Phase 3 in §6.B for why they cannot be given up.
+As soon as the two startup steps that need `CAP_CHOWN` are done — the state layout and the
+enrollment-marker reconcile — and **before the daemon creates its first thread**, it narrows its
+own capability set to [`retained_capability_mask()`](../crates/facelock-daemon/src/server.rs):
+`CAP_SETUID` + `CAP_SETGID` and nothing else (`capset` on all three of
+effective/permitted/inheritable, plus `PR_SET_NO_NEW_PRIVS`). Those two are the notification
+privilege-drop's, and only its; see Phase 3 in §6.B for why they cannot be given up.
+
+**Why that timing is the whole of the guarantee.** Linux capabilities and `PR_SET_NO_NEW_PRIVS`
+are per-*thread* attributes: `capset(2)`/`prctl(2)` with `pid = 0` change the calling thread and
+nothing else, and a thread that already exists keeps what it had for as long as it lives. (This
+is why libcap ships `libpsx` to broadcast a capability change across a process's threads.) The
+drop therefore has to happen while the daemon is still single-threaded — before
+`FaceEngine::load` brings up ONNX Runtime's intra-op pools, and before the tokio runtime spawns
+the workers and blocking threads that every D-Bus method body does its real work on. Narrowing
+any later reaches none of them, and `capget` cannot report the mistake either: it is per-thread
+too, so it would inspect the one thread that *did* drop and confirm itself. `server::run` takes
+a `CapabilitiesDropped` token it cannot construct, so the ordering is a compile-time
+requirement rather than a comment.
+
+The narrowing asks only for capabilities the process already holds
+(`capabilities_to_keep(permitted)`). `capset` requires the new permitted set to be a subset of
+the old and rejects a non-conforming request *wholesale* — dropping nothing at all — so a
+daemon started under, say, `CapabilityBoundingSet=CAP_CHOWN` with no ambient caps would
+otherwise fail the drop entirely and land in the fatal branch below. Intersecting first means
+the call only ever removes, and `CAP_CHOWN` is never in the result.
 
 **The drop is then read back and checked.** `capget` reports what the kernel actually left
 behind, and `drop_capabilities_or_refuse()` compares it against the retained mask:
@@ -651,15 +670,15 @@ behind, and `drop_capabilities_or_refuse()` compares it against the retained mas
 | Outcome | What the daemon does |
 |---------|----------------------|
 | Nothing beyond the retained set is held | Serve. This is the steady state. |
-| Anything beyond it survived (including a `capset` that failed outright) | **Refuse to serve** — return before the first authentication, release the bus name, exit non-zero |
+| Anything beyond it survived (including a `capset` that failed outright) | **Refuse to serve** — exit non-zero before claiming the bus name, so no client ever sees a half-privileged daemon |
 | Held set is *narrower* than the retained mask | Warn and serve — desktop notifications may not work, nothing the security model promised is violated |
 | `capget` itself failed | **Refuse to serve** — an unverifiable guarantee is not a guarantee |
 
 The check is deliberately one-sided ("is anything *extra* still here?"). A daemon started under
-a narrower bounding set than the shipped unit grants cannot raise into the retained mask, so its
-`capset` fails; that costs notifications and must not stop it from authenticating anyone. The
-ambient set needs no separate check — the kernel clears a capability from ambient the moment it
-leaves permitted or inheritable.
+a narrower bounding set than the shipped unit grants simply keeps less than the retained mask;
+that costs notifications and must not stop it from authenticating anyone. The ambient set needs
+no separate check — the kernel clears a capability from ambient the moment it leaves permitted
+or inheritable.
 
 **Why fatal.** This used to warn and continue, which was defensible while the dropped set held
 nothing the security model had promised to remove. With `CAP_CHOWN` in the bounding set for
@@ -671,7 +690,17 @@ the model SHA-256 check. `Restart=on-failure` will retry it every `RestartSec=3`
 same restart loop a failed `ensure_state_layout` already produces (the unit sets no
 `StartLimit*`, so systemd's defaults may not trip on a 3-second interval). Each attempt logs the
 capability mask that survived, so the journal says exactly what is wrong rather than only that
-something is.
+something is. Reaching that loop takes a genuine kernel-level refusal to narrow: an operator
+running the daemon with fewer capabilities than the shipped unit grants is *not* a failure here,
+because the drop only ever asks for what is already held.
+
+**Regression coverage.** `test/pkg-validate.sh` reads `CapPrm`/`CapEff` from
+`/proc/<pid>/task/*/status` on the running daemon and asserts `CAP_CHOWN` is clear on **every**
+thread. That walk is the point: `/proc/<pid>/status` reports the main thread, which is the one
+thread that always drops, so it is exactly the blind spot a per-thread bug hides in. The unit
+tests cover the mask arithmetic, and
+`server::tests::only_threads_created_after_the_narrowing_inherit_it` pins the ordering itself by
+running both orders against a real tokio runtime.
 
 #### B. systemd Hardening (Implemented)
 
@@ -692,13 +721,15 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
   drop into the user's session bus, and `runuser` calls `setgroups()`/`setuid()`, which require
   `CAP_SETGID` + `CAP_SETUID`. They are declared **Ambient** (not merely in the bounding set) so
   the caps survive the exec into the non-setuid `runuser` under `NoNewPrivileges=yes`. The daemon
-  also narrows its in-process capability set to exactly these two after initialization
-  (`drop_capabilities_or_refuse()` in `facelock-daemon/src/server.rs`, holding them in
-  effective/permitted/inheritable); everything else is dropped.
+  also narrows its in-process capability set to exactly these two once the startup chowns are
+  done and while it is still single-threaded (`drop_capabilities_or_refuse()` in
+  `facelock-daemon/src/server.rs`, holding them in effective/permitted/inheritable); everything
+  else is dropped.
   - **`CAP_CHOWN` is startup-only, and that is enforced rather than attempted.** It is in the
-    bounding set but deliberately **not** ambient, and the in-process drop clears it the moment
-    the daemon has claimed its bus name — so it is never held while authenticating anyone, and no
-    exec'd child can inherit it. Root without `CAP_CHOWN` cannot `chown(2)` at all, and two
+    bounding set but deliberately **not** ambient, and the in-process drop clears it as soon as
+    the two startup chowns are done and before the daemon spawns a single thread — so no thread
+    of the process holds it while anyone is being authenticated, and no exec'd child can inherit
+    it. Root without `CAP_CHOWN` cannot `chown(2)` at all, and two
     startup steps need it on an install that is
     being *upgraded* rather than freshly packaged: `state_layout::ensure_state_layout`, which
     chowns `/var/lib/facelock` and the files under it to `root:facelock` (a failure there is
