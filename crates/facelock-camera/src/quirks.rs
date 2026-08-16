@@ -829,6 +829,56 @@ notes = "Full test quirk"
         Some(QuirksDb::load_file(&path).expect("defaults file parses"))
     }
 
+    /// Every `format_preference` shipped in `config/quirks.d/00-defaults.toml`
+    /// must be a format facelock can actually decode.
+    ///
+    /// This is the coupling #90 introduced and nothing else guards: the file
+    /// writes the padded V4L2 spelling (`"Y16 "`), `load_file` normalizes it,
+    /// and `capture::quirk_format_preference` then checks it against
+    /// `DECODABLE_FORMATS` and *drops it with a warning* if it does not match.
+    /// A shipped preference that fails this check does not fail loudly at
+    /// runtime — it silently stops selecting the RealSense IR sensor node.
+    #[test]
+    fn shipped_quirk_format_preferences_are_decodable() {
+        let Some(quirks) = shipped_default_quirks() else {
+            return;
+        };
+        let mut checked = 0;
+        for q in &quirks {
+            let Some(pref) = q.format_preference.as_deref() else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                crate::capture::DECODABLE_FORMATS.contains(&pref.trim()),
+                "shipped quirk {:?} prefers {pref:?}, which facelock cannot decode — \
+                 it would be dropped at open with a warning",
+                q.notes
+            );
+        }
+        assert!(
+            checked >= 4,
+            "expected the shipped RealSense (Y16) and BRIO (GREY) preferences to be \
+             covered; only {checked} were found"
+        );
+    }
+
+    /// `load_file` is what turns the file's padded `"Y16 "` into the `"Y16"`
+    /// every comparison downstream expects. Asserted against the real shipped
+    /// file, not a fixture, because the padded spelling in *that* file is what
+    /// makes the normalization load-bearing.
+    #[test]
+    fn shipped_quirk_format_preferences_are_normalized_by_the_loader() {
+        let Some(quirks) = shipped_default_quirks() else {
+            return;
+        };
+        for q in &quirks {
+            if let Some(pref) = q.format_preference.as_deref() {
+                assert_eq!(pref, pref.trim(), "loader left padding on {pref:?}");
+            }
+        }
+    }
+
     /// Table-driven regression for #99: every shipped `name_pattern` quirk in
     /// `config/quirks.d/00-defaults.toml` must still match a device name of
     /// the shape it is written for, and none of them may match an ordinary

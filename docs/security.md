@@ -195,6 +195,19 @@ not hinge on whatever a single pre-AGC frame happened to see. A scene-derived sc
 covered lens at open clips later frames to flat white, which this check *rejects*), but on
 hardware where it recurs, pin `y16_bit_depth`.
 
+"The session" is the lifetime of one open camera, and under the daemon's warm camera hold
+(ADR 008 §4) that can span several authentication attempts, not just one: a held stream
+keeps the scale it pinned. A **reopen** always recalibrates — the daemon's camera factory
+resolves and opens afresh on every cold open, so no scale is ever carried across a reopen
+onto a device that did not produce it. That is the same invariant `ResolvedCamera` holds
+for `is_ir` and the fingerprint.
+
+Cost note: on a Y16 device with no `y16_bit_depth` quirk, the calibration burst runs inside
+`Camera::open`, *before* the warmup discard and with the IR emitter already enabled — so it
+is emitter-LED-on time, bounded by one second, on every cold open. Declaring
+`y16_bit_depth` skips it entirely and is the preferred configuration on IR hardware. The
+shipped RealSense entries in `config/quirks.d/00-defaults.toml` do **not** declare one yet.
+
 **Raw-frame calibration**: on the raw frame, flat surfaces (photos/screens in IR) score
 std_dev **< 5**, real IR skin scores **> 15**. The cutoff `security.ir_texture_min_stddev`
 defaults to **10.0** (between the two bands). Lower it if real faces are being rejected;

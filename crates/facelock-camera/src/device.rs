@@ -122,7 +122,7 @@ fn has_decodable_format(device: &DeviceInfo) -> bool {
     device
         .formats
         .iter()
-        .any(|f| crate::capture::DECODABLE_FORMATS.contains(&f.fourcc.as_str()))
+        .any(|f| crate::capture::DECODABLE_FORMATS.contains(&f.fourcc.trim()))
 }
 
 /// True if the device enumerates at least one IR-typical mono format
@@ -329,11 +329,20 @@ fn classify_ir_sources_with_ids(
         let pref = quirks
             .and_then(|db| db.find_match_with_ids(&devices[i], Some(ids)))
             .and_then(|q| q.format_preference.clone());
+        // Both sides trimmed. Ingest normalizes FourCCs now, but this
+        // comparison decides whether a node is demoted out of `force_ir`, and
+        // a false here in *every* node of the group means no node is demoted
+        // and `force_ir` is trusted for all of them — the RGB sibling
+        // included. That is the wrong direction to fail in, so it does not
+        // get to depend on normalization having happened upstream.
         let node_has_ir_format = |j: usize| {
             has_native_ir_format(&devices[j])
-                || pref
-                    .as_deref()
-                    .is_some_and(|p| devices[j].formats.iter().any(|f| f.fourcc == p))
+                || pref.as_deref().is_some_and(|p| {
+                    devices[j]
+                        .formats
+                        .iter()
+                        .any(|f| f.fourcc.trim() == p.trim())
+                })
         };
 
         // Only demote when format evidence exists within the group; otherwise
@@ -1006,6 +1015,47 @@ mod tests {
         let sources = [IrSource::Format, IrSource::None];
         let picked = pick_auto_device(&devices, &sources).expect("a device is picked");
         assert_eq!(picked.path, "/dev/video2");
+    }
+
+    #[test]
+    fn ir_typical_and_decodable_format_sets_deliberately_disagree() {
+        // The rebase of #90 onto the evidence-based IR classification (#98)
+        // put two format lists side by side, and they are NOT the same set.
+        // Pinning the disagreement here so a later edit to either list is a
+        // deliberate act rather than an accident:
+        //
+        //   - Y8/Y10/Y12 are IR evidence but facelock cannot decode them, so a
+        //     node whose only IR evidence is one of them classifies as IR and
+        //     is then excluded from auto-detection.
+        //   - YUYV/NV12/MJPG are decodable but are not IR evidence.
+        //
+        // If Y8/Y10/Y12 decode support is ever added, the first assertion is
+        // what will fail and point at this comment.
+        let ir_only: Vec<&str> = IR_TYPICAL_FOURCCS
+            .iter()
+            .copied()
+            .filter(|f| !crate::capture::DECODABLE_FORMATS.contains(f))
+            .collect();
+        assert_eq!(
+            ir_only,
+            vec!["Y12", "Y10", "Y8"],
+            "IR-typical but undecodable — these classify as IR and are then \
+             excluded from auto-detection"
+        );
+
+        let decodable_only: Vec<&str> = crate::capture::DECODABLE_FORMATS
+            .iter()
+            .copied()
+            .filter(|f| !IR_TYPICAL_FOURCCS.contains(f))
+            .collect();
+        assert_eq!(decodable_only, vec!["YUYV", "NV12", "MJPG"]);
+
+        // And the consequence, stated as behavior: adding Y16 decode support
+        // did NOT make Y16 evidence of anything new — a Y16-only node was IR
+        // before #90 and is IR after it. #90 only made it openable.
+        let y16_only = device_at("/dev/video0", "Depth Camera", &["Y16"]);
+        assert!(has_decodable_format(&y16_only));
+        assert_eq!(heuristic_ir_source(&y16_only), IrSource::Format);
     }
 
     #[test]

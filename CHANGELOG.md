@@ -280,6 +280,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negotiating an unsupported format (and then failing every capture), opening a
   device with no decodable format errors immediately with the advertised and
   supported format lists.
+- **Pixel-format names lose V4L2's trailing-space padding on machine-readable
+  surfaces** (#89): FourCCs are normalized where they enter facelock (device
+  enumeration and quirks-file parsing), so `facelock devices --json` and the
+  `ListDevices` D-Bus reply now carry `"Y16"` where they previously carried
+  `"Y16 "`. The human-readable `facelock devices` table already trimmed and is
+  unchanged. A consumer matching the padded spelling exactly needs updating; one
+  that trims already does not.
 
 ### Fixed
 
@@ -404,6 +411,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (hardware truth, no frame inspected); otherwise it is calibrated from the peak
   of a short burst of frames rather than a single frame, so a dark pre-AGC frame
   at open no longer pins an 8-bit scale that clips the rest of the session.
+  "The session" is the lifetime of one open camera: the daemon's warm camera
+  hold keeps the scale it pinned, and a reopen recalibrates — no scale is
+  carried across a reopen onto a device that did not produce it. On IR hardware
+  the burst is emitter-LED-on time inside `Camera::open` (bounded by one
+  second); declaring `y16_bit_depth` skips it.
 
 ## [0.1.4] - 2026-05-31
 

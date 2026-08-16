@@ -68,8 +68,17 @@ fn select_format(preferred: &[&str], available: &[String]) -> Option<usize> {
 
 /// A quirk's `format_preference`, dropped when facelock cannot decode it —
 /// honoring it would negotiate a format every subsequent capture fails on.
+///
+/// Trimmed rather than compared raw. `QuirksDb::load_file` already normalizes
+/// what it parses, but the shipped `config/quirks.d/00-defaults.toml` writes
+/// the PADDED V4L2 spelling (`format_preference = "Y16 "`) for all three
+/// RealSense entries — so if that normalization ever regressed, an exact
+/// comparison here would silently reclassify every one of them as
+/// "undecodable" and drop the preference that picks their IR sensor node.
+/// Trimming makes this predicate independent of where the `Quirk` came from
+/// (parsed file, `push_quirk_for_test`, or constructed in code).
 fn quirk_format_preference(quirk: Option<&Quirk>) -> Option<&str> {
-    let pref = quirk.and_then(|q| q.format_preference.as_deref())?;
+    let pref = quirk.and_then(|q| q.format_preference.as_deref())?.trim();
     if !DECODABLE_FORMATS.contains(&pref) {
         tracing::warn!(
             format = pref,
@@ -680,6 +689,18 @@ mod tests {
         let quirk = quirk_with_format("GREY");
         assert_eq!(quirk_format_preference(Some(&quirk)), Some("GREY"));
         assert_eq!(quirk_format_preference(None), None);
+    }
+
+    #[test]
+    fn quirk_format_preference_accepts_the_padded_v4l2_spelling() {
+        // `config/quirks.d/00-defaults.toml` writes `format_preference = "Y16 "`
+        // for the three RealSense entries. `QuirksDb::load_file` normalizes it,
+        // but this predicate must not DEPEND on that having happened: an exact
+        // comparison here would turn a regression in the loader into three
+        // silently-dropped IR-sensor preferences plus a misleading "not a
+        // decodable format" warning.
+        let quirk = quirk_with_format("Y16 ");
+        assert_eq!(quirk_format_preference(Some(&quirk)), Some("Y16"));
     }
 
     #[test]

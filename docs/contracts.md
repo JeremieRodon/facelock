@@ -466,11 +466,30 @@ in priority order `quirk format_preference > GREY > Y16 > YUYV > NV12 > MJPG`
 and **fails** if the device advertises none of them (no silent fallback to an
 undecodable format).
 
+A quirk's `format_preference` is compared whitespace-trimmed and is **dropped
+with a warning** if it names a format facelock cannot decode, rather than
+winning negotiation and then failing every capture.
+
 On a Y16 device, open also pins the session's 16-bit-to-8-bit shift, which is
 never recomputed per frame (`docs/security.md` §1.C). A quirk's `y16_bit_depth`
 (8..=16) is authoritative and skips frame inspection; otherwise the shift comes
 from the brightest sample in a burst of frames captured at open (at least the
-device's `warmup_frames`, bounded by one second).
+device's `warmup_frames`, bounded by one second). The pinned shift belongs to
+the open camera: a warm hold (see "Camera hold" above) keeps it, and a reopen
+recalibrates. A Y16 device that produces no frame at all within the calibration
+budget fails `Camera::open` rather than opening with a guessed scale.
+
+Open also **rejects a padded stride**: for GREY/NV12 (`bytesperline == width`)
+and Y16/YUYV (`bytesperline == 2 * width`), a device reporting anything else
+errors at open instead of decoding sheared frames. Compressed formats (MJPG)
+are exempt — their `bytesperline` is not a row size.
+
+**FourCC normalization.** V4L2 pads FourCCs to four characters with trailing
+spaces (`"Y16 "`). Facelock strips that padding at every ingest point — device
+enumeration (`query_device`) and quirks-file parsing — so `DeviceInfo.formats`,
+the `ListDevices` D-Bus payload and `facelock devices --json` all carry the
+unpadded spelling (`"Y16"`, not `"Y16 "`). The human-readable `facelock devices`
+table already trimmed, so only the machine-readable surfaces change.
 
 ## Database Schema
 
