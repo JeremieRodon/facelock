@@ -303,10 +303,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chowns `/var/lib/facelock` to `root:facelock`, and whose failure is fatal —
   the daemon exits 1) and the enrollment-marker reconcile (which chowns each
   marker to its user). The capability is deliberately **not** ambient and is
-  cleared by the in-process capability drop as soon as the daemon claims its bus
-  name, so it is never held while authenticating anyone and no exec'd child
-  inherits it. `systemd-analyze security` moves 2.6 → 2.8 (still OK); it scores
-  the bounding set and cannot see the in-process drop.
+  cleared by the in-process capability drop as soon as those two steps are done
+  and before the daemon creates its first thread, so no thread of the process
+  holds it while anyone is being authenticated and no exec'd child inherits it.
+  `systemd-analyze security` moves 2.6 → 2.8 (still OK); it scores the bounding
+  set and cannot see the in-process drop.
 - **The daemon's capability drop is now verified, and refuses to serve if it did
   not happen.** It used to log `failed to drop capabilities (continuing)` and
   carry on, which made "narrowed after initialization" a best-effort claim. That
@@ -318,7 +319,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAP_SETUID`+`CAP_SETGID` survived. Refusing is not a lockout: PAM degrades to
   the password exactly as it does when the daemon is not running. A daemon
   started under a *narrower* set than the shipped unit grants still runs (it
-  holds nothing extra) with a warning that notifications may not work.
+  holds nothing extra) with a warning that notifications may not work — the drop
+  requests only capabilities the process already has, so a narrower start can no
+  longer fail the drop wholesale and trip the refusal.
+- **The capability drop happens while the daemon is still single-threaded.**
+  Capabilities and `PR_SET_NO_NEW_PRIVS` are per-*thread* and inherited only
+  forwards, so a drop performed once the ONNX Runtime pools and the tokio
+  runtime existed narrowed only the calling thread — leaving every thread that
+  actually serves `Authenticate` holding `CAP_CHOWN`, with a per-thread `capget`
+  read-back that could not see it. `test/pkg-validate.sh` now walks
+  `/proc/<pid>/task/*/status` on the running daemon and asserts `CAP_CHOWN` is
+  clear on every thread.
 
 ## [0.1.4] - 2026-05-31
 
