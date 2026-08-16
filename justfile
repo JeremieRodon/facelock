@@ -86,30 +86,47 @@ test-arch-pam: _build-test-container
 test-arch-layout: _build-test-container
     podman run --rm facelock-pam-test /run-layout-tests.sh
 
-# Guard for the camera tiers: the Containerfile bakes models/ into the image
-# with a tolerant `|| true`, so building from a checkout without the ONNX
-# models (fresh clone/worktree — they are downloaded, not tracked) produces an
-# image whose daemon cannot load the face engine and whose enroll bails before
-# opening the camera. Fail loudly here instead of debugging opaque test FAILs.
+# Guard for every tier that needs a daemon which can actually load the face
+# engine: the camera tiers (the Containerfile bakes models/ into the image with
+# a tolerant `|| true`, so a checkout without the ONNX models produces an image
+# whose daemon cannot load the engine and whose enroll bails before opening the
+# camera) and the package tiers (pkg-validate.sh starts the daemon under the
+# hardened unit and walks /proc/<pid>/task/* for CAP_CHOWN — no models, no
+# daemon, no assertion). Fail loudly here instead of debugging opaque test
+# FAILs, or worse, reading a green summary that skipped the interesting half.
 # Check the two non-optional models by name: a checkout holding only the
 # optional ones (det_10g.onnx, glintr100.onnx) satisfies a bare *.onnx glob but
 # still leaves the default detector/embedder missing at runtime.
-_require-models:
+#
+# `allow_opt_out=1` (package tiers only) lets FACELOCK_ALLOW_MISSING_MODELS=1
+# turn the refusal into a warning: those tiers still validate packaging without
+# models, and pkg-validate.sh then *counts* what it skipped. The camera tiers
+# pass "0" — without models they have nothing left to test.
+_require-models allow_opt_out="0":
     #!/usr/bin/env bash
     set -euo pipefail
     missing=()
     for m in models/scrfd_2.5g_bnkps.onnx models/w600k_r50.onnx; do
         [ -f "$m" ] || missing+=("$m")
     done
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo "error: missing required ONNX models — the camera test tiers need them baked into the image:" >&2
-        for m in "${missing[@]}"; do echo "         $m" >&2; done
-        echo "       They are downloaded, not tracked. Copy them from the install tree" >&2
-        echo "       ('sudo facelock setup' downloads them to /var/lib/facelock/models):" >&2
-        echo "         sudo cp /var/lib/facelock/models/*.onnx models/" >&2
-        echo "       (models/*.onnx is gitignored, so this cannot be committed by accident.)" >&2
-        exit 1
+    [ ${#missing[@]} -gt 0 ] || exit 0
+    if [ "{{allow_opt_out}}" = "1" ] && [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = "1" ]; then
+        echo "warning: missing ONNX models, continuing (FACELOCK_ALLOW_MISSING_MODELS=1):" >&2
+        for m in "${missing[@]}"; do echo "           $m" >&2; done
+        echo "         The daemon-start assertions will be reported as SKIPPED, not passed." >&2
+        exit 0
     fi
+    echo "error: missing required ONNX models — this test tier needs them baked into the image:" >&2
+    for m in "${missing[@]}"; do echo "         $m" >&2; done
+    echo "       They are downloaded, not tracked. Copy them from the install tree" >&2
+    echo "       ('sudo facelock setup' downloads them to /var/lib/facelock/models):" >&2
+    echo "         sudo cp /var/lib/facelock/models/*.onnx models/" >&2
+    echo "       (models/*.onnx is gitignored, so this cannot be committed by accident.)" >&2
+    if [ "{{allow_opt_out}}" = "1" ]; then
+        echo "       To validate packaging only, with the daemon-start assertions counted" >&2
+        echo "       as skipped: FACELOCK_ALLOW_MISSING_MODELS=1 just <recipe>" >&2
+    fi
+    exit 1
 
 # Automated daemon integration tests (Arch, requires camera)
 test-arch-integration: _require-models _build-test-container
@@ -119,8 +136,23 @@ test-arch-integration: _require-models _build-test-container
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
     done
-    podman run --rm $devices facelock-pam-test /run-integration-tests.sh
+    env_args=()
+    # run-integration-tests.sh reads FACELOCK_LIVE_TIMEOUT *inside* the
+    # container, so without -e a caller's value is silently ignored and every
+    # live step keeps the stock 90s — the one knob that helps when a human has
+    # to sit still in frame. The value is interpolated straight into
+    # `timeout --foreground`, so it must be a timeout(1) duration.
+    if [ -n "${FACELOCK_LIVE_TIMEOUT:-}" ]; then
+        if [[ ! "$FACELOCK_LIVE_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]]; then
+            echo "error: FACELOCK_LIVE_TIMEOUT='$FACELOCK_LIVE_TIMEOUT' is not a timeout(1) duration (e.g. 300s, 5m)" >&2
+            exit 1
+        fi
+        env_args+=(-e "FACELOCK_LIVE_TIMEOUT=$FACELOCK_LIVE_TIMEOUT")
+        echo "live steps time out after $FACELOCK_LIVE_TIMEOUT (default 90s)"
+    fi
+    podman run --rm $devices "${env_args[@]}" facelock-pam-test /run-integration-tests.sh
 
+# FACELOCK_LIVE_TIMEOUT=300s just test-arch-oneshot      # relax the live steps
 # Automated oneshot (daemonless) integration tests (Arch, requires camera)
 test-arch-oneshot: _require-models _build-test-container
     #!/usr/bin/env bash
@@ -129,7 +161,18 @@ test-arch-oneshot: _require-models _build-test-container
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
     done
-    podman run --rm $devices facelock-pam-test /run-oneshot-tests.sh
+    env_args=()
+    # As in test-arch-integration: the timeout is read inside the container, so
+    # it has to be forwarded or the caller's value does nothing.
+    if [ -n "${FACELOCK_LIVE_TIMEOUT:-}" ]; then
+        if [[ ! "$FACELOCK_LIVE_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]]; then
+            echo "error: FACELOCK_LIVE_TIMEOUT='$FACELOCK_LIVE_TIMEOUT' is not a timeout(1) duration (e.g. 300s, 5m)" >&2
+            exit 1
+        fi
+        env_args+=(-e "FACELOCK_LIVE_TIMEOUT=$FACELOCK_LIVE_TIMEOUT")
+        echo "live steps time out after $FACELOCK_LIVE_TIMEOUT (default 90s)"
+    fi
+    podman run --rm $devices "${env_args[@]}" facelock-pam-test /run-oneshot-tests.sh
 
 # Dev shell — interactive Arch container with host models for fast iteration (requires camera)
 test-arch-dev-shell: _build-test-container
@@ -622,8 +665,11 @@ test-deb: build-release
     podman build -t facelock-deb-test -f test/Containerfile.ubuntu .
     podman run --rm facelock-deb-test
 
+# Needs models/*.onnx: the validation starts the daemon under the hardened unit
+# and checks what it holds at runtime. FACELOCK_ALLOW_MISSING_MODELS=1 runs the
+# packaging half only, with the rest counted as skipped.
 # Package test — build real .deb, install via dpkg, validate under booted systemd
-test-deb-pkg: build-release
+test-deb-pkg: (_require-models "1") build-release
     #!/usr/bin/env bash
     set -euo pipefail
     podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
@@ -636,8 +682,9 @@ test-deb-tpm-pkg: build-release
     podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-tpm-pkg -f test/Containerfile.deb-tpm-e2e .
     podman run --rm facelock-deb-tpm-pkg
 
+# Same model requirement (and same opt-out) as test-deb-pkg.
 # Package test — build real .rpm, install via dnf, validate under booted systemd
-test-rpm-pkg: build-release
+test-rpm-pkg: (_require-models "1") build-release
     #!/usr/bin/env bash
     set -euo pipefail
     podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .

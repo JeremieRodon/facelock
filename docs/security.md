@@ -721,6 +721,12 @@ tests cover the mask arithmetic, and
 `server::tests::only_threads_created_after_the_narrowing_inherit_it` pins the ordering itself by
 running both orders against a real tokio runtime.
 
+That walk only happens if the daemon actually starts, which needs `models/*.onnx` in the
+checkout (they are gitignored). `just test-deb-pkg` / `just test-rpm-pkg` refuse to run without
+them, and `pkg-validate.sh` fails rather than skipping — set
+`FACELOCK_ALLOW_MISSING_MODELS=1` to accept a partial run, which then reports the missing
+assertions in its `N skipped` count instead of passing silently.
+
 #### B. systemd Hardening (Implemented)
 
 The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
