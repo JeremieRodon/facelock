@@ -136,8 +136,23 @@ test-arch-integration: _require-models _build-test-container
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
     done
-    podman run --rm $devices facelock-pam-test /run-integration-tests.sh
+    env_args=()
+    # run-integration-tests.sh reads FACELOCK_LIVE_TIMEOUT *inside* the
+    # container, so without -e a caller's value is silently ignored and every
+    # live step keeps the stock 90s — the one knob that helps when a human has
+    # to sit still in frame. The value is interpolated straight into
+    # `timeout --foreground`, so it must be a timeout(1) duration.
+    if [ -n "${FACELOCK_LIVE_TIMEOUT:-}" ]; then
+        if [[ ! "$FACELOCK_LIVE_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]]; then
+            echo "error: FACELOCK_LIVE_TIMEOUT='$FACELOCK_LIVE_TIMEOUT' is not a timeout(1) duration (e.g. 300s, 5m)" >&2
+            exit 1
+        fi
+        env_args+=(-e "FACELOCK_LIVE_TIMEOUT=$FACELOCK_LIVE_TIMEOUT")
+        echo "live steps time out after $FACELOCK_LIVE_TIMEOUT (default 90s)"
+    fi
+    podman run --rm $devices "${env_args[@]}" facelock-pam-test /run-integration-tests.sh
 
+# FACELOCK_LIVE_TIMEOUT=300s just test-arch-oneshot      # relax the live steps
 # Automated oneshot (daemonless) integration tests (Arch, requires camera)
 test-arch-oneshot: _require-models _build-test-container
     #!/usr/bin/env bash
@@ -146,7 +161,18 @@ test-arch-oneshot: _require-models _build-test-container
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
     done
-    podman run --rm $devices facelock-pam-test /run-oneshot-tests.sh
+    env_args=()
+    # As in test-arch-integration: the timeout is read inside the container, so
+    # it has to be forwarded or the caller's value does nothing.
+    if [ -n "${FACELOCK_LIVE_TIMEOUT:-}" ]; then
+        if [[ ! "$FACELOCK_LIVE_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]]; then
+            echo "error: FACELOCK_LIVE_TIMEOUT='$FACELOCK_LIVE_TIMEOUT' is not a timeout(1) duration (e.g. 300s, 5m)" >&2
+            exit 1
+        fi
+        env_args+=(-e "FACELOCK_LIVE_TIMEOUT=$FACELOCK_LIVE_TIMEOUT")
+        echo "live steps time out after $FACELOCK_LIVE_TIMEOUT (default 90s)"
+    fi
+    podman run --rm $devices "${env_args[@]}" facelock-pam-test /run-oneshot-tests.sh
 
 # Dev shell — interactive Arch container with host models for fast iteration (requires camera)
 test-arch-dev-shell: _build-test-container

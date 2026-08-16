@@ -34,6 +34,17 @@ just test-arch-oneshot      # full E2E with camera (no daemon)
 just test-arch-dev-shell    # interactive shell for manual testing
 ```
 
+The two camera tiers time-box each live enroll/auth step at 90s. If you need
+longer in front of the camera, set `FACELOCK_LIVE_TIMEOUT` — the recipes
+forward it into the container:
+
+```bash
+FACELOCK_LIVE_TIMEOUT=300s just test-arch-integration
+```
+
+The value goes straight into `timeout --foreground`, so pass a `timeout(1)`
+duration (`300s`, `5m`); anything else is rejected before the container starts.
+
 Container tests validate:
 - PAM module loads without crashing
 - Returns PAM_IGNORE when daemon unavailable

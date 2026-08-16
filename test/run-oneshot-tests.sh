@@ -3,6 +3,10 @@ set -euo pipefail
 
 PASS=0
 FAIL=0
+# Per-step budget for the live camera steps (someone has to be in frame). Read
+# inside the container, so `just test-arch-oneshot` forwards the variable with
+# -e; a `podman run` by hand must do the same. Interpolated straight into
+# `timeout --foreground`, so it is a timeout(1) duration: 300s, 5m.
 LIVE_TIMEOUT="${FACELOCK_LIVE_TIMEOUT:-90s}"
 
 run_test() {
