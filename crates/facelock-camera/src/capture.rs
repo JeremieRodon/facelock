@@ -49,12 +49,6 @@ const Y16_CALIBRATION_FRAMES: usize = 8;
 /// therefore this budget plus one `CAPTURE_TIMEOUT`, not this budget alone.
 const Y16_CALIBRATION_BUDGET: Duration = Duration::from_secs(1);
 
-/// Consecutive-error ceiling for the calibration burst, kept separate from
-/// [`Y16_CALIBRATION_FRAMES`] deliberately: the frame target scales with a
-/// device's declared `warmup_frames`, and an error budget that rode along
-/// with it would silently loosen when someone lengthened the burst.
-const Y16_CALIBRATION_MAX_ERRORS: usize = 8;
-
 /// Pixel formats facelock can decode to RGB, in negotiation priority order:
 /// IR-native grayscale first, then cheap lossless raw conversions, then MJPG
 /// (JPEG decode). Also used by device auto-detection to skip devices (e.g. raw
@@ -139,54 +133,50 @@ fn y16_calibration_frames(quirk: Option<&Quirk>) -> usize {
 /// endpoint, so that case warns nothing. A quirk's `y16_bit_depth` is the
 /// only way to take the scale out of the scene's hands entirely.
 ///
-/// Individual capture errors are tolerated as long as one frame arrives; with
-/// none, opening fails rather than proceeding on a guessed scale.
+/// A capture error ends the open. It is tempting to tolerate a few and keep
+/// sampling, but no `next()` error is transient here: `v4l`'s capture stream
+/// advances `arena_index` only on a successful dequeue and re-queues that
+/// same index on the following call, so one failed dequeue leaves the buffer
+/// queued in the kernel and every later call re-queues it and gets EINVAL.
+/// Tolerating errors would therefore trade a hard failure carrying the real
+/// message for a `Camera` that returns "Invalid argument" from every capture,
+/// having reported a successfully pinned scale on the way out.
 fn calibrate_y16_shift(stream: &mut Stream<'_>, device_path: &str, target: usize) -> Result<u8> {
     let start = Instant::now();
     let mut peak = 0u16;
     let mut frames = 0usize;
-    let mut errors = 0usize;
-    let mut last_err = None;
 
-    while frames < target
-        && errors < Y16_CALIBRATION_MAX_ERRORS
-        && start.elapsed() < Y16_CALIBRATION_BUDGET
-    {
+    while frames < target && start.elapsed() < Y16_CALIBRATION_BUDGET {
         match stream.next() {
             Ok((buf, _meta)) => {
                 peak = peak.max(preprocess::y16_peak(buf));
                 frames += 1;
             }
             Err(e) => {
-                errors += 1;
-                last_err = Some(e);
+                return Err(FacelockError::Camera(format!(
+                    "{device_path}: Y16 calibration failed after {frames} frame(s): {e}"
+                )));
             }
         }
     }
 
     if frames == 0 {
-        let detail = match last_err {
-            Some(e) => e.to_string(),
-            None => "no frame arrived within the calibration budget".to_string(),
-        };
         return Err(FacelockError::Camera(format!(
-            "{device_path}: Y16 calibration failed: {detail}"
+            "{device_path}: Y16 calibration failed: no frame arrived within the \
+             calibration budget"
         )));
     }
 
-    // A burst cut short by the wall-clock budget or the error budget pins the
-    // scale from however few frames arrived, and at one frame that is the
-    // single-frame AGC race the burst exists to avoid. The peak is still a
-    // lower bound, so the shift is not wrong by construction — but it was
-    // decided on less evidence than intended, and nothing else says so: a
-    // mid-range peak from one dark frame takes the `Normal` arm below and
-    // logs nothing.
+    // A burst cut short by the wall-clock budget pins the scale from however
+    // few frames arrived, and at one frame that is the single-frame AGC race
+    // the burst exists to avoid. It was decided on less evidence than
+    // intended, and nothing else says so: a mid-range peak off one dark frame
+    // takes the `Normal` arm below and logs nothing.
     if frames < target {
         tracing::warn!(
             device = %device_path,
             frames,
             target,
-            errors,
             elapsed_ms = start.elapsed().as_millis() as u64,
             "Y16 calibration burst ended early: pinned the session scale from \
              fewer frames than intended, so the camera's exposure may not have \
