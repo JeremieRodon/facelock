@@ -86,6 +86,223 @@ test-arch-pam: _build-test-container
 test-arch-layout: _build-test-container
     podman run --rm facelock-pam-test /run-layout-tests.sh
 
+# models/*.onnx is gitignored and never tracked, so a fresh clone — and every
+# `git worktree add`, which is how this repo is normally worked in — starts
+# with an empty models/, while the camera and package test tiers all need the
+# two required models baked into the image. Run this once per checkout.
+#
+# Sources, cheapest first (or pass one: `just link-models /path/to/models`):
+#   1. the main checkout's models/. A worktree normally lives inside the main
+#      checkout, so this is the same filesystem and the link costs nothing.
+#   2. /var/lib/facelock/models/, where `sudo facelock setup` puts them. The
+#      models are 0644 under a 0755 dir, so reading them needs no sudo — but
+#      /var/lib/facelock itself is 0710 root:facelock, so getting in needs the
+#      facelock group (or root).
+#
+# Hardlink, never symlink: test/Containerfile does `COPY models/ /build/models/`
+# and podman's COPY does not follow a symlink pointing outside the build
+# context, so a symlinked models/ would build a clean-looking image with no
+# models in it — the exact failure this recipe exists to prevent. Hardlinks
+# fall back to a copy when the source is on another filesystem; /var/lib
+# usually is, and btrfs refuses links across subvolumes even on one device.
+#
+# Every file is checked against the sha256 in models/manifest.toml before it
+# lands, and lands via a temp name, so an interrupted copy cannot leave a
+# truncated model behind for the daemon to reject later.
+#
+# Populate models/*.onnx from an existing checkout or install tree
+link-models src="": (_link-models "explicit" src)
+
+# mode=explicit (`just link-models`) — try every mechanism, report each file,
+#   and fail if a required model is still missing at the end.
+# mode=auto (dependency of _require-models) — hardlink only, say nothing when
+#   there is nothing to do, and never fail. A copy can be 435MB; that is worth
+#   opting into, not something `just test-arch-integration` should spend behind
+#   your back. When auto cannot finish the job it stays quiet and leaves the
+#   diagnosis to _require-models, which owns that message.
+_link-models mode="explicit" src="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [ "{{mode}}" = "explicit" ]; then explicit=1; else explicit=0; fi
+
+    manifest=models/manifest.toml
+    if [ ! -f "$manifest" ]; then
+        echo "error: $manifest is missing — it is tracked, so this is not a fresh-checkout problem" >&2
+        exit 1
+    fi
+
+    # filename <TAB> sha256 <TAB> required(1|0), read straight out of the
+    # manifest so adding a model there does not need a second list updated here.
+    models_meta="$(awk '
+        /^\[\[models\]\]/ { if (fn != "") print fn "\t" sha "\t" req; fn = ""; sha = ""; req = 1 }
+        $1 == "filename" { gsub(/"/, "", $3); fn = $3 }
+        $1 == "sha256" { gsub(/"/, "", $3); sha = $3 }
+        $1 == "optional" && $3 == "true" { req = 0 }
+        END { if (fn != "") print fn "\t" sha "\t" req }
+    ' "$manifest")"
+
+    # need: missing and required — the set that decides which source is usable.
+    # wanted: what we will actually place. auto only ever chases `need`.
+    declare -A sha_of=()
+    need=()
+    optional_missing=()
+    while IFS=$'\t' read -r fn sha req; do
+        if [ -z "$fn" ]; then continue; fi
+        sha_of["$fn"]="$sha"
+        if [ -f "models/$fn" ]; then continue; fi
+        if [ "$req" = "1" ]; then need+=("$fn"); else optional_missing+=("$fn"); fi
+    done <<< "$models_meta"
+
+    wanted=("${need[@]}")
+    if [ "$explicit" = 1 ]; then wanted+=("${optional_missing[@]}"); fi
+
+    if [ ${#wanted[@]} -eq 0 ]; then
+        if [ "$explicit" = 1 ]; then echo "models/ already has every model in $manifest — nothing to do"; fi
+        exit 0
+    fi
+
+    candidates=()
+    if [ -n "{{src}}" ]; then
+        candidates+=("{{src}}")
+    else
+        # `git worktree list` prints the main worktree first. That is the
+        # checkout a worktree can hardlink from for free.
+        main_checkout="$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p' || true)"
+        if [ -n "$main_checkout" ] && [ "$(realpath -m "$main_checkout")" != "$(realpath .)" ]; then
+            candidates+=("$main_checkout/models")
+        fi
+        candidates+=(/var/lib/facelock/models)
+    fi
+
+    # A usable source has every required model we are missing, and at least one
+    # file we actually want (so we do not "pick" a source with nothing to give).
+    source_dir=""
+    for c in "${candidates[@]}"; do
+        if [ ! -d "$c" ]; then continue; fi
+        usable=1
+        for fn in "${need[@]}"; do
+            if [ ! -r "$c/$fn" ]; then usable=0; break; fi
+        done
+        if [ "$usable" = 0 ]; then continue; fi
+        for fn in "${wanted[@]}"; do
+            if [ -r "$c/$fn" ]; then source_dir="$c"; break; fi
+        done
+        if [ -n "$source_dir" ]; then break; fi
+    done
+
+    if [ -z "$source_dir" ]; then
+        # auto: _require-models is about to say the same thing, better.
+        if [ "$explicit" = 0 ]; then exit 0; fi
+        if [ ${#need[@]} -eq 0 ]; then
+            # Both required models are here and only the optional ones are not,
+            # with nothing around that has them. The test tiers do not need
+            # them, so this is a note, not a failure — and re-running stays a
+            # no-op instead of turning into an error the second time.
+            echo "models/ has both required models; no candidate source has the optional ones:"
+            for fn in "${optional_missing[@]}"; do echo "  $fn"; done
+            exit 0
+        fi
+        echo "error: found no source holding the required models that models/ is missing:" >&2
+        for fn in "${need[@]}"; do echo "         $fn" >&2; done
+        echo "       Looked in:" >&2
+        for c in "${candidates[@]}"; do
+            if [ -d "$c" ]; then
+                echo "         $c (exists, but does not have them all — or is not readable)" >&2
+            else
+                echo "         $c (no such directory)" >&2
+            fi
+        done
+        echo "       Download them once, then re-run this:" >&2
+        echo "         sudo facelock setup      # downloads to /var/lib/facelock/models" >&2
+        echo "       Or point at a directory that already has them:" >&2
+        echo "         just link-models /path/to/models" >&2
+        exit 1
+    fi
+
+    if [ "$explicit" = 1 ]; then echo "source: $source_dir"; fi
+
+    # A partially written model is worse than a missing one: it satisfies the
+    # `[ -f ]` guards and then fails sha256 verification inside the container.
+    tmp=""
+    cleanup() { if [ -n "$tmp" ]; then rm -f "$tmp"; fi; }
+    trap cleanup EXIT
+
+    linked=0
+    copied=0
+    copied_bytes=0
+    for fn in "${wanted[@]}"; do
+        if [ ! -r "$source_dir/$fn" ]; then continue; fi
+        size="$(stat -c %s "$source_dir/$fn")"
+        tmp="models/.$fn.tmp.$$"
+        rm -f "$tmp"
+        if [ "$explicit" = 1 ]; then
+            printf '  %-24s %6s  ' "$fn" "$(numfmt --to=iec "$size")"
+        fi
+        if ln "$source_dir/$fn" "$tmp" 2>/dev/null; then
+            method=hardlink
+        elif [ "$explicit" = 1 ]; then
+            # Another filesystem, or fs.protected_hardlinks refusing a link to a
+            # file we do not own. Copying is what is left, and it is not free.
+            printf 'copying (hardlink not possible)'
+            cp -- "$source_dir/$fn" "$tmp"
+            method=copy
+        else
+            rm -f "$tmp"
+            tmp=""
+            continue
+        fi
+
+        want_sha="${sha_of[$fn]}"
+        got_sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+        if [ "$want_sha" != "$got_sha" ]; then
+            rm -f "$tmp"
+            tmp=""
+            if [ "$explicit" = 1 ]; then printf '\n'; fi
+            echo "warning: $source_dir/$fn does not match its sha256 in $manifest — skipped" >&2
+            echo "           expected $want_sha" >&2
+            echo "           got      $got_sha" >&2
+            continue
+        fi
+
+        mv -f "$tmp" "models/$fn"
+        tmp=""
+        if [ "$method" = hardlink ]; then
+            linked=$((linked + 1))
+            if [ "$explicit" = 1 ]; then printf 'hardlink\n'; fi
+        else
+            copied=$((copied + 1))
+            copied_bytes=$((copied_bytes + size))
+            printf ' done\n'
+        fi
+    done
+
+    still_missing=()
+    for fn in "${need[@]}"; do
+        if [ ! -f "models/$fn" ]; then still_missing+=("$fn"); fi
+    done
+    if [ ${#still_missing[@]} -gt 0 ]; then
+        if [ "$explicit" = 0 ]; then exit 0; fi
+        echo "error: models/ is still missing a required model after linking from $source_dir:" >&2
+        for fn in "${still_missing[@]}"; do echo "         $fn" >&2; done
+        exit 1
+    fi
+
+    if [ "$explicit" = 1 ]; then
+        echo "models/ has both required models — $linked hardlinked (no extra disk), $copied copied ($(numfmt --to=iec "$copied_bytes"))"
+        left_out=()
+        for fn in "${optional_missing[@]}"; do
+            if [ ! -f "models/$fn" ]; then left_out+=("$fn"); fi
+        done
+        if [ ${#left_out[@]} -gt 0 ]; then
+            echo "optional models not at $source_dir (no test tier needs them): ${left_out[*]}"
+        fi
+    elif [ "$linked" -gt 0 ]; then
+        # Never silent: hardlinks cost nothing but they are still a change to
+        # the working tree, made on the way to a test the caller asked for.
+        echo "hardlinked $linked model(s) into models/ from $source_dir (just link-models)"
+    fi
+
 # Guard for every tier that needs a daemon which can actually load the face
 # engine: the camera tiers (the Containerfile bakes models/ into the image with
 # a tolerant `|| true`, so a checkout without the ONNX models produces an image
@@ -102,7 +319,12 @@ test-arch-layout: _build-test-container
 # turn the refusal into a warning: those tiers still validate packaging without
 # models, and pkg-validate.sh then *counts* what it skipped. The camera tiers
 # pass "0" — without models they have nothing left to test.
-_require-models allow_opt_out="0":
+#
+# The _link-models dependency makes the common case not happen at all: a fresh
+# worktree hardlinks from the main checkout on the way in, so neither the
+# refusal nor the opt-out is reached. It only ever uses free mechanisms, so when
+# it declines, everything below still applies unchanged.
+_require-models allow_opt_out="0": (_link-models "auto")
     #!/usr/bin/env bash
     set -euo pipefail
     missing=()
@@ -118,10 +340,12 @@ _require-models allow_opt_out="0":
     fi
     echo "error: missing required ONNX models — this test tier needs them baked into the image:" >&2
     for m in "${missing[@]}"; do echo "         $m" >&2; done
-    echo "       They are downloaded, not tracked. Copy them from the install tree" >&2
-    echo "       ('sudo facelock setup' downloads them to /var/lib/facelock/models):" >&2
-    echo "         sudo cp /var/lib/facelock/models/*.onnx models/" >&2
-    echo "       (models/*.onnx is gitignored, so this cannot be committed by accident.)" >&2
+    echo "       They are downloaded, not tracked. Populate models/ from a checkout" >&2
+    echo "       or install tree that already has them:" >&2
+    echo "         just link-models" >&2
+    echo "       It names what it looked at, and how to get the models, if it finds" >&2
+    echo "       no source. (models/*.onnx is gitignored, so nothing you link in can" >&2
+    echo "       be committed by accident.)" >&2
     if [ "{{allow_opt_out}}" = "1" ]; then
         echo "       To validate packaging only, with the daemon-start assertions counted" >&2
         echo "       as skipped: FACELOCK_ALLOW_MISSING_MODELS=1 just <recipe>" >&2
