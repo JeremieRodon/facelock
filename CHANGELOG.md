@@ -264,6 +264,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--json` output corrupted by log lines on stdout** (#149): the CLI's tracing
+  subscriber inherited `tracing_subscriber`'s default writer, which is *stdout*
+  — the same stream `devices --json`, `list --json` and `is-enrolled --json`
+  print their payload on. Any diagnostic that passed the `RUST_LOG` filter was
+  prepended to the JSON, so with `daemon.mode = "daemon"` and the daemon
+  stopped, `facelock devices --json | jq .` failed on the D-Bus fallback WARN.
+  All tracing output now goes to stderr, in `facelock`, `facelock-bench` and
+  `facelock-polkit` alike; stdout carries the payload and nothing else. The
+  three `facelock` init sites were collapsed into one `logging::init_stderr`,
+  and the conformance test that already guarded the log *filter* now also
+  guards the *writer* by asserting no other file in the crate touches
+  `tracing_subscriber` at all. Also: a `RUST_LOG` that cannot be parsed is now
+  reported at WARN instead of being silently discarded.
+- **One-shot `facelock auth` could not clear a stale enrollment marker**: the
+  enrollment pre-flight gate short-circuits above the marker convergence point,
+  so on a daemonless install — where daemon startup's `reconcile_all` never runs
+  — a marker left behind by a database restored from a pre-enrollment backup (or
+  a row removed out of band) was permanent: every later attempt was rejected at
+  the gate and returned before converging, and `facelock is-enrolled` reported
+  enrolled forever. The one-shot now deletes a marker the database
+  authoritatively contradicts, at the gate that observes the contradiction. The
+  marker *write* stays below the pre-flight gates exactly as before — this is a
+  removal only (one `unlink`, no temp file, no `chown`, no `rename`, no
+  directory created), it is idempotent, and it is reachable only when the marker
+  is already false, so no attacker-drivable filesystem work is added on the
+  wrong side of the rate limiter. `docs/contracts.md` no longer implies the
+  one-shot path re-derives every marker; it converges exactly one user's.
 - **`setup --systemd --pam` silently dropped `--pam`**: the dispatch was an
   `if systemd {} else if pam {}` chain, so asking for both ran only systemd and
   said nothing about it. It now runs both, systemd first, matching the order the

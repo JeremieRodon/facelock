@@ -236,13 +236,14 @@ fn reconcile_enrollment_markers(config: &Config) {
 pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
     crate::ipc_client::require_root("sudo facelock daemon")?;
 
-    // Init tracing (daemon uses its own tracing setup with target=true).
+    // Init tracing (the daemon is the one caller that wants targets rendered).
     // See crate::logging's module doc for why this must not build its own
-    // fallback filter by hand.
-    tracing_subscriber::fmt()
-        .with_env_filter(crate::logging::default_env_filter())
-        .with_target(true)
-        .init();
+    // subscriber by hand. The writer is stderr rather than the previous
+    // stdout: the shipped unit sets `StandardOutput=journal` *and*
+    // `StandardError=journal`, so the journal sees exactly what it saw before,
+    // and a daemon run in the foreground now behaves like every other
+    // subcommand.
+    crate::logging::init_stderr(true);
 
     info!("facelock daemon starting");
 

@@ -42,6 +42,24 @@ Stable contracts. Do not change without updating this document.
 | `facelock bench` | Benchmarks |
 | `facelock restart` | Restart daemon |
 
+### CLI Output Streams
+
+**stdout is the answer; stderr is everything else.** Every `facelock`
+subcommand prints its result — the JSON payload of `--json`, the rendered
+table, the state word — on stdout, and *only* that. Diagnostics (`tracing`
+output, whatever `RUST_LOG` selects, warnings such as the D-Bus fallback
+notice) go to stderr on every process this repository builds.
+
+This is what makes `facelock devices --json | jq .` and
+`facelock is-enrolled --json` safe to pipe: an integration reading stdout gets
+the payload whatever the log level, and an operator raising `RUST_LOG` to debug
+cannot break a script by doing so. Before this was contract, the subscriber
+inherited `tracing_subscriber`'s stdout default and a single WARN corrupted the
+JSON (#149).
+
+An unparseable `RUST_LOG` is reported at WARN (on stderr) and the built-in
+filter is used, rather than the value being silently discarded.
+
 ### facelock setup Flag Composition
 
 Flags **compose**; they are not mutually exclusive. The rule:
@@ -217,10 +235,17 @@ unprivileged user. The marker is a hint that can drift from the database; **PAM
 at auth time remains authoritative** and nothing in the auth path consults it.
 
 Markers are written by `enroll`, `remove` and `clear`, and converged from the
-database by `setup`, by daemon startup, and by the one-shot `facelock auth` path
-for the user being authenticated. Convergence re-derives every marker from the
-database, so it is idempotent and there is no migration state to keep. An
-install upgraded from a release that predates markers backfills itself on the
+database by `setup`, by daemon startup, and by the one-shot `facelock auth`
+path. Convergence re-derives markers from the database rather than replaying
+recorded steps, so it is idempotent and there is no migration state to keep.
+The scope differs by caller and that difference is contract:
+
+| Caller | Scope |
+|--------|-------|
+| `setup`, daemon startup (`reconcile_all`) | **Every** marker: backfills each enrolled user and prunes every marker the database does not account for |
+| one-shot `facelock auth` | **One** marker — the user being authenticated. It has no reason to read other users' rows and no privileged directory listing to prune with |
+
+An install upgraded from a release that predates markers backfills itself on the
 first daemon start or the first authentication; until one of those happens,
 `is-enrolled` reports `not-enrolled` for a user who is in fact enrolled.
 
@@ -234,6 +259,18 @@ a camera another process is holding, an undecryptable template, the no-face
 timeout, a plain non-match — leaves the marker already converged. In short: an
 attempt that reaches the camera has converged the marker, whatever it goes on
 to decide.
+
+That placement means the one-shot's *write* only ever converges a marker
+upward: reaching it requires the enrollment gate to have passed. The downward
+direction — a marker whose database rows are gone, which a daemonless install
+has no `reconcile_all` to prune — is handled at the gate that has the evidence:
+when the database authoritatively reports **zero** models for the user, the
+one-shot deletes any marker claiming otherwise before returning the rejection.
+That is a removal and nothing else: one `unlink(2)` on a single validated path
+component, no temp file, no `chown`, no `rename`, and no marker directory
+created. It is idempotent (a repeat attempt finds nothing to unlink) and it is
+reachable only when the marker is already false, so it can delete a stale marker
+and never a correct one.
 
 ### facelock auth Exit Codes
 
