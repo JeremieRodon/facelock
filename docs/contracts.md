@@ -42,6 +42,24 @@ Stable contracts. Do not change without updating this document.
 | `facelock bench` | Benchmarks |
 | `facelock restart` | Restart daemon |
 
+### CLI Output Streams
+
+**stdout is the answer; stderr is everything else.** Every `facelock`
+subcommand prints its result — the JSON payload of `--json`, the rendered
+table, the state word — on stdout, and *only* that. Diagnostics (`tracing`
+output, whatever `RUST_LOG` selects, warnings such as the D-Bus fallback
+notice) go to stderr on every process this repository builds.
+
+This is what makes `facelock devices --json | jq .` and
+`facelock is-enrolled --json` safe to pipe: an integration reading stdout gets
+the payload whatever the log level, and an operator raising `RUST_LOG` to debug
+cannot break a script by doing so. Before this was contract, the subscriber
+inherited `tracing_subscriber`'s stdout default and a single WARN corrupted the
+JSON (#149).
+
+An unparseable `RUST_LOG` is reported at WARN (on stderr) and the built-in
+filter is used, rather than the value being silently discarded.
+
 ### facelock setup Flag Composition
 
 Flags **compose**; they are not mutually exclusive. The rule:

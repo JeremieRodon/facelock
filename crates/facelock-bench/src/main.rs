@@ -86,6 +86,10 @@ enum Command {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(default_env_filter())
+        // Diagnostics on stderr, report on stdout (#149). This binary prints a
+        // measurement report a caller may well capture; `tracing_subscriber`'s
+        // default writer is stdout, which interleaves the two.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();

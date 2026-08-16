@@ -246,7 +246,12 @@ async fn register_agent(system_conn: &Connection) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Diagnostics on stderr, the same split every other binary here uses
+    // (#149). This agent prints no payload of its own, so nothing changes for
+    // a journal reader — it keeps the rule uniform across the repository.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
     let system_conn = Connection::system()
         .await

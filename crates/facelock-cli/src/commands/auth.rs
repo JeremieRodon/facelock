@@ -33,13 +33,9 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
         }
     };
 
-    tracing_subscriber::fmt()
-        // See crate::logging's module doc for why this must not build its
-        // own fallback filter by hand.
-        .with_env_filter(crate::logging::default_env_filter())
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    // See crate::logging's module doc for why this must not build its own
+    // subscriber by hand: it owns both the filter and the stderr writer.
+    crate::logging::init_stderr(false);
 
     // Loaded once, up front: auto-detection and the interrogation below must
     // be decided by the SAME quirk set, or the device picked and the device

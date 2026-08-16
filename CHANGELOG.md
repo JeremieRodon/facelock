@@ -258,6 +258,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--json` output corrupted by log lines on stdout** (#149): the CLI's tracing
+  subscriber inherited `tracing_subscriber`'s default writer, which is *stdout*
+  — the same stream `devices --json`, `list --json` and `is-enrolled --json`
+  print their payload on. Any diagnostic that passed the `RUST_LOG` filter was
+  prepended to the JSON, so with `daemon.mode = "daemon"` and the daemon
+  stopped, `facelock devices --json | jq .` failed on the D-Bus fallback WARN.
+  All tracing output now goes to stderr, in `facelock`, `facelock-bench` and
+  `facelock-polkit` alike; stdout carries the payload and nothing else. The
+  three `facelock` init sites were collapsed into one `logging::init_stderr`,
+  and the conformance test that already guarded the log *filter* now also
+  guards the *writer* by asserting no other file in the crate touches
+  `tracing_subscriber` at all. Also: a `RUST_LOG` that cannot be parsed is now
+  reported at WARN instead of being silently discarded.
 - **`setup --systemd --pam` silently dropped `--pam`**: the dispatch was an
   `if systemd {} else if pam {}` chain, so asking for both ran only systemd and
   said nothing about it. It now runs both, systemd first, matching the order the

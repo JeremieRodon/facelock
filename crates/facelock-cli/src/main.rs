@@ -248,11 +248,11 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(exit_code);
         }
         other => {
-            // Default tracing init for all other commands
-            tracing_subscriber::fmt()
-                .with_env_filter(logging::default_env_filter())
-                .with_target(false)
-                .init();
+            // Default tracing init for all other commands. Diagnostics land on
+            // stderr, which is what leaves stdout free for the payload these
+            // commands print — `devices --json`, `list --json`,
+            // `is-enrolled --json` (#149). See `crate::logging`.
+            logging::init_stderr(false);
 
             match other {
                 // -- Dispatched before the shared config parse (D7). --
