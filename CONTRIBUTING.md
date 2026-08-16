@@ -71,6 +71,25 @@ cargo clippy --workspace -- -D warnings
 
 Run these before every commit. They require no camera or models.
 
+### Models
+
+`models/*.onnx` is gitignored, so a fresh clone -- and every `git worktree add`
+-- starts without models, while tiers 2 and 3 need them. If another checkout on
+the machine has them, or `sudo facelock setup` has already downloaded them to
+`/var/lib/facelock/models`, populate the new checkout from there instead of
+downloading 435MB again:
+
+```bash
+just link-models                  # main checkout first, then the install tree
+just link-models /path/to/models  # or say where to look
+```
+
+It hardlinks where it can (a worktree shares a filesystem with its main
+checkout, so that is free and instant), copies where it cannot, and verifies
+every file against the sha256 in `models/manifest.toml`. The camera tiers run
+it themselves, hardlink-only, so a fresh worktree usually provisions itself
+before you notice it was empty.
+
 ### Tier 2: Hardware tests (camera + models)
 
 ```bash

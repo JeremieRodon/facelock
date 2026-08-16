@@ -78,6 +78,23 @@ cargo build --workspace
 cargo run --bin facelock -- setup       # download models
 ```
 
+`models/*.onnx` is gitignored, so a fresh clone -- and every `git worktree add`
+-- starts without models, while tiers 2 and 3 need them. Rather than download
+435MB per checkout, populate the new one from any checkout on the machine that
+already has them, or from what `sudo facelock setup` put in
+`/var/lib/facelock/models`:
+
+```bash
+just link-models                  # main checkout first, then the install tree
+just link-models /path/to/models  # or say where to look
+```
+
+It hardlinks where it can (a worktree shares a filesystem with its main
+checkout, so that is free and instant), copies where it cannot, and verifies
+every file against the sha256 in `models/manifest.toml`. The camera tiers run
+it themselves, hardlink-only, so a fresh worktree usually provisions itself
+before you notice it was empty.
+
 ### No-Daemon Development
 All CLI commands work without a daemon -- the CLI falls back to direct mode silently:
 ```bash
@@ -144,6 +161,7 @@ Local full CI: `bash test/run-tests.sh`
 
 | Recipe | Description |
 |--------|-------------|
+| `just link-models` | Populate `models/*.onnx` from an existing checkout or install tree |
 | `just test` | Unit tests |
 | `just lint` | Clippy |
 | `just check` | test + lint + fmt |
