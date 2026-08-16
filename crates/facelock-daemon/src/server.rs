@@ -1341,12 +1341,21 @@ fn notify_auth_outcome(
 
 /// Run the daemon's D-Bus server until shutdown (signal, D-Bus `Shutdown`,
 /// or idle timeout). Blocking: builds its own multi-threaded tokio runtime.
+///
+/// Takes a [`CapabilitiesDropped`] because building that runtime is the point
+/// of no return for the capability narrowing: `Builder::build()` spawns the
+/// worker threads, each worker's blocking-pool threads descend from a worker,
+/// and every D-Bus method body runs its real work on one of those. A thread
+/// keeps the credentials it was created with, so a narrowing that happens
+/// after this line reaches none of them. The token is the caller's proof it
+/// happened before.
 pub fn run(
     handler: ProductionHandler,
     idle_timeout_secs: u64,
     startup_config_mtime: Option<std::time::SystemTime>,
     rebuild: Option<ProductionRebuild>,
     notifier_factory: NotifierFactory,
+    _narrowed: &CapabilitiesDropped,
 ) -> Result<(), ServerError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1376,6 +1385,49 @@ const fn retained_capability_mask() -> u32 {
     // CAP_SETGID = 6, CAP_SETUID = 7.
     (1 << 7) | (1 << 6)
 }
+
+/// The part of [`retained_capability_mask`] this process can actually keep,
+/// given what it currently holds as `permitted`.
+///
+/// `capset(2)` requires the new permitted set to be a subset of the old one,
+/// and enforces it *wholesale*: a request naming one capability the process
+/// does not have is rejected in its entirety and drops nothing at all. So the
+/// retained mask cannot be requested absolutely. An operator who wants no
+/// desktop notifications and writes a drop-in with
+/// `CapabilityBoundingSet=CAP_CHOWN` + `AmbientCapabilities=` starts the
+/// daemon with `permitted == {CAP_CHOWN}`; an absolute request for
+/// `{CAP_SETUID, CAP_SETGID}` returns `EPERM`, `CAP_CHOWN` survives, the
+/// read-back below calls that a violation, and `Restart=on-failure` turns a
+/// legitimate narrower configuration into a permanent 3-second restart loop —
+/// with the journal blaming the wrong thing.
+///
+/// Intersecting first makes the call only ever *remove*, so it cannot fail for
+/// this reason, and a narrower-than-retained start lands in the "warn and
+/// serve" branch the asymmetric policy describes instead of the fatal one.
+/// Whatever comes back, `CAP_CHOWN` is not in it: the mask has no bit 0.
+const fn capabilities_to_keep(permitted: u64) -> u32 {
+    (permitted & retained_capability_mask() as u64) as u32
+}
+
+/// Proof that the capability narrowing has already run, on a thread that is an
+/// ancestor of every thread the process goes on to create.
+///
+/// Linux capabilities and `PR_SET_NO_NEW_PRIVS` are per-*thread* attributes:
+/// `capset(2)`/`prctl(2)` with `hdr.pid == 0` change the calling thread and
+/// nothing else, and a thread that already exists keeps what it had for as
+/// long as it lives. (This is why libcap ships `libpsx` to broadcast a
+/// capability change across a process's threads.) Narrowing therefore has to
+/// happen while the daemon is still single-threaded — before
+/// `FaceEngine::load` brings up ONNX Runtime's intra-op pools and before
+/// [`run`] builds the tokio runtime.
+///
+/// That ordering is not something [`run`] can verify for itself, and a
+/// read-back cannot catch a mistake either: `capget(pid = 0)` inspects the one
+/// thread that *did* drop, so the verification would be self-confirming. A
+/// token only [`drop_capabilities_or_refuse`] can mint moves the requirement
+/// to where the compiler checks it.
+#[derive(Debug)]
+pub struct CapabilitiesDropped(());
 
 /// CAP_CHOWN's capability number.
 ///
@@ -1449,20 +1501,24 @@ struct CapData {
 /// `_LINUX_CAPABILITY_VERSION_3`. Two [`CapData`] words: caps 0-31, then 32-63.
 const LINUX_CAP_V3: u32 = 0x2008_0522;
 
-/// Drop all Linux capabilities except CAP_SETUID + CAP_SETGID, and set
-/// PR_SET_NO_NEW_PRIVS.
+/// Drop every Linux capability except `keep`, and set PR_SET_NO_NEW_PRIVS.
 ///
-/// After initialization the daemon has already opened the camera fd, loaded
-/// models, connected to D-Bus, and opened the database. It no longer needs any
-/// elevated capabilities EXCEPT the two required to drop privilege for desktop
-/// notifications (`runuser` → `setgroups`/`setuid`); those are retained via
-/// [`retained_capability_mask`] in the effective, permitted, AND inheritable
-/// sets, and everything else is cleared.
+/// By the time this runs the daemon has converged the state layout and the
+/// enrollment markers — the only two things it ever needed `CAP_CHOWN` for —
+/// so it no longer needs any elevated capability EXCEPT the two required to
+/// drop privilege for desktop notifications (`runuser` →
+/// `setgroups`/`setuid`). `keep` comes from [`capabilities_to_keep`] and is
+/// therefore always a subset of what is currently permitted; it goes in the
+/// effective, permitted, AND inheritable sets, and everything else is cleared.
+///
+/// **Per-thread.** `hdr.pid = 0` means the calling thread, so this narrows one
+/// thread and every thread created from it afterwards — see
+/// [`CapabilitiesDropped`] for why that constrains where it may be called.
 ///
 /// Returns `Ok(())` on success. Callers must not treat an error as merely
 /// advisory: [`drop_capabilities_or_refuse`] is the entry point, and it decides
 /// what a failure costs by *reading back* what is actually held.
-fn drop_capabilities() -> std::result::Result<(), String> {
+fn drop_capabilities(keep: u32) -> std::result::Result<(), String> {
     unsafe {
         // Prevent the process (and children) from ever gaining new privileges
         let ret = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -1473,15 +1529,15 @@ fn drop_capabilities() -> std::result::Result<(), String> {
             ));
         }
 
-        // Retain exactly CAP_SETUID + CAP_SETGID (needed for the runuser/su
-        // notification privilege-drop); clear every other capability. The
-        // retained bits go in effective, permitted, AND inheritable — the
-        // inheritable set is what lets systemd AmbientCapabilities keep these
-        // caps across the exec into the non-setuid `runuser` under
-        // NoNewPrivileges. V3 uses two CapData structs (caps 0-31 and 32-63);
-        // the retained caps (6, 7) live in the low word, so the high word
-        // stays fully zeroed.
-        let keep = retained_capability_mask();
+        // Retain `keep` — normally CAP_SETUID + CAP_SETGID, the two the
+        // runuser/su notification privilege-drop needs; clear every other
+        // capability. The retained bits go in effective, permitted, AND
+        // inheritable — the inheritable set is what lets systemd
+        // AmbientCapabilities keep these caps across the exec into the
+        // non-setuid `runuser` under NoNewPrivileges. V3 uses two CapData
+        // structs (caps 0-31 and 32-63); the retained caps (6, 7) live in the
+        // low word, so the high word stays fully zeroed — which is also what
+        // clears anything above 31.
         let mut header = CapHeader {
             version: LINUX_CAP_V3,
             pid: 0,
@@ -1549,6 +1605,10 @@ fn read_capabilities() -> std::result::Result<HeldCapabilities, String> {
 /// Drop capabilities, verify the drop actually happened, and refuse to serve if
 /// it did not.
 ///
+/// **Call this from the daemon's main thread, before anything spawns a
+/// thread.** The narrowing is per-thread and is inherited only forwards; see
+/// [`CapabilitiesDropped`], the token this returns, which [`run`] demands.
+///
 /// This used to log `failed to drop capabilities (continuing)` and carry on.
 /// That was tolerable while the dropped set held nothing the security model had
 /// promised to remove — the two retained caps were the whole story, and a
@@ -1573,41 +1633,60 @@ fn read_capabilities() -> std::result::Result<HeldCapabilities, String> {
 ///   trade `state_layout::ensure_state_layout` already makes a few lines
 ///   earlier in startup, and the same "fail closed" convention as the model
 ///   SHA-256 check.
-/// - **Drop failed but nothing extra is held → warn and continue.** The daemon
-///   was started under a narrower capability set than the shipped unit grants,
-///   so `capset` could not *raise* into the retained mask. Notifications may
-///   not work; nothing about the security model is violated, and refusing here
-///   would turn an operator's hardening edit into a daemon that will not run.
+/// - **Drop failed but nothing extra is held → warn and continue.** Nothing
+///   about the security model is violated, and refusing here would turn an
+///   operator's hardening edit into a daemon that will not run.
 /// - **The read-back itself failed → fatal.** An unverifiable guarantee is not
 ///   a guarantee.
-fn drop_capabilities_or_refuse() -> std::result::Result<(), String> {
-    let dropped = drop_capabilities();
+///
+/// A daemon started under a narrower capability set than the shipped unit
+/// grants reaches none of those branches any more: [`capabilities_to_keep`]
+/// asks only for capabilities the process already has, so the drop succeeds
+/// and simply keeps less.
+pub fn drop_capabilities_or_refuse() -> std::result::Result<CapabilitiesDropped, ServerError> {
+    let refuse = |m: String| ServerError::Capabilities(m);
 
-    let held = read_capabilities()
-        .map_err(|e| format!("could not verify that capabilities were dropped: {e}"))?;
+    // Read before dropping: the request has to be a subset of what is already
+    // permitted or the kernel rejects it wholesale and nothing is dropped.
+    let before = read_capabilities()
+        .map_err(|e| refuse(format!("could not read the capabilities to drop: {e}")))?;
+    let keep = capabilities_to_keep(before.permitted);
+    let dropped = drop_capabilities(keep);
+
+    let held = read_capabilities().map_err(|e| {
+        refuse(format!(
+            "could not verify that capabilities were dropped: {e}"
+        ))
+    })?;
     let extra = capabilities_beyond_retained(held);
     if extra != 0 {
         let why = match &dropped {
             Ok(()) => "the drop reported success".to_string(),
             Err(e) => format!("the drop failed: {e}"),
         };
-        return Err(format!(
+        return Err(refuse(format!(
             "still holding capabilities that must be dropped before serving: {} ({why})",
             describe_capability_mask(extra)
-        ));
+        )));
     }
 
     match dropped {
-        Ok(()) => info!(
-            "retained CAP_SETUID+CAP_SETGID for notification privilege-drop; verified all others dropped (including CAP_CHOWN) and set no-new-privs"
+        Ok(()) if keep == retained_capability_mask() => info!(
+            "narrowed to CAP_SETUID+CAP_SETGID for the notification privilege-drop before any \
+             other thread exists; verified all others dropped (including CAP_CHOWN) and set \
+             no-new-privs"
+        ),
+        Ok(()) => warn!(
+            "started under a narrower capability set than the shipped unit grants: kept {keep:#010x} \
+             of the retained mask, so desktop notifications may not work. Everything else, \
+             CAP_CHOWN included, is dropped and verified."
         ),
         Err(e) => warn!(
             "capability drop reported a failure, but nothing beyond the retained set is held — \
-             started under a narrower capability set than the shipped unit grants? \
              desktop notifications may not work: {e}"
         ),
     }
-    Ok(())
+    Ok(CapabilitiesDropped(()))
 }
 
 async fn run_dbus_server(
@@ -1635,20 +1714,20 @@ async fn run_dbus_server(
 
     info!("facelock daemon running on D-Bus system bus as {BUS_NAME}");
 
-    // Drop capabilities now that initialization is complete — camera fd is
-    // open, models are loaded, D-Bus is connected, database is open.
+    // The capability narrowing does NOT happen here. It used to, on the
+    // reasoning that a failure after the bus name is claimed is one clients
+    // pay for — but by this line the process is long since multi-threaded
+    // (ONNX Runtime's intra-op pools, then every tokio worker), and the
+    // narrowing only ever reaches the calling thread and its descendants. The
+    // threads that actually serve `Authenticate` would have kept CAP_CHOWN for
+    // the daemon's whole life, and the `capget` read-back — also per-thread —
+    // would have inspected the one thread that did drop and confirmed itself.
     //
-    // This is also what bounds CAP_CHOWN's window. The unit puts it in the
-    // bounding set (not the ambient set) for two startup-only chowns — the
-    // state layout and the enrollment-marker reconcile — and this call is what
-    // takes it away again, before the first authentication. See the capability
-    // block in systemd/facelock-daemon.service.
-    //
-    // `?`, not a warning: the bus name is already claimed above, so from here
-    // on every failure to narrow the process is a failure the *clients* would
-    // pay for. Returning unwinds `_connection`, releases the name, and exits
-    // non-zero before a single authentication is served.
-    drop_capabilities_or_refuse().map_err(ServerError::Capabilities)?;
+    // So it moved to the top of `commands::daemon::run`, before anything
+    // spawns a thread, and `run` demands the `CapabilitiesDropped` token as
+    // proof. The bus-name argument gets simpler rather than weaker: refusing
+    // before the name is claimed means no client ever sees a half-privileged
+    // daemon at all.
 
     // Spawn a background task to release the camera on system suspend.
     // Best-effort: if logind is unavailable, log a warning and continue.
@@ -2294,10 +2373,9 @@ mod tests {
 
     /// The deliberate asymmetry: holding *fewer* caps than the mask is not a
     /// violation. A daemon started under a narrower bounding set than the
-    /// shipped unit grants (an operator edit, an unusual container) cannot
-    /// raise into the retained mask, so `capset` fails — that costs desktop
-    /// notifications and nothing the security model promised, and must not
-    /// stop the daemon from serving.
+    /// shipped unit grants (an operator edit, an unusual container) keeps less
+    /// than the retained mask — that costs desktop notifications and nothing
+    /// the security model promised, and must not stop it from serving.
     #[test]
     fn holding_fewer_caps_than_retained_is_not_a_violation() {
         // CAP_SETUID only: CAP_SETGID was never in the bounding set.
@@ -2307,6 +2385,87 @@ mod tests {
             inheritable: 0,
         };
         assert_eq!(capabilities_beyond_retained(held), 0);
+    }
+
+    /// The realistic narrower shape, which is *not* a subset of the retained
+    /// mask and so is not covered by the test above: an operator who wants no
+    /// desktop notifications writes a drop-in with
+    /// `CapabilityBoundingSet=CAP_CHOWN` and `AmbientCapabilities=`, and the
+    /// daemon starts with `permitted == {CAP_CHOWN}` — narrower than the mask
+    /// in one direction and wider in the other.
+    ///
+    /// Requesting the retained mask absolutely is `EPERM` here (the kernel
+    /// requires the new permitted set to be a subset of the old), and `capset`
+    /// rejects wholesale, so *nothing* would be dropped: CAP_CHOWN survives,
+    /// the read-back calls it a violation, and `Restart=on-failure` flaps the
+    /// daemon every `RestartSec` forever over a legitimate configuration.
+    /// Intersecting first asks for nothing the process lacks.
+    #[test]
+    fn a_bounding_set_of_cap_chown_alone_narrows_to_nothing() {
+        let permitted = 1u64 << CAP_CHOWN;
+
+        // Pre-drop, this state *is* a violation — which is what makes the
+        // wholesale-rejection failure mode fatal rather than merely untidy.
+        let before = HeldCapabilities {
+            effective: permitted,
+            permitted,
+            inheritable: 0,
+        };
+        assert_eq!(capabilities_beyond_retained(before), 1 << CAP_CHOWN);
+
+        // The drop asks for nothing, so it cannot be refused, and clears
+        // CAP_CHOWN on the way.
+        let keep = capabilities_to_keep(permitted);
+        assert_eq!(keep, 0, "must not request a capability the process lacks");
+
+        let after = HeldCapabilities {
+            effective: u64::from(keep),
+            permitted: u64::from(keep),
+            inheritable: u64::from(keep),
+        };
+        assert_eq!(capabilities_beyond_retained(after), 0);
+    }
+
+    /// `capset` requires the new permitted set to be a subset of the old one.
+    /// The mask handed to it must satisfy that for *every* starting set, not
+    /// just the shipped one — this is the property that keeps the drop from
+    /// failing wholesale and dropping nothing.
+    #[test]
+    fn the_kept_mask_is_always_a_subset_of_what_is_already_permitted() {
+        for permitted in [
+            0,
+            1 << CAP_CHOWN,
+            u64::from(retained_capability_mask()),
+            u64::from(retained_capability_mask()) | (1 << CAP_CHOWN), // the shipped unit
+            1 << 7,                                                   // CAP_SETUID alone
+            u64::MAX,                                                 // unconfined root
+        ] {
+            let keep = u64::from(capabilities_to_keep(permitted));
+            assert_eq!(
+                keep & !permitted,
+                0,
+                "kept {keep:#x} is not a subset of permitted {permitted:#x}"
+            );
+            assert_eq!(
+                keep & !u64::from(retained_capability_mask()),
+                0,
+                "kept {keep:#x} reaches beyond the retained mask"
+            );
+            assert_eq!(
+                keep & (1 << CAP_CHOWN),
+                0,
+                "CAP_CHOWN must never be kept, whatever the process started with"
+            );
+        }
+    }
+
+    /// The shipped configuration is unchanged by the intersection: bounding
+    /// `CAP_SETUID CAP_SETGID CAP_CHOWN` with the first two ambient still keeps
+    /// exactly the two the notification privilege-drop needs.
+    #[test]
+    fn the_shipped_unit_still_keeps_both_notification_caps() {
+        let permitted = u64::from(retained_capability_mask()) | (1 << CAP_CHOWN);
+        assert_eq!(capabilities_to_keep(permitted), retained_capability_mask());
     }
 
     /// **The load-bearing test.** CAP_CHOWN surviving in *any* of the three
@@ -2407,5 +2566,95 @@ mod tests {
             0,
             "effective must be a subset of permitted; got {held:?}"
         );
+    }
+
+    /// This thread's `NoNewPrivs` bit, straight from `/proc`. `None` when
+    /// `/proc` is not mounted or the field is absent.
+    ///
+    /// `/proc/thread-self` is the calling *thread*, not the process — which is
+    /// the whole point of the test below, and the same distinction that makes
+    /// `/proc/<pid>/status` (the main thread) the wrong thing to assert on a
+    /// running daemon.
+    fn no_new_privs() -> Option<bool> {
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
+        let value = status.lines().find_map(|l| l.strip_prefix("NoNewPrivs:"))?;
+        Some(value.trim() == "1")
+    }
+
+    fn set_no_new_privs() -> std::io::Result<()> {
+        // SAFETY: PR_SET_NO_NEW_PRIVS takes no pointer arguments, and setting
+        // it is unprivileged and always permitted.
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// **The regression pin for the ordering.** Narrowing a process is a
+    /// per-thread operation inherited only forwards, so *when* it happens
+    /// decides *which* threads it reaches. This runs both orders against a
+    /// real `tokio` multi-threaded runtime and shows the difference.
+    ///
+    /// Demonstrated with `PR_SET_NO_NEW_PRIVS` rather than `capset` because
+    /// the two travel by the same mechanism — a `task_struct` field copied at
+    /// `clone(2)` and never broadcast to siblings — and this is the half an
+    /// unprivileged test can actually set. `/proc/<tid>/status` reports it per
+    /// thread, exactly as it reports `CapPrm`, which is what
+    /// `test/pkg-validate.sh` walks across `/proc/<pid>/task/*` on the running
+    /// daemon.
+    ///
+    /// The whole experiment runs on a thread this test spawns: the bit is
+    /// irreversible, so it must land somewhere the test owns rather than on a
+    /// harness thread.
+    #[test]
+    fn only_threads_created_after_the_narrowing_inherit_it() {
+        std::thread::spawn(|| {
+            if no_new_privs() != Some(false) {
+                // No /proc, or something already set it for this process tree.
+                // Nothing left to demonstrate either way.
+                return;
+            }
+
+            let build = || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("multi-threaded runtime")
+            };
+            let worker_bit = |rt: &tokio::runtime::Runtime| {
+                rt.block_on(async { tokio::spawn(async { no_new_privs() }).await.unwrap() })
+            };
+
+            // A runtime built BEFORE the narrowing: the order this code used
+            // to have, where the drop sat after the bus name was claimed.
+            let early = build();
+            // Force its workers into existence now, as production does long
+            // before that old drop site (models loaded, bus connected).
+            early.block_on(async { tokio::spawn(async {}).await.unwrap() });
+
+            set_no_new_privs().expect("PR_SET_NO_NEW_PRIVS is unprivileged");
+            assert_eq!(no_new_privs(), Some(true), "the calling thread narrows");
+
+            // A runtime built AFTER it: the order `commands::daemon::run` now
+            // guarantees by demanding a `CapabilitiesDropped`.
+            let late = build();
+
+            assert_eq!(
+                worker_bit(&early),
+                Some(false),
+                "a worker that existed before the narrowing kept the wider credentials. \
+                 This is the defect: narrowing once the runtime is up reaches none of the \
+                 threads that serve Authenticate, and a per-thread read-back cannot see it."
+            );
+            assert_eq!(
+                worker_bit(&late),
+                Some(true),
+                "a worker created after the narrowing must inherit it"
+            );
+        })
+        .join()
+        .expect("experiment thread");
     }
 }

@@ -37,16 +37,41 @@ type CameraFactory = Box<dyn Fn(&Config) -> Result<Camera<'static>, String> + Se
 /// makes that unrepresentable, and it is the same one `server`'s mtime watch
 /// stats (`paths::config_path()`).
 fn build_handler() -> Result<(ProductionHandler, u64), String> {
+    build_handler_from(load_config_and_ensure_layout()?)
+}
+
+/// The privileged prologue: parse the config and converge the on-disk layout.
+///
+/// Split out of [`build_handler`] because it is the part that needs
+/// `CAP_CHOWN`, and the daemon narrows its capabilities between this and the
+/// rest of startup (see [`run`]). `build_handler` still runs both halves back
+/// to back, because it is also the live-reload recipe — a reload re-reads the
+/// config and re-converges the layout exactly as before. What a reload no
+/// longer has is `CAP_CHOWN`, which is the documented model rather than a
+/// regression: the steady state chowns nothing, and a reload that genuinely
+/// needed one now fails the rebuild (the daemon logs it and keeps serving with
+/// the handler it already has) instead of quietly succeeding on a thread that
+/// happened to still hold the capability.
+fn load_config_and_ensure_layout() -> Result<Config, String> {
     // Deliberate re-read (D7): this is the daemon's config lifecycle — one
     // parse at startup, one per mtime-triggered reload (maybe_reload_handler).
     // Everything downstream consumes the Config held by the handler.
-    let mut config = Config::load().map_err(|e| format!("failed to load config: {e}"))?;
+    let config = Config::load().map_err(|e| format!("failed to load config: {e}"))?;
 
     // Before anything opens the store: the daemon runs as root, so this is
     // where an upgraded install converges on the documented modes. A handful
     // of stat calls in the steady state.
     crate::state_layout::ensure_state_layout(&config).map_err(|e| format!("{e:#}"))?;
 
+    Ok(config)
+}
+
+/// Everything after the privileged prologue: device resolution, the ONNX
+/// engine, the store, the handler. None of it needs a capability, which is why
+/// [`run`] can drop them before calling this — and must, because
+/// `FaceEngine::load` is where ONNX Runtime brings up its intra-op thread
+/// pools, and those threads keep whatever credentials they are born with.
+fn build_handler_from(mut config: Config) -> Result<(ProductionHandler, u64), String> {
     let quirks = QuirksDb::load();
 
     if config.device.path.is_none() {
@@ -221,18 +246,47 @@ pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
 
     info!("facelock daemon starting");
 
-    let (handler, idle_timeout_secs) = match build_handler() {
-        Ok(r) => r,
+    // Startup is ordered around one hinge: everything that needs CAP_CHOWN
+    // runs first, then the process narrows itself, then everything that
+    // creates a thread runs.
+    //
+    // The narrowing has to land in that gap because capabilities and
+    // PR_SET_NO_NEW_PRIVS are per-*thread* and inherited only forwards. Doing
+    // it later — as this did, after the bus name was claimed — leaves every
+    // thread already in flight holding CAP_CHOWN for the daemon's lifetime:
+    // ONNX Runtime's intra-op pools (six threads, spawned inside
+    // `FaceEngine::load`) and every tokio worker and blocking thread, which is
+    // to say precisely the threads that go on to serve `Authenticate`.
+    // `capget` would not have caught it either, being per-thread itself.
+    //
+    // Here the process is still single-threaded, so the narrowing reaches the
+    // whole daemon, and refusing costs nothing anyone can observe: no bus name
+    // is claimed yet, so a client sees the same thing it sees when the daemon
+    // is not running at all.
+    let config = match load_config_and_ensure_layout() {
+        Ok(c) => c,
         Err(e) => {
             error!("{e}");
             std::process::exit(1);
         }
     };
 
-    // After the handler, so the store exists and the state layout has been
-    // ensured; the handler owns the parsed config, so this adds no second read
-    // of the config file (resolved::config_load_call_sites_are_pinned).
-    reconcile_enrollment_markers(&handler.config);
+    // The other CAP_CHOWN user, and the last one: markers are chowned to the
+    // user each describes. Moved ahead of the handler (it used to read
+    // `handler.config`) so it stays on the privileged side of the hinge; it
+    // takes the same parsed Config, so this still adds no second read of the
+    // config file (resolved::config_load_call_sites_are_pinned).
+    reconcile_enrollment_markers(&config);
+
+    let narrowed = facelock_daemon::server::drop_capabilities_or_refuse()?;
+
+    let (handler, idle_timeout_secs) = match build_handler_from(config) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("{e}");
+            std::process::exit(1);
+        }
+    };
 
     let config_mtime = std::fs::metadata(facelock_core::paths::config_path())
         .and_then(|m| m.modified())
@@ -247,6 +301,7 @@ pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
         config_mtime,
         Some(rebuild),
         notifier_factory,
+        &narrowed,
     )
     .map_err(Into::into)
 }
