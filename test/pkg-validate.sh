@@ -3,6 +3,23 @@ set -euo pipefail
 
 PASS=0
 FAIL=0
+SKIP=0
+
+# Record an assertion (or a whole block of them) that did not run.
+#
+# Counting these is the point. A summary that can only say "N passed, 0 failed"
+# reads identically whether every assertion ran or a third of them were stepped
+# over — which is exactly how the runtime CAP_CHOWN thread walk went missing
+# from a green "39 passed, 0 failed" run while the same command with models
+# present reported 42. A run that skips must not be able to look like a run
+# that checked.
+skip_test() {
+    local name="$1"
+    local reason="$2"
+
+    echo "SKIP: $name ($reason)"
+    SKIP=$((SKIP + 1))
+}
 
 run_test() {
     local name="$1"
@@ -82,6 +99,8 @@ run_test "facelock runtime directories exist (tmpfiles)" "if command -v systemd-
 # PAM tests (only if pamtester is available)
 if command -v pamtester >/dev/null 2>&1 && [ -f /etc/pam.d/facelock-test ]; then
     run_test "PAM module loads via pamtester" "pamtester facelock-test testuser authenticate < /dev/null 2>&1 | grep -qiE '(successfully|authentication failure)'"
+else
+    skip_test "PAM module loads via pamtester" "pamtester or /etc/pam.d/facelock-test unavailable"
 fi
 
 # D-Bus tests (only if dbus-daemon is available)
@@ -94,13 +113,19 @@ if command -v dbus-daemon >/dev/null 2>&1; then
         run_test "D-Bus facelock service activatable" "busctl --system list --activatable 2>/dev/null | grep -q org.facelock.Daemon"
     elif command -v dbus-send >/dev/null 2>&1; then
         run_test "D-Bus facelock service activatable" "dbus-send --system --dest=org.freedesktop.DBus --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListActivatableNames 2>/dev/null | grep -q org.facelock.Daemon"
+    else
+        skip_test "D-Bus facelock service activatable" "neither busctl nor dbus-send available"
     fi
 
     # Polkit agent D-Bus boundary: non-allowlisted actions decline (fall
     # through to password), allowlisted actions pass the allowlist gate.
     if [ -x /polkit-agent-validate.sh ]; then
         run_test "polkit agent allowlist gate (D-Bus boundary)" "/polkit-agent-validate.sh"
+    else
+        skip_test "polkit agent allowlist gate (D-Bus boundary)" "/polkit-agent-validate.sh not present in this image"
     fi
+else
+    skip_test "D-Bus block (bus starts, service activatable, polkit allowlist gate)" "dbus-daemon unavailable"
 fi
 
 # systemd hardening validation — only runs under a booted systemd
@@ -222,7 +247,8 @@ if [ -d /run/systemd/system ] && systemctl show facelock-daemon >/dev/null 2>&1;
         run_test "sandbox blocks AF_INET socket (outbound TCP impossible)" "! af_inet_in_sandbox"
         run_test "control: AF_INET socket allowed without sandbox" "af_inet_unrestricted"
     else
-        echo "SKIP: outbound-TCP-blocked check (systemd-run or python3 unavailable)"
+        skip_test "sandbox blocks AF_INET socket (outbound TCP impossible)" "systemd-run or python3 unavailable"
+        skip_test "control: AF_INET socket allowed without sandbox" "systemd-run or python3 unavailable"
     fi
 
     # Daemon start test. The daemon loads ONNX models at startup, so this
@@ -243,11 +269,35 @@ if [ -d /run/systemd/system ] && systemctl show facelock-daemon >/dev/null 2>&1;
         # assertion that makes the promise checkable.
         run_test "runtime: no daemon thread holds CAP_CHOWN while serving" "daemon_threads_without_cap_chown"
         systemctl stop facelock-daemon 2>/dev/null || true
+    elif [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = "1" ]; then
+        # Explicitly asked for a partial run. Name every assertion that is not
+        # running so the results line has to account for them.
+        no_models="no ONNX models at /var/lib/facelock/models, FACELOCK_ALLOW_MISSING_MODELS=1"
+        skip_test "facelock-daemon starts under hardened unit" "$no_models"
+        skip_test "facelock-daemon answers on D-Bus" "$no_models"
+        skip_test "runtime: no daemon thread holds CAP_CHOWN while serving" "$no_models"
     else
-        echo "SKIP: daemon start test (no ONNX models at /var/lib/facelock/models — run via just test-deb-pkg/test-rpm-pkg with repo models present)"
+        # Under a booted systemd, missing models are a broken invocation, not a
+        # property of the environment: the whole reason to boot systemd here is
+        # to start the daemon and read what it holds. Silently dropping the
+        # block left `just test-deb-pkg` reporting a clean pass on a checkout
+        # that never started a daemon — and the assertion it dropped is the
+        # only one that can catch a per-thread capability regression. Fail.
+        echo "FAIL: daemon-start block did not run (no ONNX models at /var/lib/facelock/models)"
+        echo "      Missing: the daemon start, its D-Bus Ping, and the runtime"
+        echo "      CAP_CHOWN thread walk — the regression pin for the per-thread"
+        echo "      capability drop. The unit: CapabilityBoundingSet assertions above"
+        echo "      read systemd configuration only and pass either way."
+        echo "      Fix: run from a checkout with the ONNX models present"
+        echo "        sudo cp /var/lib/facelock/models/*.onnx models/   # gitignored, cannot be committed"
+        echo "        just test-deb-pkg   # or test-rpm-pkg"
+        echo "      To accept a partial run, set FACELOCK_ALLOW_MISSING_MODELS=1;"
+        echo "      the three assertions are then counted as skipped, not passed."
+        FAIL=$((FAIL + 1))
     fi
 else
-    echo "SKIP: not running under a booted systemd (unit directives not verifiable here)"
+    skip_test "systemd hardening + daemon-runtime block (unit directives, sandbox probes, daemon start, runtime CAP_CHOWN walk)" \
+        "not running under a booted systemd"
 fi
 
 # Package removal test — must come last since it removes the package
@@ -269,11 +319,16 @@ elif command -v rpm >/dev/null 2>&1 && rpm -q facelock >/dev/null 2>&1; then
         "[ ! -f /lib/security/pam_facelock.so ] && [ ! -f /usr/lib/security/pam_facelock.so ] && [ ! -f /usr/lib64/security/pam_facelock.so ]"
     run_test "Config preserved after rpm -e (config(noreplace))" "[ -f /etc/facelock/config.toml ] || [ -f /etc/facelock/config.toml.rpmsave ]"
 else
-    echo "(no package-manager-installed facelock — skipping removal tests)"
+    skip_test "package removal block (removal, binary/PAM module gone, config preserved)" \
+        "facelock was not installed by dpkg or rpm here"
 fi
 
 echo ""
-echo "=== Results: $PASS passed, $FAIL failed ==="
+echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped ==="
+if [ "$SKIP" -gt 0 ]; then
+    echo "NOTE: $SKIP assertion(s)/block(s) above did not run — this run proves less"
+    echo "      than a full one. Grep the log for '^SKIP:' to see which."
+fi
 
 if [ "$FAIL" -gt 0 ]; then
     exit 1

@@ -12,18 +12,33 @@ set -euo pipefail
 
 IMAGE="${1:?usage: run-pkg-validate-systemd.sh <image>}"
 
-# Bind-mount repo ONNX models (if present) so the daemon-start test can run:
-# `facelock daemon` loads models at startup. Models are large and gitignored,
-# so this is best-effort — pkg-validate.sh skips the daemon-start test
-# honestly when the mount is absent.
+# Bind-mount repo ONNX models so the daemon-start test can run: `facelock
+# daemon` loads models at startup. Models are large and gitignored, so a fresh
+# worktree does not have them — which used to mean the daemon-start block (and
+# the runtime CAP_CHOWN thread walk inside it) quietly vanished from an
+# otherwise green run. It is now a failure inside the container unless
+# FACELOCK_ALLOW_MISSING_MODELS=1 says a partial run is wanted, and that
+# opt-out is forwarded into the exec below.
 mounts=()
 shopt -s nullglob
 onnx=(models/*.onnx)
 shopt -u nullglob
 if [ "${#onnx[@]}" -gt 0 ]; then
     mounts=(-v "$PWD/models:/var/lib/facelock/models")
+elif [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = "1" ]; then
+    echo "WARNING: no models/*.onnx in repo — the daemon-start assertions will be" >&2
+    echo "         reported as skipped (FACELOCK_ALLOW_MISSING_MODELS=1)." >&2
 else
-    echo "NOTE: no models/*.onnx in repo — daemon-start test will be skipped"
+    echo "WARNING: no models/*.onnx in repo — the daemon-start assertions cannot run" >&2
+    echo "         and pkg-validate.sh will FAIL. Copy them in first:" >&2
+    echo "           sudo cp /var/lib/facelock/models/*.onnx models/" >&2
+    echo "         or set FACELOCK_ALLOW_MISSING_MODELS=1 to accept a partial run." >&2
+fi
+
+# Forward the opt-out into the container; pkg-validate.sh reads it.
+exec_env=()
+if [ -n "${FACELOCK_ALLOW_MISSING_MODELS:-}" ]; then
+    exec_env=(-e "FACELOCK_ALLOW_MISSING_MODELS=$FACELOCK_ALLOW_MISSING_MODELS")
 fi
 
 # --systemd=always: podman sets up /run, /tmp, cgroups and SIGRTMIN+3 for a
@@ -51,4 +66,4 @@ if [ -z "$booted" ]; then
     exit 1
 fi
 
-podman exec "$cid" /pkg-validate.sh
+podman exec "${exec_env[@]}" "$cid" /pkg-validate.sh
