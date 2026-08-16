@@ -106,7 +106,14 @@ pub fn y16_shift_from_peak(peak: u16) -> u8 {
 /// frame. Recomputing it per frame is contrast normalization upstream of
 /// [`check_ir_texture`], whose `min_stddev` cutoff is calibrated against a
 /// fixed scale (see `docs/security.md` §1.C).
-pub fn y16_shift(data: &[u8]) -> u8 {
+///
+/// Test-only, deliberately: a one-shot whole-buffer helper is the shape a
+/// per-frame call takes, and shipping it as API invites exactly the recompute
+/// the paragraph above forbids. The capture path pins the scale from a burst
+/// instead (`calibrate_y16_shift`); this remains so the tests can pin the
+/// peak-to-shift mapping in one call.
+#[cfg(test)]
+fn y16_shift(data: &[u8]) -> u8 {
     y16_shift_from_peak(y16_peak(data))
 }
 

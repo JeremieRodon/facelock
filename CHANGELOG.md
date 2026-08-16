@@ -280,13 +280,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negotiating an unsupported format (and then failing every capture), opening a
   device with no decodable format errors immediately with the advertised and
   supported format lists.
-- **Pixel-format names lose V4L2's trailing-space padding on machine-readable
-  surfaces** (#89): FourCCs are normalized where they enter facelock (device
-  enumeration and quirks-file parsing), so `facelock devices --json` and the
-  `ListDevices` D-Bus reply now carry `"Y16"` where they previously carried
-  `"Y16 "`. The human-readable `facelock devices` table already trimmed and is
-  unchanged. A consumer matching the padded spelling exactly needs updating; one
-  that trims already does not.
+- **Pixel-format names lose V4L2's trailing-space padding** (#89): FourCCs are
+  normalized where they enter facelock (device enumeration and quirks-file
+  parsing), so `facelock devices --json` now carries `"Y16"` where it
+  previously carried `"Y16 "`. This applies on the direct backend only, which
+  is the one that reports formats at all: the D-Bus `DeviceInfo` carries no
+  formats field, so a daemon-backed `--json` reports `"formats": []` either
+  way. The human-readable `facelock devices` table already trimmed and is
+  unchanged. A consumer that reads formats from the direct backend and matches
+  the padded spelling exactly needs updating; one that trims already does not.
 
 ### Fixed
 

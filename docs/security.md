@@ -204,9 +204,13 @@ for `is_ir` and the fingerprint.
 
 Cost note: on a Y16 device with no `y16_bit_depth` quirk, the calibration burst runs inside
 `Camera::open`, *before* the warmup discard and with the IR emitter already enabled — so it
-is emitter-LED-on time, bounded by one second, on every cold open. Declaring
-`y16_bit_depth` skips it entirely and is the preferred configuration on IR hardware. The
-shipped RealSense entries in `config/quirks.d/00-defaults.toml` do **not** declare one yet.
+is emitter-LED-on time on every cold open. The burst stops starting captures after one
+second, but the check sits at the top of its loop, so a dequeue already in flight can carry
+it to about one second plus one `CAPTURE_TIMEOUT`. It is also paid *in addition to* the
+caller's own warmup discard, so a device declaring `warmup_frames = 10` spends 10 burst
+frames and then discards 10 more. Declaring `y16_bit_depth` skips the burst entirely and is
+the preferred configuration on IR hardware. The shipped RealSense entries in
+`config/quirks.d/00-defaults.toml` do **not** declare one yet.
 
 **Raw-frame calibration**: on the raw frame, flat surfaces (photos/screens in IR) score
 std_dev **< 5**, real IR skin scores **> 15**. The cutoff `security.ir_texture_min_stddev`

@@ -474,7 +474,9 @@ On a Y16 device, open also pins the session's 16-bit-to-8-bit shift, which is
 never recomputed per frame (`docs/security.md` §1.C). A quirk's `y16_bit_depth`
 (8..=16) is authoritative and skips frame inspection; otherwise the shift comes
 from the brightest sample in a burst of frames captured at open (at least the
-device's `warmup_frames`, bounded by one second). The pinned shift belongs to
+device's `warmup_frames`; the burst stops starting captures after one second,
+so a dequeue already in flight can carry it to roughly one second plus one
+`CAPTURE_TIMEOUT`). The pinned shift belongs to
 the open camera: a warm hold (see "Camera hold" above) keeps it, and a reopen
 recalibrates. A Y16 device that produces no frame at all within the calibration
 budget fails `Camera::open` rather than opening with a guessed scale.
@@ -486,10 +488,15 @@ are exempt — their `bytesperline` is not a row size.
 
 **FourCC normalization.** V4L2 pads FourCCs to four characters with trailing
 spaces (`"Y16 "`). Facelock strips that padding at every ingest point — device
-enumeration (`query_device`) and quirks-file parsing — so `DeviceInfo.formats`,
-the `ListDevices` D-Bus payload and `facelock devices --json` all carry the
-unpadded spelling (`"Y16"`, not `"Y16 "`). The human-readable `facelock devices`
-table already trimmed, so only the machine-readable surfaces change.
+enumeration (`query_device`) and quirks-file parsing — so `DeviceInfo.formats`
+carries the unpadded spelling (`"Y16"`, not `"Y16 "`).
+
+The only machine-readable surface that changes is `facelock devices --json`
+**on the direct backend**, which is where format detail exists at all: the
+D-Bus `DeviceInfo` does not carry formats, so under the daemon backend
+`--json` reports `"formats": []` and there is no spelling to change
+(`BackendCaps::device_formats`, false for `BackendKind::Daemon`). The
+human-readable `facelock devices` table already trimmed.
 
 ## Database Schema
 

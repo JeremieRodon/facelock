@@ -42,7 +42,18 @@ const Y16_CALIBRATION_FRAMES: usize = 8;
 /// Wall-clock ceiling on that burst. Frames are already flowing when it runs,
 /// so it normally costs a fraction of a second; the budget keeps a stalling
 /// camera from stretching `Camera::open` by `CAPTURE_TIMEOUT` eight times over.
+///
+/// This bounds when the burst STOPS starting new captures, not when it
+/// returns: the check sits at the top of the loop, so a dequeue begun just
+/// under the budget can still block for `CAPTURE_TIMEOUT`. Worst case is
+/// therefore this budget plus one `CAPTURE_TIMEOUT`, not this budget alone.
 const Y16_CALIBRATION_BUDGET: Duration = Duration::from_secs(1);
+
+/// Consecutive-error ceiling for the calibration burst, kept separate from
+/// [`Y16_CALIBRATION_FRAMES`] deliberately: the frame target scales with a
+/// device's declared `warmup_frames`, and an error budget that rode along
+/// with it would silently loosen when someone lengthened the burst.
+const Y16_CALIBRATION_MAX_ERRORS: usize = 8;
 
 /// Pixel formats facelock can decode to RGB, in negotiation priority order:
 /// IR-native grayscale first, then cheap lossless raw conversions, then MJPG
@@ -116,8 +127,17 @@ fn y16_calibration_frames(quirk: Option<&Quirk>) -> usize {
 }
 
 /// Pin the session Y16 scale by sampling a burst of frames and taking the
-/// brightest sample any of them produced. The peak is a lower bound on the
-/// sensor's full scale, so more frames can only improve the estimate.
+/// brightest sample any of them produced.
+///
+/// More frames raise the peak toward the sensor's full scale, which is the
+/// point of the burst. They do NOT bound it from above: `y16_peak` is an
+/// unbounded max over every pixel, so one stuck pixel or one specular IR
+/// glint sets it alone. On a 10-bit sensor a pixel latched at 4095 pins
+/// shift 4 where 2 was right, and every later frame is scaled down 4x —
+/// enough to drop a real face under `ir_texture_min_stddev` for the whole
+/// session. `Y16Calibration::Saturated` only catches the `u16::MAX`
+/// endpoint, so that case warns nothing. A quirk's `y16_bit_depth` is the
+/// only way to take the scale out of the scene's hands entirely.
 ///
 /// Individual capture errors are tolerated as long as one frame arrives; with
 /// none, opening fails rather than proceeding on a guessed scale.
@@ -129,7 +149,7 @@ fn calibrate_y16_shift(stream: &mut Stream<'_>, device_path: &str, target: usize
     let mut last_err = None;
 
     while frames < target
-        && errors < Y16_CALIBRATION_FRAMES
+        && errors < Y16_CALIBRATION_MAX_ERRORS
         && start.elapsed() < Y16_CALIBRATION_BUDGET
     {
         match stream.next() {
@@ -152,6 +172,27 @@ fn calibrate_y16_shift(stream: &mut Stream<'_>, device_path: &str, target: usize
         return Err(FacelockError::Camera(format!(
             "{device_path}: Y16 calibration failed: {detail}"
         )));
+    }
+
+    // A burst cut short by the wall-clock budget or the error budget pins the
+    // scale from however few frames arrived, and at one frame that is the
+    // single-frame AGC race the burst exists to avoid. The peak is still a
+    // lower bound, so the shift is not wrong by construction — but it was
+    // decided on less evidence than intended, and nothing else says so: a
+    // mid-range peak from one dark frame takes the `Normal` arm below and
+    // logs nothing.
+    if frames < target {
+        tracing::warn!(
+            device = %device_path,
+            frames,
+            target,
+            errors,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Y16 calibration burst ended early: pinned the session scale from \
+             fewer frames than intended, so the camera's exposure may not have \
+             settled. Set the quirk's y16_bit_depth for this device to pin the \
+             scale from hardware instead."
+        );
     }
 
     let (shift, verdict) = preprocess::y16_calibration(peak);
