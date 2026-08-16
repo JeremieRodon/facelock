@@ -933,10 +933,9 @@ impl SoftwareSealer {
     }
 
     /// Encrypt arbitrary bytes, optionally binding to `aad`.
-    #[allow(deprecated)] // aes-gcm uses deprecated generic-array API
     pub fn seal_bytes_with_aad(&self, data: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
-        use aes_gcm::aead::{Aead, Payload};
-        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use aes_gcm::aead::{Aead, Nonce, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit};
         use rand::Rng;
 
         let cipher = Aes256Gcm::new_from_slice(&self.key)
@@ -944,7 +943,8 @@ impl SoftwareSealer {
 
         let mut nonce_bytes = [0u8; AES_NONCE_SIZE];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = <&Nonce<Aes256Gcm>>::try_from(&nonce_bytes[..])
+            .map_err(|e| FacelockError::Encryption(format!("invalid nonce: {e}")))?;
 
         let payload = Payload {
             msg: data,
@@ -965,10 +965,9 @@ impl SoftwareSealer {
     }
 
     /// Decrypt a software-encrypted blob, optionally requiring `aad`.
-    #[allow(deprecated)] // aes-gcm uses deprecated generic-array API
     pub fn unseal_bytes_with_aad(&self, sealed: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
-        use aes_gcm::aead::{Aead, Payload};
-        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use aes_gcm::aead::{Aead, Nonce, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit};
 
         let min_size = 1 + AES_NONCE_SIZE + 16; // version + nonce + tag (minimum)
         if sealed.len() < min_size {
@@ -982,7 +981,8 @@ impl SoftwareSealer {
             )));
         }
 
-        let nonce = Nonce::from_slice(&sealed[1..1 + AES_NONCE_SIZE]);
+        let nonce = <&Nonce<Aes256Gcm>>::try_from(&sealed[1..1 + AES_NONCE_SIZE])
+            .map_err(|e| FacelockError::Encryption(format!("invalid nonce: {e}")))?;
         let ciphertext = &sealed[1 + AES_NONCE_SIZE..];
 
         let cipher = Aes256Gcm::new_from_slice(&self.key)
@@ -1450,6 +1450,63 @@ mod tests {
         let sealed2 = sealer.seal_bytes_with_aad(data, None).unwrap();
         let via_plain = sealer.unseal_bytes(&sealed2).unwrap();
         assert_eq!(via_plain, data);
+    }
+
+    // Golden vectors for the software blob format: 0x02 | 12-byte nonce |
+    // ciphertext || 16-byte tag. Both were produced by an AES-256-GCM
+    // implementation outside the `aes-gcm` crate, so they pin the *on-disk*
+    // format rather than whatever the current crate version happens to emit.
+    // The round-trip tests above cannot catch a format change, because they
+    // seal and unseal with the same code. Stored embeddings outlive any
+    // dependency bump: if an `aes-gcm` upgrade ever changed nonce placement,
+    // tag position, or AAD handling, every existing enrollment would silently
+    // become undecryptable, and these are the tests that would say so.
+    const GOLDEN_KEY: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    const GOLDEN_PLAINTEXT: &[u8] = b"facelock software-sealed embedding v2";
+    const GOLDEN_AAD: &[u8] = b"facelock-device:golden-cam";
+
+    #[test]
+    fn software_unseal_golden_blob_no_aad() {
+        const GOLDEN_NO_AAD: [u8; 66] = [
+            0x02, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x21,
+            0x63, 0xb5, 0x7e, 0xa9, 0x8a, 0xa1, 0x70, 0xad, 0x32, 0xf8, 0xed, 0xc5, 0x9e, 0x19,
+            0x1f, 0xe6, 0xfb, 0xf4, 0x51, 0x91, 0x17, 0x3a, 0x18, 0x18, 0x02, 0x88, 0xe7, 0x78,
+            0x0d, 0x64, 0xdb, 0x6f, 0x77, 0x8e, 0x8a, 0x9d, 0xe9, 0x03, 0x38, 0x64, 0xb5, 0x0e,
+            0x3c, 0xb5, 0x64, 0x9b, 0xd6, 0x69, 0x59, 0x6d, 0xb0, 0xac,
+        ];
+
+        let sealer = SoftwareSealer::from_key(GOLDEN_KEY);
+        let plaintext = sealer
+            .unseal_bytes(&GOLDEN_NO_AAD)
+            .expect("golden unbound blob must still decrypt");
+        assert_eq!(plaintext, GOLDEN_PLAINTEXT);
+    }
+
+    #[test]
+    fn software_unseal_golden_blob_with_aad() {
+        const GOLDEN_WITH_AAD: [u8; 66] = [
+            0x02, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x21,
+            0x63, 0xb5, 0x7e, 0xa9, 0x8a, 0xa1, 0x70, 0xad, 0x32, 0xf8, 0xed, 0xc5, 0x9e, 0x19,
+            0x1f, 0xe6, 0xfb, 0xf4, 0x51, 0x91, 0x17, 0x3a, 0x18, 0x18, 0x02, 0x88, 0xe7, 0x78,
+            0x0d, 0x64, 0xdb, 0x6f, 0x77, 0x8e, 0x8a, 0x9d, 0xa0, 0x39, 0x79, 0x50, 0xc3, 0xe0,
+            0x74, 0xcb, 0x1b, 0x25, 0xc6, 0x69, 0x20, 0x78, 0xbc, 0xcf,
+        ];
+
+        let sealer = SoftwareSealer::from_key(GOLDEN_KEY);
+        let plaintext = sealer
+            .unseal_bytes_with_aad(&GOLDEN_WITH_AAD, Some(GOLDEN_AAD))
+            .expect("golden device-bound blob must still decrypt");
+        assert_eq!(plaintext, GOLDEN_PLAINTEXT);
+
+        // The AAD is authenticated, not stored: decrypting without it must fail.
+        assert!(
+            sealer.unseal_bytes(&GOLDEN_WITH_AAD).is_err(),
+            "golden device-bound blob must not decrypt without its AAD"
+        );
     }
 
     #[cfg(unix)]
