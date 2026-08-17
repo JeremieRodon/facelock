@@ -20,19 +20,6 @@ pub mod status;
 pub mod test_cmd;
 pub mod tpm;
 
-use clap::Subcommand;
-
-#[derive(Subcommand)]
-pub enum TpmCommand {
-    /// Report TPM availability and configuration
-    Status,
-    /// Seal the AES encryption key with TPM (migrate keyfile → tpm)
-    SealKey,
-    /// Unseal the AES key from TPM back to a plaintext keyfile (migrate tpm → keyfile)
-    UnsealKey,
-    /// Read-only check that the sealed AES key currently unseals (verifies PCR
-    /// policy is satisfied). Writes nothing; exits non-zero if unseal fails.
-    UnsealCheck,
-    /// Display current PCR values for configured indices
-    PcrBaseline,
-}
+/// Re-exported so the historical `commands::TpmCommand` path keeps working;
+/// the enum itself lives beside its dispatcher in [`tpm`].
+pub use tpm::TpmCommand;

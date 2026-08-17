@@ -1,17 +1,32 @@
 use std::process::Command;
 
 use anyhow::{Context, bail};
+use clap::Subcommand;
 
-pub fn run(edit: bool) -> anyhow::Result<()> {
+/// Verbs on the config file.
+///
+/// `None` at the call site means [`ConfigCommand::Show`]: bare `facelock
+/// config` still displays, which is the unprivileged read DEC-6 lists (ADR
+/// 009).
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Print the config file path and contents (what bare `facelock config` does)
+    Show,
+    /// Open the config file in $EDITOR
+    Edit,
+}
+
+pub fn run(command: Option<ConfigCommand>) -> anyhow::Result<()> {
     let config_path = facelock_core::paths::config_path();
 
-    if edit {
-        // DEC-6: display stays unprivileged (it reads a 0644 file), but
-        // editing is root — must run before the editor ever opens (C6).
-        crate::ipc_client::require_root("sudo facelock config --edit")?;
-        open_in_editor(&config_path)?;
-    } else {
-        show_config(&config_path)?;
+    match command.unwrap_or(ConfigCommand::Show) {
+        ConfigCommand::Show => show_config(&config_path)?,
+        ConfigCommand::Edit => {
+            // DEC-6: display stays unprivileged (it reads a 0644 file), but
+            // editing is root — must run before the editor ever opens (C6).
+            crate::ipc_client::require_root("sudo facelock config edit")?;
+            open_in_editor(&config_path)?;
+        }
     }
 
     Ok(())
@@ -80,7 +95,7 @@ fn open_in_editor(config_path: &std::path::Path) -> anyhow::Result<()> {
     if let (Some(old), Some(new)) = (old_config, new_config) {
         if needs_daemon_restart(&old, &new) {
             println!("Daemon-relevant settings changed. Restarting daemon...");
-            restart_daemon();
+            crate::commands::daemon::restart_daemon();
         }
     }
 
@@ -116,40 +131,6 @@ fn needs_daemon_restart(old: &facelock_core::Config, new: &facelock_core::Config
         || old.storage.db_path != new.storage.db_path
         // Model directory change
         || old.daemon.model_dir != new.daemon.model_dir
-}
-
-/// Restart the facelock daemon via systemd, or via D-Bus shutdown if systemd is unavailable.
-fn restart_daemon() {
-    // Try systemd first (most common)
-    let result = Command::new("systemctl")
-        .args(["restart", "facelock-daemon.service"])
-        .status();
-
-    match result {
-        Ok(s) if s.success() => println!("Daemon restarted."),
-        _ => {
-            // Fallback: send shutdown via D-Bus, let systemd auto-restart or D-Bus activation
-            // handle the next request
-            let _ = Command::new("busctl")
-                .args([
-                    "--system",
-                    "call",
-                    "org.facelock.Daemon",
-                    "/org/facelock/Daemon",
-                    "org.facelock.Daemon",
-                    "Shutdown",
-                ])
-                .status();
-            println!("Daemon shutdown requested (will restart on next use).");
-        }
-    }
-}
-
-/// Restart the facelock daemon. Called by `facelock restart`.
-pub fn restart() -> anyhow::Result<()> {
-    crate::ipc_client::require_root("sudo facelock restart")?;
-    restart_daemon();
-    Ok(())
 }
 
 fn find_fallback_editor() -> String {

@@ -259,24 +259,58 @@ facelock status
 
 ## facelock config
 
-Show or edit the configuration file.
+Show or edit the configuration file. Bare `facelock config` is
+`facelock config show`.
+
+### facelock config show
+
+Print the config file path and its contents, then report whether it parses.
+Unprivileged — it reads a `0644` file.
 
 ```bash
 facelock config                         # show config path and contents
-facelock config --edit                  # open in $EDITOR
+facelock config show                    # the same, spelled out
+```
+
+### facelock config edit
+
+Open the config file in `$EDITOR` (then `$VISUAL`, then `nano`/`vi`/`vim`),
+validate it on save, and restart the daemon when a setting it caches at startup
+changed. Requires root.
+
+```bash
+sudo facelock config edit
 ```
 
 ## facelock daemon
 
-Run the persistent authentication daemon.
+Run or restart the persistent authentication daemon. Bare `facelock daemon` is
+`facelock daemon run`, which is the form every shipped service unit invokes.
+
+### facelock daemon run
+
+Run the daemon in the foreground. Requires root — it opens the camera and the
+face database. Normally managed by systemd, not run manually.
 
 ```bash
-facelock daemon                         # use default config
-facelock daemon -c /path/to/config.toml # short alias for --config
-facelock daemon --config /path/to/config.toml
+sudo facelock daemon                         # use default config
+sudo facelock daemon run                     # the same, spelled out
+sudo facelock daemon -c /path/to/config.toml # short alias for --config
+sudo facelock daemon --config /path/to/config.toml
 ```
 
-Normally managed by systemd, not run manually.
+### facelock daemon restart
+
+Restart the persistent daemon. On systemd systems, runs `systemctl restart
+facelock-daemon.service`. Otherwise, sends a D-Bus shutdown request and the
+daemon restarts on next use via D-Bus activation.
+
+Requires root. If run interactively as a non-root user, the CLI prompts to
+re-run via `sudo`.
+
+```bash
+sudo facelock daemon restart
+```
 
 ## facelock auth
 
@@ -291,7 +325,10 @@ Exit codes: 0 = matched, 1 = no match, 2 = error.
 
 ## facelock tpm
 
-TPM integration status and management.
+Everything that manages the embedding encryption key: the TPM device that can
+seal it, and the key material itself. `encrypt`, `decrypt` and `reseal` live
+here because the group owns the key's lifecycle — `encrypt` and `decrypt` run
+software AES-256-GCM with no TPM involved.
 
 ### facelock tpm status
 
@@ -321,7 +358,7 @@ sudo facelock tpm unseal-key
 
 Read-only check that the sealed AES key still unseals under the current PCR
 values. Writes nothing, and exits non-zero when it does not — which is the
-signal to run [`facelock reseal`](#facelock-reseal).
+signal to run [`facelock tpm reseal`](#facelock-tpm-reseal).
 
 ```bash
 sudo facelock tpm unseal-check
@@ -334,6 +371,45 @@ Display the current PCR values for all configured PCR indices.
 ```bash
 sudo facelock tpm pcr-baseline
 ```
+
+### facelock tpm encrypt
+
+Encrypt all unencrypted embeddings in the database with AES-256-GCM. The cipher
+is software either way; `encryption.method` decides only where the key lives.
+
+```bash
+sudo facelock tpm encrypt                 # encrypt using the configured key
+sudo facelock tpm encrypt --generate-key  # generate a new key file (or seal a new TPM key) WITHOUT re-encrypting embeddings
+```
+
+`--generate-key` only creates the key material. Run `facelock tpm encrypt`
+(without the flag) afterwards to encrypt the embeddings.
+
+### facelock tpm decrypt
+
+Decrypt all software-encrypted embeddings in the database (reverting
+AES-256-GCM encryption).
+
+```bash
+sudo facelock tpm decrypt
+```
+
+### facelock tpm reseal
+
+Re-seal the TPM AES key under the current PCR values. This is the recovery step
+after a firmware or kernel change moves a measured PCR and the sealed key stops
+unsealing. Requires root, and applies only when `encryption.method = "tpm"` —
+under any other method it errors rather than quietly doing nothing.
+
+```bash
+sudo facelock tpm reseal
+```
+
+It prefers unsealing the existing blob, which still works while the PCR policy
+is satisfied, so it is safe to run proactively before a firmware update; once
+the PCRs have moved it falls back to the plaintext key backup. With neither
+available there is nothing to re-seal and it fails. Run
+`facelock tpm unseal-check` to find out which of those you are in.
 
 ## facelock bench
 
@@ -472,42 +548,6 @@ both keeps working.
 Wiring `/etc/pam.d/hyprlock` itself is a separate, root step — see
 [`facelock pam`](#facelock-pam). This command touches no file outside `$HOME`.
 
-## facelock encrypt
-
-Encrypt all unencrypted embeddings in the database with AES-256-GCM.
-
-```bash
-facelock encrypt                        # encrypt using the configured key
-facelock encrypt --generate-key         # generate a new key file (or seal a new TPM key) WITHOUT re-encrypting embeddings
-```
-
-`--generate-key` only creates the key material. Run `facelock encrypt` (without the flag) afterwards to encrypt the embeddings.
-
-## facelock decrypt
-
-Decrypt all software-encrypted embeddings in the database (reverting AES-256-GCM encryption).
-
-```bash
-facelock decrypt
-```
-
-## facelock reseal
-
-Re-seal the TPM AES key under the current PCR values. This is the recovery step
-after a firmware or kernel change moves a measured PCR and the sealed key stops
-unsealing. Requires root, and applies only when `encryption.method = "tpm"` —
-under any other method it errors rather than quietly doing nothing.
-
-```bash
-sudo facelock reseal
-```
-
-It prefers unsealing the existing blob, which still works while the PCR policy
-is satisfied, so it is safe to run proactively before a firmware update; once
-the PCRs have moved it falls back to the plaintext key backup. With neither
-available there is nothing to re-seal and it fails. Run
-`facelock tpm unseal-check` to find out which of those you are in.
-
 ## facelock audit
 
 View the structured audit log of authentication events.
@@ -524,16 +564,6 @@ facelock audit --follow                 # long form
 |------|-------|---------|-------------|
 | `--follow` | `-f` | false | Watch for new entries (like `tail -f`) |
 | `--lines N` | `-l` | 20 | Number of recent entries to display |
-
-## facelock restart
-
-Restart the persistent daemon. On systemd systems, runs `systemctl restart facelock-daemon.service`. Otherwise, sends a D-Bus shutdown request and the daemon restarts on next use via D-Bus activation.
-
-Requires root. If run interactively as a non-root user, the CLI prompts to re-run via `sudo`.
-
-```bash
-facelock restart
-```
 
 ## User Resolution
 

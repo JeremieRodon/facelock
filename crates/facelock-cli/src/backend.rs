@@ -25,8 +25,8 @@
 //! - **`status`** consumes facts, not transport: its daemon probe is
 //!   [`probe_daemon`] here in the seam (H8), so `ipc_client` stays
 //!   single-sited.
-//! - Maintenance commands (`bench`, `encrypt`, `tpm`, `audit`, `auth`,
-//!   `daemon`) are direct-by-nature and never select.
+//! - Maintenance commands (`bench`, `tpm`, `audit`, `auth`, `daemon`) are
+//!   direct-by-nature and never select.
 
 use anyhow::bail;
 use zbus::blocking::Connection;

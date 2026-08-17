@@ -101,16 +101,15 @@ facelock list           List enrolled models
 facelock remove <id>    Remove a specific model
 facelock clear          Remove all models for a user
 facelock preview        Live camera preview
-facelock config         Show/edit configuration
+facelock config         Show configuration (config edit to open $EDITOR)
 facelock status         Check system status
-facelock daemon         Run persistent daemon
+facelock daemon         Run persistent daemon (daemon restart to restart it)
 facelock auth           One-shot auth (PAM helper)
 facelock devices        List cameras
 facelock tpm status     TPM status/management
+facelock tpm encrypt    Encrypt stored embeddings (tpm decrypt to reverse)
+facelock tpm reseal     Re-seal the TPM key under current PCRs
 facelock bench          Benchmarks and calibration
-facelock encrypt        Encrypt stored embeddings
-facelock decrypt        Decrypt stored embeddings
-facelock restart        Restart daemon
 facelock audit          View structured audit log
 ```
 

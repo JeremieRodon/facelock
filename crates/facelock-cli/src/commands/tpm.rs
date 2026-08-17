@@ -1,9 +1,39 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use clap::Subcommand;
 use facelock_core::config::Config;
 
-use crate::commands::TpmCommand;
+/// Everything that manages the embedding encryption key.
+///
+/// `encrypt`, `decrypt` and `reseal` live here rather than at the top level
+/// (ADR 009): the group owns the key's whole lifecycle, and `reseal` was
+/// already implemented in this module. `encrypt`/`decrypt` run software
+/// AES-256-GCM with no TPM involved (ADR 004) — the group's `about` says so.
+#[derive(Subcommand)]
+pub enum TpmCommand {
+    /// Report TPM availability and configuration
+    Status,
+    /// Seal the AES encryption key with TPM (migrate keyfile → tpm)
+    SealKey,
+    /// Unseal the AES key from TPM back to a plaintext keyfile (migrate tpm → keyfile)
+    UnsealKey,
+    /// Read-only check that the sealed AES key currently unseals (verifies PCR
+    /// policy is satisfied). Writes nothing; exits non-zero if unseal fails.
+    UnsealCheck,
+    /// Display current PCR values for configured indices
+    PcrBaseline,
+    /// Encrypt all unencrypted embeddings with AES-256-GCM
+    Encrypt {
+        /// Generate a new encryption key (does not encrypt)
+        #[arg(long)]
+        generate_key: bool,
+    },
+    /// Decrypt all software-encrypted embeddings
+    Decrypt,
+    /// Re-seal the TPM AES key under current PCRs (recovery after a firmware/kernel change)
+    Reseal,
+}
 
 pub fn run(config: &Config, command: TpmCommand) -> Result<()> {
     match command {
@@ -12,6 +42,14 @@ pub fn run(config: &Config, command: TpmCommand) -> Result<()> {
         TpmCommand::UnsealKey => unseal_key(config),
         TpmCommand::UnsealCheck => unseal_check(config),
         TpmCommand::PcrBaseline => pcr_baseline(config),
+        // Key material, not the TPM device: software AES-256-GCM either way
+        // (ADR 004). The group owns the key's lifecycle, which is why these
+        // three moved under it (ADR 009).
+        TpmCommand::Encrypt { generate_key } => {
+            crate::commands::encrypt::run_encrypt(config, generate_key)
+        }
+        TpmCommand::Decrypt => crate::commands::encrypt::run_decrypt(config),
+        TpmCommand::Reseal => run_reseal(config),
     }
 }
 
@@ -20,7 +58,7 @@ pub fn run(config: &Config, command: TpmCommand) -> Result<()> {
 /// Exercises the real unseal path (including PolicyPCR replay for PCR-bound
 /// keys) without writing anything or mutating config. Returns an error (non-zero
 /// exit) when unseal fails — e.g. after a bound PCR changed. Used by operators to
-/// confirm whether `facelock reseal` is needed, and by the TPM E2E suite.
+/// confirm whether `facelock tpm reseal` is needed, and by the TPM E2E suite.
 fn unseal_check(config: &Config) -> Result<()> {
     crate::ipc_client::require_root("sudo facelock tpm unseal-check")?;
 
@@ -49,7 +87,7 @@ fn unseal_check(config: &Config) -> Result<()> {
             Err(e) => {
                 anyhow::bail!(
                     "sealed key does NOT unseal ({}): {e}\n\
-                     If a bound PCR changed (firmware/kernel update), run: sudo facelock reseal",
+                     If a bound PCR changed (firmware/kernel update), run: sudo facelock tpm reseal",
                     sealed_path.display()
                 );
             }
@@ -141,7 +179,7 @@ fn seal_key(config: &Config) -> Result<()> {
         if !key_path.exists() {
             anyhow::bail!(
                 "No plaintext key file found at {}.\n\
-                 Generate one first with: sudo facelock encrypt --generate-key",
+                 Generate one first with: sudo facelock tpm encrypt --generate-key",
                 key_path.display()
             );
         }
@@ -188,7 +226,7 @@ fn seal_key(config: &Config) -> Result<()> {
         );
         println!("Config updated: encryption.method = \"tpm\"");
         println!(
-            "\nKeep the plaintext key backup at {}: it lets `sudo facelock reseal`\n\
+            "\nKeep the plaintext key backup at {}: it lets `sudo facelock tpm reseal`\n\
              recover face auth after a firmware/kernel PCR change (and roll back to the\n\
              keyfile method) WITHOUT re-enrolling.",
             key_path.display()
@@ -197,7 +235,7 @@ fn seal_key(config: &Config) -> Result<()> {
             "Tradeoff: while that backup exists, the tpm method's at-rest confidentiality\n\
              against anyone who can read the file reduces to its 0600 (root-only) protection.\n\
              PCR binding stays off by default (tpm.pcr_binding = false); enabling it commits\n\
-             you to running `reseal` after each bound-PCR change, so keeping the backup is the\n\
+             you to running `tpm reseal` after each bound-PCR change, so keeping the backup is the\n\
              recommended setup. Remove it only if you accept re-enrolling to recover."
         );
 
@@ -272,20 +310,20 @@ fn unseal_key(config: &Config) -> Result<()> {
     }
 }
 
-/// Re-seal the AES key under the CURRENT PCR values (`facelock reseal`).
+/// Re-seal the AES key under the CURRENT PCR values (`facelock tpm reseal`).
 ///
 /// This is the recovery path for TPM PCR binding: a firmware/kernel update that
 /// changes a bound PCR makes the old sealed blob refuse to unseal. Password login
-/// keeps working throughout; running `reseal` restores face auth by re-sealing
+/// keeps working throughout; running `tpm reseal` restores face auth by re-sealing
 /// the key against the new PCR state. The key is recovered from the existing
 /// sealed blob when PCRs are still valid, otherwise from the plaintext key backup
 /// at `encryption.key_path` if present.
 pub fn run_reseal(config: &Config) -> Result<()> {
-    crate::ipc_client::require_root("sudo facelock reseal")?;
+    crate::ipc_client::require_root("sudo facelock tpm reseal")?;
 
     if config.encryption.method != facelock_core::config::EncryptionMethod::Tpm {
         anyhow::bail!(
-            "`facelock reseal` only applies when encryption.method = \"tpm\" \
+            "`facelock tpm reseal` only applies when encryption.method = \"tpm\" \
              (current: {:?}). Nothing to reseal.",
             config.encryption.method
         );
@@ -342,7 +380,7 @@ pub fn run_reseal(config: &Config) -> Result<()> {
                         "cannot recover the AES key: the sealed blob no longer unseals under \
                          the current PCRs and there is no plaintext backup at {}.\n\
                          Password login still works. Restore a key backup to {}, then re-run \
-                         `sudo facelock reseal`, or clear and re-enroll: sudo facelock clear --yes",
+                         `sudo facelock tpm reseal`, or clear and re-enroll: sudo facelock clear --yes",
                         key_path.display(),
                         key_path.display()
                     );

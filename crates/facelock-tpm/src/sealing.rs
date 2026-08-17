@@ -415,7 +415,7 @@ impl TpmSealer {
     /// The sealed blob is written to a file created at mode 0600 in a single
     /// `open(2)` (no create-then-`chmod` window, finding #11) and flushed with
     /// `sync_all`. An existing file at `path` is truncated in place, so this is
-    /// safe to use for re-sealing (`facelock reseal`).
+    /// safe to use for re-sealing (`facelock tpm reseal`).
     pub fn seal_key_to_file(
         &mut self,
         key: &[u8; 32],

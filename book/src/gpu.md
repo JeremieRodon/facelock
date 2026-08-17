@@ -40,7 +40,7 @@ execution_provider = "cuda"    # or "rocm" or "openvino"
 ### 3. Restart the daemon
 
 ```bash
-facelock restart
+sudo facelock daemon restart
 ```
 
 ### 4. Verify

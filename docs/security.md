@@ -507,7 +507,7 @@ absent device ids, so it is opt-in only.
 object is created with `userWithAuth = false` and its PCR selection is recorded in the sealed
 blob (version byte `0x03`). Unseal starts a *real* policy session and replays `PolicyPCR`
 against the current PCRs, so a firmware/kernel change to a bound PCR makes the key refuse to
-unseal (face auth then falls through to password). Recovery is `sudo facelock reseal`, which
+unseal (face auth then falls through to password). Recovery is `sudo facelock tpm reseal`, which
 re-seals the key under the current PCR state (recovering the key from the existing blob if the
 PCRs still match, otherwise from the `encryption.key` backup). **Keeping that plaintext
 `encryption.key` backup is the recommended setup**: it makes reseal recovery painless — no

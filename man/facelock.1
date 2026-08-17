@@ -271,12 +271,17 @@ hidden alias and keeps parsing; the per-frame payload is unchanged.
 User to match faces against (defaults to current user).
 .RE
 .TP
-.B config
-Show or edit configuration.
+.B config \fR[\fIsubcommand\fR]
+Show or edit configuration. With no subcommand, shows.
 .RS
 .TP
-.B \-\-edit
-Open config file in editor.
+.B show
+Print the config file path and contents, and whether the file parses. Reads a
+0644 file and needs no root.
+.TP
+.B edit
+Open the config file in \fB$EDITOR\fR, validate it on save, and restart the
+daemon when a setting it caches at startup changed. Requires root.
 .RE
 .TP
 .B status
@@ -291,10 +296,21 @@ performed is reported as such; the report never substitutes a guessed value.
 .B devices
 List available camera devices.
 .TP
-.B daemon
-Run the persistent authentication daemon. Registers on the D-Bus system bus
-as \fBorg.facelock.Daemon\fR to service authentication and enrollment requests
+.B daemon \fR[\fIsubcommand\fR]
+Run or restart the persistent authentication daemon. With no subcommand, runs
+it \(em the form every shipped service unit invokes.
+.RS
+.TP
+.B run
+Run the daemon in the foreground. Registers on the D-Bus system bus as
+\fBorg.facelock.Daemon\fR to service authentication and enrollment requests
 from the PAM module and CLI.
+.TP
+.B restart
+Restart the facelock daemon via systemd, or via a D-Bus shutdown request when
+systemd is unavailable, in which case the daemon restarts on next use through
+D-Bus activation. Requires root.
+.RE
 .IP
 Takes \fB\-c\fR, \fB\-\-config\fR from GLOBAL OPTIONS above.
 .TP
@@ -342,7 +358,10 @@ Generate a comprehensive benchmark report.
 .RE
 .TP
 .B tpm \fIsubcommand\fR
-TPM integration status and management.
+Manage the embedding encryption key and the TPM that can seal it. The group
+owns the key's whole lifecycle, so \fBencrypt\fR, \fBdecrypt\fR and
+\fBreseal\fR live here \(em the cipher is software AES-256-GCM either way, and
+\fBencryption.method\fR decides only where the key lives.
 .RS
 .TP
 .B status
@@ -358,10 +377,29 @@ Unseal the AES key from TPM back to a plaintext keyfile (migrate TPM to keyfile)
 Read-only check that the sealed AES key currently unseals, verifying the PCR
 policy is still satisfied. Writes nothing and exits non-zero if the unseal
 fails, which is the signal to run
-.BR "facelock reseal" .
+.BR "facelock tpm reseal" .
 .TP
 .B pcr\-baseline
 Display current PCR values for configured indices.
+.TP
+.B encrypt
+Encrypt all unencrypted embeddings in the database with AES-256-GCM.
+\fB\-\-generate\-key\fR generates a new encryption key without encrypting
+embeddings.
+.TP
+.B decrypt
+Decrypt all software-encrypted embeddings in the database.
+.TP
+.B reseal
+Re-seal the TPM AES key under the current PCR values \(em the recovery step
+after a firmware or kernel change moves a measured PCR and the sealed key stops
+unsealing. Requires root, and applies only when \fBencryption.method\fR is
+\fBtpm\fR; under any other method it errors rather than quietly doing nothing.
+It prefers unsealing the existing blob, which still works while the PCR policy
+is satisfied, so it is safe to run proactively before a firmware update; once
+the PCRs have moved it falls back to the plaintext key backup. Use
+.B "facelock tpm unseal\-check"
+to find out which of those applies.
 .RE
 .TP
 .B pam \fIsubcommand\fR
@@ -427,31 +465,6 @@ fingerprint icon coexists, so a machine using both keeps working.
 .B status
 Show the current hyprlock integration state.
 .RE
-.TP
-.B encrypt
-Encrypt all unencrypted embeddings in the database with AES-256-GCM.
-.RS
-.TP
-.B \-\-generate\-key
-Generate a new encryption key without encrypting embeddings.
-.RE
-.TP
-.B decrypt
-Decrypt all software-encrypted embeddings in the database.
-.TP
-.B reseal
-Re-seal the TPM AES key under the current PCR values \(em the recovery step
-after a firmware or kernel change moves a measured PCR and the sealed key stops
-unsealing. Requires root, and applies only when \fBencryption.method\fR is
-\fBtpm\fR; under any other method it errors rather than quietly doing nothing.
-It prefers unsealing the existing blob, which still works while the PCR policy
-is satisfied, so it is safe to run proactively before a firmware update; once
-the PCRs have moved it falls back to the plaintext key backup. Use
-.B "facelock tpm unseal\-check"
-to find out which of those applies.
-.TP
-.B restart
-Restart the facelock daemon via systemd.
 .TP
 .B audit
 View the structured audit log.
