@@ -22,6 +22,11 @@
 //! sink, not the string — `bail!` text a human reads on stderr localizes,
 //! the same event written to audit/syslog/tracing does not.
 //!
+//! `--quiet` acts here rather than at the call sites: [`set_verbosity`]
+//! silences [`Terminal::info`] and nothing else, so converting a `println!`
+//! into a message is also what makes it quietable — no caller ever asks
+//! whether it should be printing.
+//!
 //! # The vocabulary is split by domain
 //!
 //! There is no single `Message` enum. Each domain owns its own, and this
@@ -213,6 +218,81 @@ pub trait Message: std::fmt::Debug {
 }
 
 // ---------------------------------------------------------------------------
+// Verbosity
+// ---------------------------------------------------------------------------
+
+/// How much the human sink says.
+///
+/// **`--quiet` suppresses informational stdout only; errors and exit codes are
+/// unchanged.** [`Terminal::error`] is never suppressed, so a quiet run that
+/// fails still says why on stderr and still exits non-zero. That is
+/// `is-enrolled --quiet`'s existing semantics (see
+/// [`crate::commands::is_enrolled`]) and it is the house rule for every
+/// command. Prompts ([`Terminal::confirm`]) are unaffected too — a silenced
+/// question is a hang, not a quieter program. The debug side channel
+/// (`trace`) also keeps firing: the machine event stream is not user-facing
+/// output, so `RUST_LOG=facelock=debug` works the same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verbosity {
+    #[default]
+    Normal,
+    Quiet,
+}
+
+/// Process-global verbosity. Written once, from the parsed global `--quiet`
+/// flag, before any other thread exists; `Relaxed` is therefore enough — no
+/// other state is published through it.
+static VERBOSITY: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(Verbosity::Normal as u8);
+
+/// Set the process verbosity. Call once, early in `main`, next to [`init`].
+pub fn set_verbosity(verbosity: Verbosity) {
+    VERBOSITY.store(verbosity as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process verbosity ([`Verbosity::Normal`] until [`set_verbosity`] runs).
+///
+/// The decode names every level rather than testing for `Quiet` and defaulting,
+/// so the next one to be added is visible here instead of quietly demoting to
+/// `Normal`. Rust cannot check a `u8` match against the enum, so the guarantee
+/// is a test: `every_level_round_trips_through_the_stored_byte` walks a
+/// wildcard-free `match` over [`Verbosity`] — a new level does not compile
+/// until it joins that walk, and then fails the round trip until it is listed
+/// below. The trailing arm is unreachable ([`set_verbosity`] is the only
+/// writer) and resolves to `Normal`, the setting that hides nothing.
+pub fn verbosity() -> Verbosity {
+    let stored = VERBOSITY.load(std::sync::atomic::Ordering::Relaxed);
+    match stored {
+        v if v == Verbosity::Normal as u8 => Verbosity::Normal,
+        v if v == Verbosity::Quiet as u8 => Verbosity::Quiet,
+        _ => Verbosity::Normal,
+    }
+}
+
+/// The walk that holds [`verbosity`]'s decode to this enum.
+///
+/// Wildcard-free on purpose, the same discipline as the [`Samples`] walks: a
+/// level added without a line here does not compile.
+#[cfg(test)]
+impl Verbosity {
+    fn next_level(self) -> Option<Self> {
+        match self {
+            Verbosity::Normal => Some(Verbosity::Quiet),
+            Verbosity::Quiet => None,
+        }
+    }
+}
+
+/// Whether [`Terminal::info`] writes anything to stdout.
+///
+/// The decision is a pure function of the global so it can be tested without
+/// capturing stdout — the test that matters is *what the sink decides*, not
+/// what a captured pipe received.
+fn info_enabled() -> bool {
+    verbosity() == Verbosity::Normal
+}
+
+// ---------------------------------------------------------------------------
 // Sinks
 // ---------------------------------------------------------------------------
 
@@ -228,13 +308,19 @@ fn trace(msg: &dyn Message) {
 pub struct Terminal;
 
 impl Terminal {
-    /// Informational message to stdout.
+    /// Informational message to stdout — the half [`Verbosity::Quiet`]
+    /// silences. The machine rendering is emitted either way.
     pub fn info(&self, msg: &dyn Message) {
         trace(msg);
-        println!("{}", msg.localized());
+        if info_enabled() {
+            println!("{}", msg.localized());
+        }
     }
 
     /// Warning/error message to stderr (the process continues).
+    ///
+    /// Never suppressed: `--quiet` is about informational chatter, and a
+    /// program that hid the reason it failed would be a worse one.
     pub fn error(&self, msg: &dyn Message) {
         trace(msg);
         eprintln!("{}", msg.localized());
@@ -400,6 +486,55 @@ mod tests {
             "PAM service file absent: /etc/pam.d/omarchy-lock-face. Nothing to remove."
         );
     }
+
+    /// `--quiet` gates informational stdout and nothing else.
+    ///
+    /// Asserted on `info_enabled` rather than on captured stdout: the sink's
+    /// decision is the contract, and a capture test would prove the same thing
+    /// while making every future sink change a plumbing exercise. What the
+    /// other three sinks do is structural — `error`, `confirm` and
+    /// `confirm_default_yes` never call `info_enabled`, so there is no state
+    /// in which they could go quiet.
+    #[test]
+    fn quiet_suppresses_info_only() {
+        let _guard = VERBOSITY_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(verbosity(), Verbosity::Normal, "default must be Normal");
+        assert!(info_enabled());
+
+        set_verbosity(Verbosity::Quiet);
+        assert_eq!(verbosity(), Verbosity::Quiet);
+        assert!(!info_enabled(), "Quiet must silence Terminal::info");
+
+        set_verbosity(Verbosity::Normal);
+        assert!(info_enabled(), "Normal must restore informational output");
+    }
+
+    /// Every level survives the `u8` the global stores it in.
+    ///
+    /// This is what makes `verbosity`'s `u8` match honest. The walk is
+    /// wildcard-free, so a new level cannot compile without joining it; once
+    /// it has, this fails until `verbosity` decodes it too. Without the pair,
+    /// an unlisted level would read back as `Normal` and silently un-quiet
+    /// the program.
+    #[test]
+    fn every_level_round_trips_through_the_stored_byte() {
+        let _guard = VERBOSITY_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+        let mut level = Some(Verbosity::Normal);
+        while let Some(current) = level {
+            set_verbosity(current);
+            assert_eq!(
+                verbosity(),
+                current,
+                "{current:?} must survive the u8 round trip"
+            );
+            level = current.next_level();
+        }
+        set_verbosity(Verbosity::Normal);
+    }
+
+    /// Held by every test that writes the process-global verbosity, so two of
+    /// them cannot interleave their mutate/restore sequences.
+    static VERBOSITY_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The answer hint is appended by the sink and the question alone is the
     /// msgid, so a translator cannot advertise an answer `read_answer` will

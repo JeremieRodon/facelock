@@ -91,6 +91,15 @@ JSON (#149).
 An unparseable `RUST_LOG` is reported at WARN (on stderr) and the built-in
 filter is used, rather than the value being silently discarded.
 
+**`--quiet` suppresses informational stdout only; errors and exit codes are
+unchanged.** A quiet run that fails still says why on stderr and still exits
+non-zero, and prompts are unaffected — a silenced question is a hang, not a
+quieter program. This generalizes `is-enrolled --quiet`, which has always meant
+"leave only the exit code". The flag is read once at the message sink
+(`message::set_verbosity`), so it covers every command whose output goes
+through that seam; commands still printing directly are tracked by
+[#140](https://github.com/tyvsmith/facelock/issues/140).
+
 ### facelock setup Flag Composition
 
 Flags **compose**; they are not mutually exclusive. The rule:

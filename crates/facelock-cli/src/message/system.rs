@@ -24,6 +24,16 @@ pub enum SystemMessage {
     ConfirmAddToGroup { user: String },
     GroupAddSkipped { user: String },
     AddedToGroup { user: String },
+
+    // -- installing and removing the unit files --
+    DisablingSystemdUnits,
+    SystemdUnitsDisabled,
+    InstallingSystemdUnits,
+    WroteFile { path: String },
+    RefreshedLegacyFile { path: String },
+    SystemctlDaemonReloadDone,
+    SystemctlEnableDone { unit: String },
+    DbusActivationEnabled,
 }
 
 impl Message for SystemMessage {
@@ -67,6 +77,24 @@ impl Message for SystemMessage {
                 ),
                 &[("user", user.clone())],
             ),
+            DisablingSystemdUnits => translate("Disabling facelock-daemon systemd units..."),
+            SystemdUnitsDisabled => translate("facelock-daemon service disabled and stopped."),
+            InstallingSystemdUnits => {
+                translate("Installing facelock-daemon systemd and D-Bus units...")
+            }
+            WroteFile { path } => fill(translate("  Wrote {path}"), &[("path", path.clone())]),
+            RefreshedLegacyFile { path } => fill(
+                translate("  Refreshed legacy {path}"),
+                &[("path", path.clone())],
+            ),
+            SystemctlDaemonReloadDone => translate("  systemctl daemon-reload done."),
+            SystemctlEnableDone { unit } => fill(
+                translate("  systemctl enable {unit} done."),
+                &[("unit", unit.clone())],
+            ),
+            DbusActivationEnabled => {
+                translate("\nfacelock-daemon D-Bus activation is now enabled.")
+            }
         }
     }
 }
@@ -96,7 +124,72 @@ impl super::Samples for SystemMessage {
             AlreadyInGroup { .. } => ConfirmAddToGroup { user: s("u") },
             ConfirmAddToGroup { .. } => GroupAddSkipped { user: s("u") },
             GroupAddSkipped { .. } => AddedToGroup { user: s("u") },
-            AddedToGroup { .. } => return None,
+            AddedToGroup { .. } => DisablingSystemdUnits,
+            DisablingSystemdUnits => SystemdUnitsDisabled,
+            SystemdUnitsDisabled => InstallingSystemdUnits,
+            InstallingSystemdUnits => WroteFile { path: s("/p") },
+            WroteFile { .. } => RefreshedLegacyFile { path: s("/p") },
+            RefreshedLegacyFile { .. } => SystemctlDaemonReloadDone,
+            SystemctlDaemonReloadDone => SystemctlEnableDone {
+                unit: s("u.service"),
+            },
+            SystemctlEnableDone { .. } => DbusActivationEnabled,
+            DbusActivationEnabled => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The unit-install narration, pinned to the bytes `run_systemd`
+    /// printed. `facelock setup --systemd` is a scripted entry point
+    /// (packaging, Omarchy), so these lines are read by more than humans.
+    #[test]
+    fn english_fallback_is_byte_identical() {
+        use SystemMessage::*;
+
+        assert_eq!(
+            DisablingSystemdUnits.localized(),
+            "Disabling facelock-daemon systemd units..."
+        );
+        assert_eq!(
+            SystemdUnitsDisabled.localized(),
+            "facelock-daemon service disabled and stopped."
+        );
+        assert_eq!(
+            InstallingSystemdUnits.localized(),
+            "Installing facelock-daemon systemd and D-Bus units..."
+        );
+        assert_eq!(
+            WroteFile {
+                path: "/etc/systemd/system/facelock-daemon.service".into()
+            }
+            .localized(),
+            "  Wrote /etc/systemd/system/facelock-daemon.service"
+        );
+        assert_eq!(
+            RefreshedLegacyFile {
+                path: "/usr/lib/systemd/system/facelock-daemon.service".into()
+            }
+            .localized(),
+            "  Refreshed legacy /usr/lib/systemd/system/facelock-daemon.service"
+        );
+        assert_eq!(
+            SystemctlDaemonReloadDone.localized(),
+            "  systemctl daemon-reload done."
+        );
+        assert_eq!(
+            SystemctlEnableDone {
+                unit: "facelock-daemon.service".into()
+            }
+            .localized(),
+            "  systemctl enable facelock-daemon.service done."
+        );
+        assert_eq!(
+            DbusActivationEnabled.localized(),
+            "\nfacelock-daemon D-Bus activation is now enabled."
+        );
     }
 }
