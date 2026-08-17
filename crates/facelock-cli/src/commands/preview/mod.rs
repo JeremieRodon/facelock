@@ -10,7 +10,7 @@ use crate::backend::{Backend, BackendKind};
 use crate::ipc_client;
 use crate::message::{AccessMessage, Terminal};
 
-pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Result<()> {
+pub fn run(config: &Config, json: bool, user: Option<String>) -> anyhow::Result<()> {
     // DEC-6/N13: `PreviewDetectFrame` is root-only now — it was the last
     // unprivileged consumer of a per-frame similarity score (the
     // hill-climbing oracle N12/N13 close by construction).
@@ -29,13 +29,13 @@ pub fn run(config: &Config, text_only: bool, user: Option<String>) -> anyhow::Re
         // is unavailable depends on the kind: a stopped daemon is a degraded
         // state, not a configuration choice (the old single message blamed
         // "oneshot mode" for both).
-        if !text_only {
+        if !json {
             Terminal.error(&graphical_unavailable_message(backend.kind()));
         }
         return text_only::run_direct(config, &user);
     }
 
-    if text_only {
+    if json {
         return text_only::run(&user);
     }
 

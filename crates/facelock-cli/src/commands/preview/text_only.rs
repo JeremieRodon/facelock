@@ -47,25 +47,27 @@ pub fn run(user: &str) -> anyhow::Result<()> {
         }
 
         let (width, height) = jpeg_dimensions(&jpeg_data);
-        let recognized = faces.iter().filter(|f| f.recognized).count();
-        let unrecognized = faces.len() - recognized;
-
-        let output = serde_json::json!({
-            "frame": frame_count,
-            "fps": (current_fps * 10.0).round() / 10.0,
-            "jpeg_size": jpeg_data.len(),
-            "width": width,
-            "height": height,
-            "recognized": recognized,
-            "unrecognized": unrecognized,
-            "faces": faces.iter().map(|f| serde_json::json!({
-                "x": f.x, "y": f.y,
-                "width": f.width, "height": f.height,
-                "confidence": (f.confidence * 1000.0).round() / 1000.0,
-                "similarity": (f.similarity * 1000.0).round() / 1000.0,
-                "recognized": f.recognized,
-            })).collect::<Vec<_>>(),
-        });
+        let output = frame_json(
+            frame_count,
+            current_fps,
+            Some(jpeg_data.len()),
+            width,
+            height,
+            faces
+                .iter()
+                .map(|f| {
+                    face_json(
+                        f.x,
+                        f.y,
+                        f.width,
+                        f.height,
+                        f.confidence,
+                        f.similarity,
+                        f.recognized,
+                    )
+                })
+                .collect(),
+        );
 
         let mut handle = stdout.lock();
         if writeln!(handle, "{output}").is_err() {
@@ -98,7 +100,11 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
     let stored = match crate::direct::open_store_existing(config) {
         Ok(store) => crate::direct::load_user_embeddings(&store, config, user)?,
         Err(facelock_store::StoreError::Absent { .. }) => {
-            Terminal.info(&FaceMessage::NoModelsEnrolled {
+            // stderr, not the informational sink: stdout here is the frame
+            // stream, and this loop cannot see whether `--json` was passed.
+            // As stdout chatter this localized sentence prefixed the stream
+            // on any fresh oneshot install, so `jq` failed on line 1.
+            Terminal.error(&FaceMessage::NoModelsEnrolled {
                 user: user.to_string(),
             });
             Vec::new()
@@ -133,7 +139,7 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
         let faces_result = engine.process(&frame);
         let faces = faces_result.unwrap_or_default();
 
-        let face_json: Vec<serde_json::Value> = faces
+        let faces_json: Vec<serde_json::Value> = faces
             .iter()
             .map(|(det, embedding)| {
                 let mut best_sim: f32 = 0.0;
@@ -143,26 +149,26 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
                         best_sim = sim;
                     }
                 }
-                serde_json::json!({
-                    "x": det.bbox.x, "y": det.bbox.y,
-                    "width": det.bbox.width, "height": det.bbox.height,
-                    "confidence": (det.confidence * 1000.0).round() / 1000.0,
-                    "similarity": (best_sim * 1000.0).round() / 1000.0,
-                    "recognized": best_sim >= threshold,
-                })
+                face_json(
+                    det.bbox.x,
+                    det.bbox.y,
+                    det.bbox.width,
+                    det.bbox.height,
+                    det.confidence,
+                    best_sim,
+                    best_sim >= threshold,
+                )
             })
             .collect();
 
-        let recognized = face_json.iter().filter(|f| f["recognized"] == true).count();
-        let output = serde_json::json!({
-            "frame": frame_count,
-            "fps": (current_fps * 10.0).round() / 10.0,
-            "width": frame.width,
-            "height": frame.height,
-            "recognized": recognized,
-            "unrecognized": faces.len() - recognized,
-            "faces": face_json,
-        });
+        let output = frame_json(
+            frame_count,
+            current_fps,
+            None,
+            frame.width,
+            frame.height,
+            faces_json,
+        );
 
         let mut handle = stdout.lock();
         if writeln!(handle, "{output}").is_err() {
@@ -171,6 +177,67 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
     }
 
     Ok(())
+}
+
+/// One face, as `--json` reports it.
+///
+/// The two loops above build a face row from different sources (a
+/// `PreviewFace` off the bus; a `FaceDetection` plus a locally computed
+/// similarity in direct mode), so the field set and the rounding live here
+/// rather than twice. Coordinates are pixels in the original, pre-JPEG frame.
+///
+/// `confidence` and `similarity` are rounded to three decimals **in `f32`**,
+/// and JSON numbers are `f64`, so the widening puts the trailing digits back:
+/// `0.988f32` serializes as `0.9879999756813049`. That is what this has always
+/// emitted and the pins below record it. A consumer compares numbers, never
+/// the rendered text.
+fn face_json(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    confidence: f32,
+    similarity: f32,
+    recognized: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "x": x, "y": y,
+        "width": width, "height": height,
+        "confidence": (confidence * 1000.0).round() / 1000.0,
+        "similarity": (similarity * 1000.0).round() / 1000.0,
+        "recognized": recognized,
+    })
+}
+
+/// One frame, as `--json` emits it: a document per line on stdout.
+///
+/// `jpeg_size` is `Some` only on the daemon path, the only one holding a JPEG
+/// to measure; the direct loop has never reported it, and this keeps that
+/// difference stated instead of implied by two copies of the payload. The
+/// counts are derived from `faces` rather than passed alongside them, so they
+/// cannot disagree with the rows they summarize.
+fn frame_json(
+    frame: u64,
+    fps: f32,
+    jpeg_size: Option<usize>,
+    width: u32,
+    height: u32,
+    faces: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let recognized = faces.iter().filter(|f| f["recognized"] == true).count();
+    let mut output = serde_json::json!({
+        "frame": frame,
+        "fps": (fps * 10.0).round() / 10.0,
+        "width": width,
+        "height": height,
+        "recognized": recognized,
+        "unrecognized": faces.len() - recognized,
+        "faces": faces,
+    });
+    if let Some(bytes) = jpeg_size {
+        output["jpeg_size"] = serde_json::json!(bytes);
+    }
+    output
 }
 
 /// Try to extract JPEG dimensions without full decode.
@@ -193,5 +260,115 @@ mod tests {
     fn jpeg_dimensions_returns_zero_for_invalid() {
         let (w, h) = jpeg_dimensions(&[0, 1, 2, 3]);
         assert_eq!((w, h), (0, 0));
+    }
+
+    // Both loops need a daemon or a camera, so the payload is pinned one
+    // level down, at the builders they share — the lowest seam here that
+    // does no I/O. `preview --json` was `preview --text-only` and emitted
+    // exactly these bytes; the rename must not have moved a key or a digit.
+
+    #[test]
+    fn daemon_frame_is_the_documented_json_line() {
+        let frame = frame_json(
+            7,
+            15.24,
+            Some(4096),
+            640,
+            480,
+            vec![face_json(10.0, 20.0, 100.0, 120.0, 0.98765, 0.61234, true)],
+        );
+
+        assert_eq!(
+            frame.to_string(),
+            concat!(
+                r#"{"faces":[{"confidence":0.9879999756813049,"height":120.0,"#,
+                r#""recognized":true,"similarity":0.6119999885559082,"#,
+                r#""width":100.0,"x":10.0,"y":20.0}],"#,
+                r#""fps":15.199999809265137,"frame":7,"height":480,"#,
+                r#""jpeg_size":4096,"recognized":1,"unrecognized":0,"width":640}"#,
+            )
+        );
+    }
+
+    /// The direct loop has no JPEG, so it reports no `jpeg_size`. Every other
+    /// key is the same one, which is the half a consumer branches on.
+    #[test]
+    fn direct_frame_omits_jpeg_size_and_keeps_every_other_key() {
+        let frame = frame_json(1, 0.0, None, 1280, 720, Vec::new());
+
+        let object = frame.as_object().expect("a frame is a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "faces",
+                "fps",
+                "frame",
+                "height",
+                "recognized",
+                "unrecognized",
+                "width",
+            ]
+        );
+    }
+
+    /// stdout in this module is the frame stream and nothing else.
+    ///
+    /// `--json` is parsed one level up, so neither loop here knows whether a
+    /// human or `jq` is reading, and both must keep stdout clean either way.
+    /// The regression this catches shipped: the no-enrollment notice in
+    /// `run_direct` went through `Terminal::info`, which writes to stdout, so
+    /// a fresh oneshot install prefixed the stream with a localized sentence
+    /// and a consumer failed on the first line. Human text goes to stderr.
+    ///
+    /// A source scan is the only seam available: both loops need a daemon or
+    /// a camera to run. Needles are assembled at runtime so this test does
+    /// not match itself, following `backend.rs`'s single-siting pins.
+    #[test]
+    fn nothing_beside_the_frame_stream_writes_to_stdout() {
+        let source = include_str!("text_only.rs");
+        let info_sink = format!("Terminal{}info(", ".");
+        let bare_stdout = format!("{}!(", String::from("print") + "ln");
+
+        for (index, line) in source.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let number = index + 1;
+            assert!(
+                !code.contains(&info_sink),
+                "line {number}: the informational sink writes to stdout, which \
+                 here is the frame stream; use Terminal::error"
+            );
+            // `eprint` is masked first so only the stdout macro can match.
+            assert!(
+                !code.replace("eprint", "eprint_").contains(&bare_stdout),
+                "line {number}: bare stdout printing beside the frame stream; \
+                 human text belongs on stderr"
+            );
+        }
+    }
+
+    /// The counts summarize the rows, so they are read off them. A face row
+    /// that says `recognized: false` cannot end up inside `recognized: 1`.
+    #[test]
+    fn counts_are_derived_from_the_face_rows() {
+        let frame = frame_json(
+            1,
+            30.0,
+            None,
+            640,
+            480,
+            vec![
+                face_json(0.0, 0.0, 1.0, 1.0, 0.9, 0.7, true),
+                face_json(0.0, 0.0, 1.0, 1.0, 0.9, 0.1, false),
+                face_json(0.0, 0.0, 1.0, 1.0, 0.9, 0.2, false),
+            ],
+        );
+
+        assert_eq!(frame["recognized"], 1);
+        assert_eq!(frame["unrecognized"], 2);
     }
 }

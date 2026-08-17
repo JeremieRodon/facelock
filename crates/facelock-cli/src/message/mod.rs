@@ -514,6 +514,16 @@ mod tests {
              To rollback:\n  sudo cp /etc/pam.d/sudo.facelock-backup /etc/pam.d/sudo\n\
              \u{20} # or: sudo facelock pam remove --service sudo"
         );
+        // Not a historical pin either: #169 renamed `preview --text-only` to
+        // `preview --json`, and this is the one runtime string that tells an
+        // operator which flag to reach for, so it was changed on purpose.
+        // Pinned so the next change to it is also on purpose. The second
+        // sentence says "text-only mode" about the mode, not the flag.
+        assert_eq!(
+            AccessMessage::PreviewGraphicalNeedsDaemonOneshot.localized(),
+            "Graphical preview requires the daemon. In oneshot mode, use --json.\n\
+             Falling back to text-only mode.\n"
+        );
         // The module-missing refusal was an inline `bail!` on the same path.
         assert_eq!(
             PamMessage::PamModuleNotInstalled {

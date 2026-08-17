@@ -63,8 +63,13 @@ impl Message for AccessMessage {
             DaemonUnreachableFallback => translate(
                 "Warning: daemon.mode = \"daemon\" but the facelock daemon is unreachable — falling back to direct camera access.\nStart the facelock-daemon service to use it.",
             ),
+            // The flag is `--json` since #169; `--text-only` is a hidden
+            // alias that `preview --help` no longer lists, so naming it here
+            // taught a spelling the program had stopped showing. "text-only
+            // mode" in the second sentence describes the mode, not the flag,
+            // and stays.
             PreviewGraphicalNeedsDaemonOneshot => translate(
-                "Graphical preview requires the daemon. In oneshot mode, use --text-only.\nFalling back to text-only mode.\n",
+                "Graphical preview requires the daemon. In oneshot mode, use --json.\nFalling back to text-only mode.\n",
             ),
             PreviewGraphicalDaemonUnreachable => translate(
                 "Graphical preview requires the daemon, which is configured but not reachable.\nFalling back to text-only mode. Start the facelock-daemon service to use it.\n",
