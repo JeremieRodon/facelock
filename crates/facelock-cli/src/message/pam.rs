@@ -75,6 +75,57 @@ pub enum PamMessage {
         path: String,
         backup: String,
     },
+
+    // -- `facelock pam` (#174) ---------------------------------------------
+    /// The closing copy-pasteable hint. One variant carrying the whole block,
+    /// because it is one paragraph a translator has to be able to reflow, not
+    /// four independent sentences.
+    PamExtensionHint {
+        line: String,
+    },
+    PamInvalidServiceName {
+        service: String,
+    },
+    /// `remedy` is the flag that unlocks this surface: `--allow-sensitive` on
+    /// `pam add`, `--yes` on the `setup --pam` alias, which keeps its
+    /// combined meaning. Carrying it as data is what lets one message be
+    /// truthful on both.
+    PamSensitiveRefused {
+        service: String,
+        remedy: String,
+    },
+    PamModuleNotInstalled {
+        path: String,
+    },
+    PamServiceAbsentSkipped {
+        path: String,
+    },
+    PamPlanAdd {
+        path: String,
+        hint: String,
+    },
+    PamPlanRemove {
+        path: String,
+    },
+    PamPlanNoChange {
+        path: String,
+    },
+    PamPlanAbsent {
+        path: String,
+    },
+    PamStatusPresent {
+        path: String,
+    },
+    PamStatusMissing {
+        path: String,
+    },
+    PamStatusAbsent {
+        path: String,
+    },
+    PamStatusUnknown {
+        path: String,
+        error: String,
+    },
 }
 
 impl Message for PamMessage {
@@ -157,7 +208,7 @@ impl Message for PamMessage {
                 service,
             } => fill(
                 translate(
-                    "Installed facelock PAM line into {path}\n\nTo rollback:\n  sudo cp {backup} {path}\n  # or: sudo facelock setup --pam --remove --service {service}",
+                    "Installed facelock PAM line into {path}\n\nTo rollback:\n  sudo cp {backup} {path}\n  # or: sudo facelock pam remove --service {service}",
                 ),
                 &[
                     ("path", path.clone()),
@@ -180,6 +231,66 @@ impl Message for PamMessage {
             PamBackupExists { path, backup } => fill(
                 translate("Backup exists at {backup}\nTo restore: sudo cp {backup} {path}"),
                 &[("path", path.clone()), ("backup", backup.clone())],
+            ),
+            PamExtensionHint { line } => fill(
+                translate(
+                    "\n==> facelock PAM line for manual extension to other services:\n==>   {line}\n==> Add the above line above the first 'auth' line in any /etc/pam.d/<service> file.",
+                ),
+                &[("line", line.clone())],
+            ),
+            PamInvalidServiceName { service } => fill(
+                translate(
+                    "Invalid PAM service name '{service}': a service is one file name under /etc/pam.d, so it may not be empty, contain '/', or be '.' or '..'.",
+                ),
+                &[("service", service.clone())],
+            ),
+            PamSensitiveRefused { service, remedy } => fill(
+                translate(
+                    "Refusing to modify '{service}': this is a sensitive PAM service.\nRe-run with {remedy} to accept the risk of locking yourself out.",
+                ),
+                &[("service", service.clone()), ("remedy", remedy.clone())],
+            ),
+            PamModuleNotInstalled { path } => fill(
+                translate(
+                    "PAM module not found at {path}.\nInstall it first: cargo build --release -p pam-facelock && sudo cp target/release/libpam_facelock.so {path}",
+                ),
+                &[("path", path.clone())],
+            ),
+            PamServiceAbsentSkipped { path } => fill(
+                translate("PAM service file absent: {path}. Nothing to add."),
+                &[("path", path.clone())],
+            ),
+            PamPlanAdd { path, hint } => fill(
+                translate("Would add the facelock PAM line to {path} ({hint})."),
+                &[("path", path.clone()), ("hint", hint.clone())],
+            ),
+            PamPlanRemove { path } => fill(
+                translate("Would remove the facelock PAM line from {path}."),
+                &[("path", path.clone())],
+            ),
+            PamPlanNoChange { path } => fill(
+                translate("No change needed for {path}."),
+                &[("path", path.clone())],
+            ),
+            PamPlanAbsent { path } => fill(
+                translate("PAM service file absent: {path}. Nothing to do."),
+                &[("path", path.clone())],
+            ),
+            PamStatusPresent { path } => fill(
+                translate("{path}: facelock PAM line present"),
+                &[("path", path.clone())],
+            ),
+            PamStatusMissing { path } => fill(
+                translate("{path}: no facelock PAM line"),
+                &[("path", path.clone())],
+            ),
+            PamStatusAbsent { path } => fill(
+                translate("{path}: service file absent"),
+                &[("path", path.clone())],
+            ),
+            PamStatusUnknown { path, error } => fill(
+                translate("{path}: unreadable ({error})"),
+                &[("path", path.clone()), ("error", error.clone())],
             ),
         }
     }
@@ -240,7 +351,31 @@ impl super::Samples for PamMessage {
                 path: s("/p"),
                 backup: s("/b"),
             },
-            PamBackupExists { .. } => return None,
+            PamBackupExists { .. } => PamExtensionHint {
+                line: s("auth ..."),
+            },
+            PamExtensionHint { .. } => PamInvalidServiceName { service: s("../x") },
+            PamInvalidServiceName { .. } => PamSensitiveRefused {
+                service: s("sshd"),
+                remedy: s("--allow-sensitive"),
+            },
+            PamSensitiveRefused { .. } => PamModuleNotInstalled { path: s("/p") },
+            PamModuleNotInstalled { .. } => PamServiceAbsentSkipped { path: s("/p") },
+            PamServiceAbsentSkipped { .. } => PamPlanAdd {
+                path: s("/p"),
+                hint: s("h"),
+            },
+            PamPlanAdd { .. } => PamPlanRemove { path: s("/p") },
+            PamPlanRemove { .. } => PamPlanNoChange { path: s("/p") },
+            PamPlanNoChange { .. } => PamPlanAbsent { path: s("/p") },
+            PamPlanAbsent { .. } => PamStatusPresent { path: s("/p") },
+            PamStatusPresent { .. } => PamStatusMissing { path: s("/p") },
+            PamStatusMissing { .. } => PamStatusAbsent { path: s("/p") },
+            PamStatusAbsent { .. } => PamStatusUnknown {
+                path: s("/p"),
+                error: s("e"),
+            },
+            PamStatusUnknown { .. } => return None,
         })
     }
 }

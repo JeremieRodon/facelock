@@ -18,6 +18,14 @@ use crate::message::{
     fail,
 };
 
+// The `/etc/pam.d` writer lives in `commands/pam.rs` (#174) — `facelock pam
+// add|remove|status` is its command, and `setup --pam` is an alias onto it.
+// What stays here is the wizard's *menu* (`PAM_CANDIDATES`, `candidates_in`):
+// it is the list of services setup offers to configure, which is a property of
+// the setup flow rather than of the writer, and moving it would have split the
+// multi-select from the entries it renders for no gain.
+use super::pam::{PAM_DIR, PAM_LINE, PAM_MODULE_PATH, is_facelock_pam_line};
+
 /// Embedded systemd unit file.
 const SERVICE_UNIT: &str = include_str!("../../../../systemd/facelock-daemon.service");
 
@@ -33,8 +41,9 @@ const MANIFEST_TOML: &str = include_str!("../../../../models/manifest.toml");
 /// Marker file written on successful setup completion.
 pub const SETUP_COMPLETE_MARKER: &str = "/etc/facelock/.setup-complete";
 
-/// PAM service targeted by `--pam` when `--service` is not given.
-pub const DEFAULT_PAM_SERVICE: &str = "sudo";
+/// PAM service targeted by `--pam` when `--service` is not given. Declared by
+/// the writer and re-exported so `setup::DEFAULT_PAM_SERVICE` keeps resolving.
+pub use super::pam::DEFAULT_PAM_SERVICE;
 
 // ---------------------------------------------------------------------------
 // CLI argument resolution
@@ -300,11 +309,27 @@ pub fn run(non_interactive: bool) -> anyhow::Result<()> {
 ///
 /// Only when a base setup runs. `ipc_client::require_root` prompts and re-execs
 /// under `sudo` on a TTY, and standalone `--pam` / `--systemd` never did that:
-/// they bail immediately from their own root checks (`run_pam`, `check_root`).
+/// they bail immediately from their own root checks (`commands::pam`,
+/// `check_root`).
 /// Escalating there would be a new, surprising behavior for exactly the
 /// scripted invocations that must stay byte-compatible.
 pub fn needs_root_precheck(plan: &SetupPlan) -> bool {
     plan.base.is_some()
+}
+
+/// How `setup`'s flags map onto the writer's two independent knobs
+/// (`--no-confirm`, `--allow-sensitive`).
+///
+/// A pure function rather than an expression inline in [`run_with_plan`]
+/// because it *is* the security property: `--non-interactive` promises no
+/// prompts, so it suppresses the per-file "Proceed?" confirmation, and it
+/// deliberately does **not** bypass the sensitive-service gate. `setup --yes`
+/// is the one flag that still means both halves — "skip the prompt" *and*
+/// "unlock system-auth/login/sshd" — and so maps onto both. On `facelock pam
+/// add` the two are separate flags and neither implies the other.
+fn setup_pam_knobs(plan: &SetupPlan) -> (bool, bool) {
+    let no_prompt = plan.base == Some(BaseMode::NonInteractive);
+    (plan.yes || no_prompt, plan.yes)
 }
 
 /// Execute a resolved plan: base setup first (if any), then the standalone
@@ -336,22 +361,23 @@ pub fn run_with_plan(plan: SetupPlan) -> anyhow::Result<()> {
         SystemdPref::Ask | SystemdPref::Skip => {}
     }
 
+    // `--pam` is an alias onto `facelock pam add|remove` (#174): the plan and
+    // its precedence rules stay here, the execution is the writer's.
     match &plan.pam {
         PamPref::Remove {
             service,
             if_present,
-        } => run_pam(service, true, *if_present, plan.yes)?,
+        } => super::pam::remove_for_setup(std::slice::from_ref(service), *if_present)?,
         PamPref::Install { service } => {
             // The wizard's step 9 already applied `--pam`; installing again here
             // would be a second, unasked-for edit of the same file.
             if !wizard_ran {
-                let service = service.as_deref().unwrap_or(DEFAULT_PAM_SERVICE);
-                // `--non-interactive` promises no prompts, so the per-file
-                // "Proceed?" confirmation is suppressed. It deliberately does
-                // *not* bypass the SENSITIVE_SERVICES gate, which checks `--yes`.
-                let no_prompt = plan.base == Some(BaseMode::NonInteractive);
-                pam_install(service, plan.yes, no_prompt)?;
-                print_pam_extension_hint();
+                let service = service
+                    .as_deref()
+                    .unwrap_or(DEFAULT_PAM_SERVICE)
+                    .to_string();
+                let (no_confirm, allow_sensitive) = setup_pam_knobs(&plan);
+                super::pam::install_for_setup(&[service], no_confirm, allow_sensitive)?;
             }
         }
         PamPref::Ask | PamPref::Skip => {}
@@ -550,7 +576,11 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         wizard_hyprlock_handoff(&theme);
     }
 
-    print_pam_extension_hint();
+    // The closing hint fires once per wizard run, whatever step 9 decided —
+    // it is advice about extending PAM by hand, not a report of what happened.
+    Terminal.info(&PamMessage::PamExtensionHint {
+        line: PAM_LINE.to_string(),
+    });
 
     // -- Summary --
     Terminal.info(&SetupMessage::SetupCompleteHeader);
@@ -1927,7 +1957,7 @@ fn wizard_systemd_setup(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Resu
 /// every file byte-identical" is testable against a tempdir.
 ///
 /// `module_present` is the caller's answer to "is `pam_facelock.so` installed?".
-/// It is hoisted out of [`pam_install_in`] so the check happens once, before any
+/// It is hoisted out of the writer so the check happens once, before any
 /// prompt or write, and so tests can drive the write path on a machine that has
 /// no PAM module installed.
 fn pam_step_in(
@@ -1959,7 +1989,12 @@ fn pam_step_in(
             Terminal.info(&PamMessage::ConfiguringPamFor {
                 service: service.clone(),
             });
-            pam_install_in(base, &service, plan.yes, false)?;
+            // Step 9 runs only under a wizard base, never
+            // `--non-interactive`, so `setup_pam_knobs` reduces to `plan.yes`
+            // on both knobs here. Splitting them would make `--pam --service X
+            // --yes` start prompting where it never did.
+            let (no_confirm, allow_sensitive) = setup_pam_knobs(plan);
+            super::pam::install_one_in(base, &service, allow_sensitive, no_confirm)?;
             Ok(vec![service])
         }
         PamStep::Ask => wizard_pam_setup_in(base, theme),
@@ -1985,34 +2020,34 @@ fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec
     let labels: Vec<&str> = candidates.iter().map(|c| c.description).collect();
     let defaults: Vec<bool> = candidates.iter().map(|c| c.default_enabled).collect();
 
-    let selected_services: Vec<String> = if !is_interactive() {
-        // Non-TTY / non-interactive: auto-select per defaults.
-        candidates
-            .iter()
-            .zip(defaults.iter())
-            .filter(|(_, d)| **d)
-            .map(|(c, _)| c.service.to_string())
-            .collect()
-    } else {
-        let selections = MultiSelect::with_theme(theme)
-            .with_prompt(PamMessage::PromptSelectPamServices.localized())
-            .items(&labels)
-            .defaults(&defaults)
-            .interact()?;
-        selections
-            .into_iter()
-            .map(|i| candidates[i].service.to_string())
-            .collect()
-    };
+    // The multi-select is the only thing that can select a service here, and
+    // it needs a terminal. There used to be a `!is_interactive()` arm that
+    // auto-selected every `default_enabled` candidate instead — hyprlock,
+    // swaylock, kscreenlocker_greet and lightdm, written with no consent from
+    // anyone. It could not fire in production (`run_with_plan` demotes a
+    // non-TTY wizard base to `run_non_interactive` under the same
+    // `is_interactive()` test, so `run_wizard` — this function's only caller —
+    // never runs headless), and the one test that reached it did so by calling
+    // step 9 directly.
+    let selections = MultiSelect::with_theme(theme)
+        .with_prompt(PamMessage::PromptSelectPamServices.localized())
+        .items(&labels)
+        .defaults(&defaults)
+        .interact()?;
+    let selected_services: Vec<String> = selections
+        .into_iter()
+        .map(|i| candidates[i].service.to_string())
+        .collect();
 
     let mut configured = Vec::new();
     for service in selected_services {
         Terminal.info(&PamMessage::ConfiguringPamFor {
             service: service.clone(),
         });
-        // `yes = true`: the multi-select above *is* the per-service consent, and
-        // no candidate is in SENSITIVE_SERVICES.
-        match pam_install_in(base, &service, true, false) {
+        // The multi-select above *is* the per-service consent, so no
+        // confirmation is asked for again; no candidate is in
+        // SENSITIVE_SERVICES, so the gate is moot either way.
+        match super::pam::install_one_in(base, &service, true, true) {
             Ok(()) => configured.push(service),
             Err(e) => {
                 Terminal.info(&PamMessage::PamConfigureFailed {
@@ -2747,253 +2782,12 @@ const PAM_CANDIDATES: &[PamCandidate] = &[
     },
 ];
 
-/// The real PAM configuration directory. `candidates_in` and `pam_install_in`
-/// take it as a parameter so tests can point them at a tempdir instead.
-const PAM_DIR: &str = "/etc/pam.d";
-
 /// Returns candidates from `PAM_CANDIDATES` whose service file exists under `base`.
 fn candidates_in(base: &Path) -> Vec<&'static PamCandidate> {
     PAM_CANDIDATES
         .iter()
         .filter(|c| base.join(c.service).exists())
         .collect()
-}
-
-// The four prints below are the last in this file that still write to stdout
-// directly instead of going through the message sink, and they stay that way
-// on purpose: this whole region moves to `commands/pam.rs` (#174), which
-// converts them during the move. Converting them here would only make that
-// move a conflict.
-
-// --- PAM installation ---
-
-const PAM_LINE: &str = "auth      sufficient pam_facelock.so";
-
-/// Print a copy-pasteable hint so users can extend PAM integration to any service.
-fn print_pam_extension_hint() {
-    println!();
-    println!("==> facelock PAM line for manual extension to other services:");
-    println!("==>   {PAM_LINE}");
-    println!(
-        "==> Add the above line above the first 'auth' line in any /etc/pam.d/<service> file."
-    );
-}
-
-const PAM_MODULE_PATH: &str = "/lib/security/pam_facelock.so";
-const SENSITIVE_SERVICES: &[&str] = &["system-auth", "login", "sshd"];
-
-/// Check if a PAM config line references pam_facelock, regardless of spacing.
-fn is_facelock_pam_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    !trimmed.starts_with('#') && trimmed.contains("pam_facelock.so")
-}
-
-pub fn run_pam(service: &str, remove: bool, if_present: bool, yes: bool) -> anyhow::Result<()> {
-    // 1. Check root
-    if !nix::unistd::Uid::current().is_root() {
-        bail!("PAM configuration requires root. Run with sudo.");
-    }
-
-    if remove {
-        pam_remove(service, if_present)
-    } else {
-        pam_install(service, yes, false)?;
-        print_pam_extension_hint();
-        Ok(())
-    }
-}
-
-/// [`pam_install_in`] against the real [`PAM_DIR`], plus the module-presence
-/// precondition that the parameterized form leaves to its caller.
-///
-/// Root is re-checked here rather than only in [`run_pam`]: this function edits
-/// `/etc/pam.d`, and it is reachable both from `run_pam` and directly from
-/// `run_with_plan`. The parameterized [`pam_install_in`] deliberately does not
-/// check, so tests can drive the write path against a tempdir unprivileged.
-fn pam_install(service: &str, yes: bool, no_prompt: bool) -> anyhow::Result<()> {
-    // 1. Check root
-    if !nix::unistd::Uid::current().is_root() {
-        bail!("PAM configuration requires root. Run with sudo.");
-    }
-
-    // 2. Check PAM module exists
-    if !Path::new(PAM_MODULE_PATH).exists() {
-        bail!(
-            "PAM module not found at {PAM_MODULE_PATH}.\n\
-             Install it first: cargo build --release -p pam-facelock && \
-             sudo cp target/release/libpam_facelock.so {PAM_MODULE_PATH}"
-        );
-    }
-
-    pam_install_in(Path::new(PAM_DIR), service, yes, no_prompt)
-}
-
-/// Insert the facelock PAM line into `<base>/<service>`.
-///
-/// `yes` gates [`SENSITIVE_SERVICES`]; `no_prompt` only suppresses the per-file
-/// "Proceed?" confirmation, because `--non-interactive` promises no prompts but
-/// must not weaken the sensitive-service gate.
-///
-/// The caller is responsible for checking that the PAM module is installed.
-fn pam_install_in(base: &Path, service: &str, yes: bool, no_prompt: bool) -> anyhow::Result<()> {
-    // 3. Refuse sensitive services without --yes
-    if SENSITIVE_SERVICES.contains(&service) && !yes {
-        bail!(
-            "Refusing to modify '{service}' without --yes flag.\n\
-             This is a sensitive PAM service. Use: facelock setup --pam --service {service} --yes"
-        );
-    }
-
-    let pam_file = base.join(service);
-    let pam_path = pam_file.display().to_string();
-    let pam_file = pam_file.as_path();
-
-    if !pam_file.exists() {
-        bail!("PAM service file not found: {pam_path}");
-    }
-
-    // Read existing content
-    let content =
-        fs::read_to_string(pam_file).with_context(|| format!("failed to read {pam_path}"))?;
-
-    // Check idempotency — match on the module name, not exact spacing
-    if content.lines().any(is_facelock_pam_line) {
-        Terminal.info(&PamMessage::PamLineAlreadyPresent {
-            path: pam_path.clone(),
-        });
-        return Ok(());
-    }
-
-    // 4. Preview change and confirm before any modification
-    let backup_path = format!("{pam_path}.facelock-backup");
-
-    // Decide where the line will go BEFORE prompting, so the preview is accurate.
-    let insertion_hint = if content.lines().any(|l| l.trim_start().starts_with("auth")) {
-        PamMessage::PamInsertBeforeAuthHint
-    } else {
-        PamMessage::PamInsertAtTopHint
-    };
-
-    Terminal.info(&PamMessage::PamModifyPreview {
-        path: pam_path.clone(),
-        line: PAM_LINE.to_string(),
-        hint: insertion_hint.localized(),
-        backup: backup_path.clone(),
-    });
-
-    let proceed = if yes || no_prompt || !std::io::stdin().is_terminal() {
-        true
-    } else {
-        Confirm::new()
-            .with_prompt(PamMessage::ConfirmProceed.localized())
-            .default(true)
-            .interact()
-            .context("failed to read confirmation")?
-    };
-
-    if !proceed {
-        Terminal.info(&PamMessage::PamSkippedFile {
-            path: pam_path.clone(),
-        });
-        return Ok(());
-    }
-
-    // 4b. Create backup (always, before any modification)
-    fs::copy(pam_file, &backup_path)
-        .with_context(|| format!("failed to back up {pam_path} to {backup_path}"))?;
-    Terminal.info(&PamMessage::PamBackedUp {
-        path: pam_path.clone(),
-        backup: backup_path.clone(),
-    });
-
-    // 5. Prepend PAM line before first auth line
-    let mut new_lines: Vec<String> = Vec::new();
-    let mut inserted = false;
-
-    for line in content.lines() {
-        if !inserted && line.trim_start().starts_with("auth") {
-            new_lines.push(PAM_LINE.to_string());
-            inserted = true;
-        }
-        new_lines.push(line.to_string());
-    }
-
-    if !inserted {
-        // No auth line found; append at the top
-        new_lines.insert(0, PAM_LINE.to_string());
-    }
-
-    // Preserve trailing newline
-    let mut output = new_lines.join("\n");
-    if content.ends_with('\n') {
-        output.push('\n');
-    }
-
-    fs::write(pam_file, &output).with_context(|| format!("failed to write {pam_path}"))?;
-
-    Terminal.info(&PamMessage::PamInstalled {
-        path: pam_path.clone(),
-        backup: backup_path.clone(),
-        service: service.to_string(),
-    });
-
-    Ok(())
-}
-
-fn pam_remove(service: &str, if_present: bool) -> anyhow::Result<()> {
-    pam_remove_in(Path::new(PAM_DIR), service, if_present)
-}
-
-fn pam_remove_in(base: &Path, service: &str, if_present: bool) -> anyhow::Result<()> {
-    let pam_file = base.join(service.trim_start_matches('/'));
-    let pam_path = pam_file.display().to_string();
-
-    let content = match fs::read_to_string(&pam_file) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if if_present {
-                Terminal.info(&PamMessage::PamServiceAbsent {
-                    path: pam_path.clone(),
-                });
-                return Ok(());
-            }
-            bail!("PAM service file not found: {pam_path}");
-        }
-        Err(error) => return Err(error).with_context(|| format!("failed to read {pam_path}")),
-    };
-
-    let original_count = content.lines().count();
-    let new_lines: Vec<&str> = content
-        .lines()
-        .filter(|line| !is_facelock_pam_line(line))
-        .collect();
-
-    if new_lines.len() == original_count {
-        Terminal.info(&PamMessage::PamNoLineFound {
-            path: pam_path.clone(),
-        });
-    } else {
-        let mut output = new_lines.join("\n");
-        if content.ends_with('\n') {
-            output.push('\n');
-        }
-
-        fs::write(&pam_file, &output).with_context(|| format!("failed to write {pam_path}"))?;
-        Terminal.info(&PamMessage::PamRemoved {
-            path: pam_path.clone(),
-        });
-    }
-
-    // Offer backup restore
-    let backup_path = format!("{pam_path}.facelock-backup");
-    if Path::new(&backup_path).exists() {
-        Terminal.info(&PamMessage::PamBackupExists {
-            path: pam_path.clone(),
-            backup: backup_path.clone(),
-        });
-    }
-
-    Ok(())
 }
 
 fn verify_after_download(path: &Path, expected_sha256: &str, name: &str) -> anyhow::Result<()> {
@@ -3561,73 +3355,6 @@ mod tests {
     }
 
     #[test]
-    fn pam_insert_before_first_auth_line() {
-        let original = "\
-#%PAM-1.0
-auth    include   system-local-login
-auth    include   system-login
-account include   system-login
-";
-        // Simulate the insertion logic
-        let mut new_lines: Vec<String> = Vec::new();
-        let mut inserted = false;
-        for line in original.lines() {
-            if !inserted && line.trim_start().starts_with("auth") {
-                new_lines.push(PAM_LINE.to_string());
-                inserted = true;
-            }
-            new_lines.push(line.to_string());
-        }
-        let mut output = new_lines.join("\n");
-        if original.ends_with('\n') {
-            output.push('\n');
-        }
-
-        assert!(inserted);
-        let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines[0], "#%PAM-1.0");
-        assert_eq!(lines[1], PAM_LINE);
-        assert_eq!(lines[2], "auth    include   system-local-login");
-    }
-
-    #[test]
-    fn pam_idempotent_detection() {
-        // Exact match
-        let content = format!("#%PAM-1.0\n{PAM_LINE}\nauth    include   system-login\n");
-        assert!(content.lines().any(is_facelock_pam_line));
-
-        // Different spacing should still match
-        let content2 =
-            "#%PAM-1.0\nauth  sufficient  pam_facelock.so\nauth    include   system-login\n";
-        assert!(content2.lines().any(is_facelock_pam_line));
-
-        // Commented-out line should not match
-        let content3 =
-            "#%PAM-1.0\n#auth sufficient pam_facelock.so\nauth    include   system-login\n";
-        assert!(!content3.lines().any(is_facelock_pam_line));
-    }
-
-    #[test]
-    fn pam_remove_filters_line() {
-        // Should remove regardless of spacing
-        let content = "#%PAM-1.0\nauth  sufficient  pam_facelock.so\nauth    include   system-login\naccount include   system-login\n";
-        let new_lines: Vec<&str> = content
-            .lines()
-            .filter(|line| !is_facelock_pam_line(line))
-            .collect();
-        assert_eq!(new_lines.len(), 3);
-        assert!(!new_lines.iter().any(|l| is_facelock_pam_line(l)));
-    }
-
-    #[test]
-    fn sensitive_services_detected() {
-        assert!(SENSITIVE_SERVICES.contains(&"system-auth"));
-        assert!(SENSITIVE_SERVICES.contains(&"login"));
-        assert!(SENSITIVE_SERVICES.contains(&"sshd"));
-        assert!(!SENSITIVE_SERVICES.contains(&"sudo"));
-    }
-
-    #[test]
     fn detect_candidates_filters_by_presence() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("sudo"), "").unwrap();
@@ -3912,6 +3639,13 @@ mod action_tests {
 
     /// The plan's acceptance criterion: declining PAM leaves every file under
     /// the PAM directory byte-identical, and adds none.
+    ///
+    /// `hash_harness_detects_a_real_pam_write` below is the foil that keeps
+    /// this honest. It used to be `default_plan_still_configures_pam`, which
+    /// drove the default (`Ask`) plan and relied on step 9 auto-selecting every
+    /// `default_enabled` candidate when stdin was not a terminal. That branch
+    /// is gone (#174) and the test with it — `cargo test` from a terminal gets
+    /// a tty on stdin, so it was already blocking on the multi-select there.
     #[test]
     fn no_pam_leaves_every_pam_file_byte_identical() {
         let dir = fake_pam_d();
@@ -3977,85 +3711,6 @@ mod action_tests {
         assert_eq!(before, hash_dir(dir.path()));
     }
 
-    #[test]
-    fn pam_remove_if_present_missing_service_is_a_noop() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let before = hash_dir(dir.path());
-
-        pam_remove_in(dir.path(), "omarchy-lock-face", true).unwrap();
-
-        assert_eq!(before, hash_dir(dir.path()));
-        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
-    }
-
-    #[test]
-    fn pam_remove_missing_service_without_if_present_still_errors() {
-        let dir = tempfile::TempDir::new().unwrap();
-
-        let error = pam_remove_in(dir.path(), "omarchy-lock-face", false).unwrap_err();
-
-        let rendered = error.to_string();
-        assert!(rendered.contains("PAM service file not found:"));
-        assert!(rendered.contains("omarchy-lock-face"));
-        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
-    }
-
-    #[test]
-    fn pam_remove_if_present_removes_an_existing_facelock_line() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pam_file = dir.path().join("omarchy-lock-face");
-        fs::write(
-            &pam_file,
-            format!("#%PAM-1.0\n{PAM_LINE}\nauth include system-auth\n"),
-        )
-        .unwrap();
-
-        pam_remove_in(dir.path(), "omarchy-lock-face", true).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(pam_file).unwrap(),
-            "#%PAM-1.0\nauth include system-auth\n"
-        );
-    }
-
-    #[test]
-    fn pam_remove_if_present_preserves_a_file_without_a_facelock_line() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pam_file = dir.path().join("omarchy-lock-face");
-        let original = b"#%PAM-1.0\nauth include system-auth\n";
-        fs::write(&pam_file, original).unwrap();
-
-        pam_remove_in(dir.path(), "omarchy-lock-face", true).unwrap();
-
-        assert_eq!(fs::read(pam_file).unwrap(), original);
-    }
-
-    #[test]
-    fn pam_remove_if_present_does_not_suppress_other_read_errors() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let before = hash_dir(dir.path());
-
-        let error = pam_remove_in(dir.path(), ".", true).unwrap_err();
-
-        assert!(error.to_string().contains("failed to read"));
-        assert_eq!(before, hash_dir(dir.path()));
-    }
-
-    #[test]
-    fn pam_remove_absolute_service_stays_anchored_under_base() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let base = dir.path().join("pam.d");
-        fs::create_dir(&base).unwrap();
-        let absolute_target = dir.path().join("outside-service");
-        let original = format!("#%PAM-1.0\n{PAM_LINE}\nauth include system-auth\n");
-        fs::write(&absolute_target, &original).unwrap();
-
-        pam_remove_in(&base, absolute_target.to_str().unwrap(), true).unwrap();
-
-        assert_eq!(fs::read_to_string(absolute_target).unwrap(), original);
-        assert!(fs::read_dir(base).unwrap().next().is_none());
-    }
-
     // -- `--pam` in a wizard base -------------------------------------------
 
     /// `--pam --service hyprlock` configures exactly `hyprlock`.
@@ -4080,9 +3735,18 @@ mod action_tests {
     }
 
     /// Bare `--pam` means `sudo`, not the candidates' `default_enabled` set.
+    ///
+    /// `yes` is set for the same reason its sibling tests set it: without it
+    /// the write reaches the per-file "Proceed?" confirmation, and `cargo test`
+    /// run from a terminal hands the test a real tty on stdin, so the prompt
+    /// blocks the suite rather than failing it. The assertion is about *which*
+    /// service is configured; prompting is not part of it.
     #[test]
     fn pam_without_service_means_sudo_not_the_default_enabled_set() {
-        let plan = pam_plan(PamPref::Install { service: None });
+        let plan = SetupPlan {
+            yes: true,
+            ..pam_plan(PamPref::Install { service: None })
+        };
         assert_eq!(
             pam_step_for(&plan),
             PamStep::Install(DEFAULT_PAM_SERVICE.to_string())
@@ -4099,22 +3763,27 @@ mod action_tests {
         assert_eq!(before["polkit-1"], after["polkit-1"]);
     }
 
-    /// The sensitive-service gate still requires `--yes`, and refusing it
-    /// writes nothing.
+    /// The `setup --yes` mapping is the security property the flag split has
+    /// to preserve, and it is the one part of it that lives on this side of
+    /// the seam. `commands::pam` pins that the engine honours the knobs;
+    /// this pins that `setup` sets them right.
     #[test]
-    fn sensitive_service_refused_without_yes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("sshd"),
-            "#%PAM-1.0\nauth\t\tinclude\t\tsystem-auth\n",
-        )
-        .unwrap();
-        let before = hash_dir(dir.path());
+    fn setup_maps_yes_to_both_knobs_and_non_interactive_to_only_one() {
+        let with = |base, yes| {
+            setup_pam_knobs(&SetupPlan {
+                base,
+                yes,
+                ..SetupPlan::default()
+            })
+        };
 
-        // `no_prompt` (what `--non-interactive` sets) must not weaken the gate.
-        let err = pam_install_in(dir.path(), "sshd", false, true).unwrap_err();
-        assert!(err.to_string().contains("Refusing to modify 'sshd'"));
-        assert_eq!(before, hash_dir(dir.path()));
+        // Standalone `--pam`: ask, and refuse the sensitive services.
+        assert_eq!(with(None, false), (false, false));
+        // `--non-interactive --pam`: no prompts, and *still* refuse them.
+        assert_eq!(with(Some(BaseMode::NonInteractive), false), (true, false));
+        // `--pam --yes`: the documented combined meaning — both halves.
+        assert_eq!(with(None, true), (true, true));
+        assert_eq!(with(Some(BaseMode::NonInteractive), true), (true, true));
     }
 
     // -- `--no-systemd` -----------------------------------------------------
@@ -4203,22 +3872,6 @@ mod action_tests {
         assert!(pam_step_for(&plan).touches_pam_d());
     }
 
-    /// ...and step 9 under a default plan really does write. Under `cargo test`
-    /// stdin is not a terminal, so it falls back to the candidates'
-    /// `default_enabled` set — which is exactly what `--no-pam` must prevent.
-    #[test]
-    fn default_plan_still_configures_pam() {
-        let dir = fake_pam_d();
-        let before = hash_dir(dir.path());
-
-        let plan = SetupPlan::default();
-        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
-
-        assert!(configured.contains(&"sudo".to_string()));
-        assert!(configured.contains(&"hyprlock".to_string()));
-        assert_ne!(before, hash_dir(dir.path()));
-    }
-
     /// `-y` makes the step 6/7/8 confirmations take their default instead of
     /// prompting. `cargo test` gives us a non-tty stdin, so a real prompt here
     /// would fail — `Ok(true)` is proof it was suppressed.
@@ -4243,7 +3896,7 @@ mod action_tests {
     }
 
     /// A PAM module that is not installed short-circuits step 9 before any
-    /// write — the check the tests above hoist out of `pam_install_in`.
+    /// write — the check the tests above hoist out of the writer.
     #[test]
     fn missing_pam_module_writes_nothing() {
         let dir = fake_pam_d();
@@ -4254,21 +3907,5 @@ mod action_tests {
 
         assert!(configured.is_empty());
         assert_eq!(before, hash_dir(dir.path()));
-    }
-
-    /// `pam_install` edits `/etc/pam.d` and is reachable from `run_with_plan`
-    /// without going through `run_pam`, so it must refuse non-root itself.
-    /// Regression: routing standalone `--pam` through `pam_install` once let an
-    /// unprivileged `facelock setup --pam` read and report on `/etc/pam.d/sudo`.
-    #[test]
-    fn pam_install_refuses_without_root() {
-        if nix::unistd::Uid::current().is_root() {
-            return; // the check cannot fire; nothing to assert
-        }
-        let err = pam_install("sudo", true, true).unwrap_err().to_string();
-        assert!(
-            err.contains("requires root"),
-            "expected the root refusal before any other check, got: {err}"
-        );
     }
 }

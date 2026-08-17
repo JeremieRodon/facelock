@@ -15,7 +15,7 @@ use facelock_cli::commands::hyprlock::HyprlockCommand;
 use facelock_cli::commands::setup::{SetupArgs, resolve_setup_plan};
 use facelock_cli::{commands, logging, message, notifications, resolved};
 
-use args::{ConfirmArg, JsonArg, SetupCli, UserArg};
+use args::{ConfirmArg, JsonArg, PamCli, SetupCli, UserArg};
 
 #[derive(Parser)]
 #[command(name = "facelock", about = "Linux face authentication", version)]
@@ -123,6 +123,11 @@ enum Commands {
         #[command(subcommand)]
         command: TpmCommand,
     },
+    /// Manage the facelock line in /etc/pam.d service files
+    Pam {
+        #[command(subcommand)]
+        command: PamCli,
+    },
     /// Manage hyprlock lock-screen integration (no root required)
     Hyprlock {
         #[command(subcommand)]
@@ -208,6 +213,14 @@ fn main() -> anyhow::Result<()> {
                 Commands::IsEnrolled { user, json } => {
                     std::process::exit(commands::is_enrolled::run(user.user, json.json, quiet))
                 }
+                // `pam` consumes no `Config` either: `add`/`remove` edit
+                // `/etc/pam.d` and `status` reads it, and neither wants a
+                // missing or broken config file to be the thing that stops
+                // them. Its exit code is its own — `status` answers on grep's
+                // 0/1/2 scale — so it exits here rather than returning `()`.
+                Commands::Pam { command } => {
+                    std::process::exit(commands::pam::run(command.into(), quiet)?)
+                }
                 Commands::Hyprlock { command } => commands::hyprlock::run(command),
                 Commands::Config { edit } => commands::config::run(edit),
                 Commands::Restart => commands::config::restart(),
@@ -267,6 +280,7 @@ fn main() -> anyhow::Result<()> {
                         Commands::Daemon
                         | Commands::Auth { .. }
                         | Commands::IsEnrolled { .. }
+                        | Commands::Pam { .. }
                         | Commands::Hyprlock { .. }
                         | Commands::Config { .. }
                         | Commands::Restart
@@ -853,6 +867,46 @@ mod tests {
             &["facelock", "audit", "-f", "-l", "5"],
             &["facelock", "list", "-u", "alice", "--json"],
             &["facelock", "devices", "--json"],
+            // `facelock pam` (#174). The new verb is additive: every row above
+            // is what `setup --pam` accepted before it existed, and both
+            // spellings keep working.
+            &["facelock", "pam", "add"],
+            &["facelock", "pam", "add", "--service", "sudo"],
+            &[
+                "facelock",
+                "pam",
+                "add",
+                "--service",
+                "sudo",
+                "--service",
+                "polkit-1",
+                "--no-confirm",
+                "--dry-run",
+                "--json",
+            ],
+            &[
+                "facelock",
+                "pam",
+                "add",
+                "--service",
+                "system-auth",
+                "--allow-sensitive",
+                "-y",
+            ],
+            &["facelock", "pam", "add", "--service", "x", "--if-present"],
+            &["facelock", "pam", "remove"],
+            &[
+                "facelock",
+                "pam",
+                "remove",
+                "--service",
+                "sudo",
+                "--if-present",
+                "--no-confirm",
+            ],
+            &["facelock", "pam", "status"],
+            &["facelock", "pam", "status", "--service", "sudo", "--json"],
+            &["facelock", "--quiet", "pam", "status", "--json"],
         ] {
             Cli::try_parse_from(argv)
                 .unwrap_or_else(|e| panic!("`{}` must still parse: {e}", argv.join(" ")));
@@ -908,5 +962,77 @@ mod tests {
             panic!("expected the Clear variant");
         };
         assert!(confirm.yes);
+    }
+
+    // -----------------------------------------------------------------------
+    // `facelock pam` (#174)
+    // -----------------------------------------------------------------------
+
+    fn pam_request(args: &[&str]) -> facelock_cli::commands::pam::PamRequest {
+        let argv: Vec<&str> = ["facelock", "pam"].iter().chain(args).copied().collect();
+        let cli = Cli::try_parse_from(argv).expect("expected these args to parse");
+        let Commands::Pam { command } = cli.command else {
+            panic!("expected the Pam variant");
+        };
+        command.into()
+    }
+
+    /// The defect the verb exists to fix: one process, several services. The
+    /// old surface took a single `Option<String>`, so a wrapper wanting three
+    /// services ran three of them.
+    #[test]
+    fn pam_service_is_repeatable_and_ordered() {
+        assert_eq!(
+            pam_request(&["add", "--service", "sudo", "--service", "polkit-1"]).services,
+            ["sudo", "polkit-1"]
+        );
+        // Empty is not "no services" — it is `sudo`, resolved in the command.
+        assert!(pam_request(&["add"]).services.is_empty());
+    }
+
+    /// **`--no-confirm` must never imply `--allow-sensitive`.** They are
+    /// separate authorizations: "do not ask me" and "yes, edit system-auth".
+    /// `setup --yes` keeps the combined meaning and is the sole exception.
+    #[test]
+    fn no_confirm_and_allow_sensitive_are_independent() {
+        for skip_prompts in [
+            &["add", "--no-confirm"][..],
+            &["add", "--yes"],
+            &["add", "-y"],
+        ] {
+            let request = pam_request(skip_prompts);
+            assert!(request.no_confirm, "{skip_prompts:?}");
+            assert!(
+                !request.allow_sensitive,
+                "{skip_prompts:?} must not unlock the sensitive services"
+            );
+        }
+
+        let request = pam_request(&["add", "--allow-sensitive"]);
+        assert!(request.allow_sensitive);
+        assert!(
+            !request.no_confirm,
+            "--allow-sensitive accepts a risk; it does not skip the question"
+        );
+
+        // `setup --yes` is the documented exception, unchanged.
+        assert!(plan(&["--pam", "--yes"]).yes);
+    }
+
+    /// `--allow-sensitive` is an `add`-only flag: removal can only take away a
+    /// way to authenticate, so there is nothing to gate.
+    #[test]
+    fn remove_and_status_do_not_offer_allow_sensitive() {
+        for argv in [
+            &["facelock", "pam", "remove", "--allow-sensitive"][..],
+            &["facelock", "pam", "status", "--allow-sensitive"],
+            &["facelock", "pam", "status", "--dry-run"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "`{}` must not parse",
+                argv.join(" ")
+            );
+        }
     }
 }
