@@ -19,6 +19,17 @@ and login managers.
 .PP
 All face recognition inference runs locally using ONNX models (SCRFD for
 detection and ArcFace for embedding). No cloud services are contacted.
+.SH GLOBAL OPTIONS
+These are declared once and accepted by every subcommand, on either side of the
+subcommand name \(em \fBfacelock \-c \fIpath\fB daemon\fR and
+\fBfacelock daemon \-c \fIpath\fR are the same invocation.
+.TP
+.B \-c\fR, \fB\-\-config \fIpath\fR
+Path to the config file. Takes precedence over
+.BR FACELOCK_CONFIG .
+.TP
+.B \-q\fR, \fB\-\-quiet
+Suppress non-essential stdout and report the result through the exit code.
 .SH COMMANDS
 .TP
 .B setup
@@ -140,9 +151,10 @@ Output a JSON object with the keys \fBenrolled\fR (boolean), \fBmodels\fR
 (integer) and \fBupdated\fR (ISO 8601 timestamp, or null) instead of
 \fByes\fR/\fBno\fR. Does not change the exit status.
 .TP
-.B \-\-quiet
+.B \-q\fR, \fB\-\-quiet
 Suppress stdout and report only via the exit status. Errors are still written
-to stderr.
+to stderr. This is the global flag (see GLOBAL OPTIONS), so
+\fBfacelock \-\-quiet is\-enrolled\fR is the same invocation.
 .RE
 .TP
 .B enroll
@@ -164,7 +176,7 @@ Remove a specific face model by its numeric ID.
 Username (default: current user).
 .TP
 .B \-y\fR, \fB\-\-yes
-Skip confirmation prompt.
+Skip the confirmation prompt. Also accepted as \fB\-\-no\-confirm\fR.
 .RE
 .TP
 .B clear
@@ -175,7 +187,7 @@ Remove all face models for a user.
 Username (default: current user).
 .TP
 .B \-y\fR, \fB\-\-yes
-Skip confirmation prompt.
+Skip the confirmation prompt. Also accepted as \fB\-\-no\-confirm\fR.
 .RE
 .TP
 .B list
@@ -232,23 +244,21 @@ List available camera devices.
 Run the persistent authentication daemon. Registers on the D-Bus system bus
 as \fBorg.facelock.Daemon\fR to service authentication and enrollment requests
 from the PAM module and CLI.
-.RS
-.TP
-.B \-c\fR, \fB\-\-config \fIpath\fR
-Path to config file.
-.RE
+.IP
+Takes \fB\-c\fR, \fB\-\-config\fR from GLOBAL OPTIONS above.
 .TP
 .B auth
 One-shot authentication (used by the PAM module). Exits with code 0 on
-success or non-zero on failure.
+success or non-zero on failure. The PAM module spawns
+\fBfacelock auth \-\-user \fIname\fB \-\-config \fIpath\fR.
 .RS
 .TP
-.B \-\-user \fIusername\fR
-Username to authenticate (required).
-.TP
-.B \-\-config \fIpath\fR
-Path to config file.
+.B \-u\fR, \fB\-\-user \fIusername\fR
+Username to authenticate. Required here and only here: the caller names the
+subject, and it must never fall back to the process owner.
 .RE
+.IP
+Takes \fB\-\-config\fR from GLOBAL OPTIONS above.
 .TP
 .B bench \fIsubcommand\fR
 Benchmark and calibration tools.

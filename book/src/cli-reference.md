@@ -4,11 +4,18 @@ All commands are subcommands of the `facelock` binary.
 
 ## Global flags
 
-The following flag is accepted by every subcommand (declared `global = true`):
+These are declared once (`global = true`) and accepted by every subcommand, on
+either side of the subcommand name — `facelock -c X daemon` and
+`facelock daemon -c X` are the same invocation:
 
 | Flag | Description |
 |------|-------------|
-| `--config <PATH>` | Override the config file path. Takes precedence over `FACELOCK_CONFIG`. |
+| `-c`, `--config <PATH>` | Override the config file path. Takes precedence over `FACELOCK_CONFIG`. |
+| `-q`, `--quiet` | Suppress non-essential stdout; the exit code still reports the result. |
+
+No subcommand re-declares either one. Flag spelling in general is pinned by the
+`cli_flag_conformance` test — see [Contracts](contracts.md), "CLI Flag
+Spelling", for the invariants and the short-letter registry.
 
 ## facelock setup
 
@@ -292,7 +299,7 @@ Remove a specific face model by ID.
 ```bash
 facelock remove 3                       # remove model #3
 facelock remove 3 --user alice          # for specific user
-facelock remove 3 --yes                 # skip confirmation
+facelock remove 3 --yes                 # skip confirmation (alias: --no-confirm)
 ```
 
 ## facelock clear
@@ -301,7 +308,7 @@ Remove all face models for a user.
 
 ```bash
 facelock clear                          # current user
-facelock clear --user alice --yes       # skip confirmation
+facelock clear --user alice --yes       # skip confirmation (alias: --no-confirm)
 ```
 
 ## facelock preview
@@ -355,8 +362,8 @@ Run the persistent authentication daemon.
 
 ```bash
 facelock daemon                         # use default config
-facelock daemon -c /path/to/config.toml # short alias for --config
-facelock daemon --config /path/to/config.toml
+facelock daemon -c /path/to/config.toml # the global --config, either position
+facelock -c /path/to/config.toml daemon
 ```
 
 Normally managed by systemd, not run manually.
@@ -367,8 +374,12 @@ One-shot authentication. Used by the PAM module in oneshot mode.
 
 ```bash
 facelock auth --user alice              # authenticate
+facelock auth -u alice                  # same thing
 facelock auth --user alice --config /etc/facelock/config.toml
 ```
+
+`--user` is required here and only here: the PAM module names the subject, and
+`auth` must never fall back to the process owner.
 
 Exit codes: 0 = matched, 1 = no match, 2 = error.
 

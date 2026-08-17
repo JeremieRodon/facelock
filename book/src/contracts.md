@@ -27,13 +27,30 @@ Stable contracts. Do not change without updating this document.
 | `facelock status` | Check system status |
 | `facelock config` | Show/edit configuration |
 | `facelock daemon` | Run persistent daemon |
-| `facelock auth --user X` | One-shot auth (PAM helper) |
+| `facelock auth --user X` | One-shot auth (PAM helper). `--user` is required here and only here; `--config` is the global flag, not a per-command one |
 | `facelock tpm status` | TPM status |
 | `facelock encrypt` | Encrypt face database |
 | `facelock decrypt` | Decrypt face database |
 | `facelock audit` | View audit log |
 | `facelock bench` | Benchmarks |
 | `facelock restart` | Restart daemon |
+
+### CLI Flag Spelling
+
+Flag spelling is a compatibility surface: `pam_facelock.so` spawns
+`facelock auth --user <name> --config <path>` byte for byte. Shared clap arg
+structs in `crates/facelock-cli/src/args.rs` give each flag family one spelling,
+and the conformance test `cli_flag_conformance` in
+`crates/facelock-cli/src/main.rs` walks the whole command tree and fails on
+drift. The short-letter registry — every short letter and the long names allowed
+to bind it — lives in that test.
+
+- `--user` is `-u` everywhere it exists, including `auth`
+- `auth --user` is required; every other `--user` defaults to the current user
+- `--yes` is `-y` and accepts `--no-confirm` everywhere
+- `--json` and `--dry-run` take no short letter
+- `--config` (`-c`) and `--quiet` (`-q`) are global, declared once, and accepted
+  on either side of the subcommand name
 
 ## Operating Modes
 
