@@ -191,9 +191,34 @@ to attacker-controlled illumination. A quirk's `y16_bit_depth`
 (`/etc/facelock/quirks.d/`) is **authoritative** when present — the shift becomes
 `bit_depth - 8` and no frame is inspected; the fallback samples a burst of frames at open
 (at least the device's declared `warmup_frames`) and takes their peak, so the scale does
-not hinge on whatever a single pre-AGC frame happened to see. A scene-derived scale is a reliability risk rather than a bypass (a
-covered lens at open clips later frames to flat white, which this check *rejects*), but on
-hardware where it recurs, pin `y16_bit_depth`.
+not hinge on whatever a single pre-AGC frame happened to see.
+
+**A scene-derived scale is not purely a reliability risk. One of its two error directions
+is fail-open.** Both are worth stating plainly:
+
+- *Shift too high* (a stuck pixel or specular glint inflates the burst peak): frames go
+  dark, std_dev collapses, this check **rejects**. Fails closed.
+- *Shift too low* (the burst never saw anything bright): nothing clips while raw samples
+  stay under the truncated full scale, so it acts as a clean 2^k contrast stretch on
+  exactly the buffer this check measures — the Y16→8-bit output reaches `check_ir_texture`
+  unmodified, because the RGB replication is 3x and `rgb_to_gray`'s coefficients sum to
+  256. std_dev scales linearly with the stretch. On a 12-bit sensor whose burst peaks near
+  1000, the shift lands at 2 instead of 4 and every score is multiplied by 4: a flat
+  spoof at a true std_dev of 4, inside the "flat surfaces score < 5" band below, measures
+  16 and clears the 10.0 cutoff. **`ir_texture_min_stddev` is an absolute threshold on a
+  scale-dependent statistic, so at the wrong scale it stops discriminating at all.**
+
+Exploiting it needs a Y16 device with no `y16_bit_depth`, influence over the scene across
+a cold open, and a spoof dim enough to stay unclipped; the peak is a max over every pixel
+with the emitter lit, so holding it under a quarter of full scale needs a uniformly dim
+field of view. This is analysis, not a demonstration: facelock has no Y16 hardware, and
+the <5 / >15 bands below were measured on an **8-bit GREY** node and have never been
+validated through the Y16 path.
+
+Pin `y16_bit_depth` on any Y16 device you control — it removes the scene from the decision
+entirely. V4L2 cannot report a sensor's effective bit depth, so on an unlisted camera the
+shift is necessarily a guess; making this check scale-invariant is the generic fix and is
+tracked separately.
 
 "The session" is the lifetime of one open camera, and under the daemon's warm camera hold
 (ADR 008 §4) that can span several authentication attempts, not just one: a held stream

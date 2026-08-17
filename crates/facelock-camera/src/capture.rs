@@ -407,7 +407,33 @@ impl<'a> Camera<'a> {
                     shift
                 }
                 None => {
-                    calibrate_y16_shift(&mut stream, &device_path, y16_calibration_frames(quirk))?
+                    // Not `?`: the emitter is already lit and `Camera` does not
+                    // exist yet, so an early return here would skip the `Drop`
+                    // that is the only thing which turns it back off. Every
+                    // other failure path above runs before the emitter is
+                    // enabled; this one is the exception, so it cleans up.
+                    match calibrate_y16_shift(
+                        &mut stream,
+                        &device_path,
+                        y16_calibration_frames(quirk),
+                    ) {
+                        Ok(shift) => shift,
+                        Err(e) => {
+                            if ir_emitter_active {
+                                if let Some(ref xu_info) = emitter_xu_info {
+                                    if let Err(off) =
+                                        ir_emitter::disable_emitter_with_info(&device_path, xu_info)
+                                    {
+                                        tracing::warn!(
+                                            "failed to disable IR emitter on {device_path} after \
+                                             Y16 calibration failed: {off}"
+                                        );
+                                    }
+                                }
+                            }
+                            return Err(e);
+                        }
+                    }
                 }
             }
         } else {
