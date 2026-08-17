@@ -1295,4 +1295,307 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Reference-doc coverage (#172)
+    // -----------------------------------------------------------------------
+
+    /// `docs/cli.md` is the user-facing CLI reference. Reached the way
+    /// `commands/capabilities.rs` reaches `docs/contracts.md` and `setup.rs`
+    /// reaches the systemd unit: embedded, so a doc that stops describing the
+    /// binary breaks the build rather than the reader.
+    const CLI_DOC: &str = include_str!("../../../docs/cli.md");
+
+    /// The book ships a second copy of the same reference. It is a near-copy,
+    /// not a generated one, so it rots independently — `docs/cli.md` gained
+    /// `is-enrolled` long before this file did.
+    const BOOK_CLI_DOC: &str = include_str!("../../../book/src/cli-reference.md");
+
+    /// The man page. Matched only through [`unescaped_man_page`].
+    const MAN_PAGE: &str = include_str!("../../../man/facelock.1");
+
+    /// Both prose copies of the CLI reference, by repository path so a failure
+    /// names the file that is missing the entry rather than just the entry.
+    const MARKDOWN_REFERENCES: &[(&str, &str)] = &[
+        ("docs/cli.md", CLI_DOC),
+        ("book/src/cli-reference.md", BOOK_CLI_DOC),
+    ];
+
+    /// `man(7)` writes a literal hyphen as `\-`, so `system-auth` is on disk as
+    /// `system\-auth` and a plain substring search for it fails. Undoing that
+    /// one escape is the whole normalization these checks need; nothing here
+    /// looks at roff structure.
+    fn unescaped_man_page() -> String {
+        MAN_PAGE.replace(r"\-", "-")
+    }
+
+    /// The body of one `##` section, so a check scoped to a section cannot be
+    /// satisfied by matching text somewhere else in the file.
+    fn section_of<'a>(doc: &'a str, heading: &str) -> &'a str {
+        let start = doc
+            .find(heading)
+            .unwrap_or_else(|| panic!("`{}` is missing from the document", heading.trim()));
+        let body = &doc[start + heading.len()..];
+        match body.find("\n## ") {
+            Some(end) => &body[..end],
+            None => body,
+        }
+    }
+
+    /// Every subcommand the binary offers is written down.
+    ///
+    /// The rot this exists to stop was real: `is-enrolled`, `hyprlock`,
+    /// `reseal`, `pam` and `capabilities` all shipped without ever reaching
+    /// the reference, and `is-enrolled` is the one command Omarchy's
+    /// integration depends on.
+    ///
+    /// **Top-level commands get a `## facelock <name>` heading of their own.**
+    /// A nested verb (`bench camera-reopen`, `tpm unseal-check`, `pam status`,
+    /// `hyprlock enable`) does *not*: it is documented under its parent's
+    /// section, which is how the file already reads and how a reader looks one
+    /// up. So the assertion for a nested verb is weaker on purpose — the full
+    /// invocation must appear somewhere in the file — but it is still enough
+    /// to catch a whole verb going undocumented, which is what happened to
+    /// `tpm unseal-check`.
+    ///
+    /// Clap's built-in `help` pseudo-command is skipped at every level.
+    ///
+    /// Both prose copies are checked. The book's is a hand-maintained near-copy
+    /// rather than a generated one, so holding only `docs/cli.md` to this would
+    /// leave the copy that rots more freely unpinned.
+    #[test]
+    fn docs_cli_documents_every_subcommand() {
+        let root = Cli::command();
+
+        for (doc_path, doc) in MARKDOWN_REFERENCES {
+            for command in root.get_subcommands() {
+                let name = command.get_name();
+                if name == "help" {
+                    continue;
+                }
+                let heading = format!("\n## facelock {name}\n");
+                assert!(
+                    doc.contains(&heading),
+                    "`facelock {name}` ships but `{doc_path}` has no \
+                     `## facelock {name}` heading"
+                );
+
+                for nested in command.get_subcommands() {
+                    let nested_name = nested.get_name();
+                    if nested_name == "help" {
+                        continue;
+                    }
+                    let invocation = format!("facelock {name} {nested_name}");
+                    assert!(
+                        doc.contains(&invocation),
+                        "`{invocation}` ships but is not mentioned anywhere in \
+                         `{doc_path}`; document it under the `## facelock {name}` section"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `## Machine-readable output` section names every command that
+    /// offers `--json`.
+    ///
+    /// That section is a third copy of a list the binary already holds twice —
+    /// the `JSON_COMMANDS` registry above, and the table in
+    /// `docs/contracts.md`. Prose is the copy that rots silently, because
+    /// nothing fails when a newly added `--json` never reaches it.
+    /// `JSON_COMMANDS` is pinned against the clap tree and not against this
+    /// text, so the two checks do not prop each other up: the walk below is the
+    /// clap tree, and a command satisfies it only by being written down.
+    ///
+    /// One direction only. Asserting that nothing *else* is named there would
+    /// mean parsing prose for command names, and the reverse direction is
+    /// already covered — a command named here that binds no `--json` fails
+    /// `cli_flag_conformance` against `JSON_COMMANDS` first.
+    #[test]
+    fn docs_cli_machine_output_section_names_every_json_command() {
+        let root = Cli::command();
+        let mut commands = Vec::new();
+        walk(&root, "", &mut commands);
+
+        let section = section_of(CLI_DOC, "\n## Machine-readable output\n");
+
+        for (path, command) in &commands {
+            if !command.get_arguments().any(|arg| arg.get_id() == "json") {
+                continue;
+            }
+            assert!(
+                section.contains(path.as_str()),
+                "`{path}` offers `--json` but the `## Machine-readable output` \
+                 section of docs/cli.md does not name it"
+            );
+        }
+    }
+
+    /// Every `facelock …` line the reference shows must actually parse.
+    ///
+    /// A reference example is a promise that the command line works, and the
+    /// cheapest way to break that promise is to document a flag that was
+    /// renamed or never existed. This does not prove an example *succeeds* —
+    /// most need root, a camera or a TPM — only that clap accepts it, which is
+    /// the half a unit test can own.
+    ///
+    /// Extraction rules, and why each one is what it is:
+    ///
+    /// - only ```` ```bash ```` blocks, so prose that names a flag inline is
+    ///   left alone (the `setup` section deliberately cites the invocation
+    ///   that *refuses*, as prose, to explain the sensitive-service gate);
+    /// - a leading `sudo ` is stripped, since half the examples need root;
+    /// - a trailing ` # …` comment is stripped;
+    /// - the invocation ends at the first shell operator (`|`, `||`, `&&`,
+    ///   `;`, `&`), so a piped example documents a real pipeline and still
+    ///   gets its `facelock` half checked;
+    /// - **no placeholders.** A `<user>` or `<model_id>` in an example is
+    ///   rejected outright rather than substituted, because a reference
+    ///   example should be runnable as written — and a substituted
+    ///   placeholder would make `--user <user>` pass while `remove <id>`
+    ///   failed, which is an arbitrary line. Angle brackets are used for
+    ///   metavariables in the flag *tables*, which are not bash blocks.
+    fn documented_invocations() -> Vec<Vec<String>> {
+        const OPERATORS: &[&str] = &["|", "||", "&&", ";", "&"];
+
+        let mut invocations = Vec::new();
+        let mut in_bash = false;
+
+        for line in CLI_DOC.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                in_bash = !in_bash && trimmed == "```bash";
+                continue;
+            }
+            if !in_bash {
+                continue;
+            }
+
+            let command = trimmed.strip_prefix("sudo ").unwrap_or(trimmed).trim();
+            if command != "facelock" && !command.starts_with("facelock ") {
+                continue;
+            }
+            // ` #` rather than `#`: a `#` can legitimately open an argument.
+            let command = match command.split_once(" #") {
+                Some((before, _)) => before.trim(),
+                None => command,
+            };
+
+            let argv: Vec<String> = command
+                .split_whitespace()
+                .take_while(|token| !OPERATORS.contains(token))
+                .map(str::to_string)
+                .collect();
+
+            for token in &argv {
+                assert!(
+                    !token.contains('<') && !token.contains('>'),
+                    "`{command}` in docs/cli.md carries a placeholder or redirect \
+                     (`{token}`); a reference example must be runnable as written"
+                );
+            }
+            invocations.push(argv);
+        }
+
+        assert!(
+            invocations.len() > 20,
+            "extracted only {} invocations from docs/cli.md — the extractor is \
+             probably broken, not the doc",
+            invocations.len()
+        );
+        invocations
+    }
+
+    #[test]
+    fn docs_cli_examples_all_parse() {
+        for argv in documented_invocations() {
+            Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("`{}` in docs/cli.md must parse: {e}", argv.join(" ")));
+        }
+    }
+
+    /// No example installs into a gated PAM service without the flag that
+    /// unlocks it.
+    ///
+    /// This is the bug that motivated the gap: `docs/cli.md` documented
+    /// `facelock setup --pam --service login`, and `login` is in
+    /// `SENSITIVE_SERVICES`, so the command as written **fails**. Parsing
+    /// cannot catch it — the gate is a runtime refusal, not a parse error —
+    /// so the check has to resolve the invocation the way `main` does and ask
+    /// the writer's own question.
+    ///
+    /// Only the add direction is gated. `pam remove --service login` is a
+    /// documented example precisely because removal is never gated.
+    #[test]
+    fn docs_cli_examples_never_install_into_a_gated_service() {
+        use facelock_cli::commands::pam::{PamAction, SENSITIVE_SERVICES};
+
+        // Which services are gated is enumerated in prose in every reference,
+        // and a reader who cannot look the list up has to discover it by being
+        // refused. `SENSITIVE_SERVICES` is the only copy that decides anything,
+        // so every other copy is checked against it.
+        //
+        // Containment is a deliberately loose test: `login` would also match
+        // "login managers". It still catches the failure that matters, which is
+        // a name added to `SENSITIVE_SERVICES` and written down nowhere.
+        let man = unescaped_man_page();
+        let mut references = MARKDOWN_REFERENCES.to_vec();
+        references.push(("man/facelock.1", &man));
+        for (doc_path, doc) in &references {
+            for service in SENSITIVE_SERVICES {
+                assert!(
+                    doc.contains(service),
+                    "`{doc_path}` never names the gated service `{service}`"
+                );
+            }
+        }
+
+        let gated = |services: &[String]| -> Option<String> {
+            services
+                .iter()
+                .find(|s| SENSITIVE_SERVICES.contains(&s.as_str()))
+                .cloned()
+        };
+
+        for argv in documented_invocations() {
+            let rendered = argv.join(" ");
+            let cli = Cli::try_parse_from(&argv).expect("checked by docs_cli_examples_all_parse");
+
+            match cli.command {
+                Commands::Pam { command } => {
+                    let request: facelock_cli::commands::pam::PamRequest = command.into();
+                    if request.action != PamAction::Add || request.allow_sensitive {
+                        continue;
+                    }
+                    if let Some(service) = gated(&request.services) {
+                        panic!(
+                            "`{rendered}` in docs/cli.md installs into the gated service \
+                             `{service}` without --allow-sensitive, so it fails as written"
+                        );
+                    }
+                }
+                Commands::Setup(setup) => {
+                    let plan = resolve_setup_plan(SetupArgs::from(setup));
+                    // `setup --yes` is the documented exception: it maps onto
+                    // --allow-sensitive as well as --no-confirm.
+                    if plan.yes {
+                        continue;
+                    }
+                    let PamPref::Install {
+                        service: Some(service),
+                    } = &plan.pam
+                    else {
+                        continue;
+                    };
+                    if let Some(service) = gated(std::slice::from_ref(service)) {
+                        panic!(
+                            "`{rendered}` in docs/cli.md installs into the gated service \
+                             `{service}` without -y, so it fails as written"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }

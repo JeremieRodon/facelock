@@ -94,6 +94,11 @@ Used with \fB\-\-pam\fR: target PAM service (default: sudo). Requires
 Used with \fB\-\-pam\fR: remove the facelock PAM line instead of adding it.
 Requires \fB\-\-pam\fR.
 .TP
+.B \-\-if\-present
+Used with \fB\-\-pam \-\-remove\fR: treat an absent service file as success
+rather than an error. Read, parse and write failures remain fatal. Requires
+\fB\-\-remove\fR.
+.TP
 .B \-\-camera \fIpath\fR|\fBauto\fR
 Camera device path, or \fBauto\fR to re-detect the IR camera from the attached
 hardware. \fBauto\fR fails if zero or more than one IR-capable device is found;
@@ -123,6 +128,16 @@ that action; any flag that only makes sense while the base setup runs
 \fB\-\-no\-systemd\fR, \fB\-\-enroll\fR, \fB\-\-no\-enroll\fR) forces the base
 setup, and the requested actions run in addition to it. For an action pair, the
 later flag on the command line wins.
+.IP
+\fB\-\-pam\fR is an alias onto
+.B "facelock pam add"
+and
+.BR "facelock pam remove" ,
+which is the primary spelling and the one that takes several services in one
+process. Every \fBsetup \-\-pam\fR invocation keeps parsing and keeps its
+behaviour, including the rule that \fB\-y\fR is what unlocks a sensitive
+service here where \fB\-\-allow\-sensitive\fR does it on
+.BR "facelock pam add" .
 .TP
 .B is\-enrolled
 Report whether a user has a usable face enrollment. The exit status is the
@@ -136,11 +151,19 @@ See
 .B EXIT STATUS
 below. It reads only the per-user marker file under
 .IR /var/lib/facelock/enrolled/ ;
-it does not activate the daemon over D-Bus, does not open a camera, does not
-read the face database, and does not require membership of the
+it does not activate the daemon over D-Bus, does not open a camera, and does
+not read the face database. It never errors merely because the caller is
+outside the
 .B facelock
-group. The marker is a hint for deciding whether to offer a face-auth
-affordance \(em PAM at authentication time remains authoritative.
+group, but it cannot report
+.B enrolled
+for one either: the marker sits under two 0710 root:facelock directories, so a
+non-member reads EACCES and is reported
+.BR not\-enrolled .
+That is the correct answer \(em the group is required to reach the daemon at
+all, so face auth genuinely is not operational for that caller yet. The marker
+is a hint for deciding whether to offer a face-auth affordance \(em PAM at
+authentication time remains authoritative.
 .RS
 .TP
 .B \-u\fR, \fB\-\-user \fIusername\fR
@@ -148,14 +171,40 @@ Username (default: current user).
 .TP
 .B \-\-json
 Output a JSON object with the keys \fBenrolled\fR (boolean), \fBmodels\fR
-(integer) and \fBupdated\fR (ISO 8601 timestamp, or null) instead of
-\fByes\fR/\fBno\fR. Does not change the exit status.
+(integer) and \fBupdated\fR (ISO 8601 timestamp, or null) instead of the state
+word. \fBmodels\fR is 0 and \fBupdated\fR is null when the user is not
+enrolled. Does not change the exit status.
 .TP
 .B \-q\fR, \fB\-\-quiet
 Suppress stdout and report only via the exit status. Errors are still written
 to stderr. This is the global flag (see GLOBAL OPTIONS), so
 \fBfacelock \-\-quiet is\-enrolled\fR is the same invocation.
 .RE
+.TP
+.B capabilities
+Report what this build can do, as capability names \(em one per line on stdout.
+Answers from the binary's own clap tree and compiled-in constants: it reads no
+config file, activates no daemon and opens no camera, and so needs no root. It
+is what replaces grepping \fB\-\-help\fR in a wrapper script, since help text
+is not an API. Probe by name, never by version: a distro or git build can carry
+a version that says nothing about what is in it.
+.RS
+.TP
+.B \-\-json
+Emit one JSON object with the keys \fBversion\fR (this binary's own version)
+and \fBcapabilities\fR (a sorted, deduplicated array of names) instead of the
+plain list.
+.TP
+.B \-q\fR, \fB\-\-quiet
+Suppress stdout, leaving the exit status as the whole answer. This is the
+global flag (see GLOBAL OPTIONS).
+.RE
+.IP
+Both forms exit 0; the command has no failure mode. A build that predates the
+command answers by failing \(em unrecognized subcommand on stderr, exit 2 \(em
+which a caller reads as "no capabilities at all". See
+.B EXIT STATUS
+below.
 .TP
 .B enroll
 Capture and store a face embedding for authentication.
@@ -213,8 +262,10 @@ Username (default: current user).
 Live camera preview with face detection overlay.
 .RS
 .TP
-.B \-\-text\-only
-Print detection results to stdout instead of graphical preview.
+.B \-\-json
+Print one JSON object per frame on stdout instead of opening the graphical
+preview. This flag shipped as \fB\-\-text\-only\fR, which survives as a
+hidden alias and keeps parsing; the per-frame payload is unchanged.
 .TP
 .B \-u\fR, \fB\-\-user \fIusername\fR
 User to match faces against (defaults to current user).
@@ -282,6 +333,10 @@ Measure ONNX model load time.
 .B calibrate
 Sweep thresholds and measure FAR/FRR.
 .TP
+.B camera\-reopen
+Measure what reopening the camera costs, reporting the open / STREAMON / warmup
+split. Needs no enrolled face and loads no models.
+.TP
 .B report
 Generate a comprehensive benchmark report.
 .RE
@@ -299,8 +354,78 @@ Seal the AES encryption key with TPM (migrate keyfile to TPM).
 .B unseal\-key
 Unseal the AES key from TPM back to a plaintext keyfile (migrate TPM to keyfile).
 .TP
+.B unseal\-check
+Read-only check that the sealed AES key currently unseals, verifying the PCR
+policy is still satisfied. Writes nothing and exits non-zero if the unseal
+fails, which is the signal to run
+.BR "facelock reseal" .
+.TP
 .B pcr\-baseline
 Display current PCR values for configured indices.
+.RE
+.TP
+.B pam \fIsubcommand\fR
+Manage the facelock line in
+.I /etc/pam.d
+service files. This command owns every write to that directory;
+\fBsetup \-\-pam\fR is an alias onto it. \fB\-\-service\fR is repeatable on
+all three verbs and defaults to \fBsudo\fR, so several services are configured
+in one process under one root check.
+.RS
+.TP
+.B add
+Add the facelock line to one or more service files. Root. Accepts
+\fB\-\-service \fIname\fR (repeatable), \fB\-y\fR, \fB\-\-yes\fR
+(alias \fB\-\-no\-confirm\fR) to skip the per-file confirmation,
+\fB\-\-allow\-sensitive\fR to also permit \fBsystem\-auth\fR,
+\fBlogin\fR and \fBsshd\fR, \fB\-\-if\-present\fR to treat a missing
+service file as success, \fB\-\-dry\-run\fR to print the resolved plan
+without writing, and \fB\-\-json\fR. \fB\-\-yes\fR never implies
+\fB\-\-allow\-sensitive\fR: they are separate authorizations. Every service
+is validated before any file is written.
+.TP
+.B remove
+Remove the facelock line. Root. Same flags as \fBadd\fR except
+\fB\-\-allow\-sensitive\fR, which it does not offer \(em removal can only
+take away a way to authenticate, so there is nothing to gate. It never prompts,
+and the \fI.facelock\-backup\fR file written by \fBadd\fR is left in place.
+.TP
+.B status
+Report whether services carry the line. Reads only and needs
+.B no
+root: this is the probe to branch on instead of grepping
+.I /etc/pam.d
+yourself. Offers \fB\-\-service\fR and \fB\-\-json\fR, and neither
+\fB\-\-dry\-run\fR nor \fB\-\-allow\-sensitive\fR \(em there is no write
+to preview or gate. The exit status is the answer; see
+.B EXIT STATUS
+below.
+.RE
+.TP
+.B hyprlock \fIsubcommand\fR
+Manage hyprlock lock-screen integration: the face glyph in
+\fBplaceholder_text\fR and the \fBignore_empty_input = false\fR setting that
+lets a bare Enter submit to PAM. Runs as your normal user and refuses to run as
+root, since it edits
+.I ~/.config/hypr/hyprlock.conf
+and root would leave root-owned files under
+.IR $HOME .
+A backup is taken before the first edit. Wiring
+.I /etc/pam.d/hyprlock
+itself is a separate, root step \(em see \fBpam add\fR above.
+.RS
+.TP
+.B enable
+Add the face icon and set \fBignore_empty_input = false\fR. \fB\-\-no\-icon\fR
+sets only the functional flag, for a hyprlock font with no Nerd Font glyphs, and
+leaves any existing icon alone.
+.TP
+.B disable
+Remove the face icon, and restore \fBignore_empty_input\fR only when no
+fingerprint icon coexists, so a machine using both keeps working.
+.TP
+.B status
+Show the current hyprlock integration state.
 .RE
 .TP
 .B encrypt
@@ -313,6 +438,17 @@ Generate a new encryption key without encrypting embeddings.
 .TP
 .B decrypt
 Decrypt all software-encrypted embeddings in the database.
+.TP
+.B reseal
+Re-seal the TPM AES key under the current PCR values \(em the recovery step
+after a firmware or kernel change moves a measured PCR and the sealed key stops
+unsealing. Requires root, and applies only when \fBencryption.method\fR is
+\fBtpm\fR; under any other method it errors rather than quietly doing nothing.
+It prefers unsealing the existing blob, which still works while the PCR policy
+is satisfied, so it is safe to run proactively before a firmware update; once
+the PCRs have moved it falls back to the plaintext key backup. Use
+.B "facelock tpm unseal\-check"
+to find out which of those applies.
 .TP
 .B restart
 Restart the facelock daemon via systemd.
@@ -413,6 +549,24 @@ unreadable one are both reported this way.
 Error: an invalid
 .BR \-\-user ,
 or a marker that exists but cannot be parsed.
+.PP
+.B facelock pam status
+uses the same 0/1/2 scale, for the same reason \(em it is a boolean query whose
+exit status is the answer. Across several services the worst outcome wins:
+.TP
+.B 0
+Every requested service carries the facelock line.
+.TP
+.B 1
+At least one requested service exists without it.
+.TP
+.B 2
+At least one is absent, unreadable, or misnamed.
+.PP
+.B facelock capabilities
+always exits 0 \(em it has no failure mode. A build too old to have the command
+exits 2 with clap's unrecognized-subcommand error on stderr and nothing on
+stdout, which a caller reads as "no capabilities at all".
 .PP
 .B facelock auth
 exits 0 when the face matched, 1 when it did not, and 2 on error.

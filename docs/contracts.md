@@ -559,7 +559,9 @@ the codes themselves match `grep`'s 0 = match / 1 = no match / 2 = error.
 Default stdout is `enrolled` / `not-enrolled` — the state word, as `systemctl
 is-active` prints `active`. `--quiet` suppresses stdout and leaves only the exit
 code; it is the global `-q` flag, so `facelock --quiet is-enrolled` is the same
-invocation. `--json` emits `{"enrolled": bool, "models": N, "updated": "<ISO8601>"}`.
+invocation. `--json` emits `{"enrolled": bool, "models": N, "updated": "<ISO8601>"}`;
+when the user is not enrolled there is no marker to read a timestamp from, so
+`models` is `0` and `updated` is `null`.
 
 `is-enrolled` answers from `/var/lib/facelock/enrolled/<user>` alone. It never
 activates the daemon over D-Bus, never opens a camera, and never reads the

@@ -27,9 +27,10 @@ facelock setup --non-interactive        # base setup, no prompts, no PAM/systemd
 facelock setup --systemd                # install systemd units
 facelock setup --systemd --disable      # disable systemd units
 facelock setup --pam                    # install to /etc/pam.d/sudo
-facelock setup --pam --service login    # install to specific service
-facelock setup --pam --remove           # remove PAM line
-facelock setup --pam --service sshd -y  # skip confirmation for sensitive services
+facelock setup --pam --service polkit-1 # install to a specific service
+facelock setup --pam --remove           # remove the PAM line
+facelock setup --pam --remove --if-present  # a missing service file is success
+facelock setup --pam --service sshd -y  # a sensitive service: -y is what unlocks it
 facelock setup --no-pam                 # wizard, but never touch /etc/pam.d
 facelock setup --camera /dev/video2     # answer step 1 from the command line
 ```
@@ -101,6 +102,7 @@ Each pair is a clap override pair: **a later flag wins over an earlier one.** `-
 Two details worth knowing:
 
 - `--pam` inside the wizard configures **exactly one service** — `--service`, defaulting to `sudo`. It does not apply the multi-select's pre-checked candidates. `--pam` means the same thing everywhere, whether or not the base setup is also running.
+- `--pam` is an alias onto [`facelock pam add`](#facelock-pam) / `facelock pam remove`, which is the primary spelling and the one that takes several services in one process. Every `setup --pam` invocation keeps parsing and keeps its behaviour, including that `-y` is what unlocks a sensitive service here where `--allow-sensitive` does it on `facelock pam add`.
 - `--enroll` answers the "would you like to enroll a face now?" confirmation as well as forcing the step, so it runs unattended. Combined with `--non-interactive` it enrolls without any prompt at all.
 
 ### Action modifiers
@@ -109,6 +111,7 @@ Two details worth knowing:
 |------|----------|---------|
 | `--service <name>` | `--pam` | Target PAM service. Default `sudo`. |
 | `--remove` | `--pam` | Remove the facelock PAM line instead of adding it. |
+| `--if-present` | `--remove` | Treat an absent service file as success rather than an error. Read, parse and write failures stay fatal. |
 | `--disable` | `--systemd` | Disable and stop the units instead of installing them. |
 
 These `requires` relationships are enforced by the parser. `facelock setup --remove` is a clear error naming the missing `--pam`, not a silently ignored flag.
@@ -243,7 +246,28 @@ The database is `600 root:root` — encrypted biometric templates are read by th
 
 **PAM at auth time remains authoritative.** Nothing in the authentication path consults the marker.
 
-Markers are maintained by `enroll`, `remove`, and `clear`, and reconciled from the database on every `setup` run.
+Markers are maintained by `enroll`, `remove`, and `clear`, and reconciled from the database on every `setup` run. See `docs/contracts.md`, "facelock is-enrolled Exit Codes", for the stability promise and for how the scope of that reconciliation differs between `setup`, daemon startup and the one-shot `facelock auth` path.
+
+## facelock capabilities
+
+Report what this build can do, as capability names. Unprivileged: it answers from the binary's own clap tree and compiled-in constants, reading no config file, activating no daemon and opening no camera.
+
+```bash
+facelock capabilities                   # one name per line
+facelock capabilities --json            # {"version", "capabilities"}
+```
+
+With the name array elided:
+
+```json
+{"capabilities":["capabilities","devices-json","is-enrolled"],"version":"0.1.4"}
+```
+
+This is what replaces grepping `--help` in a wrapper script: **help text is not an API**, and a grep against it breaks on a reworded flag description, a line wrap, or a translated help template.
+
+Both forms exit 0 — the command has no failure mode — and `--quiet` suppresses stdout, leaving the exit code as the whole answer. A build that predates the command answers by failing: clap's unrecognized-subcommand error on stderr, exit 2, nothing on stdout. A caller reads any non-zero exit as "no capabilities at all", which is the true answer for that build.
+
+**Probe by name, never by version.** A version comparison is the wrong test twice over: a git or distro build can carry a version that says nothing about what is in it, and a backport can add a feature without moving the number. The names this build emits, what each one promises, and the stability rules that govern them are in `docs/contracts.md`, "facelock capabilities".
 
 ## facelock enroll
 
@@ -317,11 +341,12 @@ Live camera preview with face detection overlay.
 
 ```bash
 facelock preview                        # Wayland graphical window
-facelock preview --text-only            # JSON output to stdout
+facelock preview --json                 # one JSON object per frame on stdout
 facelock preview --user alice           # match against specific user
 ```
 
-Text-only mode outputs one JSON object per frame:
+`--json` shipped as `--text-only`, which stays a hidden alias and keeps parsing; the payload is unchanged. One object per line, one per frame:
+
 ```json
 {"frame":1,"fps":15.2,"width":640,"height":480,"recognized":1,"unrecognized":0,"faces":[...]}
 ```
@@ -331,10 +356,15 @@ Text-only mode outputs one JSON object per frame:
 List available V4L2 video capture devices.
 
 ```bash
-facelock devices
+facelock devices                        # human-readable listing
+facelock devices --json                 # JSON output
 ```
 
 Shows device path, name, driver, formats, resolutions, and IR status.
+
+`--json` emits an array of device objects with `path`, `name`, `driver`, `is_ir`, and `formats`; each format carries `fourcc`, `description`, and `sizes`, a list of `[width, height]` pairs. It is a typed schema derived from the device struct, so a script reads it rather than parsing the listing above, whose columns, indentation and `[IR]` tag are free to change.
+
+`formats` is empty whenever the daemon answers: the D-Bus device type does not carry format detail, so only the direct (oneshot) backend fills it in. The human listing omits the section for the same reason.
 
 ## facelock status
 
@@ -411,6 +441,14 @@ Unseal the AES key from the TPM back to a plaintext keyfile, migrating from TPM-
 facelock tpm unseal-key
 ```
 
+### facelock tpm unseal-check
+
+Read-only check that the sealed AES key still unseals under the current PCR values. Writes nothing, and exits non-zero when it does not — which is the signal to run [`facelock reseal`](#facelock-reseal).
+
+```bash
+sudo facelock tpm unseal-check
+```
+
 ### facelock tpm pcr-baseline
 
 Display the current PCR values for all configured PCR indices.
@@ -445,6 +483,94 @@ reports the per-phase median. That total is what `device.camera_release_secs`
 trades LED-on time against -- holding the stream warm after a failed attempt
 buys a retry exactly this much (ADR 008).
 
+## facelock pam
+
+Manage the facelock line in `/etc/pam.d` service files. This command owns every write to `/etc/pam.d`; `setup --pam` is an alias onto it, and the setup wizard's step 9 calls the same writer, so there is one implementation of the edit and one set of rules.
+
+`--service` is repeatable on all three verbs and defaults to `sudo`, so several services are configured in one process, under one root check. That is the defect the verb exists to fix: the old `setup --pam --service X` took a single value, so configuring three services meant three processes.
+
+`add` and `remove` require root and never offer to re-exec under `sudo` — silently re-running an `/etc/pam.d` edit on a wrapper script's behalf is a surprise, not a convenience. `status` reads only and needs no root.
+
+### facelock pam add
+
+```bash
+sudo facelock pam add                                        # /etc/pam.d/sudo
+sudo facelock pam add --service polkit-1 --service hyprlock  # several at once
+sudo facelock pam add --service sshd --allow-sensitive       # unlock a gated service
+sudo facelock pam add --service hyprlock --if-present        # a missing file is success
+sudo facelock pam add --service sudo --dry-run               # print the plan, write nothing
+sudo facelock pam add --service sudo --json                  # machine-readable result
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--service <NAME>` | Service to act on; repeat for several (default: `sudo`). |
+| `-y`, `--yes` (alias `--no-confirm`) | Skip the per-file confirmation, and nothing else. |
+| `--allow-sensitive` | Also permit the gated services `system-auth`, `login`, `sshd`. |
+| `--if-present` | Treat a missing service file as success instead of an error. |
+| `--dry-run` | Print the resolved plan, write nothing, exit 0. |
+| `--json` | Emit one JSON document instead of human text. |
+
+**`--yes` never implies `--allow-sensitive`.** They are separate authorizations: "do not ask me" and "yes, edit `system-auth`". Locking yourself out of a machine should take two decisions, not one.
+
+Every service is validated — name, existence, the sensitive gate, and what the edit would be — before **any** file is written, so a typo'd or gated service name leaves every other service untouched. With no TTY on stdin the per-file confirmation is skipped as if `--yes` were given, which is what has always made this work from a provisioning script; the gate is decided in the validation phase, before any prompt exists, so an unattended `pam add --service system-auth` still refuses.
+
+`--dry-run` is honoured after the root check, so it still needs root. `pam status` is the unprivileged read to reach for instead.
+
+### facelock pam remove
+
+```bash
+sudo facelock pam remove                                     # /etc/pam.d/sudo
+sudo facelock pam remove --service login                     # removal is never gated
+sudo facelock pam remove --service hyprlock --if-present     # a missing file is success
+sudo facelock pam remove --service sudo --dry-run --json
+```
+
+Takes the same flags as `add` except `--allow-sensitive`, which it does not offer: removal can only take away a way to authenticate, so there is nothing to gate. It never prompts either, and the `.facelock-backup` file written by `add` is left in place.
+
+### facelock pam status
+
+```bash
+facelock pam status                                          # /etc/pam.d/sudo
+facelock pam status --service sudo --service polkit-1
+facelock pam status --service sudo --json
+```
+
+Unprivileged, and the probe to branch on instead of grepping `/etc/pam.d` yourself: it answers from the same file, without root, and reports "absent" and "unreadable" as themselves rather than as "not configured". It offers `--service` and `--json` and neither `--dry-run` nor `--allow-sensitive` — there is no write to preview or gate.
+
+The exit code is the answer, on the same 0/1/2 scale as `is-enrolled` and `grep`:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Every requested service carries the line |
+| `1` | At least one exists without it |
+| `2` | At least one is absent, unreadable, or misnamed |
+
+Across several services the worst outcome wins. `--json` emits one document:
+
+```json
+{"command":"status","dry_run":false,"services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
+```
+
+The document's shape and the `action` vocabulary are a stability contract, including the rule that a consumer must tolerate an `action` it does not recognize rather than treat it as an error. See `docs/contracts.md`, "facelock pam Semantics", for that, for the `add`/`remove` exit codes, and for what `--json` does on a validation failure.
+
+## facelock hyprlock
+
+Manage hyprlock lock-screen integration: the face glyph in `placeholder_text`, and the `ignore_empty_input = false` setting that lets a bare Enter submit to PAM.
+
+```bash
+facelock hyprlock enable                # face icon, and allow the empty-Enter submit
+facelock hyprlock enable --no-icon      # only set ignore_empty_input = false
+facelock hyprlock disable               # undo
+facelock hyprlock status                # report the current state
+```
+
+Runs as your normal user and refuses to run as root, since it edits `~/.config/hypr/hyprlock.conf` and root would leave root-owned files in `$HOME`. A backup is taken before the first edit.
+
+`--no-icon` is for a hyprlock font with no Nerd Font glyphs; it flips the functional setting and leaves any existing icon alone. `disable` restores `ignore_empty_input` only when no fingerprint icon coexists, so a machine using both keeps working.
+
+Wiring `/etc/pam.d/hyprlock` itself is a separate, root step — see [`facelock pam`](#facelock-pam). This command touches no file outside `$HOME`.
+
 ## facelock encrypt
 
 Encrypt all unencrypted embeddings in the database with AES-256-GCM.
@@ -463,6 +589,18 @@ Decrypt all software-encrypted embeddings in the database (reverting AES-256-GCM
 ```bash
 facelock decrypt
 ```
+
+## facelock reseal
+
+Re-seal the TPM AES key under the current PCR values. This is the recovery step after a firmware or kernel change moves a measured PCR and the sealed key stops unsealing.
+
+```bash
+sudo facelock reseal
+```
+
+Requires root, and applies only when `encryption.method = "tpm"` — under any other method it errors rather than quietly doing nothing.
+
+It prefers unsealing the existing blob, which still works while the PCR policy is satisfied, so it is safe to run proactively before a firmware update; once the PCRs have moved it falls back to the plaintext key backup. With neither available there is nothing to re-seal and it fails. Run `facelock tpm unseal-check` to find out which of those you are in.
 
 ## facelock audit
 

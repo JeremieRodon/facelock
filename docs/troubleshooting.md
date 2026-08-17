@@ -65,7 +65,7 @@
    refuses to open it with an error listing the advertised formats. Point
    `device.path` at a processed camera instead — see "Intel IPU6/IPU7 MIPI
    cameras" in `docs/compatibility.md`.
-3. **Verify frames are usable**: run `facelock preview --text-only` (or
+3. **Verify frames are usable**: run `facelock preview --json` (or
    `facelock preview`) and check that you see a live image with your face
    detected.
 4. Run with `RUST_LOG=facelock_daemon=debug` to see per-frame rejection
