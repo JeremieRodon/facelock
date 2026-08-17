@@ -170,6 +170,15 @@ fn main() -> anyhow::Result<()> {
         facelock_core::paths::set_process_config_override(PathBuf::from(path));
     }
 
+    // `--quiet` is likewise global, and lands at the message sink rather than
+    // at any call site: it silences `Terminal::info` and nothing else, so
+    // errors, prompts, exit codes and the `RUST_LOG` event stream are
+    // unchanged. `is-enrolled` reads the same flag directly for its
+    // exit-code-only mode, which predates the sink.
+    if quiet {
+        message::set_verbosity(message::Verbosity::Quiet);
+    }
+
     match command {
         // Daemon and auth init their own tracing, so handle them separately
         Commands::Daemon => commands::daemon::run(notifications::daemon_notifier_factory()),

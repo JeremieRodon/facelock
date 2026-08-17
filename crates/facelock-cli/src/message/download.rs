@@ -32,6 +32,19 @@ pub enum DownloadMessage {
     ModelDownloaded {
         name: String,
     },
+
+    // -- the non-interactive flow, which narrates each file as it goes --
+    ModelDownloadPending {
+        name: String,
+        size_mb: u64,
+        purpose: String,
+    },
+    ModelRedownloading {
+        name: String,
+    },
+    ModelRedownloaded {
+        name: String,
+    },
 }
 
 impl Message for DownloadMessage {
@@ -70,6 +83,26 @@ impl Message for DownloadMessage {
                 translate("  [ok] {name} downloaded and verified"),
                 &[("name", name.clone())],
             ),
+            ModelDownloadPending {
+                name,
+                size_mb,
+                purpose,
+            } => fill(
+                translate("  [download] {name} (~{size_mb}MB) - {purpose}"),
+                &[
+                    ("name", name.clone()),
+                    ("size_mb", size_mb.to_string()),
+                    ("purpose", purpose.clone()),
+                ],
+            ),
+            ModelRedownloading { name } => fill(
+                translate("  [redownload] {name} - checksum mismatch, re-downloading"),
+                &[("name", name.clone())],
+            ),
+            ModelRedownloaded { name } => fill(
+                translate("  [ok] {name} re-downloaded and verified"),
+                &[("name", name.clone())],
+            ),
         }
     }
 }
@@ -104,7 +137,67 @@ impl super::Samples for DownloadMessage {
             ConfirmDownloadRequiredModels => SkippingModelDownload,
             SkippingModelDownload => DownloadingModel { name: s("n") },
             DownloadingModel { .. } => ModelDownloaded { name: s("n") },
-            ModelDownloaded { .. } => return None,
+            ModelDownloaded { .. } => ModelDownloadPending {
+                name: s("n"),
+                size_mb: 1,
+                purpose: s("p"),
+            },
+            ModelDownloadPending { .. } => ModelRedownloading { name: s("n") },
+            ModelRedownloading { .. } => ModelRedownloaded { name: s("n") },
+            ModelRedownloaded { .. } => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The model-progress lines, pinned to the bytes `commands/setup.rs`
+    /// printed. The first two are pinned even though they predate this
+    /// change: the non-interactive flow now renders them too, so they are
+    /// load-bearing on both paths.
+    #[test]
+    fn english_fallback_is_byte_identical() {
+        use DownloadMessage::*;
+
+        assert_eq!(
+            ModelPresentOk {
+                name: "SCRFD 2.5G".into(),
+                purpose: "face detection".into()
+            }
+            .localized(),
+            "  [ok] SCRFD 2.5G (face detection)"
+        );
+        assert_eq!(
+            ModelDownloaded {
+                name: "SCRFD 2.5G".into()
+            }
+            .localized(),
+            "  [ok] SCRFD 2.5G downloaded and verified"
+        );
+        assert_eq!(
+            ModelDownloadPending {
+                name: "ArcFace R50".into(),
+                size_mb: 166,
+                purpose: "face embedding".into()
+            }
+            .localized(),
+            "  [download] ArcFace R50 (~166MB) - face embedding"
+        );
+        assert_eq!(
+            ModelRedownloading {
+                name: "ArcFace R50".into()
+            }
+            .localized(),
+            "  [redownload] ArcFace R50 - checksum mismatch, re-downloading"
+        );
+        assert_eq!(
+            ModelRedownloaded {
+                name: "ArcFace R50".into()
+            }
+            .localized(),
+            "  [ok] ArcFace R50 re-downloaded and verified"
+        );
     }
 }

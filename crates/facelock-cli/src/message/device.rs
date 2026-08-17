@@ -28,6 +28,19 @@ pub enum DeviceMessage {
     // -- model quality / inference device --
     PromptSelectModelQuality,
     PromptSelectInferenceDevice,
+    SelectedModelsStandard,
+    SelectedModelsBalanced,
+    SelectedModelsHigh,
+    DetectedProvider { detail: String },
+
+    // The three warnings below reach `Terminal::info`, so `--quiet` suppresses
+    // them. Deliberate: they have always gone to stdout, and routing them to
+    // `error` to make them unsuppressible would move them to stderr, breaking
+    // both the byte-identity pins and any script reading setup's stdout.
+    // Stream fidelity won; do not "fix" these into `error`.
+    ProviderQueryFailed { error: String },
+    NvidiaDriverMissing,
+    CudaRuntimeMissing,
 }
 
 impl Message for DeviceMessage {
@@ -77,6 +90,31 @@ impl Message for DeviceMessage {
             ),
             PromptSelectModelQuality => translate("Select model quality"),
             PromptSelectInferenceDevice => translate("Select inference device"),
+            SelectedModelsStandard => {
+                translate("  Selected standard models (fast, good accuracy).")
+            }
+            SelectedModelsBalanced => {
+                translate("  Selected balanced models (fast detection, high-accuracy embedding).")
+            }
+            SelectedModelsHigh => {
+                translate("  Selected high-accuracy models (larger, ~40-50ms slower).")
+            }
+            DetectedProvider { detail } => fill(
+                translate("  Detected: {detail}"),
+                &[("detail", detail.clone())],
+            ),
+            ProviderQueryFailed { error } => fill(
+                translate(
+                    "  ⚠ Could not query the ONNX Runtime for available providers: {error}\n    Selecting cpu. Re-run with an explicit --execution-provider once the\n    runtime is installed if you need GPU inference.",
+                ),
+                &[("error", error.clone())],
+            ),
+            NvidiaDriverMissing => translate(
+                "  ⚠ NVIDIA driver not detected. Install the NVIDIA driver package\n    before starting the daemon.",
+            ),
+            CudaRuntimeMissing => translate(
+                "  ⚠ CUDA-enabled ONNX Runtime not found. Install onnxruntime-opt-cuda\n    before starting the daemon, or inference will fall back to CPU.",
+            ),
         }
     }
 }
@@ -119,7 +157,63 @@ impl super::Samples for DeviceMessage {
             AutoCameraManyIr { .. } => CameraDeviceMissing { path: s("/d") },
             CameraDeviceMissing { .. } => PromptSelectModelQuality,
             PromptSelectModelQuality => PromptSelectInferenceDevice,
-            PromptSelectInferenceDevice => return None,
+            PromptSelectInferenceDevice => SelectedModelsStandard,
+            SelectedModelsStandard => SelectedModelsBalanced,
+            SelectedModelsBalanced => SelectedModelsHigh,
+            SelectedModelsHigh => DetectedProvider { detail: s("d") },
+            DetectedProvider { .. } => ProviderQueryFailed { error: s("e") },
+            ProviderQueryFailed { .. } => NvidiaDriverMissing,
+            NvidiaDriverMissing => CudaRuntimeMissing,
+            CudaRuntimeMissing => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The strings this domain took over from `commands/setup.rs`, pinned to
+    /// the bytes those `println!` call sites printed. See the same test in
+    /// [`super::super::setup`] for why a failing pin is fixed by restoring
+    /// the string, never by editing the expectation.
+    #[test]
+    fn english_fallback_is_byte_identical() {
+        use DeviceMessage::*;
+
+        assert_eq!(
+            SelectedModelsStandard.localized(),
+            "  Selected standard models (fast, good accuracy)."
+        );
+        assert_eq!(
+            SelectedModelsBalanced.localized(),
+            "  Selected balanced models (fast detection, high-accuracy embedding)."
+        );
+        assert_eq!(
+            SelectedModelsHigh.localized(),
+            "  Selected high-accuracy models (larger, ~40-50ms slower)."
+        );
+        assert_eq!(
+            DetectedProvider {
+                detail: "cuda (available: cpu, cuda)".into()
+            }
+            .localized(),
+            "  Detected: cuda (available: cpu, cuda)"
+        );
+        assert_eq!(
+            ProviderQueryFailed {
+                error: "libonnxruntime.so not found".into()
+            }
+            .localized(),
+            "  \u{26a0} Could not query the ONNX Runtime for available providers: libonnxruntime.so not found\n    Selecting cpu. Re-run with an explicit --execution-provider once the\n    runtime is installed if you need GPU inference."
+        );
+        assert_eq!(
+            NvidiaDriverMissing.localized(),
+            "  \u{26a0} NVIDIA driver not detected. Install the NVIDIA driver package\n    before starting the daemon."
+        );
+        assert_eq!(
+            CudaRuntimeMissing.localized(),
+            "  \u{26a0} CUDA-enabled ONNX Runtime not found. Install onnxruntime-opt-cuda\n    before starting the daemon, or inference will fall back to CPU."
+        );
     }
 }

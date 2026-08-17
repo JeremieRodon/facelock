@@ -4,11 +4,18 @@ All commands are subcommands of the `facelock` binary.
 
 ## Global flags
 
-The following flag is accepted by every subcommand (declared `global = true`):
+The following flags are accepted by every subcommand (declared `global = true`):
 
 | Flag | Description |
 |------|-------------|
-| `--config <PATH>` | Override the config file path. Takes precedence over `FACELOCK_CONFIG`. |
+| `-c`, `--config <PATH>` | Override the config file path. Takes precedence over `FACELOCK_CONFIG`. |
+| `-q`, `--quiet` | Suppress informational output on stdout. Errors (stderr), prompts and exit codes are unaffected. |
+
+`--quiet` is complete for `facelock setup` except the PAM extension hint, which
+[#174](https://github.com/tyvsmith/facelock/issues/174) converts along with the
+rest of that region. Other commands still print some output directly rather than
+through the message seam the flag gates, so they stay partly noisy until
+[#140](https://github.com/tyvsmith/facelock/issues/140) is finished.
 
 ## facelock setup
 

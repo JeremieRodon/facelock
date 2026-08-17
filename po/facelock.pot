@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: facelock\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-15 17:26-0700\n"
+"POT-Creation-Date: 2026-08-17 12:31-0700\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -72,106 +72,157 @@ msgid ""
 "Falling back to text-only mode. Start the facelock-daemon service to use it.\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:38
+#: crates/facelock-cli/src/message/device.rs:51
 msgid ""
 "  No video devices found.\n"
 "  Check that your camera is connected and the v4l2 module is loaded."
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:41
+#: crates/facelock-cli/src/message/device.rs:54
 #, python-brace-format
 msgid "  Auto-selected IR camera: {path} ({name})"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:45
+#: crates/facelock-cli/src/message/device.rs:58
 #, python-brace-format
 msgid "  Auto-selected IR camera: {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:49
+#: crates/facelock-cli/src/message/device.rs:62
 #, python-brace-format
 msgid "  Selected: {path} ({name})"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:53
+#: crates/facelock-cli/src/message/device.rs:66
 #, python-brace-format
 msgid "  Selected: {value}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:56
+#: crates/facelock-cli/src/message/device.rs:69
 msgid "Select camera device"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:58
+#: crates/facelock-cli/src/message/device.rs:71
 msgid "--camera=auto found no video devices; check that the camera is connected and the v4l2 module is loaded"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:62
+#: crates/facelock-cli/src/message/device.rs:75
 msgid ""
 "--camera=auto found no IR-capable camera among the detected devices:\n"
 "{listed}\n"
 "  Pass an explicit device path, e.g. --camera={example}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:68
+#: crates/facelock-cli/src/message/device.rs:81
 msgid ""
 "--camera=auto found {count} IR-capable cameras:\n"
 "{listed}\n"
 "  Pass an explicit device path to choose one."
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:74
+#: crates/facelock-cli/src/message/device.rs:87
 #, python-brace-format
 msgid "camera device {path} does not exist; pass a valid /dev/video* path or --camera=auto"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:78
+#: crates/facelock-cli/src/message/device.rs:91
 msgid "Select model quality"
 msgstr ""
 
-#: crates/facelock-cli/src/message/device.rs:79
+#: crates/facelock-cli/src/message/device.rs:92
 msgid "Select inference device"
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:42
+#: crates/facelock-cli/src/message/device.rs:94
+msgid "  Selected standard models (fast, good accuracy)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/device.rs:97
+msgid "  Selected balanced models (fast detection, high-accuracy embedding)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/device.rs:100
+msgid "  Selected high-accuracy models (larger, ~40-50ms slower)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/device.rs:103
+#, python-brace-format
+msgid "  Detected: {detail}"
+msgstr ""
+
+#: crates/facelock-cli/src/message/device.rs:108
+msgid ""
+"  ⚠ Could not query the ONNX Runtime for available providers: {error}\n"
+"    Selecting cpu. Re-run with an explicit --execution-provider once the\n"
+"    runtime is installed if you need GPU inference."
+msgstr ""
+
+#: crates/facelock-cli/src/message/device.rs:113
+msgid ""
+"  ⚠ NVIDIA driver not detected. Install the NVIDIA driver package\n"
+"    before starting the daemon."
+msgstr ""
+
+#: crates/facelock-cli/src/message/device.rs:116
+msgid ""
+"  ⚠ CUDA-enabled ONNX Runtime not found. Install onnxruntime-opt-cuda\n"
+"    before starting the daemon, or inference will fall back to CPU."
+msgstr ""
+
+#: crates/facelock-cli/src/message/download.rs:55
 #, python-brace-format
 msgid "  [ok] {name} ({purpose})"
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:45
+#: crates/facelock-cli/src/message/download.rs:58
 msgid "  All models are already present and verified."
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:46
+#: crates/facelock-cli/src/message/download.rs:59
 msgid "  Models to download:"
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:52
+#: crates/facelock-cli/src/message/download.rs:65
 #, python-brace-format
 msgid "    - {name} (~{size_mb}MB) - {purpose}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:60
+#: crates/facelock-cli/src/message/download.rs:73
 #, python-brace-format
 msgid "  Total download size: ~{mb}MB"
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:63
+#: crates/facelock-cli/src/message/download.rs:76
 msgid "Download required models?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:64
+#: crates/facelock-cli/src/message/download.rs:77
 msgid "  Skipping model download."
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:66
+#: crates/facelock-cli/src/message/download.rs:79
 #, python-brace-format
 msgid "  Downloading {name}..."
 msgstr ""
 
-#: crates/facelock-cli/src/message/download.rs:70
+#: crates/facelock-cli/src/message/download.rs:83
 #, python-brace-format
 msgid "  [ok] {name} downloaded and verified"
+msgstr ""
+
+#: crates/facelock-cli/src/message/download.rs:91
+#, python-brace-format
+msgid "  [download] {name} (~{size_mb}MB) - {purpose}"
+msgstr ""
+
+#: crates/facelock-cli/src/message/download.rs:99
+#, python-brace-format
+msgid "  [redownload] {name} - checksum mismatch, re-downloading"
+msgstr ""
+
+#: crates/facelock-cli/src/message/download.rs:103
+#, python-brace-format
+msgid "  [ok] {name} re-downloaded and verified"
 msgstr ""
 
 #: crates/facelock-cli/src/message/face.rs:109
@@ -466,7 +517,7 @@ msgid ""
 "To restore: sudo cp {backup} {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:82
+#: crates/facelock-cli/src/message/setup.rs:191
 msgid ""
 "\n"
 "  Facelock v{version}\n"
@@ -481,245 +532,359 @@ msgid ""
 "    - Daemon and PAM configuration\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:86
+#: crates/facelock-cli/src/message/setup.rs:195
 msgid ""
 "\n"
 "--- Step 1: Camera Selection ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:87
+#: crates/facelock-cli/src/message/setup.rs:196
 msgid ""
 "\n"
 "--- Step 2: Model Quality ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:88
+#: crates/facelock-cli/src/message/setup.rs:197
 msgid ""
 "\n"
 "--- Step 3: Inference Device ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:89
+#: crates/facelock-cli/src/message/setup.rs:198
 msgid ""
 "\n"
 "--- Step 4: Model Download ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:90
+#: crates/facelock-cli/src/message/setup.rs:199
 msgid ""
 "\n"
 "--- Step 5: Embedding Encryption ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:91
+#: crates/facelock-cli/src/message/setup.rs:200
 msgid ""
 "\n"
 "--- Step 6: Face Enrollment ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:93
+#: crates/facelock-cli/src/message/setup.rs:202
 msgid ""
 "\n"
 "--- Step 6: Face Enrollment (skipped, --no-enroll) ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:95
+#: crates/facelock-cli/src/message/setup.rs:204
 msgid ""
 "\n"
 "--- Step 7: Test Recognition ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:97
+#: crates/facelock-cli/src/message/setup.rs:206
 msgid ""
 "\n"
 "--- Step 7: Test Recognition (skipped, no face enrolled) ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:99
+#: crates/facelock-cli/src/message/setup.rs:208
 msgid ""
 "\n"
 "--- Step 8: Daemon Configuration ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:100
+#: crates/facelock-cli/src/message/setup.rs:209
 msgid ""
 "\n"
 "--- Step 9: PAM Configuration ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:101
+#: crates/facelock-cli/src/message/setup.rs:210
 msgid ""
 "\n"
 "--- Setup Complete ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:104
+#: crates/facelock-cli/src/message/setup.rs:213
 msgid ""
 "  Camera detection failed: {error}\n"
 "  You can configure the camera later in the config file.\n"
 "  Continuing with current setting: {current}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:110
+#: crates/facelock-cli/src/message/setup.rs:219
 msgid ""
 "  Model quality selection failed: {error}\n"
 "  Continuing with current setting: {current}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:116
+#: crates/facelock-cli/src/message/setup.rs:225
 msgid ""
 "  Inference device selection failed: {error}\n"
 "  Continuing with current setting: {current}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:122
+#: crates/facelock-cli/src/message/setup.rs:231
 msgid ""
 "  Model download failed: {error}\n"
 "  You can retry later with: sudo facelock setup --non-interactive"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:128
+#: crates/facelock-cli/src/message/setup.rs:237
 msgid ""
 "  Encryption setup failed: {error}\n"
 "  You can configure encryption later with: sudo facelock encrypt --generate-key"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:134
+#: crates/facelock-cli/src/message/setup.rs:243
 msgid ""
 "  Enrollment failed: {error}\n"
 "  You can enroll later with: facelock enroll"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:139
+#: crates/facelock-cli/src/message/setup.rs:248
 msgid ""
 "  Test failed: {error}\n"
 "  You can test later with: facelock test"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:144
+#: crates/facelock-cli/src/message/setup.rs:253
 msgid ""
 "  Systemd setup failed: {error}\n"
 "  You can enable it later with: sudo facelock setup --systemd"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:150
+#: crates/facelock-cli/src/message/setup.rs:259
 msgid ""
 "  Group setup failed: {error}\n"
 "  Add manually: sudo usermod -aG facelock <user>"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:156
+#: crates/facelock-cli/src/message/setup.rs:265
 msgid ""
 "  PAM setup failed: {error}\n"
 "  You can configure PAM later with: sudo facelock setup --pam"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:160
+#: crates/facelock-cli/src/message/setup.rs:269
 msgid "Would you like to enroll a face now?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:161
+#: crates/facelock-cli/src/message/setup.rs:270
 msgid "  Skipping face enrollment."
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:162
+#: crates/facelock-cli/src/message/setup.rs:271
 msgid "Would you like to test recognition?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:163
+#: crates/facelock-cli/src/message/setup.rs:272
 msgid "  Skipping recognition test."
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:165
+#: crates/facelock-cli/src/message/setup.rs:274
 #, python-brace-format
 msgid "  Camera:     {value}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:169
+#: crates/facelock-cli/src/message/setup.rs:278
 #, python-brace-format
 msgid "  Models:     {dir} ({quality})"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:173
+#: crates/facelock-cli/src/message/setup.rs:282
 #, python-brace-format
 msgid "  Inference:  {value}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:177
+#: crates/facelock-cli/src/message/setup.rs:286
 #, python-brace-format
 msgid "  Database:   {value}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:181
+#: crates/facelock-cli/src/message/setup.rs:290
 #, python-brace-format
 msgid "  Encryption: {value}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:185
+#: crates/facelock-cli/src/message/setup.rs:294
 #, python-brace-format
 msgid "  Daemon:   {status}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:188
+#: crates/facelock-cli/src/message/setup.rs:297
 msgid "not configured (--no-systemd)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:189
+#: crates/facelock-cli/src/message/setup.rs:298
 msgid "configured from the command line"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:190
+#: crates/facelock-cli/src/message/setup.rs:299
 msgid "enabled (D-Bus activation)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:191
+#: crates/facelock-cli/src/message/setup.rs:300
 msgid "not configured"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:193
+#: crates/facelock-cli/src/message/setup.rs:302
 #, python-brace-format
 msgid "  PAM:      {services}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:196
+#: crates/facelock-cli/src/message/setup.rs:305
 msgid "  PAM:      not configured (--no-pam)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:197
+#: crates/facelock-cli/src/message/setup.rs:306
 msgid "  PAM:      not configured"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:198
+#: crates/facelock-cli/src/message/setup.rs:307
 msgid "  Face:     enrolled"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:200
+#: crates/facelock-cli/src/message/setup.rs:309
 msgid "  Face:     not enrolled (--no-enroll; run `facelock enroll`)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:202
+#: crates/facelock-cli/src/message/setup.rs:311
 msgid "  Face:     not enrolled (run `facelock enroll`)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:203
+#: crates/facelock-cli/src/message/setup.rs:312
 msgid "facelock setup: preparing system...\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:205
+#: crates/facelock-cli/src/message/setup.rs:314
 #, python-brace-format
 msgid "Checking {count} model(s)...\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:208
+#: crates/facelock-cli/src/message/setup.rs:317
 msgid ""
 "\n"
 "Setup complete."
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:210
+#: crates/facelock-cli/src/message/setup.rs:319
 msgid ""
 "\n"
 "Setup complete. Run `facelock enroll` to register your face."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:321
+msgid "  Directories created."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:323
+#, python-brace-format
+msgid "  Created default config at {path}"
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:326
+msgid ""
+"\n"
+"Enrolling face..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:328
+msgid "  Setting up AES-256-GCM encryption for face embeddings."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:330
+msgid "  TPM 2.0 detected and functional."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:332
+#, python-brace-format
+msgid "  TPM-sealed key already exists at {path}."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:335
+msgid "  Generating and sealing AES key with TPM..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:337
+#, python-brace-format
+msgid "  TPM-sealed key written to {path} (permissions: 0600)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:340
+msgid "  Encryption enabled (TPM-sealed key)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:342
+#, python-brace-format
+msgid "  Encryption key already exists at {path}."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:345
+msgid "  Generating encryption key..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:347
+#, python-brace-format
+msgid "  Key written to {path} (permissions: 0600)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:350
+msgid "  Encryption enabled."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:352
+msgid ""
+"  ⚠ WARNING: encryption disabled (--encryption=none).\n"
+"    Biometric templates will be stored UNENCRYPTED in the database.\n"
+"    `facelock enroll` refuses to write plaintext embeddings unless\n"
+"    security.allow_plaintext is also set in the config."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:355
+#, python-brace-format
+msgid "  Encryption already configured ({method})."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:359
+#, python-brace-format
+msgid "  [ok] Generated TPM-sealed encryption key at {path}"
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:363
+msgid "  [ok] AES-256-GCM encryption enabled (TPM-sealed key)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:366
+#, python-brace-format
+msgid "  [ok] Generated encryption key at {path}"
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:369
+msgid "  [ok] AES-256-GCM encryption enabled."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:372
+msgid ""
+"\n"
+"  WARNING: encrypted face models already exist in {db_path} but the\n"
+"  encryption key is missing. Generating a new key would make them unreadable.\n"
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:377
+#, python-brace-format
+msgid "  Removed {count} orphaned model(s)."
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:381
+msgid ""
+"\n"
+"==> To finish hyprlock integration, run as your normal user:\n"
+"==>     facelock hyprlock enable"
+msgstr ""
+
+#: crates/facelock-cli/src/message/setup.rs:384
+#, python-brace-format
+msgid "  hyprlock integration applied for {user}."
 msgstr ""
 
 #: crates/facelock-cli/src/message/status.rs:115
@@ -959,57 +1124,94 @@ msgstr ""
 msgid "not configured for facelock"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:33
+#: crates/facelock-cli/src/message/system.rs:43
 msgid "Enable daemon mode with D-Bus activation?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:35
+#: crates/facelock-cli/src/message/system.rs:45
 msgid ""
 "  systemd not detected. Skipping daemon configuration.\n"
 "  Facelock will use oneshot mode for authentication."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:38
+#: crates/facelock-cli/src/message/system.rs:48
 msgid "  Skipping systemd setup. Facelock will use oneshot mode."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:41
+#: crates/facelock-cli/src/message/system.rs:51
 msgid ""
 "  Skipping daemon configuration (--no-systemd).\n"
 "  No unit files are written and systemctl is not invoked."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:44
+#: crates/facelock-cli/src/message/system.rs:54
 msgid "  Answered on the command line; applied once setup finishes."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:46
+#: crates/facelock-cli/src/message/system.rs:56
 msgid "  Creating 'facelock' system group..."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:48
+#: crates/facelock-cli/src/message/system.rs:58
 msgid ""
 "  Note: running daemon commands (preview/test) as a normal user requires\n"
 "  membership in the 'facelock' group: sudo usermod -aG facelock <user>"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:51
+#: crates/facelock-cli/src/message/system.rs:61
 #, python-brace-format
 msgid "  User '{user}' is already in the 'facelock' group."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:56
+#: crates/facelock-cli/src/message/system.rs:66
 #, python-brace-format
 msgid "Add user '{user}' to the 'facelock' group? (required to run facelock preview/test without sudo)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:61
+#: crates/facelock-cli/src/message/system.rs:71
 #, python-brace-format
 msgid "  Skipped. Add later with: sudo usermod -aG facelock {user}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:66
+#: crates/facelock-cli/src/message/system.rs:76
 msgid ""
 "  Added '{user}' to the 'facelock' group.\n"
 "  NOTE: log out and back in for the new group membership to take effect."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:80
+msgid "Disabling facelock-daemon systemd units..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:81
+msgid "facelock-daemon service disabled and stopped."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:83
+msgid "Installing facelock-daemon systemd and D-Bus units..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:85
+#, python-brace-format
+msgid "  Wrote {path}"
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:87
+#, python-brace-format
+msgid "  Refreshed legacy {path}"
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:90
+msgid "  systemctl daemon-reload done."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:92
+#, python-brace-format
+msgid "  systemctl enable {unit} done."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:96
+msgid ""
+"\n"
+"facelock-daemon D-Bus activation is now enabled."
 msgstr ""

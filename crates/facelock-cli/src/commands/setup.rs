@@ -613,7 +613,7 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     } else {
         Terminal.info(&SetupMessage::SummaryFaceNotEnrolled);
     }
-    println!();
+    Terminal.info(&SetupMessage::BlankLine);
 
     let manifest: ModelManifest =
         toml::from_str(MANIFEST_TOML).context("failed to parse model manifest")?;
@@ -857,13 +857,12 @@ fn preset_of_models(detector: &str, embedder: &str) -> Option<ModelPreset> {
         .find(|p| preset_models(*p) == (detector, embedder))
 }
 
-fn preset_summary(preset: ModelPreset) -> &'static str {
+/// What the wizard says once a preset is chosen.
+fn preset_summary(preset: ModelPreset) -> DeviceMessage {
     match preset {
-        ModelPreset::Standard => "Selected standard models (fast, good accuracy).",
-        ModelPreset::Balanced => {
-            "Selected balanced models (fast detection, high-accuracy embedding)."
-        }
-        ModelPreset::High => "Selected high-accuracy models (larger, ~40-50ms slower).",
+        ModelPreset::Standard => DeviceMessage::SelectedModelsStandard,
+        ModelPreset::Balanced => DeviceMessage::SelectedModelsBalanced,
+        ModelPreset::High => DeviceMessage::SelectedModelsHigh,
     }
 }
 
@@ -885,7 +884,7 @@ fn set_model_preset(config: &mut Config, preset: ModelPreset) -> anyhow::Result<
 /// `--models`, so the two cannot disagree about what a preset means.
 fn apply_model_preset(config: &mut Config, preset: ModelPreset) -> anyhow::Result<()> {
     set_model_preset(config, preset)?;
-    println!("  {}", preset_summary(preset));
+    Terminal.info(&preset_summary(preset));
     update_config_models(config)?;
     Ok(())
 }
@@ -957,13 +956,15 @@ fn wizard_execution_provider(theme: &ColorfulTheme, config: &mut Config) -> anyh
 fn resolve_execution_provider_auto() -> anyhow::Result<String> {
     match facelock_face::detect_execution_provider() {
         Ok(detection) => {
-            println!("  Detected: {}", detection.explain());
+            Terminal.info(&DeviceMessage::DetectedProvider {
+                detail: detection.explain(),
+            });
             Ok(detection.provider.as_str().to_string())
         }
         Err(e) => {
-            println!("  \u{26a0} Could not query the ONNX Runtime for available providers: {e}");
-            println!("    Selecting cpu. Re-run with an explicit --execution-provider once the");
-            println!("    runtime is installed if you need GPU inference.");
+            Terminal.info(&DeviceMessage::ProviderQueryFailed {
+                error: e.to_string(),
+            });
             Ok("cpu".to_string())
         }
     }
@@ -993,12 +994,10 @@ fn warn_provider_preflight(provider: &str) {
         .any(|p| Path::new(p).exists());
 
     if !has_nvidia_driver {
-        println!("  \u{26a0} NVIDIA driver not detected. Install the NVIDIA driver package");
-        println!("    before starting the daemon.");
+        Terminal.info(&DeviceMessage::NvidiaDriverMissing);
     }
     if !has_cuda_ort {
-        println!("  \u{26a0} CUDA-enabled ONNX Runtime not found. Install onnxruntime-opt-cuda");
-        println!("    before starting the daemon, or inference will fall back to CPU.");
+        Terminal.info(&DeviceMessage::CudaRuntimeMissing);
     }
 }
 
@@ -1219,13 +1218,9 @@ fn handle_orphan_models_before_keygen(
         ),
     }
 
-    println!();
-    println!(
-        "  WARNING: encrypted face models already exist in {} but the",
-        config.storage.db_path
-    );
-    println!("  encryption key is missing. Generating a new key would make them unreadable.");
-    println!();
+    Terminal.info(&SetupMessage::OrphanModelsWarning {
+        db_path: config.storage.db_path.clone(),
+    });
 
     let Some(theme) = theme.filter(|_| is_interactive()) else {
         bail!(
@@ -1246,7 +1241,7 @@ fn handle_orphan_models_before_keygen(
     let removed = store
         .clear_all()
         .map_err(|e| anyhow::anyhow!("failed to clear orphaned models: {e}"))?;
-    println!("  Removed {removed} orphaned model(s).");
+    Terminal.info(&SetupMessage::OrphanModelsRemoved { count: removed });
     Ok(())
 }
 
@@ -1361,7 +1356,7 @@ mod orphan_guard_tests {
 }
 
 fn wizard_encryption_setup(theme: &ColorfulTheme, config: &mut Config) -> anyhow::Result<()> {
-    println!("  Setting up AES-256-GCM encryption for face embeddings.");
+    Terminal.info(&SetupMessage::EncryptionIntro);
 
     // Detect TPM availability
     let tpm_available = detect_tpm(config);
@@ -1395,13 +1390,12 @@ fn setup_encryption_tpm_key(
 
     let sealed_path = Path::new(&config.encryption.sealed_key_path);
     if sealed_path.exists() {
-        println!(
-            "  TPM-sealed key already exists at {}.",
-            sealed_path.display()
-        );
+        Terminal.info(&SetupMessage::TpmSealedKeyPresent {
+            path: sealed_path.display().to_string(),
+        });
     } else {
         handle_orphan_models_before_keygen(config, theme)?;
-        println!("  Generating and sealing AES key with TPM...");
+        Terminal.info(&SetupMessage::GeneratingTpmSealedKey);
         let pcr = if config.tpm.pcr_binding {
             Some(config.tpm.pcr_indices.as_slice())
         } else {
@@ -1413,10 +1407,9 @@ fn setup_encryption_tpm_key(
                 .context("failed to initialize TPM")?;
             facelock_tpm::generate_and_seal_key(&mut tpm, sealed_path, pcr)
                 .context("failed to generate and seal key")?;
-            println!(
-                "  TPM-sealed key written to {} (permissions: 0600).",
-                sealed_path.display()
-            );
+            Terminal.info(&SetupMessage::TpmSealedKeyWritten {
+                path: sealed_path.display().to_string(),
+            });
         }
         #[cfg(not(feature = "tpm"))]
         {
@@ -1426,7 +1419,7 @@ fn setup_encryption_tpm_key(
     }
     config.encryption.method = EncryptionMethod::Tpm;
     update_config_encryption(config, "tpm")?;
-    println!("  Encryption enabled (TPM-sealed key).");
+    Terminal.info(&SetupMessage::EncryptionEnabledTpm);
     Ok(())
 }
 
@@ -1439,21 +1432,22 @@ fn setup_encryption_keyfile(
 
     let key_path = Path::new(&config.encryption.key_path);
     if key_path.exists() {
-        println!("  Encryption key already exists at {}.", key_path.display());
+        Terminal.info(&SetupMessage::KeyfilePresent {
+            path: key_path.display().to_string(),
+        });
     } else {
         handle_orphan_models_before_keygen(config, theme)?;
-        println!("  Generating encryption key...");
+        Terminal.info(&SetupMessage::GeneratingKeyfile);
         facelock_tpm::SoftwareSealer::generate_key_file(key_path)
             .context("failed to generate encryption key")?;
-        println!(
-            "  Key written to {} (permissions: 0600).",
-            key_path.display()
-        );
+        Terminal.info(&SetupMessage::KeyfileWritten {
+            path: key_path.display().to_string(),
+        });
     }
 
     config.encryption.method = EncryptionMethod::Keyfile;
     update_config_encryption(config, "keyfile")?;
-    println!("  Encryption enabled.");
+    Terminal.info(&SetupMessage::EncryptionEnabledKeyfile);
 
     Ok(())
 }
@@ -1465,10 +1459,7 @@ fn setup_encryption_none(config: &mut Config) -> anyhow::Result<()> {
     config.encryption.method = EncryptionMethod::None;
     update_config_encryption(config, "none")?;
 
-    println!("  \u{26a0} WARNING: encryption disabled (--encryption=none).");
-    println!("    Biometric templates will be stored UNENCRYPTED in the database.");
-    println!("    `facelock enroll` refuses to write plaintext embeddings unless");
-    println!("    security.allow_plaintext is also set in the config.");
+    Terminal.info(&SetupMessage::EncryptionDisabledWarning);
     Ok(())
 }
 
@@ -1538,7 +1529,7 @@ fn detect_tpm(config: &Config) -> bool {
     {
         match facelock_tpm::TpmSealer::new(&config.tpm.tcti) {
             Ok(_) => {
-                println!("  TPM 2.0 detected and functional.");
+                Terminal.info(&SetupMessage::TpmDetected);
                 true
             }
             Err(e) => {
@@ -2044,9 +2035,7 @@ fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec
 // ---------------------------------------------------------------------------
 
 fn print_hyprlock_hint() {
-    println!();
-    println!("==> To finish hyprlock integration, run as your normal user:");
-    println!("==>     facelock hyprlock enable");
+    Terminal.info(&SetupMessage::HyprlockHint);
 }
 
 fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
@@ -2074,7 +2063,7 @@ fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
         return;
     }
 
-    println!();
+    Terminal.info(&SetupMessage::BlankLine);
     let proceed = Confirm::with_theme(theme)
         .with_prompt(format!(
             "Apply hyprlock face-unlock integration for {sudo_user}? (face icon + empty-Enter submit)"
@@ -2094,7 +2083,7 @@ fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
 
     match status {
         Ok(s) if s.success() => {
-            println!("  hyprlock integration applied for {sudo_user}.");
+            Terminal.info(&SetupMessage::HyprlockApplied { user: sudo_user });
         }
         _ => {
             print_hyprlock_hint();
@@ -2167,25 +2156,32 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
 
         match status {
             ModelStatus::Present => {
-                println!("  [ok] {} ({})", entry.name, entry.purpose);
+                Terminal.info(&DownloadMessage::ModelPresentOk {
+                    name: entry.name.clone(),
+                    purpose: entry.purpose.clone(),
+                });
             }
             ModelStatus::Missing => {
-                println!(
-                    "  [download] {} (~{}MB) - {}",
-                    entry.name, entry.size_mb, entry.purpose
-                );
+                Terminal.info(&DownloadMessage::ModelDownloadPending {
+                    name: entry.name.clone(),
+                    size_mb: entry.size_mb,
+                    purpose: entry.purpose.clone(),
+                });
                 download_model(entry, &model_path)?;
                 verify_after_download(&model_path, &entry.sha256, &entry.name)?;
-                println!("  [ok] {} downloaded and verified", entry.name);
+                Terminal.info(&DownloadMessage::ModelDownloaded {
+                    name: entry.name.clone(),
+                });
             }
             ModelStatus::BadChecksum => {
-                println!(
-                    "  [redownload] {} - checksum mismatch, re-downloading",
-                    entry.name
-                );
+                Terminal.info(&DownloadMessage::ModelRedownloading {
+                    name: entry.name.clone(),
+                });
                 download_model(entry, &model_path)?;
                 verify_after_download(&model_path, &entry.sha256, &entry.name)?;
-                println!("  [ok] {} re-downloaded and verified", entry.name);
+                Terminal.info(&DownloadMessage::ModelRedownloaded {
+                    name: entry.name.clone(),
+                });
             }
         }
     }
@@ -2211,7 +2207,7 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
     // the setup marker exists.
     let enrolled = plan.enroll == Some(true);
     if enrolled {
-        println!("\nEnrolling face...");
+        Terminal.info(&SetupMessage::EnrollingFace);
         super::enroll::run(&config, None, None, true)?;
     }
 
@@ -2241,10 +2237,12 @@ fn setup_encryption_auto(config: &Config) -> anyhow::Result<()> {
 
     // Skip if already configured
     if config.encryption.method != EncryptionMethod::None {
-        println!(
-            "  Encryption already configured ({:?}).",
-            config.encryption.method
-        );
+        Terminal.info(&SetupMessage::EncryptionAlreadyConfigured {
+            // Pre-formatted: `Debug` here is the config enum's own spelling
+            // (`Tpm`/`Keyfile`), and formatting before the seam keeps the
+            // rendering locale-independent.
+            method: format!("{:?}", config.encryption.method),
+        });
         return Ok(());
     }
 
@@ -2263,15 +2261,14 @@ fn setup_encryption_auto(config: &Config) -> anyhow::Result<()> {
                     .context("failed to initialize TPM")?;
                 facelock_tpm::generate_and_seal_key(&mut tpm, sealed_path, pcr)
                     .context("failed to generate and seal key")?;
-                println!(
-                    "  [ok] Generated TPM-sealed encryption key at {}",
-                    sealed_path.display()
-                );
+                Terminal.info(&SetupMessage::GeneratedTpmKeyAt {
+                    path: sealed_path.display().to_string(),
+                });
             }
             let mut config = config.clone();
             config.encryption.method = EncryptionMethod::Tpm;
             update_config_encryption(&config, "tpm")?;
-            println!("  [ok] AES-256-GCM encryption enabled (TPM-sealed key).");
+            Terminal.info(&SetupMessage::EncryptionEnabledTpmAuto);
             return Ok(());
         }
     }
@@ -2281,13 +2278,15 @@ fn setup_encryption_auto(config: &Config) -> anyhow::Result<()> {
     if !key_path.exists() {
         facelock_tpm::SoftwareSealer::generate_key_file(key_path)
             .context("failed to generate encryption key")?;
-        println!("  [ok] Generated encryption key at {}", key_path.display());
+        Terminal.info(&SetupMessage::GeneratedKeyfileAt {
+            path: key_path.display().to_string(),
+        });
     }
 
     let mut config = config.clone();
     config.encryption.method = EncryptionMethod::Keyfile;
     update_config_encryption(&config, "keyfile")?;
-    println!("  [ok] AES-256-GCM encryption enabled.");
+    Terminal.info(&SetupMessage::EncryptionEnabledKeyfileAuto);
     Ok(())
 }
 
@@ -2534,7 +2533,7 @@ fn create_directories(config: &Config) -> anyhow::Result<()> {
         tracing::debug!("ensured directory: {}", dir.display());
     }
 
-    println!("  Directories created.");
+    Terminal.info(&SetupMessage::DirectoriesCreated);
     Ok(())
 }
 
@@ -2557,7 +2556,9 @@ path = "/dev/video0"
             config_path.display()
         )
     })?;
-    println!("  Created default config at {}", config_path.display());
+    Terminal.info(&SetupMessage::CreatedDefaultConfig {
+        path: config_path.display().to_string(),
+    });
     Ok(())
 }
 
@@ -2757,6 +2758,12 @@ fn candidates_in(base: &Path) -> Vec<&'static PamCandidate> {
         .filter(|c| base.join(c.service).exists())
         .collect()
 }
+
+// The four prints below are the last in this file that still write to stdout
+// directly instead of going through the message sink, and they stay that way
+// on purpose: this whole region moves to `commands/pam.rs` (#174), which
+// converts them during the move. Converting them here would only make that
+// move a conflict.
 
 // --- PAM installation ---
 
@@ -3067,7 +3074,9 @@ fn refresh_legacy_copy_if_present(path: &Path, contents: &str, marker: &str) -> 
 
     write_file(path, contents.as_bytes(), 0o644)
         .with_context(|| format!("failed to refresh {}", path.display()))?;
-    println!("  Refreshed legacy {}", path.display());
+    Terminal.info(&SystemMessage::RefreshedLegacyFile {
+        path: path.display().to_string(),
+    });
     Ok(())
 }
 
@@ -3076,11 +3085,11 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
     check_systemd()?;
 
     if disable {
-        println!("Disabling facelock-daemon systemd units...");
+        Terminal.info(&SystemMessage::DisablingSystemdUnits);
         run_cmd("systemctl", &["disable", "--now", "facelock-daemon"])?;
-        println!("facelock-daemon service disabled and stopped.");
+        Terminal.info(&SystemMessage::SystemdUnitsDisabled);
     } else {
-        println!("Installing facelock-daemon systemd and D-Bus units...");
+        Terminal.info(&SystemMessage::InstallingSystemdUnits);
 
         // Install systemd service unit
         let unit_dir = Path::new(SYSTEMD_UNIT_DIR);
@@ -3090,7 +3099,9 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
         let service_path = unit_dir.join(SERVICE_FILENAME);
         write_file(&service_path, SERVICE_UNIT.as_bytes(), 0o644)
             .with_context(|| format!("failed to write {}", service_path.display()))?;
-        println!("  Wrote {}", service_path.display());
+        Terminal.info(&SystemMessage::WroteFile {
+            path: service_path.display().to_string(),
+        });
         refresh_legacy_copy_if_present(
             Path::new(LEGACY_SYSTEMD_UNIT_PATH),
             SERVICE_UNIT,
@@ -3105,7 +3116,9 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
         let policy_path = conf_dir.join(DBUS_POLICY_FILENAME);
         write_file(&policy_path, DBUS_POLICY.as_bytes(), 0o644)
             .with_context(|| format!("failed to write {}", policy_path.display()))?;
-        println!("  Wrote {}", policy_path.display());
+        Terminal.info(&SystemMessage::WroteFile {
+            path: policy_path.display().to_string(),
+        });
         refresh_legacy_copy_if_present(
             Path::new(LEGACY_DBUS_SYSTEM_CONF_PATH),
             DBUS_POLICY,
@@ -3120,7 +3133,9 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
         let dbus_svc_path = svc_dir.join(DBUS_SERVICE_FILENAME);
         write_file(&dbus_svc_path, DBUS_SERVICE.as_bytes(), 0o644)
             .with_context(|| format!("failed to write {}", dbus_svc_path.display()))?;
-        println!("  Wrote {}", dbus_svc_path.display());
+        Terminal.info(&SystemMessage::WroteFile {
+            path: dbus_svc_path.display().to_string(),
+        });
         refresh_legacy_copy_if_present(
             Path::new(LEGACY_DBUS_SYSTEM_SERVICE_PATH),
             DBUS_SERVICE,
@@ -3128,12 +3143,14 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
         )?;
 
         run_cmd("systemctl", &["daemon-reload"])?;
-        println!("  systemctl daemon-reload done.");
+        Terminal.info(&SystemMessage::SystemctlDaemonReloadDone);
 
         run_cmd("systemctl", &["enable", SERVICE_FILENAME])?;
-        println!("  systemctl enable {SERVICE_FILENAME} done.");
+        Terminal.info(&SystemMessage::SystemctlEnableDone {
+            unit: SERVICE_FILENAME.to_string(),
+        });
 
-        println!("\nfacelock-daemon D-Bus activation is now enabled.");
+        Terminal.info(&SystemMessage::DbusActivationEnabled);
     }
 
     Ok(())
