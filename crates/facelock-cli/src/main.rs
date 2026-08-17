@@ -3,6 +3,8 @@
 //! resolved, logging, …) lives in `lib.rs` so it stays testable and shareable
 //! (gap D6); this file keeps only the `Cli`/`Commands` types and `main`.
 
+mod args;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -10,17 +12,20 @@ use clap::{Parser, Subcommand};
 use facelock_cli::commands::TpmCommand;
 use facelock_cli::commands::bench::BenchCommand;
 use facelock_cli::commands::hyprlock::HyprlockCommand;
-use facelock_cli::commands::setup::{
-    EncryptionChoice, ExecutionProviderChoice, ModelPreset, SetupArgs, resolve_setup_plan,
-};
+use facelock_cli::commands::setup::{SetupArgs, resolve_setup_plan};
 use facelock_cli::{commands, logging, message, notifications, resolved};
+
+use args::{ConfirmArg, JsonArg, SetupCli, UserArg};
 
 #[derive(Parser)]
 #[command(name = "facelock", about = "Linux face authentication", version)]
 struct Cli {
     /// Path to config file
-    #[arg(long, global = true)]
+    #[arg(short = 'c', long, global = true)]
     config: Option<String>,
+    /// Suppress non-essential stdout; report the result through the exit code
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -28,81 +33,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Download models and create directories
-    Setup {
-        /// Run in non-interactive mode (skip wizard)
-        #[arg(long)]
-        non_interactive: bool,
-        /// Skip confirmation prompts, e.g. before modifying PAM files (also: --no-confirm)
-        #[arg(short, long, alias = "no-confirm")]
-        yes: bool,
-
-        // -- Action pairs. A later flag wins over an earlier one, so a wrapper
-        //    script can append an override to a command it did not construct.
-        /// Install or manage PAM module configuration
-        #[arg(long, overrides_with = "no_pam")]
-        pam: bool,
-        /// Do not touch PAM configuration at all (no prompt, no write)
-        #[arg(long = "no-pam", overrides_with = "pam")]
-        no_pam: bool,
-        /// Install and enable systemd units
-        #[arg(long, overrides_with = "no_systemd")]
-        systemd: bool,
-        /// Do not install or enable systemd units
-        #[arg(long = "no-systemd", overrides_with = "systemd")]
-        no_systemd: bool,
-        /// Enroll a face during setup
-        #[arg(long, overrides_with = "no_enroll")]
-        enroll: bool,
-        /// Do not enroll a face during setup
-        #[arg(long = "no-enroll", overrides_with = "enroll")]
-        no_enroll: bool,
-
-        // -- Action modifiers
-        /// Used with --systemd: disable and stop systemd units instead
-        #[arg(long, requires = "systemd")]
-        disable: bool,
-        /// Used with --pam: target PAM service (default: sudo)
-        #[arg(long, requires = "pam")]
-        service: Option<String>,
-        /// Used with --pam: remove the PAM line instead of adding it
-        #[arg(long, requires = "pam")]
-        remove: bool,
-        /// Used with --pam --remove: treat an absent service file as success
-        #[arg(long = "if-present", requires = "remove")]
-        if_present: bool,
-
-        // -- Choice flags. Supplying a value answers the question, and so skips
-        //    the matching wizard step.
-        /// Camera device path, or `auto` to re-detect from hardware
-        #[arg(long)]
-        camera: Option<String>,
-        /// Model quality preset
-        #[arg(long, value_enum)]
-        models: Option<ModelPreset>,
-        /// ONNX Runtime execution provider
-        #[arg(long, value_enum)]
-        execution_provider: Option<ExecutionProviderChoice>,
-        /// Embedding encryption method
-        #[arg(long, value_enum)]
-        encryption: Option<EncryptionChoice>,
-    },
+    Setup(SetupCli),
     /// Report whether a user has a usable face enrollment (exit 0 = enrolled, 1 = not enrolled, 2 = error)
     IsEnrolled {
-        /// Username (default: current user)
-        #[arg(short, long)]
-        user: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-        /// Suppress stdout; report only via the exit code
-        #[arg(long)]
-        quiet: bool,
+        #[command(flatten)]
+        user: UserArg,
+        #[command(flatten)]
+        json: JsonArg,
     },
     /// Capture and store a face
     Enroll {
-        /// Username to enroll (default: current user)
-        #[arg(short, long)]
-        user: Option<String>,
+        #[command(flatten)]
+        user: UserArg,
         /// Label for this face model
         #[arg(short, long)]
         label: Option<String>,
@@ -114,45 +56,37 @@ enum Commands {
     Remove {
         /// Model ID to remove
         model_id: u32,
-        /// Username (default: current user)
-        #[arg(short, long)]
-        user: Option<String>,
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        yes: bool,
+        #[command(flatten)]
+        user: UserArg,
+        #[command(flatten)]
+        confirm: ConfirmArg,
     },
     /// Remove all face models for a user
     Clear {
-        /// Username (default: current user)
-        #[arg(short, long)]
-        user: Option<String>,
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        yes: bool,
+        #[command(flatten)]
+        user: UserArg,
+        #[command(flatten)]
+        confirm: ConfirmArg,
     },
     /// List enrolled face models
     List {
-        /// Username (default: current user)
-        #[arg(short, long)]
-        user: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        user: UserArg,
+        #[command(flatten)]
+        json: JsonArg,
     },
     /// Test face recognition
     Test {
-        /// Username (default: current user)
-        #[arg(short, long)]
-        user: Option<String>,
+        #[command(flatten)]
+        user: UserArg,
     },
     /// Live camera preview with detection overlay
     Preview {
         /// Print detection results to stdout instead of graphical preview
         #[arg(long)]
         text_only: bool,
-        /// User to match faces against (defaults to current user)
-        #[arg(short, long)]
-        user: Option<String>,
+        #[command(flatten)]
+        user: UserArg,
     },
     /// Show or edit configuration
     Config {
@@ -164,24 +98,20 @@ enum Commands {
     Status,
     /// List available camera devices
     Devices {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        json: JsonArg,
     },
     /// Run the persistent authentication daemon
-    Daemon {
-        /// Path to config file
-        #[arg(short, long)]
-        config: Option<String>,
-    },
+    Daemon,
     /// One-shot authentication (used by PAM module)
     Auth {
+        // Required, unlike every other `--user`, and so not a `UserArg`:
+        // `pam_facelock.so` names the subject explicitly and must never fall
+        // back to the process owner. A plain comment, not a doc comment, so
+        // `auth --help` keeps clap's short template.
         /// Username to authenticate
-        #[arg(long)]
+        #[arg(short = 'u', long)]
         user: String,
-        /// Path to config file
-        #[arg(long)]
-        config: Option<String>,
     },
     /// Benchmark and calibration tools
     Bench {
@@ -226,27 +156,26 @@ fn main() -> anyhow::Result<()> {
     // subcommand dispatch. Log/tracing output is unaffected by design (D2).
     message::init();
 
-    let cli = Cli::parse();
-    let Cli { config, command } = cli;
+    let Cli {
+        config,
+        quiet,
+        command,
+    } = Cli::parse();
 
-    if let Some(path) = config {
+    // `--config` is declared once, `global = true`, so it is accepted on either
+    // side of the subcommand and lands here whichever side it was given on.
+    // This override is also how the path reaches the daemon: startup, the live
+    // reload and the mtime watch all resolve through it.
+    if let Some(path) = config.as_deref() {
         facelock_core::paths::set_process_config_override(PathBuf::from(path));
     }
 
     match command {
         // Daemon and auth init their own tracing, so handle them separately
-        Commands::Daemon { config } => {
-            // The override is how `--config` reaches the daemon: startup, the
-            // live reload and the mtime watch all resolve the path through it.
-            if let Some(path) = config {
-                facelock_core::paths::set_process_config_override(PathBuf::from(path));
-            }
-            commands::daemon::run(notifications::daemon_notifier_factory())
-        }
-        Commands::Auth { user, config } => {
-            if let Some(ref path) = config {
-                facelock_core::paths::set_process_config_override(PathBuf::from(path));
-            }
+        Commands::Daemon => commands::daemon::run(notifications::daemon_notifier_factory()),
+        Commands::Auth { user } => {
+            // `auth` is its own one-shot process and loads the config itself,
+            // so it takes the explicit path rather than re-deriving it.
             let exit_code = commands::auth::run(user, config);
             std::process::exit(exit_code);
         }
@@ -267,8 +196,8 @@ fn main() -> anyhow::Result<()> {
                 // dotfiles, `config` operates on the config file itself, and
                 // `restart` only talks to systemd — none consume a parsed
                 // Config.
-                Commands::IsEnrolled { user, json, quiet } => {
-                    std::process::exit(commands::is_enrolled::run(user, json, quiet))
+                Commands::IsEnrolled { user, json } => {
+                    std::process::exit(commands::is_enrolled::run(user.user, json.json, quiet))
                 }
                 Commands::Hyprlock { command } => commands::hyprlock::run(command),
                 Commands::Config { edit } => commands::config::run(edit),
@@ -277,41 +206,9 @@ fn main() -> anyhow::Result<()> {
                 // Setup bootstraps the config file — creates the default when
                 // missing and edits it in place — so it owns its own load; see
                 // the commented sites in commands/setup.rs.
-                Commands::Setup {
-                    non_interactive,
-                    yes,
-                    pam,
-                    no_pam,
-                    systemd,
-                    no_systemd,
-                    enroll,
-                    no_enroll,
-                    disable,
-                    service,
-                    remove,
-                    if_present,
-                    camera,
-                    models,
-                    execution_provider,
-                    encryption,
-                } => commands::setup::run_with_plan(resolve_setup_plan(SetupArgs {
-                    non_interactive,
-                    yes,
-                    pam,
-                    no_pam,
-                    systemd,
-                    no_systemd,
-                    enroll,
-                    no_enroll,
-                    disable,
-                    service,
-                    remove,
-                    if_present,
-                    camera,
-                    models,
-                    execution_provider,
-                    encryption,
-                })),
+                Commands::Setup(setup) => {
+                    commands::setup::run_with_plan(resolve_setup_plan(SetupArgs::from(setup)))
+                }
 
                 other => {
                     // The one parse for this process (D7): every remaining
@@ -330,19 +227,23 @@ fn main() -> anyhow::Result<()> {
                             user,
                             label,
                             skip_setup_check,
-                        } => commands::enroll::run(&config, user, label, skip_setup_check),
+                        } => commands::enroll::run(&config, user.user, label, skip_setup_check),
                         Commands::Remove {
                             model_id,
                             user,
-                            yes,
-                        } => commands::remove::run(&config, model_id, user, yes),
-                        Commands::Clear { user, yes } => commands::clear::run(&config, user, yes),
-                        Commands::List { user, json } => commands::list::run(&config, user, json),
-                        Commands::Test { user } => commands::test_cmd::run(&config, user),
-                        Commands::Preview { text_only, user } => {
-                            commands::preview::run(&config, text_only, user)
+                            confirm,
+                        } => commands::remove::run(&config, model_id, user.user, confirm.yes),
+                        Commands::Clear { user, confirm } => {
+                            commands::clear::run(&config, user.user, confirm.yes)
                         }
-                        Commands::Devices { json } => commands::devices::run(&config, json),
+                        Commands::List { user, json } => {
+                            commands::list::run(&config, user.user, json.json)
+                        }
+                        Commands::Test { user } => commands::test_cmd::run(&config, user.user),
+                        Commands::Preview { text_only, user } => {
+                            commands::preview::run(&config, text_only, user.user)
+                        }
+                        Commands::Devices { json } => commands::devices::run(&config, json.json),
                         Commands::Bench { command } => commands::bench::run(&config, command),
                         Commands::Tpm { command } => commands::tpm::run(&config, command),
                         Commands::Encrypt { generate_key } => {
@@ -354,13 +255,13 @@ fn main() -> anyhow::Result<()> {
                             commands::audit::run(&config, follow, lines)
                         }
                         // Already handled above
-                        Commands::Daemon { .. }
+                        Commands::Daemon
                         | Commands::Auth { .. }
                         | Commands::IsEnrolled { .. }
                         | Commands::Hyprlock { .. }
                         | Commands::Config { .. }
                         | Commands::Restart
-                        | Commands::Setup { .. }
+                        | Commands::Setup(..)
                         | Commands::Status => unreachable!(),
                     }
                 }
@@ -374,7 +275,10 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
-    use commands::setup::{BaseMode, CameraChoice, PamPref, SetupPlan, SystemdPref};
+    use commands::setup::{
+        BaseMode, CameraChoice, EncryptionChoice, ExecutionProviderChoice, ModelPreset, PamPref,
+        SetupPlan, SystemdPref,
+    };
 
     #[test]
     fn verify_cli() {
@@ -387,45 +291,10 @@ mod tests {
     fn plan(args: &[&str]) -> SetupPlan {
         let argv: Vec<&str> = ["facelock", "setup"].iter().chain(args).copied().collect();
         let cli = Cli::try_parse_from(argv).expect("expected these args to parse");
-        let Commands::Setup {
-            non_interactive,
-            yes,
-            pam,
-            no_pam,
-            systemd,
-            no_systemd,
-            enroll,
-            no_enroll,
-            disable,
-            service,
-            remove,
-            if_present,
-            camera,
-            models,
-            execution_provider,
-            encryption,
-        } = cli.command
-        else {
+        let Commands::Setup(setup) = cli.command else {
             panic!("expected the Setup variant");
         };
-        resolve_setup_plan(SetupArgs {
-            non_interactive,
-            yes,
-            pam,
-            no_pam,
-            systemd,
-            no_systemd,
-            enroll,
-            no_enroll,
-            disable,
-            service,
-            remove,
-            if_present,
-            camera,
-            models,
-            execution_provider,
-            encryption,
-        })
+        resolve_setup_plan(SetupArgs::from(setup))
     }
 
     fn parse_error(args: &[&str]) -> clap::Error {
@@ -766,11 +635,269 @@ mod tests {
             "--quiet",
         ])
         .expect("is-enrolled args should parse");
-        let Commands::IsEnrolled { user, json, quiet } = cli.command else {
+        // `--quiet` is global now, so it is read off `Cli`, not the variant.
+        assert!(cli.quiet);
+        let Commands::IsEnrolled { user, json } = cli.command else {
             panic!("expected the IsEnrolled variant");
         };
-        assert_eq!(user.as_deref(), Some("alice"));
-        assert!(json);
-        assert!(quiet);
+        assert_eq!(user.user.as_deref(), Some("alice"));
+        assert!(json.json);
+    }
+
+    // -----------------------------------------------------------------------
+    // Flag spelling (#167)
+    // -----------------------------------------------------------------------
+
+    /// The short-letter registry.
+    ///
+    /// Short letters are a single namespace shared by every subcommand: once
+    /// `-l` means `--label` on one command, spending it on something else
+    /// elsewhere makes both a trap. Each row is a letter and the long names
+    /// allowed to bind it. `cli_flag_conformance` fails on a letter that is not
+    /// listed, and on a listed letter bound to a name outside its row, so
+    /// widening the namespace is a deliberate edit here rather than a side
+    /// effect of adding a flag.
+    ///
+    /// `l` maps to two names because `enroll --label` and `audit --lines` both
+    /// ship today and both must keep working. `v` has no site at all — it is a
+    /// reservation for `--verbose`, held so the letter cannot be spent on
+    /// something else first.
+    const SHORT_REGISTRY: &[(char, &[&str])] = &[
+        ('u', &["user"]),
+        ('y', &["yes"]),
+        ('c', &["config"]),
+        ('q', &["quiet"]),
+        ('l', &["label", "lines"]),
+        ('f', &["follow"]),
+        ('v', &["verbose"]),
+    ];
+
+    /// Collect every command in the tree, keyed by its full invocation path
+    /// (`facelock bench camera-reopen`), so a failure names the offender.
+    fn walk<'a>(
+        command: &'a clap::Command,
+        prefix: &str,
+        out: &mut Vec<(String, &'a clap::Command)>,
+    ) {
+        let path = if prefix.is_empty() {
+            command.get_name().to_string()
+        } else {
+            format!("{prefix} {}", command.get_name())
+        };
+        for sub in command.get_subcommands() {
+            walk(sub, &path, out);
+        }
+        out.push((path, command));
+    }
+
+    /// Pins flag spelling across the whole command tree.
+    ///
+    /// This is the test that outlives the refactor that produced it. The shared
+    /// arg structs in `args.rs` stop drift at the sites that use them; this
+    /// stops it at the sites that do not — a hand-rolled `--user` on a new
+    /// command, a second `-c`, a `--json` that grew a short letter.
+    ///
+    /// **Recorded deviation from the G1 plan.** The plan called for a single
+    /// `UserArg` (an `Option<String>`) on every user-scoped command including
+    /// `auth`. `auth --user` is required today and `pam_facelock.so` spawns
+    /// `facelock auth --user <name>`; making it optional would let the subject
+    /// default to the process owner, which is an auth-semantics change, not a
+    /// spelling one. So `auth` keeps a required `String` and only gains `-u`,
+    /// and the requiredness rule below is asserted per command rather than
+    /// assumed uniform.
+    #[test]
+    fn cli_flag_conformance() {
+        let root = Cli::command();
+        let mut commands = Vec::new();
+        walk(&root, "", &mut commands);
+
+        for (path, command) in &commands {
+            let about = command
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(
+                !about.trim().is_empty(),
+                "`{path}` has no about text, so it renders blank in `--help`"
+            );
+
+            for arg in command.get_arguments() {
+                let id = arg.get_id().as_str();
+                // clap owns `-h`/`-V`; the registry governs our own flags only.
+                if id == "help" || id == "version" {
+                    continue;
+                }
+                let long = arg.get_long();
+
+                match id {
+                    "user" => {
+                        assert_eq!(
+                            arg.get_short(),
+                            Some('u'),
+                            "`{path} --user` must also spell `-u`"
+                        );
+                        assert_eq!(long, Some("user"), "`{path}`: user arg spelled oddly");
+                        if path == "facelock auth" {
+                            assert!(
+                                arg.is_required_set(),
+                                "`auth --user` must stay required — PAM names the subject"
+                            );
+                        } else {
+                            assert!(
+                                !arg.is_required_set(),
+                                "`{path} --user` must stay optional (defaults to current user)"
+                            );
+                        }
+                    }
+                    "yes" => {
+                        assert_eq!(arg.get_short(), Some('y'), "`{path} --yes` must spell `-y`");
+                        assert_eq!(long, Some("yes"));
+                        assert!(
+                            arg.get_all_aliases()
+                                .unwrap_or_default()
+                                .contains(&"no-confirm"),
+                            "`{path} --yes` must accept the historical `--no-confirm`"
+                        );
+                    }
+                    "json" | "dry_run" => {
+                        assert_eq!(
+                            arg.get_short(),
+                            None,
+                            "`{path} --{id}` must not claim a short letter"
+                        );
+                        // The long spelling is the whole contract for these,
+                        // so assert it too: without this a `--json-output`
+                        // would satisfy the short-letter rule vacuously.
+                        let expected = id.replace('_', "-");
+                        assert_eq!(
+                            long,
+                            Some(expected.as_str()),
+                            "`{path}`: the `{id}` arg must spell `--{expected}`"
+                        );
+                    }
+                    "quiet" => {
+                        assert_eq!(
+                            arg.get_short(),
+                            Some('q'),
+                            "`{path} --quiet` must spell `-q`"
+                        );
+                        assert_eq!(long, Some("quiet"), "`{path}`: quiet arg spelled oddly");
+                    }
+                    _ => {}
+                }
+
+                let mut shorts: Vec<char> = arg.get_short().into_iter().collect();
+                shorts.extend(arg.get_all_short_aliases().unwrap_or_default());
+                for short in shorts {
+                    let Some((_, allowed)) =
+                        SHORT_REGISTRY.iter().find(|(letter, _)| *letter == short)
+                    else {
+                        panic!(
+                            "`{path}` binds -{short} (--{}), which is not in SHORT_REGISTRY; \
+                             add a row there if the letter is really meant to be spent",
+                            long.unwrap_or(id)
+                        );
+                    };
+                    let name = long.unwrap_or(id);
+                    assert!(
+                        allowed.contains(&name),
+                        "`{path}` binds -{short} to --{name}; the registry reserves \
+                         that letter for {allowed:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every invocation that parsed before the shared arg structs landed must
+    /// still parse. The refactor is additive or it is a regression, and only a
+    /// table of real argv can tell those apart.
+    #[test]
+    fn legacy_invocations_still_parse() {
+        for argv in [
+            &["facelock", "setup", "--pam", "--service", "sudo", "--yes"][..],
+            &[
+                "facelock",
+                "setup",
+                "--pam",
+                "--service",
+                "sudo",
+                "--remove",
+                "--yes",
+            ],
+            &[
+                "facelock",
+                "setup",
+                "--pam",
+                "--service",
+                "sudo",
+                "--remove",
+                "--yes",
+                "--if-present",
+            ],
+            &["facelock", "setup", "--no-pam", "--systemd", "--enroll"],
+            &["facelock", "setup", "--pam", "--no-confirm"],
+            &["facelock", "preview", "--text-only"],
+            &["facelock", "remove", "1", "-y"],
+            &["facelock", "clear", "-u", "alice", "--yes"],
+            &["facelock", "enroll", "-u", "alice", "-l", "laptop"],
+            &["facelock", "audit", "-f", "-l", "5"],
+            &["facelock", "list", "-u", "alice", "--json"],
+            &["facelock", "devices", "--json"],
+        ] {
+            Cli::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("`{}` must still parse: {e}", argv.join(" ")));
+        }
+
+        // The PAM module spawns exactly this argv (crates/pam-facelock/src/lib.rs).
+        // `auth` no longer declares its own `--config`; this parses only because
+        // the one on `Cli` is `global = true` and is therefore still accepted
+        // after the subcommand name. Drop `global` and PAM breaks silently.
+        let cli = Cli::try_parse_from([
+            "facelock",
+            "auth",
+            "--user",
+            "alice",
+            "--config",
+            "/etc/facelock/config.toml",
+        ])
+        .expect("the argv pam_facelock.so spawns must parse");
+        assert_eq!(cli.config.as_deref(), Some("/etc/facelock/config.toml"));
+        let Commands::Auth { user } = cli.command else {
+            panic!("expected the Auth variant");
+        };
+        assert_eq!(user, "alice");
+
+        // `daemon -c X` kept its spelling when the per-command flag was deleted:
+        // the global one gained `-c`. Both sides of the subcommand work.
+        for argv in [
+            &["facelock", "daemon", "-c", "/tmp/x.toml"][..],
+            &["facelock", "-c", "/tmp/x.toml", "daemon"],
+        ] {
+            let cli = Cli::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("`{}` must parse: {e}", argv.join(" ")));
+            assert_eq!(cli.config.as_deref(), Some("/tmp/x.toml"));
+            assert!(matches!(cli.command, Commands::Daemon));
+        }
+
+        // `--quiet` moved off `is-enrolled` onto the root, so both positions
+        // must reach the same field.
+        for argv in [
+            &["facelock", "is-enrolled", "--quiet"][..],
+            &["facelock", "--quiet", "is-enrolled"],
+            &["facelock", "is-enrolled", "-q"],
+        ] {
+            let cli = Cli::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("`{}` must parse: {e}", argv.join(" ")));
+            assert!(cli.quiet, "`{}` must set the global quiet", argv.join(" "));
+        }
+
+        // `--no-confirm` was `setup`-only; it is the alias everywhere now.
+        let cli = Cli::try_parse_from(["facelock", "clear", "--no-confirm"])
+            .expect("`clear --no-confirm` must parse");
+        let Commands::Clear { confirm, .. } = cli.command else {
+            panic!("expected the Clear variant");
+        };
+        assert!(confirm.yes);
     }
 }

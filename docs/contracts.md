@@ -30,7 +30,7 @@ Stable contracts. Do not change without updating this document.
 | `facelock status` | Check system status |
 | `facelock config` | Show/edit configuration |
 | `facelock daemon` | Run persistent daemon |
-| `facelock auth --user X` | One-shot auth (PAM helper) |
+| `facelock auth --user X` | One-shot auth (PAM helper). `--user` is required here and only here; `--config` is the global flag, not a per-command one |
 | `facelock tpm status` | TPM status |
 | `facelock hyprlock enable\|disable\|status` | Manage hyprlock lock-screen integration (user, no root); `enable` accepts `--no-icon` to skip the cosmetic face glyph |
 | `facelock encrypt` | Encrypt face database |
@@ -41,6 +41,37 @@ Stable contracts. Do not change without updating this document.
 | `facelock audit` | View audit log |
 | `facelock bench` | Benchmarks |
 | `facelock restart` | Restart daemon |
+
+### CLI Flag Spelling
+
+Flag spelling is a compatibility surface, not a presentation detail: `pam_facelock.so`
+spawns `facelock auth --user <name> --config <path>` byte for byte, and wrapper
+scripts hard-code the rest. Two things hold it still.
+
+Shared clap arg structs in `crates/facelock-cli/src/args.rs` (`UserArg`,
+`ConfirmArg`, `JsonArg`, `DryRunArg`) are flattened at every site, so a command
+either offers a flag with the one spelling or does not offer it. The conformance
+test `cli_flag_conformance` in `crates/facelock-cli/src/main.rs` walks the whole
+command tree — nested subcommands included — and fails on any drift. The
+**short-letter registry** lives in that test: a `&[(char, &[&str])]` table naming
+every short letter and the long names allowed to bind it. Spending a new letter
+means editing the registry on purpose.
+
+The invariants it pins:
+
+- `--user` is `-u` on every command that has it, including `auth`
+- `auth --user` stays **required** — PAM names the subject and it must never
+  fall back to the process owner. Every other `--user` defaults to the current user
+- `--yes` is `-y` and accepts `--no-confirm` everywhere (it was `setup`-only)
+- `--json` and `--dry-run` take no short letter
+- `--config` (`-c`) and `--quiet` (`-q`) are declared once, `global = true`, and
+  are accepted on either side of the subcommand name. No command re-declares
+  them. `facelock daemon -c X` and `facelock -c X daemon` are equivalent, as are
+  `facelock is-enrolled --quiet` and `facelock --quiet is-enrolled`
+- every subcommand has non-empty `about` text
+
+`legacy_invocations_still_parse`, alongside it, is a table of real argv — the PAM
+spawn included — that must keep parsing.
 
 ### CLI Output Streams
 
@@ -226,7 +257,8 @@ the codes themselves match `grep`'s 0 = match / 1 = no match / 2 = error.
 
 Default stdout is `enrolled` / `not-enrolled` — the state word, as `systemctl
 is-active` prints `active`. `--quiet` suppresses stdout and leaves only the exit
-code. `--json` emits `{"enrolled": bool, "models": N, "updated": "<ISO8601>"}`.
+code; it is the global `-q` flag, so `facelock --quiet is-enrolled` is the same
+invocation. `--json` emits `{"enrolled": bool, "models": N, "updated": "<ISO8601>"}`.
 
 `is-enrolled` answers from `/var/lib/facelock/enrolled/<user>` alone. It never
 activates the daemon over D-Bus, never opens a camera, and never reads the
