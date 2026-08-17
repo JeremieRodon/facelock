@@ -4,6 +4,24 @@
 
 Facelock is a Linux face authentication PAM module written in Rust. Single unified binary (`facelock`) handles CLI, daemon, one-shot auth, and benchmarks. The PAM module (`pam_facelock.so`) is a thin client that either connects to the daemon or spawns `facelock auth`. IPC uses the D-Bus system bus (`org.facelock.Daemon`), not Unix sockets.
 
+## Crates
+
+Cargo workspace, 11 crates. What each is for — the manifests carry no `description`, so this is the only map.
+
+- `facelock-core` — config, types, errors, D-Bus interface, traits
+- `facelock-camera` — V4L2 capture, auto-detection, preprocessing
+- `facelock-face` — ONNX inference (SCRFD + ArcFace)
+- `facelock-store` — SQLite face embedding storage
+- `facelock-daemon` — auth/enroll logic, rate limiting, liveness, audit, D-Bus server
+- `facelock-cli` — the `facelock` binary, plus a library target so the domain layer is testable
+- `facelock-bench` — standalone benchmark and calibration utility
+- `pam-facelock` — the PAM module, a thin client to the daemon
+- `facelock-tpm` — TPM-sealed key encryption, software AES-256-GCM
+- `facelock-polkit` — polkit authentication agent
+- `facelock-test-support` — mocks and fixtures
+
+Dependencies are whatever the manifests say; there is no separate allowed-list to keep in sync. The one enforced boundary is the PAM ceiling below.
+
 ## Build & Verify
 
 ```bash
