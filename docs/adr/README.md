@@ -10,3 +10,4 @@
 | [006](006-constant-time-matching.md) | Constant-time embedding comparison via `subtle` | Accepted |
 | [007](007-systemd-hardening-tradeoffs.md) | Selective systemd hardening with documented exclusions | Accepted |
 | [008](008-camera-lifecycle.md) | Outcome-based camera hold and cancellable authentication | Accepted |
+| [009](009-cli-verb-noun-shape.md) | Verb/noun shape of the CLI command tree | Accepted |
