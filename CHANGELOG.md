@@ -116,6 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a property of the camera and its driver, not of facelock. Needs no
   enrolled face and loads no models.
 
+- **NV12 and Y16 pixel format support** (#89): NV12 (semi-planar 4:2:0, common on
+  Intel IPU6/IPU7 processed cameras via v4l2-relayd) and Y16 (16-bit IR grayscale,
+  bit-depth-aware conversion) are decoded natively. Negotiation priority is now
+  `GREY > Y16 > YUYV > NV12 > MJPG`. IPU6/IPU7 relay cameras can now be opened,
+  previewed and enrolled — but their IR sensors have no in-tree Linux driver
+  yet, so authentication still fails under the default
+  `security.require_ir = true` on stock kernels (experimental community driver
+  support is tracked in #101).
+- **Intel IPU6/IPU7 + v4l2-relayd compatibility recipe** in `docs/compatibility.md`.
+
 ### Changed
 
 - **An authentication at an empty chair ends early and costs no rate-limit
@@ -262,6 +272,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `facelock_daemon::auth::authenticate_with_embeddings`. The PAM path is
   unaffected — `facelock auth` already called the daemon implementation.
 
+- **Auto-detection skips undecodable devices** (#89): devices that advertise no
+  decodable pixel format (e.g. raw Bayer sensor nodes like the IPU7's `SGRBG10`)
+  are excluded from every auto-detection tier. When no decodable camera exists,
+  the error lists every detected device and its formats.
+- **Camera open fails fast on undecodable formats** (#89): instead of silently
+  negotiating an unsupported format (and then failing every capture), opening a
+  device with no decodable format errors immediately with the advertised and
+  supported format lists.
+- **Pixel-format names lose V4L2's trailing-space padding** (#89): FourCCs are
+  normalized where they enter facelock (device enumeration and quirks-file
+  parsing), so `facelock devices --json` now carries `"Y16"` where it
+  previously carried `"Y16 "`. This applies on the direct backend only, which
+  is the one that reports formats at all: the D-Bus `DeviceInfo` carries no
+  formats field, so a daemon-backed `--json` reports `"formats": []` either
+  way. The human-readable `facelock devices` table already trimmed and is
+  unchanged. A consumer that reads formats from the direct backend and matches
+  the padded spelling exactly needs updating; one that trims already does not.
+
 ### Fixed
 
 - **`--json` output corrupted by log lines on stdout** (#149): the CLI's tracing
@@ -328,6 +356,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured service kept its line. `prerm` now runs the same explicit removal
   loop as the other packagers in addition to the `pam-auth-update` call.
 
+- **Odd-width NV12 frames no longer panic**: a UV row is `2 * ceil(width/2)` bytes,
+  not `width`, so the short-buffer guard accepted frames that the row indexing then
+  ran past the end of.
+- **Padded camera strides are rejected at open**: devices whose `bytesperline`
+  exceeds the row size for the negotiated format (ISP hardware) now fail with an
+  error naming both values instead of decoding sheared frames.
+- **Quirk `format_preference` naming an undecodable format is ignored** with a
+  warning, rather than winning negotiation and failing every subsequent capture.
+- **IR cameras excluded from auto-detection for lacking a decodable format** are
+  logged with their path and advertised formats, so syslog explains a later
+  "not an IR camera" failure.
+
 ### Security
 
 - **`CAP_CHOWN` added to the daemon's capability bounding set, for startup
@@ -363,6 +403,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-back that could not see it. `test/pkg-validate.sh` now walks
   `/proc/<pid>/task/*/status` on the running daemon and asserts `CAP_CHOWN` is
   clear on every thread.
+
+- **Y16 8-bit scaling is pinned at camera open**: the bit-depth shift is derived
+  once and reused for the whole session. Deriving it per frame was contrast
+  normalization upstream of the IR texture check — it moved the scale
+  `security.ir_texture_min_stddev` is calibrated against in response to scene
+  illumination, and a single saturated pixel blacked out whole frames. The shift
+  comes from the new quirk key `y16_bit_depth` when a device declares one
+  (hardware truth, no frame inspected); otherwise it is calibrated from the peak
+  of a short burst of frames rather than a single frame, so a dark pre-AGC frame
+  at open no longer pins an 8-bit scale that clips the rest of the session.
+  "The session" is the lifetime of one open camera: the daemon's warm camera
+  hold keeps the scale it pinned, and a reopen recalibrates — no scale is
+  carried across a reopen onto a device that did not produce it. On IR hardware
+  the burst is emitter-LED-on time inside `Camera::open` (bounded by one
+  second); declaring `y16_bit_depth` skips it.
 
 ## [0.1.4] - 2026-05-31
 

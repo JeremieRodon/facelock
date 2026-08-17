@@ -447,11 +447,56 @@ When `device.path` is omitted:
    devices: when several nodes share one quirk-matched VID:PID and at least one
    has an IR-like format (GREY/Y16 or the quirk's `format_preference`), only the
    format-bearing node(s) are IR
-4. Prefer a quirks-confirmed IR node with a native IR format, then any
-   quirks-confirmed IR node, then an evidence-classified IR node (breaking ties
-   toward one whose name also carries an `ir`/`infrared` token — a hint only,
-   never a promotion of a node that lacks format evidence)
-5. Fall back to first available device
+4. Exclude devices that advertise no decodable pixel format
+   (GREY/Y16/YUYV/NV12/MJPG) — e.g. raw Bayer sensor nodes (Intel IPU6/IPU7).
+   This filter runs *after* step 3 and never feeds back into it: it changes
+   which node is selected, never whether a node counts as IR. The IR-typical
+   list (step 3) and the decodable list are deliberately different sets — a
+   node whose only IR evidence is Y8/Y10/Y12 is IR **and** undecodable, and is
+   excluded here with a syslog warning naming its path and formats
+5. Among the remaining nodes, prefer a quirks-confirmed IR node with a native
+   IR format, then any quirks-confirmed IR node, then an evidence-classified IR
+   node (breaking ties toward one whose name also carries an `ir`/`infrared`
+   token — a hint only, never a promotion of a node that lacks format evidence)
+6. Fall back to first decodable device; if none, error listing every detected
+   device and its formats
+
+Opening a device (auto-detected or explicit `device.path`) negotiates a format
+in priority order `quirk format_preference > GREY > Y16 > YUYV > NV12 > MJPG`
+and **fails** if the device advertises none of them (no silent fallback to an
+undecodable format).
+
+A quirk's `format_preference` is compared whitespace-trimmed and is **dropped
+with a warning** if it names a format facelock cannot decode, rather than
+winning negotiation and then failing every capture.
+
+On a Y16 device, open also pins the session's 16-bit-to-8-bit shift, which is
+never recomputed per frame (`docs/security.md` §1.C). A quirk's `y16_bit_depth`
+(8..=16) is authoritative and skips frame inspection; otherwise the shift comes
+from the brightest sample in a burst of frames captured at open (at least the
+device's `warmup_frames`; the burst stops starting captures after one second,
+so a dequeue already in flight can carry it to roughly one second plus one
+`CAPTURE_TIMEOUT`). The pinned shift belongs to
+the open camera: a warm hold (see "Camera hold" above) keeps it, and a reopen
+recalibrates. A Y16 device that produces no frame at all within the calibration
+budget fails `Camera::open` rather than opening with a guessed scale.
+
+Open also **rejects a padded stride**: for GREY/NV12 (`bytesperline == width`)
+and Y16/YUYV (`bytesperline == 2 * width`), a device reporting anything else
+errors at open instead of decoding sheared frames. Compressed formats (MJPG)
+are exempt — their `bytesperline` is not a row size.
+
+**FourCC normalization.** V4L2 pads FourCCs to four characters with trailing
+spaces (`"Y16 "`). Facelock strips that padding at every ingest point — device
+enumeration (`query_device`) and quirks-file parsing — so `DeviceInfo.formats`
+carries the unpadded spelling (`"Y16"`, not `"Y16 "`).
+
+The only machine-readable surface that changes is `facelock devices --json`
+**on the direct backend**, which is where format detail exists at all: the
+D-Bus `DeviceInfo` does not carry formats, so under the daemon backend
+`--json` reports `"formats": []` and there is no spelling to change
+(`BackendCaps::device_formats`, false for `BackendKind::Daemon`). The
+human-readable `facelock devices` table already trimmed.
 
 ## Database Schema
 

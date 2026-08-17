@@ -35,6 +35,12 @@ pub struct Quirk {
     /// Preferred pixel format
     #[serde(default)]
     pub format_preference: Option<String>,
+    /// Effective bit depth of this sensor's Y16 samples (8..=16). Authoritative
+    /// when present: the session Y16 -> 8-bit shift becomes `bit_depth - 8` and
+    /// no calibration frames are captured, so the scale cannot depend on what
+    /// the lens happened to see at open.
+    #[serde(default)]
+    pub y16_bit_depth: Option<u8>,
     /// Image rotation in degrees
     #[serde(default)]
     pub rotation: Option<u16>,
@@ -133,7 +139,15 @@ impl QuirksDb {
 
     fn load_file(path: &Path) -> Result<Vec<Quirk>, String> {
         let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
-        let file: QuirksFile = toml::from_str(&content).map_err(|e| format!("parse error: {e}"))?;
+        let mut file: QuirksFile =
+            toml::from_str(&content).map_err(|e| format!("parse error: {e}"))?;
+        // Quirk files are often written with the padded V4L2 FourCC ("Y16 ").
+        // Normalize here so comparisons against `FormatInfo::fourcc` match.
+        for quirk in &mut file.quirk {
+            if let Some(pref) = &mut quirk.format_preference {
+                *pref = pref.trim().to_string();
+            }
+        }
         Ok(file.quirk)
     }
 
@@ -464,6 +478,22 @@ notes = "Test camera"
         assert_eq!(file.quirk[0].vendor_id.as_deref(), Some("8086"));
         assert_eq!(file.quirk[0].force_ir, Some(true));
         assert_eq!(file.quirk[0].warmup_frames, Some(10));
+        // Omitted keys stay None: an entry written before y16_bit_depth existed
+        // keeps calibrating the Y16 scale from frames.
+        assert_eq!(file.quirk[0].y16_bit_depth, None);
+    }
+
+    #[test]
+    fn quirk_deserialization_y16_bit_depth() {
+        let toml = r#"
+[[quirk]]
+vendor_id = "8086"
+product_id = "0b07"
+format_preference = "Y16 "
+y16_bit_depth = 10
+"#;
+        let file: QuirksFile = toml::from_str(toml).unwrap();
+        assert_eq!(file.quirk[0].y16_bit_depth, Some(10));
     }
 
     #[test]
@@ -478,6 +508,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: Some(8),
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("HP IR".into()),
         });
@@ -506,7 +537,8 @@ notes = "Test camera"
             emitter_xu_guid: None,
             emitter_xu_selector: None,
             warmup_frames: Some(10),
-            format_preference: Some("Y16 ".into()),
+            format_preference: Some("Y16".into()),
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("Intel RealSense".into()),
         });
@@ -520,6 +552,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: None,
         });
@@ -547,6 +580,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("Logitech".into()),
         });
@@ -568,6 +602,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("first pattern".into()),
         });
@@ -580,6 +615,7 @@ notes = "Test camera"
             emitter_xu_selector: None,
             warmup_frames: None,
             format_preference: None,
+            y16_bit_depth: None,
             rotation: None,
             notes: Some("second pattern".into()),
         });
@@ -740,6 +776,7 @@ emitter_xu_guid = "abcd-1234"
 emitter_xu_selector = 3
 warmup_frames = 15
 format_preference = "GREY"
+y16_bit_depth = 12
 rotation = 90
 notes = "Full test quirk"
 "#;
@@ -749,6 +786,7 @@ notes = "Full test quirk"
         assert_eq!(q.emitter_xu_selector, Some(3));
         assert_eq!(q.warmup_frames, Some(15));
         assert_eq!(q.format_preference.as_deref(), Some("GREY"));
+        assert_eq!(q.y16_bit_depth, Some(12));
         assert_eq!(q.rotation, Some(90));
     }
 
@@ -789,6 +827,56 @@ notes = "Full test quirk"
             return None;
         }
         Some(QuirksDb::load_file(&path).expect("defaults file parses"))
+    }
+
+    /// Every `format_preference` shipped in `config/quirks.d/00-defaults.toml`
+    /// must be a format facelock can actually decode.
+    ///
+    /// This is the coupling #90 introduced and nothing else guards: the file
+    /// writes the padded V4L2 spelling (`"Y16 "`), `load_file` normalizes it,
+    /// and `capture::quirk_format_preference` then checks it against
+    /// `DECODABLE_FORMATS` and *drops it with a warning* if it does not match.
+    /// A shipped preference that fails this check does not fail loudly at
+    /// runtime — it silently stops selecting the RealSense IR sensor node.
+    #[test]
+    fn shipped_quirk_format_preferences_are_decodable() {
+        let Some(quirks) = shipped_default_quirks() else {
+            return;
+        };
+        let mut checked = 0;
+        for q in &quirks {
+            let Some(pref) = q.format_preference.as_deref() else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                crate::capture::DECODABLE_FORMATS.contains(&pref.trim()),
+                "shipped quirk {:?} prefers {pref:?}, which facelock cannot decode — \
+                 it would be dropped at open with a warning",
+                q.notes
+            );
+        }
+        assert!(
+            checked >= 4,
+            "expected the shipped RealSense (Y16) and BRIO (GREY) preferences to be \
+             covered; only {checked} were found"
+        );
+    }
+
+    /// `load_file` is what turns the file's padded `"Y16 "` into the `"Y16"`
+    /// every comparison downstream expects. Asserted against the real shipped
+    /// file, not a fixture, because the padded spelling in *that* file is what
+    /// makes the normalization load-bearing.
+    #[test]
+    fn shipped_quirk_format_preferences_are_normalized_by_the_loader() {
+        let Some(quirks) = shipped_default_quirks() else {
+            return;
+        };
+        for q in &quirks {
+            if let Some(pref) = q.format_preference.as_deref() {
+                assert_eq!(pref, pref.trim(), "loader left padding on {pref:?}");
+            }
+        }
     }
 
     /// Table-driven regression for #99: every shipped `name_pattern` quirk in

@@ -51,6 +51,26 @@
    Prefer a USB-ID quirk over a `name_pattern` one: a name-only `force_ir` is trusted only when corroborated by the device's own mono-format evidence or a real USB identity, so it will not, by itself, force a color-only device to IR.
 5. As a last resort you can set `security.require_ir = false` -- but understand this weakens spoofing resistance. Only do this for testing.
 
+## Enrollment captures 0 frames
+
+**Symptom**: `facelock enroll` ends with "only captured 0 frames, need at least 3".
+
+**Steps**:
+
+1. **Lighting**: frames with mean brightness below ~20 are rejected as too
+   dark. IR cameras usually self-illuminate, but RGB cameras need a lit room.
+   Add light and retry.
+2. **Wrong device / format**: if the configured camera is a raw sensor node
+   (e.g. Intel IPU6/IPU7 Bayer nodes, formats like `SGRBG10`), facelock now
+   refuses to open it with an error listing the advertised formats. Point
+   `device.path` at a processed camera instead — see "Intel IPU6/IPU7 MIPI
+   cameras" in `docs/compatibility.md`.
+3. **Verify frames are usable**: run `facelock preview --text-only` (or
+   `facelock preview`) and check that you see a live image with your face
+   detected.
+4. Run with `RUST_LOG=facelock_daemon=debug` to see per-frame rejection
+   reasons (dark frame, no face detected, low quality).
+
 ## Auth too slow
 
 ### First-start latency (~700ms -- 2s)
