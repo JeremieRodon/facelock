@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter: a PR stacked on another PR's branch gets the same
+  # gate as one targeting main. GitHub retargets it to main when its base
+  # merges, so it would otherwise run CI for the first time only then.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
