@@ -23,6 +23,7 @@ Stable contracts. Do not change without updating this document.
 | `facelock setup` choice flags | `--camera <PATH\|auto>`, `--models <standard\|balanced\|high>`, `--execution-provider <cpu\|cuda\|rocm\|openvino\|auto>`, `--encryption <tpm\|keyfile\|none\|auto>`. Precedence: CLI flag > config file > built-in default |
 | `facelock setup` action opt-outs | `--no-pam`, `--no-systemd`, `--no-enroll` decline an action outright (and their `--pam`/`--systemd`/`--enroll` counterparts force it). Later flag wins |
 | `facelock is-enrolled` | Report whether face auth is operational for a user. Exit code is the contract; no daemon activation, no camera. Requires `facelock` group membership to answer `enrolled` — a caller outside the group reports `not-enrolled`, which is correct: the group is required to reach the daemon at all |
+| `facelock capabilities` | Report what this build can do: one capability name per line, or `--json` for `{"version", "capabilities"}`. Unprivileged, reads no config, activates no daemon. The feature probe to branch on instead of grepping `--help` |
 | `facelock enroll` | Capture and store a face |
 | `facelock test` | Test face recognition |
 | `facelock list` | List enrolled face models |
@@ -121,6 +122,7 @@ Adding a row is the moment someone states who parses the output.
 | Command | Payload |
 |---------|---------|
 | `facelock is-enrolled --json` | one object. See "facelock is-enrolled Exit Codes" |
+| `facelock capabilities --json` | one object. See "facelock capabilities" |
 | `facelock list --json` | array of enrolled models |
 | `facelock devices --json` | array of `IpcDeviceInfo` (`facelock_core::ipc`): `path`, `name`, `driver`, `is_ir`, `formats` (empty whenever the daemon answers, which carries no format detail). Serde-derived, so it is a typed schema rather than a scrape of the human renderer, whose columns and `[IR]` tag are free to change |
 | `facelock preview --json` | one object per line, one per frame |
@@ -326,9 +328,85 @@ missing trailing newline stays missing; a backup is taken before every edit and
 never before a no-op. Golden fixtures captured from the pre-refactor code pin
 all of it.
 
+### facelock capabilities
+
+`facelock capabilities` answers "what can *this* build do?" — from the binary's
+own clap tree and compiled-in constants, without reading a config file,
+activating the daemon, or opening a camera. It is what replaces
+`facelock setup --help 2>/dev/null | grep -q -- "--no-pam"` in a wrapper
+script: **help text is not an API**, and a grep against it breaks on a reworded
+flag description, a line wrap, or a translated help template.
+
+Bare `capabilities` prints one name per line on stdout. `--json` prints one
+document on stdout. Both exit 0 — the command has no failure mode — and
+`--quiet` suppresses stdout entirely, leaving the exit code as the whole
+answer, as it does for `is-enrolled`. Neither form localizes: a capability name
+is an identifier, not prose.
+
+The `--json` document, with the array elided — the names this build emits are
+the table at the end of this section:
+
+```json
+{"version": "0.1.4", "capabilities": ["capabilities", "devices-json", "is-enrolled"]}
+```
+
+`version` is this binary's own version — byte for byte the one `facelock
+--version` prints. `capabilities` is a **sorted, deduplicated** array of
+strings.
+
+**Probe by name, not by version.** A version comparison is the wrong test
+twice over: a git or distro build can carry a version that says nothing about
+what is in it (`facelock-git` is exactly that case, and is why a downstream
+package pin cannot express "needs the `pam` verb"), and a backport can add a
+feature without moving the number. The name list cannot drift from the binary
+it came out of — a unit test maps every name to the clap argument, subcommand
+or constant that declares the surface it names, and a name with no such proof
+fails the build. What each surface *means* is pinned by the section of this
+document that owns it, and by that command's own tests. `version` is for
+humans and bug reports.
+
+**A build that predates the command** answers by failing: clap's
+"unrecognized subcommand" error, usage text on stderr, exit 2, nothing on
+stdout. A caller reads any non-zero exit as "no capabilities at all", which is
+the true answer for that build.
+
+**Stability.** The names are a contract of the same kind as the `pam --json`
+`action` vocabulary, one degree stronger:
+
+- a name, once emitted, never changes meaning
+- names are **added**; none is ever removed or repurposed
+- `version` and `capabilities` are always present, and a new top-level field is
+  additive — a consumer ignores fields it does not know
+- a consumer tolerates a **name** it does not know rather than treating it as
+  an error
+- key order within the JSON document is **not** part of the contract — parse
+  the document, do not string-match it
+
+**Naming.** Lowercase, hyphenated. A bare name (`quiet`, `is-enrolled`) means
+the command or global flag itself exists; `<command>-<feature>` names one
+feature of one command, and where the command's own name is hyphenated the
+suffix simply appends (`is-enrolled-json`). One name promises one thing: a flag
+that is not on this list is not being denied, only not yet promised.
+
+| Name | Meaning |
+|------|---------|
+| `capabilities` | this command exists, so a consumer's membership test is uniform across every name |
+| `devices-json` | `devices --json` |
+| `is-enrolled` | `is-enrolled` exists — the unprivileged enrollment probe whose exit code is the contract |
+| `is-enrolled-json` | `is-enrolled --json` |
+| `pam-dry-run` | `pam add`/`pam remove` accept `--dry-run` |
+| `pam-if-present` | `pam add`/`pam remove` accept `--if-present` |
+| `pam-json` | `pam add`/`pam remove`/`pam status` accept `--json` |
+| `pam-multi-service` | `pam add`/`pam remove`/`pam status` take a repeatable `--service` — several services in one process, one root check |
+| `pam-status` | `pam status` exists — the unprivileged `/etc/pam.d` read (DEC-6 below) |
+| `quiet` | the global `--quiet` |
+| `setup-if-present` | `setup --pam --remove --if-present` |
+| `setup-no-pam` | `setup --no-pam` |
+| `setup-systemd` | `setup --systemd` |
+
 ### CLI Privilege Model (DEC-6)
 
-The CLI is root by default: every subcommand requires root except the five
+The CLI is root by default: every subcommand requires root except the six
 listed below, which are unprivileged by design, not by omission.
 
 | Command | Why unprivileged |
@@ -337,6 +415,7 @@ listed below, which are unprivileged by design, not by omission.
 | `facelock hyprlock …` | Edits the user's own dotfile — root would write root-owned files into `$HOME`, which is wrong, not just unnecessary |
 | `facelock pam status` | Reads `0644` files under `/etc/pam.d` and writes nothing. Same role as `is-enrolled`: the probe an integration runs without `sudo`, replacing a hand-rolled `grep -q pam_facelock.so /etc/pam.d/<service>`. A file it cannot read reports `unknown` and exits 2 rather than reporting it as missing |
 | `facelock config` (display, no `--edit`) | Reads a `0644` file |
+| `facelock capabilities` | Reports what the *binary* can do, derived from its own clap tree and compiled-in constants — no file, no D-Bus, no camera, no per-user state, so there is nothing to protect. Unprivileged because the consumer is a user-level setup script deciding whether to invoke `sudo facelock …` at all: a probe that needed root to answer "do I need root?" would be useless |
 | `--help`, `--version` | — |
 
 Every other command requires root. Two escalation behaviors apply, and each
