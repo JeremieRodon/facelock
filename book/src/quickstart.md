@@ -94,7 +94,7 @@ No daemon needed -- the CLI auto-falls back to direct mode when no daemon is run
 ```bash
 sudo facelock devices            # list cameras
 sudo facelock list               # see enrolled models
-sudo facelock preview --text-only  # live detection output
+sudo facelock preview --json     # live detection output, one JSON object per frame
 sudo facelock status             # check system status
 sudo facelock bench warm-auth    # measure auth latency
 ```
