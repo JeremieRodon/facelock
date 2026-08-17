@@ -1461,6 +1461,14 @@ mod tests {
     // dependency bump: if an `aes-gcm` upgrade ever changed nonce placement,
     // tag position, or AAD handling, every existing enrollment would silently
     // become undecryptable, and these are the tests that would say so.
+    //
+    // If these fail, the format moved: investigate, never update the constants.
+    // Refreshing them to match new output converts a caught break into shipped
+    // data loss. A deliberate format change needs a new version byte plus a
+    // migration — `parse_sealed_blob` already dispatches 0x01 and 0x03.
+    //
+    // GOLDEN_KEY is synthetic and protects nothing, so publishing it is safe.
+    // Never regenerate these from a real key file: that commits key material.
     const GOLDEN_KEY: [u8; 32] = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
