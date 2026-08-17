@@ -104,24 +104,44 @@ Live camera preview with face detection overlay.
 
 ```bash
 facelock preview                        # Wayland graphical window
-facelock preview --text-only            # JSON output to stdout
+facelock preview --json                 # one JSON object per frame on stdout
 facelock preview --user alice           # match against specific user
 ```
 
-Text-only mode outputs one JSON object per frame:
+`--json` shipped as `--text-only`, which stays a hidden alias and keeps
+parsing; the payload is unchanged. One object per line, one per frame:
+
 ```json
-{"frame":1,"fps":15.2,"width":640,"height":480,"recognized":1,"unrecognized":0,"faces":[...]}
+{"faces":[{"confidence":0.5,"height":180.0,"recognized":true,"similarity":0.75,"width":180.0,"x":112.0,"y":88.0}],"fps":15.0,"frame":1,"height":480,"jpeg_size":24576,"recognized":1,"unrecognized":0,"width":640}
 ```
+
+Keys come out sorted, which is `serde_json`'s doing and not a promise.
+`jpeg_size` is present only when the daemon serves the frames; the direct
+(oneshot) path has no JPEG and omits that key, and every other key is on both.
+Numbers are `f32` rounded then widened to `f64`, so a rounded `0.988` reaches
+you as `0.9879999756813049`: compare numerically, never as text.
 
 ## facelock devices
 
 List available V4L2 video capture devices.
 
 ```bash
-facelock devices
+facelock devices                        # human-readable listing
+facelock devices --json                 # JSON output
 ```
 
 Shows device path, name, driver, formats, resolutions, and IR status.
+
+`--json` emits an array of device objects with `path`, `name`, `driver`,
+`is_ir`, and `formats`; each format carries `fourcc`, `description`, and
+`sizes`, a list of `[width, height]` pairs. It is a typed schema derived from
+the device struct, so a script reads it rather than parsing the listing above,
+whose columns, indentation and `[IR]` tag are free to change.
+
+`formats` is empty whenever the daemon answers: the D-Bus device type does not
+carry format detail, so only the direct (oneshot) backend fills it in. The
+human listing omits the section for the same reason. Read `formats` for
+capability detection only when you know you are on the direct path.
 
 ## facelock status
 

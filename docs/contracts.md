@@ -103,6 +103,45 @@ quieter program. This generalizes `is-enrolled --quiet`, which has always meant
 through that seam; commands still printing directly are tracked by
 [#140](https://github.com/tyvsmith/facelock/issues/140).
 
+### CLI Machine Output
+
+**Every command whose output a script would parse takes `--json`, and spells it
+`--json`.** One flag family (the shared `JsonArg` in
+`crates/facelock-cli/src/args.rs`), no short letter, no `--output json`, no
+per-command invention. `cli_flag_conformance` pins both halves: an arg whose
+help advertises JSON must carry the id `json`, so a second spelling fails the
+build instead of shipping.
+
+**A command gains `--json` when it has a named consumer, not to complete a
+matrix.** The coverage list is the `JSON_COMMANDS` registry inside that test,
+and it is checked in both directions: a command on the list that binds no
+`--json` fails, and a `--json` on a command absent from the list fails too.
+Adding a row is the moment someone states who parses the output.
+
+| Command | Payload |
+|---------|---------|
+| `facelock is-enrolled --json` | one object. See "facelock is-enrolled Exit Codes" |
+| `facelock list --json` | array of enrolled models |
+| `facelock devices --json` | array of `IpcDeviceInfo` (`facelock_core::ipc`): `path`, `name`, `driver`, `is_ir`, `formats` (empty whenever the daemon answers, which carries no format detail). Serde-derived, so it is a typed schema rather than a scrape of the human renderer, whose columns and `[IR]` tag are free to change |
+| `facelock preview --json` | one object per line, one per frame |
+| `facelock pam add\|remove\|status --json` | one object, whose shape is a stability contract. See "facelock pam Semantics" |
+
+`preview` is on the list because it always emitted JSON. It shipped calling the
+flag `--text-only`, which survives as a hidden alias and keeps parsing; the
+per-frame payload is byte for byte what it was.
+
+Two commands were considered and declined. `facelock test` is an interactive
+diagnostic, and `facelock audit` already has a structured log format; neither
+has a consumer asking, which under the rule above settles it. `facelock status`
+is a schema question rather than a flag question, since nothing in `health.rs`
+derives `Serialize` yet, and it is tracked separately.
+
+Machine output does not pass through the translation seam: every `--json`
+payload is built with `serde_json` and is C-locale by construction. The one
+documented exception is `pam`'s `error` field, which can interpolate a
+`strerror` string (see "facelock pam Semantics"), and which is a diagnostic
+rather than something to branch on.
+
 ### facelock setup Flag Composition
 
 Flags **compose**; they are not mutually exclusive. The rule:

@@ -81,10 +81,18 @@ enum Commands {
         user: UserArg,
     },
     /// Live camera preview with detection overlay
+    // `--text-only` is the name this flag shipped under, and it always
+    // emitted JSON — one object per frame. `mut_arg` re-labels the shared
+    // `JsonArg` here rather than a second declaration of the flag, so the
+    // spelling still comes from one struct and `cli_flag_conformance` still
+    // sees an arg with id `json`. The alias is hidden: it parses forever, and
+    // `--help` teaches the one spelling.
+    #[command(mut_arg("json", |arg: clap::Arg| arg
+        .alias("text-only")
+        .help("Print one JSON object per frame instead of the graphical preview")))]
     Preview {
-        /// Print detection results to stdout instead of graphical preview
-        #[arg(long)]
-        text_only: bool,
+        #[command(flatten)]
+        json: JsonArg,
         #[command(flatten)]
         user: UserArg,
     },
@@ -262,8 +270,8 @@ fn main() -> anyhow::Result<()> {
                             commands::list::run(&config, user.user, json.json)
                         }
                         Commands::Test { user } => commands::test_cmd::run(&config, user.user),
-                        Commands::Preview { text_only, user } => {
-                            commands::preview::run(&config, text_only, user.user)
+                        Commands::Preview { json, user } => {
+                            commands::preview::run(&config, json.json, user.user)
                         }
                         Commands::Devices { json } => commands::devices::run(&config, json.json),
                         Commands::Bench { command } => commands::bench::run(&config, command),
@@ -695,6 +703,26 @@ mod tests {
         ('v', &["verbose"]),
     ];
 
+    /// Every command that offers `--json`, by full invocation path.
+    ///
+    /// The list is the contract, in both directions: a command here without a
+    /// `json` arg fails, and a `json` arg on a command not here fails too. So
+    /// `--json` cannot appear because a matrix looked incomplete — adding a
+    /// row is the moment someone states who parses the output, which is the
+    /// rule `docs/contracts.md` records under "CLI Machine Output".
+    ///
+    /// `preview` is on the list because it always emitted JSON; it just spelled
+    /// the flag `--text-only`, which survives as a hidden alias.
+    const JSON_COMMANDS: &[&str] = &[
+        "facelock is-enrolled",
+        "facelock list",
+        "facelock devices",
+        "facelock preview",
+        "facelock pam add",
+        "facelock pam remove",
+        "facelock pam status",
+    ];
+
     /// Collect every command in the tree, keyed by its full invocation path
     /// (`facelock bench camera-reopen`), so a failure names the offender.
     fn walk<'a>(
@@ -830,6 +858,79 @@ mod tests {
                 }
             }
         }
+
+        // -- `--json` coverage (#169) ------------------------------------
+        //
+        // Spelling is pinned above; these pin *where* the flag appears, and
+        // that nothing else spells machine output a second way.
+
+        let offers_json = |path: &str| {
+            commands
+                .iter()
+                .find(|(p, _)| p == path)
+                .unwrap_or_else(|| panic!("`{path}` is in JSON_COMMANDS but not in the tree"))
+                .1
+                .get_arguments()
+                .any(|arg| arg.get_id() == "json")
+        };
+        for path in JSON_COMMANDS {
+            assert!(
+                offers_json(path),
+                "`{path}` is in JSON_COMMANDS but binds no `--json`"
+            );
+        }
+        for (path, command) in &commands {
+            if command.get_arguments().any(|arg| arg.get_id() == "json") {
+                assert!(
+                    JSON_COMMANDS.contains(&path.as_str()),
+                    "`{path}` offers `--json` without a row in JSON_COMMANDS; add one \
+                     naming the consumer that asked for it"
+                );
+            }
+        }
+
+        // A flag that advertises JSON is named `json`. Without this, a later
+        // `--output json` or a second `--text-only` would satisfy every rule
+        // above by never being called `json` in the first place. Clap aliases
+        // are not `Arg`s and carry no help, so a hidden historical spelling is
+        // exempt by construction.
+        //
+        // Everything a user could read on the flag counts, concatenated
+        // rather than one-or-the-other: short help, long help, and the
+        // possible values with their own help. A `--format <FORMAT>` over
+        // `{json, text}` documented as "Output format" says JSON nowhere in
+        // its help text and only the value list gives it away.
+        //
+        // This is deliberately over-broad. A future *input* flag such as
+        // `--from-json <path>` would trip it despite emitting nothing. Rename
+        // that arg rather than relaxing the rule: the tripwire is worth more
+        // than the one name it costs.
+        for (path, command) in &commands {
+            for arg in command.get_arguments() {
+                let mut advertised = String::new();
+                for text in [arg.get_help(), arg.get_long_help()].into_iter().flatten() {
+                    advertised.push_str(&text.to_string());
+                    advertised.push(' ');
+                }
+                for value in arg.get_possible_values() {
+                    advertised.push_str(value.get_name());
+                    advertised.push(' ');
+                    if let Some(text) = value.get_help() {
+                        advertised.push_str(&text.to_string());
+                        advertised.push(' ');
+                    }
+                }
+                if advertised.to_lowercase().contains("json") {
+                    assert_eq!(
+                        arg.get_id().as_str(),
+                        "json",
+                        "`{path} --{}` advertises JSON but is not the shared \
+                         `json` arg; machine output has one spelling",
+                        arg.get_long().unwrap_or_else(|| arg.get_id().as_str())
+                    );
+                }
+            }
+        }
     }
 
     /// Every invocation that parsed before the shared arg structs landed must
@@ -861,6 +962,7 @@ mod tests {
             &["facelock", "setup", "--no-pam", "--systemd", "--enroll"],
             &["facelock", "setup", "--pam", "--no-confirm"],
             &["facelock", "preview", "--text-only"],
+            &["facelock", "preview", "--json"],
             &["facelock", "remove", "1", "-y"],
             &["facelock", "clear", "-u", "alice", "--yes"],
             &["facelock", "enroll", "-u", "alice", "-l", "laptop"],
