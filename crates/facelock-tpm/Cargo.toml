@@ -11,7 +11,7 @@ tracing.workspace = true
 tss-esapi = { workspace = true, optional = true }
 serde = { workspace = true }
 zeroize = "1"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 rand = "0.10"
 
 [dev-dependencies]
