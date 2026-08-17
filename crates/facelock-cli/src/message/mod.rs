@@ -485,6 +485,45 @@ mod tests {
             .localized(),
             "PAM service file absent: /etc/pam.d/omarchy-lock-face. Nothing to remove."
         );
+        // The closing hint of `facelock pam add` was four bare `println!`s in
+        // `commands/setup.rs` until #174 folded them into one message. These
+        // are those four lines' exact bytes, captured from the commit before
+        // the move: a leading blank line, three `==>` lines, and no trailing
+        // newline (the sink's `println!` supplies it).
+        assert_eq!(
+            PamMessage::PamExtensionHint {
+                line: "auth      sufficient pam_facelock.so".into()
+            }
+            .localized(),
+            "\n==> facelock PAM line for manual extension to other services:\n\
+             ==>   auth      sufficient pam_facelock.so\n\
+             ==> Add the above line above the first 'auth' line in any /etc/pam.d/<service> file."
+        );
+        // Not a historical pin: #174 changed this text on purpose, from
+        // `setup --pam --remove --service X` to the verb that now owns the
+        // undo. Pinned so the next change to it is also on purpose — this is
+        // the one message that tells a locked-out operator how to get back in.
+        assert_eq!(
+            PamMessage::PamInstalled {
+                path: "/etc/pam.d/sudo".into(),
+                backup: "/etc/pam.d/sudo.facelock-backup".into(),
+                service: "sudo".into()
+            }
+            .localized(),
+            "Installed facelock PAM line into /etc/pam.d/sudo\n\n\
+             To rollback:\n  sudo cp /etc/pam.d/sudo.facelock-backup /etc/pam.d/sudo\n\
+             \u{20} # or: sudo facelock pam remove --service sudo"
+        );
+        // The module-missing refusal was an inline `bail!` on the same path.
+        assert_eq!(
+            PamMessage::PamModuleNotInstalled {
+                path: "/lib/security/pam_facelock.so".into()
+            }
+            .localized(),
+            "PAM module not found at /lib/security/pam_facelock.so.\n\
+             Install it first: cargo build --release -p pam-facelock && \
+             sudo cp target/release/libpam_facelock.so /lib/security/pam_facelock.so"
+        );
     }
 
     /// `--quiet` gates informational stdout and nothing else.

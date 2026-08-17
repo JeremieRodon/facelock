@@ -70,6 +70,139 @@ run_test "facelock daemon requires root" \
     "su -s /bin/bash testuser -c 'facelock daemon 2>&1' | grep -q 'Root required'" \
     0
 
+# --- #174: `facelock pam add | remove | status` against the real /etc/pam.d ---
+#
+# The verb is the only writer of /etc/pam.d, and everything that decides
+# whether it writes is machine state a tempdir test cannot stand in for: the
+# root check, the pam_facelock.so-is-installed check, the hard-coded
+# /etc/pam.d base, and the C-locale text of the refusals. This block proves
+# the whole path as root on a live system — install, idempotence, the status
+# probe's 0/1 scale, the sensitive-service gate, two-phase validation, name
+# confinement, removal, and the `setup --pam` alias landing in the same file.
+#
+# It writes only to service files it creates itself (facelock-scratch*) and
+# removes them at the end, so it is safe to run twice; sudo, system-auth,
+# login and sshd are read and never written. jq is not in the image, so the
+# --json documents are asserted with python.
+
+PAM_LINE_TEXT='auth      sufficient pam_facelock.so'
+
+# The `action` word for the first service in a `facelock pam --json` document.
+cat > /tmp/pam-action.py <<'EOF'
+import json, sys
+print(json.load(open(sys.argv[1]))["services"][0]["action"])
+EOF
+
+# Exit 0 only if the facelock line is present AND is the file's first `auth`
+# line — the placement contract, asserted by index rather than by eyeball.
+cat > /tmp/pam-first-auth.py <<'EOF'
+import sys
+line = "auth      sufficient pam_facelock.so"
+lines = open(sys.argv[1]).read().splitlines()
+auth = [i for i, text in enumerate(lines) if text.lstrip().startswith("auth")]
+sys.exit(0 if line in lines and auth and lines[auth[0]] == line else 1)
+EOF
+
+# Two throwaway service files with a realistic body. Nothing consumes them.
+rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
+      /etc/pam.d/facelock-scratch.facelock-backup \
+      /etc/pam.d/facelock-scratch2.facelock-backup
+cat > /etc/pam.d/facelock-scratch <<'EOF'
+#%PAM-1.0
+auth       include        system-auth
+account    include        system-auth
+session    include        system-auth
+EOF
+chmod 644 /etc/pam.d/facelock-scratch
+cp /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2
+
+run_test "pam status: existing file without the line is 'missing', exit 1" \
+    "facelock pam status --service facelock-scratch --json > /tmp/pam-status.json 2>/dev/null; test \$? -eq 1 && python3 /tmp/pam-action.py /tmp/pam-status.json | grep -qx missing" \
+    0
+
+run_test "pam add: 'installed', backup written, line is the first auth line" \
+    "facelock pam add --service facelock-scratch --json > /tmp/pam-add.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-add.json | grep -qx installed && test -f /etc/pam.d/facelock-scratch.facelock-backup && python3 /tmp/pam-first-auth.py /etc/pam.d/facelock-scratch" \
+    0
+
+sha256sum /etc/pam.d/facelock-scratch > /tmp/pam-scratch.sha
+
+run_test "pam add is idempotent: 'unchanged' and the file is byte-identical" \
+    "facelock pam add --service facelock-scratch --json > /tmp/pam-add2.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-add2.json | grep -qx unchanged && sha256sum -c --status /tmp/pam-scratch.sha" \
+    0
+
+run_test "pam status exits 0 once the line is present" \
+    "facelock pam status --service facelock-scratch" \
+    0
+
+# The sensitive-service gate. Arch's `pam` package ships /etc/pam.d/system-auth,
+# so that is what this normally runs against; the loop keeps the row honest if
+# the base image ever changes which of the three exists. The refusal is decided
+# in the validation phase, before any prompt, so --no-confirm cannot unlock it.
+PAM_SENSITIVE=""
+for svc in system-auth login sshd; do
+    if [ -f "/etc/pam.d/$svc" ]; then
+        PAM_SENSITIVE="$svc"
+        break
+    fi
+done
+
+if [ -n "$PAM_SENSITIVE" ]; then
+    # Belt and braces: the sha256 below detects a regression, and the copy
+    # taken here undoes one. This is the container's own auth stack, and every
+    # row after this one runs through it, so a failure must not be allowed to
+    # leak into them as a second, mystifying failure.
+    cp -p "/etc/pam.d/$PAM_SENSITIVE" /tmp/pam-sensitive.orig
+    sha256sum "/etc/pam.d/$PAM_SENSITIVE" > /tmp/pam-sensitive.sha
+    run_test "pam add refuses sensitive service $PAM_SENSITIVE under --no-confirm" \
+        "facelock pam add --service $PAM_SENSITIVE --no-confirm > /tmp/pam-sensitive.out 2>&1; test \$? -ne 0 && grep -q 'sensitive PAM service' /tmp/pam-sensitive.out && sha256sum -c --status /tmp/pam-sensitive.sha" \
+        0
+    cp -p /tmp/pam-sensitive.orig "/etc/pam.d/$PAM_SENSITIVE"
+    rm -f "/etc/pam.d/$PAM_SENSITIVE.facelock-backup" /tmp/pam-sensitive.orig
+else
+    echo "SKIP: no system-auth/login/sshd in the image to test the sensitive gate"
+fi
+
+sha256sum /etc/pam.d/facelock-scratch2 > /tmp/pam-scratch2.sha
+
+# Two-phase: the second service is rejected in validation, so the first one —
+# which would otherwise have been written by the time the failure happened —
+# is untouched, has no backup, and no JSON document is emitted at all.
+run_test "pam add validates every service before writing any" \
+    "facelock pam add --service facelock-scratch2 --service facelock-does-not-exist --json > /tmp/pam-twophase.out 2>&1; test \$? -ne 0 && sha256sum -c --status /tmp/pam-scratch2.sha && ! test -e /etc/pam.d/facelock-scratch2.facelock-backup && ! grep -q '\"services\"' /tmp/pam-twophase.out" \
+    0
+
+# The message grep is what makes this row mean anything: without `confined`,
+# `../facelock-escape` resolves to /etc/facelock-escape, which does not exist,
+# so the command would still exit non-zero (file-not-found) and --dry-run would
+# still write nothing — every `! test -e` would hold on the broken path too.
+run_test "pam add rejects a service name that escapes /etc/pam.d" \
+    "facelock pam add --service ../facelock-escape --dry-run > /tmp/pam-escape.out 2>&1; test \$? -ne 0 && grep -q 'Invalid PAM service name' /tmp/pam-escape.out && ! test -e /etc/facelock-escape && ! test -e /etc/facelock-escape.facelock-backup && ! test -e /etc/pam.d/facelock-escape" \
+    0
+
+run_test "pam remove: 'removed' and no facelock line left" \
+    "facelock pam remove --service facelock-scratch --json > /tmp/pam-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-remove.json | grep -qx removed && ! grep -q pam_facelock.so /etc/pam.d/facelock-scratch" \
+    0
+
+# The `setup --pam` alias must reach the same writer and the same bytes.
+run_test "setup --pam alias installs the line" \
+    "facelock setup --pam --service facelock-scratch --yes > /dev/null 2>&1; test \$? -eq 0 && grep -qxF '$PAM_LINE_TEXT' /etc/pam.d/facelock-scratch" \
+    0
+
+run_test "setup --pam --remove alias removes the line" \
+    "facelock setup --pam --service facelock-scratch --remove --yes --if-present > /dev/null 2>&1; test \$? -eq 0 && ! grep -q pam_facelock.so /etc/pam.d/facelock-scratch" \
+    0
+
+rm -f /etc/pam.d/facelock-scratch
+
+run_test "setup --pam --remove --if-present succeeds on an absent service file" \
+    "facelock setup --pam --service facelock-scratch --remove --yes --if-present" \
+    0
+
+rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
+      /etc/pam.d/facelock-scratch.facelock-backup \
+      /etc/pam.d/facelock-scratch2.facelock-backup \
+      /tmp/pam-action.py /tmp/pam-first-auth.py
+
 # --- Spec 29: Smart PAM skip (no enrolled faces) ---
 
 # In oneshot mode with no enrolled faces, facelock auth should exit 2 (PAM_IGNORE)

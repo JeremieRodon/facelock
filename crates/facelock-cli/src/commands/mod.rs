@@ -11,6 +11,7 @@ pub mod enrollment_marker;
 pub mod hyprlock;
 pub mod is_enrolled;
 pub mod list;
+pub mod pam;
 pub mod preview;
 pub mod remove;
 pub mod setup;

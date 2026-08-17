@@ -119,6 +119,32 @@ fn clear_refuses_before_confirmation_prompt_non_root() {
 }
 
 #[test]
+fn pam_add_refuses_before_touching_pam_d_non_root() {
+    // C6: the root check is the first statement in `commands::pam::run`, ahead
+    // of the module-presence check, the plan, and `--dry-run`. A dry run that
+    // succeeded unprivileged would be a preview of a command that cannot run.
+    assert_refuses_before_output(
+        &["pam", "add", "--service", "sudo", "--dry-run"],
+        &[
+            "About to modify",
+            "Would add the facelock PAM line",
+            "==> facelock PAM line",
+        ],
+    );
+}
+
+#[test]
+fn pam_remove_refuses_before_touching_pam_d_non_root() {
+    assert_refuses_before_output(
+        &["pam", "remove", "--service", "sudo", "--dry-run"],
+        &[
+            "Would remove the facelock PAM line",
+            "Removed facelock PAM line",
+        ],
+    );
+}
+
+#[test]
 fn help_exits_successfully() {
     let output = facelock_bin()
         .arg("--help")

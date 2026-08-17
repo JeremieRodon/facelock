@@ -16,7 +16,10 @@ Stable contracts. Do not change without updating this document.
 |---------|---------|
 | `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, enrollment, PAM); also manages `facelock` group membership (creates the group if missing, adds the invoking user) |
 | `facelock setup --systemd` | Install/enable systemd units |
-| `facelock setup --pam` | Install PAM module to `/etc/pam.d/` |
+| `facelock setup --pam` | Alias onto `facelock pam add\|remove` (see "facelock pam" below). Kept, and kept parsing, for every wrapper written against it |
+| `facelock pam add` | Add the facelock line to one or more `/etc/pam.d/<service>` files. Root |
+| `facelock pam remove` | Remove it. Root |
+| `facelock pam status` | Report whether services carry the line. Reads only, **no root** — the probe to branch on instead of grepping `/etc/pam.d` |
 | `facelock setup` choice flags | `--camera <PATH\|auto>`, `--models <standard\|balanced\|high>`, `--execution-provider <cpu\|cuda\|rocm\|openvino\|auto>`, `--encryption <tpm\|keyfile\|none\|auto>`. Precedence: CLI flag > config file > built-in default |
 | `facelock setup` action opt-outs | `--no-pam`, `--no-systemd`, `--no-enroll` decline an action outright (and their `--pam`/`--systemd`/`--enroll` counterparts force it). Later flag wins |
 | `facelock is-enrolled` | Report whether face auth is operational for a user. Exit code is the contract; no daemon activation, no camera. Requires `facelock` group membership to answer `enrolled` — a caller outside the group reports `not-enrolled`, which is correct: the group is required to reach the daemon at all |
@@ -120,22 +123,180 @@ so a dropped flag is now a parse error rather than silence.
 `--if-present` requires `--remove` (and therefore `--pam`). It changes only a
 missing target service file from an error into a successful no-op; read, parse
 and write failures remain fatal, and `--remove` without the flag retains its
-historical missing-file error.
+historical missing-file error. (On `facelock pam` the same flag is offered on
+**both** `add` and `remove`, since "configure hyprlock if this machine has
+hyprlock" is the same question in either direction.)
+
+**`--pam` is an alias onto `facelock pam add` / `facelock pam remove`.** The
+plan resolution above stays on `setup` — `--pam`, `--no-pam`, `--service`,
+`--remove`, `--if-present` and their precedence rules are unchanged — and only
+the execution moved. The alias is exact, including the two things that make it
+not a plain forward:
+
+- **`setup --yes` keeps its combined meaning** and is the one documented
+  exception to the flag split below. It maps onto *both* of the writer's knobs:
+  `--no-confirm` (skip the per-file question) **and** `--allow-sensitive`
+  (accept `system-auth`/`login`/`sshd`). `--non-interactive` maps onto
+  `--no-confirm` alone, as it always has.
+- **The root refusal is a hard error, not a `sudo` re-exec.** Standalone
+  `--pam` never offered the interactive escalation (`needs_root_precheck`), and
+  `facelock pam add|remove` does not either.
 
 Supplying a choice flag suppresses the corresponding wizard step. `auto` means
 "re-derive from hardware", **not** "use the default" — omitting the flag already
 gives the default. Under `--non-interactive`, an unresolvable choice is an error,
 never a prompt.
 
+### facelock pam Semantics
+
+`facelock pam add | remove | status` owns every write to `/etc/pam.d`.
+`setup --pam` is an alias onto it (above), and the wizard's step 9 calls the
+same writer, so there is one implementation of the edit and one set of rules.
+
+**Confinement.** A service name is **one path component**: not empty, no `/`,
+not `.` or `..`, no interior NUL. Rejected before any I/O, on `add`, `remove`
+and `status` alike. `base.join(service)` is not a confinement primitive — an
+absolute name *replaces* the base — so this is the check, not the join.
+Anything else is accepted: `PAM_CANDIDATES` is the wizard's menu, **not** an
+allowlist, and a service that is not on it must keep working.
+
+**Two-phase.** Every requested service is validated — name, existence
+(subject to `--if-present`), the sensitive gate, and what the edit would be —
+before **any** file is written. A validation failure writes nothing at all,
+which is what makes a caller's loop all-or-nothing for the failure that
+actually happens: a typo'd or gated service name. It is **not** a transaction:
+a write-phase I/O error on service N leaves 1..N-1 written. Those are reported
+per service and the exit code is non-zero; the remaining services are still
+attempted. The rollback is the `.facelock-backup` file written before each
+edit, which nothing in this command deletes.
+
+**`--no-confirm` never implies `--allow-sensitive`.** They are separate
+authorizations: "do not ask me" and "yes, edit `system-auth`". `--yes` and
+`--no-confirm` are the same flag (the shared `ConfirmArg` spelling, so "skip
+prompts" reads the same on `pam add` as on `remove` and `clear`) and neither
+unlocks the gate. `setup --yes` keeps the combined meaning and is the sole
+exception. `remove` is never gated at all — removal can only take away a way
+to authenticate — and never prompts, which is what `setup --pam --remove` has
+always done; `--yes`/`--no-confirm` is accepted there for symmetry and has
+nothing to suppress today.
+
+**With no TTY on stdin, `pam add` proceeds as if `--no-confirm` were given.**
+A question nobody can answer is a hang, not a safeguard, and this is what has
+always made `setup --pam` work from a provisioning script — so
+`sudo facelock pam add --service sudo < /dev/null` writes without the flag.
+The prompt this skips defaults to yes, so the flag changes nothing about the
+outcome on a TTY either; what it changes is whether you are asked. This never
+touches `--allow-sensitive`: the sensitive-service gate is decided in the
+validation phase, before any prompt exists to skip, so an unattended
+`pam add --service system-auth` still refuses.
+
+**Exit codes.**
+
+| Command | Code | Meaning |
+|---------|------|---------|
+| `pam status` | 0 | every requested service carries the line |
+| `pam status` | 1 | at least one requested service exists without it |
+| `pam status` | 2 | at least one is absent, unreadable, or misnamed |
+| `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `absent` under `--if-present`, and `declined` |
+| `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure |
+
+`pam status` is on `grep`'s scale and `is-enrolled`'s, deliberately: it is a
+boolean query whose exit code is the answer, and an absent file is exit 2 for
+the same reason `grep` gives 2 for one. Across several services the worst
+outcome wins. A **declined** confirmation is exit 0 — the command did what the
+operator asked — and `--json` is how a script tells it from an install.
+
+**`--dry-run`** prints the resolved plan, writes nothing, and exits 0. It is
+honoured *after* the root check (see DEC-6 above).
+
+**`--json`** emits exactly one document on stdout and no human text; `--quiet`
+suppresses even that, leaving the exit code as the whole answer, as it does for
+`is-enrolled`. Diagnostics stay on stderr either way.
+
+On `add` and `remove`, a validation failure produces **no** JSON document: it
+is reported as text on stderr and the process exits non-zero, matching
+`is-enrolled`, whose unanswerable case prints a reason and no payload. The
+phase that rejects is the phase that would have decided every row, so there is
+no partial document to emit.
+
+`pam status` is the other way round and **always** emits a document: it has no
+all-or-nothing phase to fail, so a rejected service name becomes an `unknown`
+row inside the document (with the reason in `error`) alongside the rows for
+every other requested service, and the invalid-name message is *also* written
+to stderr for a human. Exit 2 either way.
+
+```json
+{
+  "command": "add",
+  "dry_run": false,
+  "services": [
+    {
+      "service": "sudo",
+      "path": "/etc/pam.d/sudo",
+      "action": "installed",
+      "backup": "/etc/pam.d/sudo.facelock-backup"
+    }
+  ]
+}
+```
+
+**This shape is a stability contract.** An object rather than a bare array so a
+new top-level field is additive. Field names do not change and are not removed;
+`service`, `path`, `action` and `backup` are always present on every service
+object, and `error` is present when `action` is `failed` or `unknown`. **`error` is a
+diagnostic, not a contract** — branch on `action`, never on `error`'s text. A
+rejected service name reports the fixed C-locale string `invalid service name`,
+but the OS-level failures (`failed` on a write, `unknown` on an unreadable
+file) interpolate a `strerror` string, which follows the operator's
+`LC_MESSAGES` like any other C library message. Nothing else in a `--json`
+document is locale-dependent. `backup`
+is the `.facelock-backup` path when one exists on disk after the operation and
+`null` otherwise — always `null` under `--dry-run`, which writes none. When
+`action` is `unknown` because the *name* was rejected, `path` is the path that
+name would have resolved to (which is why it was rejected) and is not a path
+anything read or wrote.
+
+The `action` vocabulary — **new words may be added, so a consumer must tolerate
+one it does not know rather than treat it as an error**:
+
+| `action` | Verb | Meaning |
+|----------|------|---------|
+| `installed` | `add` | the line was written (under `--dry-run`, would be) |
+| `removed` | `remove` | the line was deleted (under `--dry-run`, would be) |
+| `unchanged` | `add`, `remove` | already in the requested state |
+| `absent` | all three | the service file does not exist |
+| `declined` | `add` | the operator answered no at the per-file confirmation |
+| `failed` | `add`, `remove` | the write failed; see `error` |
+| `present` | `status` | the file exists and carries a facelock line |
+| `missing` | `status` | the file exists and carries none |
+| `unknown` | `status` | the file could not be read; see `error` |
+
+`pam status --json` is what replaces `grep -q pam_facelock.so
+/etc/pam.d/<service>` in an integration script: it answers from the same file,
+without root, and reports "absent" and "unreadable" as themselves rather than
+as "not configured".
+
+**Repeatable `--service`.** `--service a --service b` acts on both in one
+process, one root check and one closing hint. Duplicates collapse. No
+`--service` means `sudo`, which is what bare `setup --pam` has always meant.
+
+**The `/etc/pam.d` bytes are unchanged from before the verb existed.** The line
+goes above the first `auth` line, or at the very top of the file when there is
+none (above the `#%PAM-1.0` header, which is where it has always gone); a
+missing trailing newline stays missing; a backup is taken before every edit and
+never before a no-op. Golden fixtures captured from the pre-refactor code pin
+all of it.
+
 ### CLI Privilege Model (DEC-6)
 
-The CLI is root by default: every subcommand requires root except the four
+The CLI is root by default: every subcommand requires root except the five
 listed below, which are unprivileged by design, not by omission.
 
 | Command | Why unprivileged |
 |---------|-------------------|
 | `facelock is-enrolled` | Answers from the caller's own `0600` marker file; the unprivileged integration point (see Exit Codes above). Never probes D-Bus |
 | `facelock hyprlock …` | Edits the user's own dotfile — root would write root-owned files into `$HOME`, which is wrong, not just unnecessary |
+| `facelock pam status` | Reads `0644` files under `/etc/pam.d` and writes nothing. Same role as `is-enrolled`: the probe an integration runs without `sudo`, replacing a hand-rolled `grep -q pam_facelock.so /etc/pam.d/<service>`. A file it cannot read reports `unknown` and exits 2 rather than reporting it as missing |
 | `facelock config` (display, no `--edit`) | Reads a `0644` file |
 | `--help`, `--version` | — |
 
@@ -150,11 +311,21 @@ command uses exactly one:
   they hard-error instead — `Root required.\n  Run: sudo facelock <cmd>` —
   rather than hang waiting for input that will never arrive
   (`ipc_client::require_root`).
-- **Hard error only.** `facelock audit` (and `facelock daemon`, whose own
-  root check predates this table) never offer the interactive prompt at all,
+- **Hard error only.** `facelock pam add`, `facelock pam remove`, `facelock
+  audit` (and `facelock daemon`, whose own root check predates this table)
+  never offer the interactive prompt at all,
   even with a TTY attached — both are typically invoked non-interactively or
   as a long-running service, where a stray confirmation prompt is a hang, not
   a convenience (`ipc_client::require_root_scripted`).
+
+`facelock pam add|remove` are in the hard-error class because the surface they
+replace was: standalone `setup --pam` bailed from its own root check rather
+than prompting, and silently re-running an `/etc/pam.d` edit under `sudo` on
+behalf of a wrapper script is a surprise, not a convenience. The check runs
+**before `--dry-run` is honoured** — a dry run that succeeded unprivileged
+would be a misleading preview of a command that cannot run — and `pam status`
+is the unprivileged read that covers the case `--dry-run` might otherwise be
+reached for.
 
 `facelock auth` is not user-facing — PAM spawns it directly, and it is not
 part of this table.
@@ -263,6 +434,9 @@ the codes themselves match `grep`'s 0 = match / 1 = no match / 2 = error.
 | 0 | User has a usable enrollment |
 | 1 | Not enrolled / not usable (includes an unreadable or absent marker) |
 | 2 | Error — bad arguments, or a marker that exists but cannot be parsed |
+
+`facelock pam status` uses the same 0/1/2 scale for the same reason; see
+"facelock pam Semantics" above.
 
 Default stdout is `enrolled` / `not-enrolled` — the state word, as `systemctl
 is-active` prints `active`. `--quiet` suppresses stdout and leaves only the exit

@@ -11,8 +11,9 @@
 //! These types are deliberately bin-private (declared by `main.rs`, absent from
 //! `lib.rs`). Nothing outside the binary consumes clap types.
 
-use clap::Args;
+use clap::{Args, Subcommand};
 
+use facelock_cli::commands::pam::{PamAction, PamRequest};
 use facelock_cli::commands::setup::{
     EncryptionChoice, ExecutionProviderChoice, ModelPreset, SetupArgs,
 };
@@ -72,7 +73,7 @@ pub struct SetupCli {
     // Not a shared `ConfirmArg`: on `setup` the flag means more than it does
     // elsewhere. It skips the per-file "Proceed?" prompt *and* unlocks the
     // gate that otherwise refuses to write into a sensitive PAM service
-    // (`SENSITIVE_SERVICES` in commands/setup.rs). Rendering that as plain
+    // (`SENSITIVE_SERVICES` in commands/pam.rs). Rendering that as plain
     // prompt suppression would understate what the user is authorizing.
     // Spelling still cannot drift: `cli_flag_conformance` pins `-y` and the
     // `no-confirm` alias on every arg named `yes`, wherever it is declared.
@@ -168,6 +169,122 @@ impl From<SetupCli> for SetupArgs {
             models,
             execution_provider,
             encryption,
+        }
+    }
+}
+
+/// The services a `facelock pam` verb acts on.
+///
+/// Repeatable, which is the point: the old `setup --pam --service X` took one
+/// `Option<String>`, so configuring three services meant three processes, three
+/// root checks and no atomicity across them. Empty means `sudo`, preserving
+/// what bare `--pam` has always meant.
+#[derive(Args)]
+pub struct PamServiceArg {
+    /// PAM service to act on; repeat for several (default: sudo)
+    #[arg(long, num_args = 1, action = clap::ArgAction::Append, value_name = "SERVICE")]
+    pub service: Vec<String>,
+}
+
+/// `facelock pam add | remove | status`.
+///
+/// Becomes a [`PamRequest`], the same way [`SetupCli`] becomes a [`SetupArgs`]:
+/// clap types stay in the binary, and the library sees plain data it can also
+/// construct in a test.
+#[derive(Subcommand)]
+pub enum PamCli {
+    /// Add the facelock line to one or more /etc/pam.d service files
+    #[command(after_help = "\
+--yes/--no-confirm only skips the per-file confirmation. Editing the sensitive \
+services system-auth, login or sshd additionally requires --allow-sensitive; \
+neither flag implies the other. Every service is validated before any file is \
+written, so a rejected service leaves the rest untouched.")]
+    Add {
+        #[command(flatten)]
+        service: PamServiceArg,
+        #[command(flatten)]
+        confirm: ConfirmArg,
+        /// Also permit the sensitive services: system-auth, login, sshd
+        #[arg(long)]
+        allow_sensitive: bool,
+        /// Treat a missing service file as success instead of an error
+        #[arg(long = "if-present")]
+        if_present: bool,
+        #[command(flatten)]
+        dry_run: DryRunArg,
+        #[command(flatten)]
+        json: JsonArg,
+    },
+    /// Remove the facelock line from one or more /etc/pam.d service files
+    #[command(after_help = "\
+Removal is never gated by the sensitive-service list and never prompts — it can \
+only take away a way to authenticate, and the .facelock-backup file written by \
+`add` is left in place. --yes/--no-confirm is accepted for symmetry with `add`.")]
+    Remove {
+        #[command(flatten)]
+        service: PamServiceArg,
+        #[command(flatten)]
+        confirm: ConfirmArg,
+        /// Treat a missing service file as success instead of an error
+        #[arg(long = "if-present")]
+        if_present: bool,
+        #[command(flatten)]
+        dry_run: DryRunArg,
+        #[command(flatten)]
+        json: JsonArg,
+    },
+    /// Report whether services carry the facelock line (exit 0 = all do, 1 = one does not, 2 = error)
+    #[command(after_help = "\
+Reads only; needs no root. This is the probe to branch on instead of grepping \
+/etc/pam.d yourself.")]
+    Status {
+        #[command(flatten)]
+        service: PamServiceArg,
+        #[command(flatten)]
+        json: JsonArg,
+    },
+}
+
+impl From<PamCli> for PamRequest {
+    fn from(cli: PamCli) -> Self {
+        match cli {
+            PamCli::Add {
+                service,
+                confirm,
+                allow_sensitive,
+                if_present,
+                dry_run,
+                json,
+            } => PamRequest {
+                action: PamAction::Add,
+                services: service.service,
+                no_confirm: confirm.yes,
+                allow_sensitive,
+                if_present,
+                dry_run: dry_run.dry_run,
+                json: json.json,
+            },
+            PamCli::Remove {
+                service,
+                confirm,
+                if_present,
+                dry_run,
+                json,
+            } => PamRequest {
+                action: PamAction::Remove,
+                services: service.service,
+                no_confirm: confirm.yes,
+                allow_sensitive: false,
+                if_present,
+                dry_run: dry_run.dry_run,
+                json: json.json,
+            },
+            PamCli::Status { service, json } => PamRequest {
+                action: PamAction::Status,
+                services: service.service,
+                json: json.json,
+                ..PamRequest::default()
+            },
         }
     }
 }
