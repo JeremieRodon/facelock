@@ -614,8 +614,15 @@ run_test_or_skip "ADR 008: success releases the camera immediately" \
 # NULL, which is the one distinction a plain SELECT loses — and writing NULL
 # back unconditionally would silently un-couple the template from its camera
 # for every test after this point.
-ADR008_DEVID="$(sqlite3 "$DB" "PRAGMA busy_timeout=8000; SELECT quote(device_id) FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo 'NULL')"
-[ -n "$ADR008_DEVID" ] || ADR008_DEVID='NULL'
+#
+# The busy timeout arrives as the `.timeout` dot command, not as a PRAGMA in
+# the statement: `PRAGMA busy_timeout=8000` returns a row, so sqlite3 prints
+# 8000 ahead of the SELECT and the restore below interpolates both tokens.
+ADR008_DEVID="$(sqlite3 -cmd ".timeout 8000" "$DB" "SELECT quote(device_id) FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo 'NULL')"
+# Two forms are safe to write back: the bare token NULL, or a single-quoted
+# string with interior quotes doubled, which is all quote() ever emits.
+# Anything else restores NULL instead of a syntax error the `|| true` hides.
+[[ "$ADR008_DEVID" =~ ^(NULL|\'([^\']|\'\')*\')$ ]] || ADR008_DEVID='NULL'
 sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id='ffff:ffff:forged' WHERE user='testuser'" || true
 
 run_test_or_skip "ADR 008: a failed attempt holds the camera, then releases it at camera_release_secs" \
@@ -625,6 +632,14 @@ run_test_or_skip "ADR 008: a departed caller cancels the request and closes the 
     "adr008_caller_departure_cancels"
 
 sqlite3 "$DB" "PRAGMA busy_timeout=8000; UPDATE face_models SET device_id=$ADR008_DEVID WHERE user='testuser'" || true
+
+# The restore runs under `|| true`, so assert it instead of trusting it. Every
+# test after this point reads the row, and a forged id left in place makes them
+# pass against a template no camera can ever match again.
+ADR008_RESTORED="$(sqlite3 -cmd ".timeout 8000" "$DB" "SELECT quote(device_id) FROM face_models WHERE user='testuser' LIMIT 1" 2>/dev/null || echo 'NULL')"
+[ -n "$ADR008_RESTORED" ] || ADR008_RESTORED='NULL'
+run_test "ADR 008: device_id survives the forged-id window (want=$ADR008_DEVID got=$ADR008_RESTORED)" \
+    "[ \"\$ADR008_RESTORED\" = \"\$ADR008_DEVID\" ]" 0
 
 # --- End ADR 008 camera lifecycle ---
 
