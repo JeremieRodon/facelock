@@ -49,6 +49,14 @@
 //! than a fully-reported one. The rollback is the `.facelock-backup` file the
 //! write phase makes before each edit, and nothing here deletes it.
 //!
+//! **Continue and report is the policy on every entry point**, not just on the
+//! verb: [`apply_all`] is the one phase-two loop, and the four entry points
+//! differ only in how they *read* its rows — [`write_in`] as an exit code, the
+//! three `setup --pam` aliases as a `Result` through [`first_failure`], once
+//! every service has been attempted. The aliases used to stop at the first
+//! failure, which made the paragraph above true of one caller and false of
+//! three (invisibly, since `setup` passes one service at a time).
+//!
 //! # Confinement
 //!
 //! A service name is **one path component** ([`confined`]), rejected before
@@ -239,6 +247,49 @@ pub struct PamRequest {
     pub json: bool,
 }
 
+/// Which write is running. [`PamAction::Status`] is not a write, and this is
+/// where that stops being something every function downstream has to re-check.
+///
+/// Past the one conversion in [`WriteAction::of`], a plan, an apply and a
+/// report cannot be handed a request that only asked to read — so the dead
+/// arms that used to answer "what does an add do with a status?" are not
+/// omissions here, they are unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAction {
+    Add,
+    Remove,
+}
+
+impl WriteAction {
+    /// The write this action asks for, or `None` for `status`.
+    fn of(action: PamAction) -> Option<Self> {
+        match action {
+            PamAction::Add => Some(WriteAction::Add),
+            PamAction::Remove => Some(WriteAction::Remove),
+            PamAction::Status => None,
+        }
+    }
+}
+
+/// One write, as everything the two phases need that is not the target list.
+///
+/// It exists so [`plan_writes`] and [`apply_all`] take *one* value describing
+/// the run instead of the same facts spread over three parameters in two
+/// orders. That spread was the live defect: `install_for_setup(services,
+/// no_confirm, allow_sensitive)` and `install_one_in(base, service,
+/// allow_sensitive, no_confirm)` both type-check when swapped, and the swap
+/// silently unlocks the sensitive-service gate. Named fields, one construction
+/// per entry point.
+struct WriteRequest<'a> {
+    action: WriteAction,
+    request: &'a PamRequest,
+    /// The flag that unlocks [`SENSITIVE_SERVICES`] **on this surface**:
+    /// `--allow-sensitive` on the verb, `--yes` on the `setup --pam` alias,
+    /// which keeps its combined meaning. The refusal has to name the flag the
+    /// caller can actually reach.
+    remedy: &'a str,
+}
+
 // ---------------------------------------------------------------------------
 // Outcomes — the `--json` vocabulary
 // ---------------------------------------------------------------------------
@@ -258,7 +309,13 @@ enum Outcome {
     Removed,
     /// The service was already in the requested state.
     Unchanged,
-    /// The service file does not exist, and `--if-present` allowed that.
+    /// The service file does not exist.
+    ///
+    /// It is a success on `add` and `remove` — the verb asked for a state the
+    /// file cannot be in, and `--if-present` said that is fine — and on
+    /// `status` it is an error (exit 2) unless `--if-present` was given there
+    /// too, because "is this service configured?" has no answer for a service
+    /// that is not installed.
     Absent,
     /// The operator answered no at the per-file confirmation.
     Declined,
@@ -322,25 +379,32 @@ struct ServiceReport {
 
 /// What a service is planned to become.
 ///
-/// The variants that rewrite the file carry the bytes they were derived from,
-/// so "there is an edit to make" and "here is what it is being made from"
-/// cannot disagree. Holding them apart — a plan beside an `Option<String>` —
-/// made two representations of one fact, and every consumer had to re-check
-/// the pairing.
+/// [`Plan::Rewrite`] carries the bytes it was derived from, so "there is an
+/// edit to make" and "here is what it is being made from" cannot disagree.
+/// **Which** edit is deliberately not recorded: the verb is
+/// [`WriteRequest::action`], and a plan that named one too was a second copy
+/// of it — the copy each `apply` function then had to check against its own,
+/// with an unreachable "this plan is for the other verb" failure on the end of
+/// both. Nor is the insertion point: it is a scan of `content`
+/// ([`insertion_hint`]), and memoizing it made a third fact that could go
+/// stale against the bytes beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
-    /// Insert the line. `at_top` records that the file has no `auth` line, so
-    /// the preview and the dry-run report can say where it lands.
-    Add { at_top: bool, content: String },
-    /// Delete the line.
-    Remove { content: String },
+    /// The file needs rewriting, from these bytes.
+    Rewrite { content: String },
     /// Already in the requested state.
     NoChange,
     /// No service file, and `--if-present` said that is fine.
     Absent,
 }
 
-/// A validated service, with the file already read.
+/// A validated service: which file the name resolves to, where its backup
+/// goes, and what is planned for it.
+///
+/// [`Target::locate`] is the only place a service name becomes a path —
+/// `base.join`, the confinement rule and the symlink rule are applied there
+/// and nowhere else — so `status` cannot answer about a different file than
+/// `add` would write.
 #[derive(Debug, Clone)]
 struct Target {
     service: String,
@@ -350,6 +414,24 @@ struct Target {
 }
 
 impl Target {
+    /// Resolve one service against `base`, or say why it cannot be.
+    ///
+    /// The plan starts as [`Plan::NoChange`], which is the truth for a caller
+    /// that is not going to write — `status` uses this and leaves it alone.
+    /// [`plan_writes`] fills it in.
+    fn locate(base: &Path, service: &str) -> Result<Self, Rejected> {
+        if confined(service).is_err() {
+            return Err(Rejected::Name);
+        }
+        let path = resolve_service_path(base, service)?;
+        Ok(Target {
+            service: service.to_string(),
+            backup: backup_path(&path),
+            path,
+            plan: Plan::NoChange,
+        })
+    }
+
     fn path_string(&self) -> String {
         self.path.display().to_string()
     }
@@ -361,6 +443,84 @@ impl Target {
     /// The backup path if it exists on disk, for the report's `backup` field.
     fn existing_backup(&self) -> Option<String> {
         existing_backup_for(&self.path)
+    }
+}
+
+/// Why a service could not be resolved.
+///
+/// Both phases reject the same three things and report them differently —
+/// [`plan_writes`] as an `Err` that stops the whole run, [`status_reports`] as
+/// an `unknown` row beside the services it could answer about — so the reason
+/// is a value here rather than a rendered message at each site. Every piece
+/// that differs between them (the fixed machine reason, the localized text,
+/// whether a `path` was resolved, whether a backup is worth probing for) hangs
+/// off it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rejected {
+    /// The name is not one path component, so nothing was resolved at all.
+    Name,
+    /// The entry is a symlink whose target is outside `base`, or one that
+    /// cannot be resolved to prove otherwise.
+    OutOfBase { link: PathBuf, target: PathBuf },
+    /// The entry is a regular file reachable by more than one name. Which
+    /// other names is exactly what a link count does not say, so the edit
+    /// cannot be shown to stay inside the directory.
+    HardLinked { link: PathBuf, links: u64 },
+}
+
+impl Rejected {
+    /// The `--json` `error` value: fixed C-locale text, never the localized
+    /// message. See [`INVALID_SERVICE_NAME`].
+    fn reason(&self) -> &'static str {
+        match self {
+            Rejected::Name => INVALID_SERVICE_NAME,
+            Rejected::OutOfBase { .. } => SYMLINKED_OUT_OF_DIR,
+            Rejected::HardLinked { .. } => HARD_LINKED,
+        }
+    }
+
+    /// The localized refusal, for a human on stderr.
+    fn message(&self, base: &Path, service: &str) -> PamMessage {
+        match self {
+            Rejected::Name => PamMessage::PamInvalidServiceName {
+                service: service.to_string(),
+            },
+            Rejected::OutOfBase { link, target } => PamMessage::PamServiceSymlinkedOutside {
+                path: link.display().to_string(),
+                target: target.display().to_string(),
+                dir: base.display().to_string(),
+            },
+            Rejected::HardLinked { link, links } => PamMessage::PamServiceHardLinked {
+                path: link.display().to_string(),
+                links: links.to_string(),
+            },
+        }
+    }
+
+    /// The entry this is about, when there is one: a real, confined path that
+    /// was `lstat`ed. `None` for a rejected *name*, where nothing was resolved.
+    fn link(&self) -> Option<&Path> {
+        match self {
+            Rejected::Name => None,
+            Rejected::OutOfBase { link, .. } | Rejected::HardLinked { link, .. } => {
+                Some(link.as_path())
+            }
+        }
+    }
+
+    /// The row's `path`. `None` for a rejected name: naming the path it
+    /// *would* have resolved to reads as one that was acted on.
+    fn path(&self) -> Option<String> {
+        Some(self.link()?.display().to_string())
+    }
+
+    /// The row's `backup`. Probed for a rejected entry, because a facelock
+    /// version that wrote through it left one there and it is what a recovery
+    /// needs; not probed for a rejected name, which would `stat`
+    /// `/etc/pam.d/../escape.facelock-backup` for a name the whole point of
+    /// [`confined`] is to not act on.
+    fn backup(&self) -> Option<String> {
+        existing_backup_for(self.link()?)
     }
 }
 
@@ -396,59 +556,6 @@ fn confined(service: &str) -> anyhow::Result<()> {
     }))
 }
 
-/// A link this refuses to write through.
-///
-/// Both phases reject the same two shapes and report them differently —
-/// [`plan_writes`] as an `Err` that stops the whole run, [`status_reports`] as
-/// an `unknown` row beside the services it could answer about — so the reason
-/// is a value here rather than a rendered message at each site. Everything
-/// that differs between the two (the fixed machine reason, the localized text,
-/// the row's `path` and `backup`) hangs off it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LinkFault {
-    /// A symlink whose target is outside `base`, or one that cannot be
-    /// resolved to prove otherwise.
-    OutOfBase { link: PathBuf, target: PathBuf },
-    /// A regular file reachable by more than one name. Which other names is
-    /// exactly what a link count does not say, so the edit cannot be shown to
-    /// stay inside the directory.
-    HardLinked { link: PathBuf, links: u64 },
-}
-
-impl LinkFault {
-    /// The `--json` `error` value: fixed C-locale text, never the localized
-    /// message. See [`INVALID_SERVICE_NAME`].
-    fn reason(&self) -> &'static str {
-        match self {
-            LinkFault::OutOfBase { .. } => SYMLINKED_OUT_OF_DIR,
-            LinkFault::HardLinked { .. } => HARD_LINKED,
-        }
-    }
-
-    /// The localized refusal, for a human on stderr.
-    fn message(&self, base: &Path) -> PamMessage {
-        match self {
-            LinkFault::OutOfBase { link, target } => PamMessage::PamServiceSymlinkedOutside {
-                path: link.display().to_string(),
-                target: target.display().to_string(),
-                dir: base.display().to_string(),
-            },
-            LinkFault::HardLinked { link, links } => PamMessage::PamServiceHardLinked {
-                path: link.display().to_string(),
-                links: links.to_string(),
-            },
-        }
-    }
-
-    /// The entry this is about: a real, confined path that was `lstat`ed, so
-    /// unlike a rejected *name* it is worth reporting.
-    fn link(&self) -> &Path {
-        match self {
-            LinkFault::OutOfBase { link, .. } | LinkFault::HardLinked { link, .. } => link,
-        }
-    }
-}
-
 /// The file a validated `service` names under `base`, or the reason it cannot
 /// be written through.
 ///
@@ -478,7 +585,7 @@ impl LinkFault {
 /// which makes the question moot. A `/etc` that has been through a
 /// deduplicating backup or `jdupes -L` can trip this without any adversary
 /// involved, so the message says how to break the link.
-fn resolve_service_path(base: &Path, service: &str) -> Result<PathBuf, LinkFault> {
+fn resolve_service_path(base: &Path, service: &str) -> Result<PathBuf, Rejected> {
     use std::os::unix::fs::MetadataExt;
 
     let path = base.join(service);
@@ -493,7 +600,7 @@ fn resolve_service_path(base: &Path, service: &str) -> Result<PathBuf, LinkFault
         // count, and a directory where a service file should be is a read
         // error reported as one, not a link fault.
         if metadata.is_file() && metadata.nlink() > 1 {
-            return Err(LinkFault::HardLinked {
+            return Err(Rejected::HardLinked {
                 link: path,
                 links: metadata.nlink(),
             });
@@ -503,8 +610,8 @@ fn resolve_service_path(base: &Path, service: &str) -> Result<PathBuf, LinkFault
 
     match (fs::canonicalize(&path), fs::canonicalize(base)) {
         (Ok(target), Ok(root)) if target.starts_with(&root) => Ok(target),
-        (Ok(target), _) => Err(LinkFault::OutOfBase { link: path, target }),
-        (Err(_), _) => Err(LinkFault::OutOfBase {
+        (Ok(target), _) => Err(Rejected::OutOfBase { link: path, target }),
+        (Err(_), _) => Err(Rejected::OutOfBase {
             target: fs::read_link(&path).unwrap_or_else(|_| path.clone()),
             link: path,
         }),
@@ -518,18 +625,16 @@ fn resolve_service_path(base: &Path, service: &str) -> Result<PathBuf, LinkFault
 /// `alias -> system-auth` inside `/etc/pam.d` is a way to reach a gated file
 /// under a name the first check waves through. Only `add` is gated —
 /// see [`SENSITIVE_SERVICES`].
-fn gate_sensitive(
-    service: &str,
-    action: PamAction,
-    allow_sensitive: bool,
-    remedy: &str,
-) -> anyhow::Result<()> {
-    if action != PamAction::Add || allow_sensitive || !SENSITIVE_SERVICES.contains(&service) {
+fn gate_sensitive(name: &str, write: &WriteRequest) -> anyhow::Result<()> {
+    if write.action != WriteAction::Add
+        || write.request.allow_sensitive
+        || !SENSITIVE_SERVICES.contains(&name)
+    {
         return Ok(());
     }
     Err(fail(PamMessage::PamSensitiveRefused {
-        service: service.to_string(),
-        remedy: remedy.to_string(),
+        service: name.to_string(),
+        remedy: write.remedy.to_string(),
     }))
 }
 
@@ -560,45 +665,39 @@ fn requested_services(services: &[String]) -> Vec<String> {
     out
 }
 
-/// Phase one: validate and read every service, or fail having written nothing.
+/// Phase one: validate and read every requested service, or fail having
+/// written nothing.
 ///
 /// Every rejection here is an `Err`, not a report row, and the caller performs
 /// no writes on `Err` — that is the whole point of the phase. Errors render on
 /// stderr as text and never as a JSON document, the same contract
 /// `is-enrolled` has for its unanswerable case.
-fn plan_writes(
-    base: &Path,
-    action: PamAction,
-    services: &[String],
-    request: &PamRequest,
-    sensitive_remedy: &str,
-) -> anyhow::Result<Vec<Target>> {
+///
+/// The service list is resolved here rather than passed in: a caller that
+/// handed in one list while the request named another had two lists to keep
+/// in step, and `install_one_in` did exactly that — it acted on one service
+/// while its request said "none, so `sudo`".
+fn plan_writes(base: &Path, write: &WriteRequest) -> anyhow::Result<Vec<Target>> {
+    let services = requested_services(&write.request.services);
     let mut targets = Vec::with_capacity(services.len());
 
-    for service in services {
-        confined(service)?;
+    for service in &services {
         // On the name as typed, before any I/O.
-        gate_sensitive(service, action, request.allow_sensitive, sensitive_remedy)?;
+        gate_sensitive(service, write)?;
 
-        let path =
-            resolve_service_path(base, service).map_err(|fault| fail(fault.message(base)))?;
+        let located =
+            Target::locate(base, service).map_err(|why| fail(why.message(base, service)))?;
         // ...and again on the file the name reached. A link `alias ->
         // system-auth` inside the directory is a gated file behind an ungated
         // name, and the gate is on the file.
-        gate_sensitive(
-            &file_name_of(&path),
-            action,
-            request.allow_sensitive,
-            sensitive_remedy,
-        )?;
+        gate_sensitive(&file_name_of(&located.path), write)?;
 
-        let backup = backup_path(&path);
-        let display = path.display().to_string();
+        let display = located.path_string();
 
-        let content = match fs::read_to_string(&path) {
+        let content = match fs::read_to_string(&located.path) {
             Ok(content) => Some(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !request.if_present {
+                if !write.request.if_present {
                     return Err(fail(PamMessage::PamFileNotFound { path: display }));
                 }
                 None
@@ -610,34 +709,21 @@ fn plan_writes(
             }
         };
 
-        let plan = match (content, action) {
-            (None, _) => Plan::Absent,
-            (Some(content), PamAction::Add) => {
-                if content.lines().any(is_facelock_pam_line) {
-                    Plan::NoChange
-                } else {
-                    Plan::Add {
-                        at_top: !content.lines().any(has_auth_keyword),
-                        content,
-                    }
-                }
-            }
-            (Some(content), PamAction::Remove) => {
-                if content.lines().any(is_facelock_pam_line) {
-                    Plan::Remove { content }
+        let plan = match content {
+            None => Plan::Absent,
+            // The same question for both verbs — "does the line exist?" — and
+            // opposite answers about whether that means work to do.
+            Some(content) => {
+                let present = content.lines().any(is_facelock_pam_line);
+                if present == (write.action == WriteAction::Remove) {
+                    Plan::Rewrite { content }
                 } else {
                     Plan::NoChange
                 }
             }
-            (Some(_), PamAction::Status) => Plan::NoChange,
         };
 
-        targets.push(Target {
-            service: service.clone(),
-            path,
-            backup,
-            plan,
-        });
+        targets.push(Target { plan, ..located });
     }
 
     Ok(targets)
@@ -663,6 +749,20 @@ pub fn is_facelock_pam_line(line: &str) -> bool {
 /// has to go above.
 fn has_auth_keyword(line: &str) -> bool {
     line.trim_start().starts_with("auth")
+}
+
+/// Where the line will land in `content`, as the message that says so.
+///
+/// Derived from the same scan [`with_line_inserted`] makes, at the two places
+/// that report it — the preview and the dry-run row. Recording the answer on
+/// the plan instead gave the preview a way to promise a placement the write
+/// then contradicted.
+fn insertion_hint(content: &str) -> PamMessage {
+    if content.lines().any(has_auth_keyword) {
+        PamMessage::PamInsertBeforeAuthHint
+    } else {
+        PamMessage::PamInsertAtTopHint
+    }
 }
 
 /// Insert [`PAM_LINE`] above the first `auth` line, or at the very top if
@@ -739,9 +839,36 @@ enum Route {
 #[derive(Clone, Copy)]
 struct Sink {
     json: bool,
+    /// Whether a `failed` row gets its human rendering here.
+    ///
+    /// The verb's rows *are* its output, so each failure is written to stderr
+    /// as it happens, interleaved with the services around it. The three
+    /// `setup --pam` aliases hand the failure back as an `Err` and their
+    /// caller renders it — `setup`'s wizard as `PamConfigureFailed`, the
+    /// standalone path through `main` — so rendering it here as well would
+    /// print it twice.
+    report_failures: bool,
 }
 
 impl Sink {
+    /// The verb's sink. `--json` decides whether the human half is rendered
+    /// at all; the report is this invocation's output either way.
+    fn verb(json: bool) -> Self {
+        Sink {
+            json,
+            report_failures: true,
+        }
+    }
+
+    /// The sink of a caller that has no `--json` to offer and returns its
+    /// failures instead of printing them: the three `setup --pam` aliases.
+    fn human() -> Self {
+        Sink {
+            json: false,
+            report_failures: false,
+        }
+    }
+
     fn info(&self, msg: &dyn Message) {
         self.emit(self.info_route(), msg);
     }
@@ -848,7 +975,7 @@ fn should_prompt(no_confirm: bool, stdin_is_tty: bool, stderr_is_tty: bool) -> b
 fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
     let path = target.path_string();
 
-    let (at_top, content) = match &target.plan {
+    let content = match &target.plan {
         Plan::NoChange => {
             sink.info(&PamMessage::PamLineAlreadyPresent { path });
             return Outcome::Unchanged;
@@ -857,12 +984,7 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
             sink.info(&PamMessage::PamServiceAbsentSkipped { path });
             return Outcome::Absent;
         }
-        Plan::Add { at_top, content } => (*at_top, content.as_str()),
-        // `plan_writes` is the only thing that builds a plan, and it never
-        // hands an add a removal. Reported as a failure rather than as
-        // "nothing to do" so a bug in this file cannot exit 0 having done
-        // nothing while claiming the service is configured.
-        Plan::Remove { .. } => return Outcome::Failed(internal_plan_mismatch(&path)),
+        Plan::Rewrite { content } => content.as_str(),
     };
     let backup = target.backup_string();
 
@@ -874,18 +996,11 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
         std::io::stderr().is_terminal(),
     );
 
-    // The insertion point is decided before prompting, so the preview is
-    // accurate rather than a guess the write could contradict.
-    let hint = if at_top {
-        PamMessage::PamInsertAtTopHint
-    } else {
-        PamMessage::PamInsertBeforeAuthHint
-    };
     sink.preview(
         &PamMessage::PamModifyPreview {
             path: path.clone(),
             line: PAM_LINE.to_string(),
-            hint: hint.localized(),
+            hint: insertion_hint(content).localized(),
             backup: backup.clone(),
         },
         prompting,
@@ -962,15 +1077,13 @@ fn apply_remove(target: &Target, sink: &Sink) -> Outcome {
         // own — it relies on the one `add` wrote. Both are stated under
         // "Limits" in docs/contracts.md; the atomic replace is the same work
         // as in `apply_add`.
-        Plan::Remove { content } => match fs::write(&target.path, with_line_removed(content)) {
+        Plan::Rewrite { content } => match fs::write(&target.path, with_line_removed(content)) {
             Ok(()) => {
                 sink.info(&PamMessage::PamRemoved { path: path.clone() });
                 Outcome::Removed
             }
             Err(error) => Outcome::Failed(format!("failed to write {path}: {error}")),
         },
-        // See `apply_add`: an impossible plan is a bug here, not a no-op.
-        Plan::Add { .. } => Outcome::Failed(internal_plan_mismatch(&path)),
     };
 
     if let Some(backup) = target.existing_backup() {
@@ -980,40 +1093,26 @@ fn apply_remove(target: &Target, sink: &Sink) -> Outcome {
     outcome
 }
 
-/// A plan that does not match the verb applying it. Unreachable — `plan_writes`
-/// builds every plan and builds it for the verb that asked — and phrased as a
-/// failure rather than a panic, so the process reports it and exits non-zero
-/// instead of aborting mid-way through a multi-service run.
-fn internal_plan_mismatch(path: &str) -> String {
-    format!("internal error: plan for {path} does not match the requested action")
-}
-
 /// Render the resolved plan for `--dry-run`, writing nothing.
-fn report_plan(target: &Target, sink: &Sink) -> Outcome {
+fn report_plan(target: &Target, action: WriteAction, sink: &Sink) -> Outcome {
     let path = target.path_string();
-    match &target.plan {
-        Plan::Add { at_top, .. } => {
-            let at_top = *at_top;
-            let hint = if at_top {
-                PamMessage::PamInsertAtTopHint
-            } else {
-                PamMessage::PamInsertBeforeAuthHint
-            };
+    match (&target.plan, action) {
+        (Plan::Rewrite { content }, WriteAction::Add) => {
             sink.info(&PamMessage::PamPlanAdd {
                 path,
-                hint: hint.localized(),
+                hint: insertion_hint(content).localized(),
             });
             Outcome::Installed
         }
-        Plan::Remove { .. } => {
+        (Plan::Rewrite { .. }, WriteAction::Remove) => {
             sink.info(&PamMessage::PamPlanRemove { path });
             Outcome::Removed
         }
-        Plan::NoChange => {
+        (Plan::NoChange, _) => {
             sink.info(&PamMessage::PamPlanNoChange { path });
             Outcome::Unchanged
         }
-        Plan::Absent => {
+        (Plan::Absent, _) => {
             sink.info(&PamMessage::PamPlanAbsent { path });
             Outcome::Absent
         }
@@ -1058,14 +1157,21 @@ fn report_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) -> S
     .to_string()
 }
 
-/// Emit the machine document on stdout.
+/// Emit the machine document on stdout, if this invocation asked for one.
 ///
-/// Through [`message::payload`], so `--quiet` reaches it without this function
-/// knowing the flag exists: under it the document is dropped and the exit code
-/// is the whole answer, which is `is-enrolled --quiet --json`'s rule
-/// generalized to every payload.
-fn emit_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) {
-    crate::message::payload(&report_json(action, dry_run, reports));
+/// The `--json` test lives here rather than at each caller, so "was a document
+/// requested?" is asked once. Through [`crate::message::payload`], so
+/// `--quiet` reaches it without this function knowing the flag exists: under
+/// it the document is dropped and the exit code is the whole answer, which is
+/// `is-enrolled --quiet --json`'s rule generalized to every payload.
+///
+/// `dry_run` is a parameter rather than read off the request because `status`
+/// has no dry run: it reports `false` whatever a library caller left in the
+/// field, since a read that always happens cannot have been a preview.
+fn emit_json(request: &PamRequest, dry_run: bool, reports: &[ServiceReport]) {
+    if request.json {
+        crate::message::payload(&report_json(request.action, dry_run, reports));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,10 +1209,19 @@ pub fn run(request: PamRequest) -> anyhow::Result<i32> {
     write_in(Path::new(PAM_DIR), &request)
 }
 
-/// The precondition the line is useless without. Hoisted out of the per-service
-/// loop: it is a property of the machine, not of a service.
+/// Whether the PAM module is where the line needs it to be.
+///
+/// A property of the machine, not of a service, so it is asked once per
+/// invocation rather than per service — and asked here rather than by each
+/// caller spelling [`PAM_MODULE_PATH`] itself, which is how `setup` came to
+/// have its own copy of the test.
+pub(crate) fn module_installed() -> bool {
+    Path::new(PAM_MODULE_PATH).exists()
+}
+
+/// The precondition the line is useless without, as the refusal to write.
 fn require_module_installed() -> anyhow::Result<()> {
-    if Path::new(PAM_MODULE_PATH).exists() {
+    if module_installed() {
         return Ok(());
     }
     Err(fail(PamMessage::PamModuleNotInstalled {
@@ -1114,74 +1229,115 @@ fn require_module_installed() -> anyhow::Result<()> {
     }))
 }
 
+/// Whether `service` under `base` carries the facelock line.
+///
+/// The question `status` answers, for a caller that wants the boolean and has
+/// no exit code to produce — `setup`'s hyprlock handoff, which read
+/// `/etc/pam.d/hyprlock` itself and so had its own copy of "where does this
+/// name resolve to" beside this module's. An unreadable or unresolvable
+/// service is `false`: the caller decides whether to *offer* something, and
+/// "cannot tell" is not a reason to.
+pub(crate) fn is_configured(base: &Path, service: &str) -> bool {
+    let Ok(target) = Target::locate(base, service) else {
+        return false;
+    };
+    fs::read_to_string(&target.path).is_ok_and(|content| content.lines().any(is_facelock_pam_line))
+}
+
+/// Phase two, for every target.
+///
+/// **Continue and report**, and that is now true of all four entry points
+/// rather than of the verb alone. A write-phase failure on service N is one
+/// independent file's failure: the rest still have their own backups and their
+/// own chance of succeeding, and a half-reported plan is harder to recover
+/// from than a fully-reported one. What the entry points differ in is how they
+/// *read* the rows — [`write_in`] turns them into an exit code, the three
+/// `setup` aliases into a `Result` through [`first_failure`], once every
+/// service has been attempted.
+fn apply_all(targets: &[Target], write: &WriteRequest, sink: &Sink) -> Vec<ServiceReport> {
+    targets
+        .iter()
+        .map(|target| {
+            let outcome = if write.request.dry_run {
+                report_plan(target, write.action, sink)
+            } else {
+                match write.action {
+                    WriteAction::Add => apply_add(target, write.request.no_confirm, sink),
+                    WriteAction::Remove => apply_remove(target, sink),
+                }
+            };
+
+            if let (Outcome::Failed(error), true) = (&outcome, sink.report_failures) {
+                sink.error(&PamMessage::PamConfigureFailed {
+                    service: target.service.clone(),
+                    error: error.clone(),
+                });
+            }
+
+            ServiceReport {
+                service: target.service.clone(),
+                path: Some(target.path_string()),
+                outcome,
+                backup: (!write.request.dry_run)
+                    .then(|| target.existing_backup())
+                    .flatten(),
+            }
+        })
+        .collect()
+}
+
+/// The closing copy-pasteable hint, once per invocation and after every
+/// service — not once per service, as a shell loop over the old
+/// one-service-per-process CLI produced. It is human-facing text, so `--json`
+/// and `--quiet` both drop it; `--dry-run` keeps it, so a dry run is a
+/// faithful preview of what the real run prints.
+fn emit_extension_hint(sink: &Sink) {
+    sink.info(&PamMessage::PamExtensionHint {
+        line: PAM_LINE.to_string(),
+    });
+}
+
+/// The first failure among the rows, for a caller whose answer is a `Result`
+/// rather than an exit code. Every service has already been attempted.
+fn first_failure(reports: &[ServiceReport]) -> anyhow::Result<()> {
+    for report in reports {
+        if let Outcome::Failed(error) = &report.outcome {
+            return Err(anyhow::anyhow!(error.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// `add` / `remove` against `base`. The engine tests drive this directly, so
 /// it performs no root or module check — [`run`] owns those.
 fn write_in(base: &Path, request: &PamRequest) -> anyhow::Result<i32> {
-    let action = request.action;
-    if action == PamAction::Status {
+    let Some(action) = WriteAction::of(request.action) else {
         // `run` routes `status` to `status_in` and never gets here. Delegating
         // rather than falling through is what stops a future caller from
         // getting a *removal* out of a request that asked to read.
         return Ok(status_in(base, request));
-    }
-    let services = requested_services(&request.services);
-    let sink = Sink { json: request.json };
+    };
+    let write = WriteRequest {
+        action,
+        request,
+        remedy: "--allow-sensitive",
+    };
+    let sink = Sink::verb(request.json);
 
     // Phase one. An `Err` here has written nothing, by construction.
-    let targets = plan_writes(base, action, &services, request, "--allow-sensitive")?;
+    let targets = plan_writes(base, &write)?;
+    let reports = apply_all(&targets, &write, &sink);
 
-    // Phase two.
-    let mut reports = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let outcome = if request.dry_run {
-            report_plan(target, &sink)
-        } else if action == PamAction::Add {
-            apply_add(target, request.no_confirm, &sink)
-        } else {
-            apply_remove(target, &sink)
-        };
-
-        if let Outcome::Failed(error) = &outcome {
-            sink.error(&PamMessage::PamConfigureFailed {
-                service: target.service.clone(),
-                error: error.clone(),
-            });
-        }
-
-        reports.push(ServiceReport {
-            service: target.service.clone(),
-            path: Some(target.path_string()),
-            outcome,
-            backup: (!request.dry_run)
-                .then(|| target.existing_backup())
-                .flatten(),
-        });
+    if action == WriteAction::Add {
+        emit_extension_hint(&sink);
     }
+    emit_json(request, request.dry_run, &reports);
 
-    // One hint per invocation, after every service — not once per service, as
-    // a shell loop over the old one-service-per-process CLI produced. It is
-    // human-facing text, so `--json` and `--quiet` both drop it; `--dry-run`
-    // keeps it, so a dry run is a faithful preview of what the real run prints.
-    if action == PamAction::Add {
-        sink.info(&PamMessage::PamExtensionHint {
-            line: PAM_LINE.to_string(),
-        });
-    }
-
-    if request.json {
-        emit_json(action, request.dry_run, &reports);
-    }
-
-    Ok(
-        if reports
-            .iter()
-            .any(|report| matches!(report.outcome, Outcome::Failed(_)))
-        {
-            WRITE_FAILED
-        } else {
-            WRITE_OK
-        },
-    )
+    Ok(if first_failure(&reports).is_err() {
+        WRITE_FAILED
+    } else {
+        WRITE_OK
+    })
 }
 
 /// `pam status` against `base`.
@@ -1195,12 +1351,10 @@ fn write_in(base: &Path, request: &PamRequest) -> anyhow::Result<i32> {
 /// service has the line, 1 at least one does not, 2 at least one could not be
 /// answered. The worst outcome wins.
 fn status_in(base: &Path, request: &PamRequest) -> i32 {
-    let sink = Sink { json: request.json };
+    let sink = Sink::verb(request.json);
     let reports = status_reports(base, &requested_services(&request.services), &sink);
 
-    if request.json {
-        emit_json(PamAction::Status, false, &reports);
-    }
+    emit_json(request, false, &reports);
 
     reports
         .iter()
@@ -1215,48 +1369,26 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
     services
         .iter()
         .map(|service| {
-            // A rejected name is answered without touching the filesystem —
-            // including the backup probe below, which would otherwise `stat`
-            // `/etc/pam.d/../escape.facelock-backup` for a name the whole
-            // point of `confined` is to not act on.
-            if confined(service).is_err() {
-                // Not an `Err` return: `status` owns its exit codes, and a
-                // usage error is exit 2 rather than the generic exit 1 `main`
-                // gives an `anyhow` failure. The human rendering is the
-                // invalid-name message rather than `PamStatusUnknown`, which
-                // would report a path this never went near as "unreadable".
-                sink.error(&PamMessage::PamInvalidServiceName {
-                    service: service.clone(),
-                });
-                return ServiceReport {
-                    service: service.clone(),
-                    path: None,
-                    outcome: Outcome::Unknown(INVALID_SERVICE_NAME.to_string()),
-                    backup: None,
-                };
-            }
-
-            let path = match resolve_service_path(base, service) {
-                Ok(path) => path,
-                // Read as `unknown`, the same word an unreadable file gets:
-                // the question "does this service carry the line?" has no
-                // answer this may go and look for. `path` is the entry — a
-                // real, confined path this did `lstat` — and its backup is
-                // probed, because a facelock version that wrote through the
-                // link left it there and it is what a recovery needs.
-                Err(fault) => {
-                    sink.error(&fault.message(base));
+            // Both rejections read as `unknown`, the same word an unreadable
+            // file gets: the question "does this service carry the line?" has
+            // no answer this may go and look for. Not an `Err` return either
+            // — `status` owns its exit codes, and a usage error is exit 2
+            // rather than the generic exit 1 `main` gives an `anyhow` failure.
+            let target = match Target::locate(base, service) {
+                Ok(target) => target,
+                Err(why) => {
+                    sink.error(&why.message(base, service));
                     return ServiceReport {
                         service: service.clone(),
-                        path: Some(fault.link().display().to_string()),
-                        outcome: Outcome::Unknown(fault.reason().to_string()),
-                        backup: existing_backup_for(fault.link()),
+                        path: why.path(),
+                        outcome: Outcome::Unknown(why.reason().to_string()),
+                        backup: why.backup(),
                     };
                 }
             };
-            let display = path.display().to_string();
+            let display = target.path_string();
 
-            let outcome = match fs::read_to_string(&path) {
+            let outcome = match fs::read_to_string(&target.path) {
                 Ok(content) if content.lines().any(is_facelock_pam_line) => {
                     sink.info(&PamMessage::PamStatusPresent {
                         path: display.clone(),
@@ -1285,10 +1417,10 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
             };
 
             ServiceReport {
-                service: service.clone(),
+                service: target.service.clone(),
                 path: Some(display),
                 outcome,
-                backup: existing_backup_for(&path),
+                backup: target.existing_backup(),
             }
         })
         .collect()
@@ -1304,10 +1436,18 @@ fn status_code(outcome: &Outcome, if_present: bool) -> i32 {
         // `--if-present` means the same thing here as on `add` and `remove`:
         // a service file that is not installed is not an error, so the row is
         // still reported and the exit code is decided by the services that do
-        // exist. It converts *absence* and nothing else — an unreadable file
-        // or a rejected name is still exit 2.
+        // exist. It converts *absence* and nothing else.
         Outcome::Absent if if_present => STATUS_PRESENT,
-        _ => STATUS_ERROR,
+        Outcome::Absent | Outcome::Unknown(_) => STATUS_ERROR,
+        // Not reachable: `status_reports` produces the four words above and no
+        // other. Spelled out rather than left to a `_` arm so that a word
+        // added to the vocabulary has to be given a code here on purpose —
+        // under a wildcard, a new `status` outcome would silently be exit 2.
+        Outcome::Installed
+        | Outcome::Removed
+        | Outcome::Unchanged
+        | Outcome::Declined
+        | Outcome::Failed(_) => STATUS_ERROR,
     }
 }
 
@@ -1315,105 +1455,72 @@ fn status_code(outcome: &Outcome, if_present: bool) -> i32 {
 // The `setup --pam` alias
 // ---------------------------------------------------------------------------
 
-/// `setup --pam [--service X]`, routed through the same engine.
+/// The three aliases take the same [`PamRequest`] the verb does.
 ///
-/// `setup --yes` keeps its combined meaning — it is the documented exception
-/// to the flag split — so the caller maps it onto **both** knobs, and the
-/// refusal names `--yes` rather than `--allow-sensitive` because that is the
-/// flag this surface actually honours.
+/// They used to take loose parameters, in two different orders —
+/// `install_for_setup(services, no_confirm, allow_sensitive)` beside
+/// `install_one_in(base, service, allow_sensitive, no_confirm)` — so a swapped
+/// pair type-checked and quietly unlocked the sensitive-service gate. `setup`
+/// builds a request, names every field, and the writer reads the same value in
+/// both phases.
 ///
-/// Root is re-checked here rather than only at the `setup` entry point:
-/// `run_with_plan` reaches this directly for a standalone `--pam`, which does
-/// not take the base setup's root pre-check.
-pub fn install_for_setup(
-    services: &[String],
-    no_confirm: bool,
-    allow_sensitive: bool,
-) -> anyhow::Result<()> {
+/// The `remedy` is `--yes` on all three: `setup --yes` keeps its combined
+/// meaning — it is the documented exception to the flag split — so the refusal
+/// has to name the flag this surface actually honours.
+///
+/// Root is re-checked in the two that `run_with_plan` reaches directly for a
+/// standalone `--pam`, which does not take the base setup's root pre-check.
+/// `install_one_in` is the wizard's, and the wizard has already checked.
+///
+/// `setup --pam [--service X]`.
+pub(crate) fn install_for_setup(request: &PamRequest) -> anyhow::Result<()> {
+    debug_assert_eq!(request.action, PamAction::Add);
     crate::ipc_client::require_root_scripted("sudo facelock setup --pam")?;
     require_module_installed()?;
 
-    let request = PamRequest {
-        action: PamAction::Add,
-        services: services.to_vec(),
-        no_confirm,
-        allow_sensitive,
-        ..PamRequest::default()
+    let write = WriteRequest {
+        action: WriteAction::Add,
+        request,
+        remedy: "--yes",
     };
-    let targets = plan_writes(
-        Path::new(PAM_DIR),
-        PamAction::Add,
-        &requested_services(services),
-        &request,
-        "--yes",
-    )?;
-
-    let sink = Sink { json: false };
-    for target in &targets {
-        if let Outcome::Failed(error) = apply_add(target, request.no_confirm, &sink) {
-            return Err(anyhow::anyhow!(error));
-        }
-    }
-    sink.info(&PamMessage::PamExtensionHint {
-        line: PAM_LINE.to_string(),
-    });
+    let sink = Sink::human();
+    let reports = apply_all(&plan_writes(Path::new(PAM_DIR), &write)?, &write, &sink);
+    // Before the hint, which the alias has never printed after a failure —
+    // unlike the verb, whose closing hint fires whatever the rows say.
+    first_failure(&reports)?;
+    emit_extension_hint(&sink);
     Ok(())
 }
 
-/// `setup --pam --remove [--if-present]`, routed through the same engine.
-pub fn remove_for_setup(services: &[String], if_present: bool) -> anyhow::Result<()> {
+/// `setup --pam --remove [--if-present]`.
+pub(crate) fn remove_for_setup(request: &PamRequest) -> anyhow::Result<()> {
+    debug_assert_eq!(request.action, PamAction::Remove);
     crate::ipc_client::require_root_scripted("sudo facelock setup --pam --remove")?;
 
-    let request = PamRequest {
-        action: PamAction::Remove,
-        services: services.to_vec(),
-        if_present,
-        ..PamRequest::default()
+    let write = WriteRequest {
+        action: WriteAction::Remove,
+        request,
+        remedy: "--yes",
     };
-    let targets = plan_writes(
-        Path::new(PAM_DIR),
-        PamAction::Remove,
-        &requested_services(services),
-        &request,
-        "--yes",
-    )?;
-
-    let sink = Sink { json: false };
-    for target in &targets {
-        if let Outcome::Failed(error) = apply_remove(target, &sink) {
-            return Err(anyhow::anyhow!(error));
-        }
-    }
-    Ok(())
+    let sink = Sink::human();
+    let reports = apply_all(&plan_writes(Path::new(PAM_DIR), &write)?, &write, &sink);
+    first_failure(&reports)
 }
 
 /// One service, against `base`, with the wizard's semantics: the multi-select
 /// already *is* the per-service consent, and the module check already ran, so
-/// neither is repeated here.
-pub(crate) fn install_one_in(
-    base: &Path,
-    service: &str,
-    allow_sensitive: bool,
-    no_confirm: bool,
-) -> anyhow::Result<()> {
-    let request = PamRequest {
-        action: PamAction::Add,
-        allow_sensitive,
-        no_confirm,
-        ..PamRequest::default()
+/// neither is repeated here — nor is the closing hint, which the wizard emits
+/// itself once, after step 9, whatever that step decided.
+pub(crate) fn install_one_in(base: &Path, request: &PamRequest) -> anyhow::Result<()> {
+    debug_assert_eq!(request.action, PamAction::Add);
+    let write = WriteRequest {
+        action: WriteAction::Add,
+        request,
+        remedy: "--yes",
     };
-    let services = vec![service.to_string()];
-    let targets = plan_writes(base, PamAction::Add, &services, &request, "--yes")?;
-
-    let sink = Sink { json: false };
-    for target in &targets {
-        // `request.no_confirm`, never the parameter: one value reaches both
-        // phases, so the request cannot describe a run the apply does not do.
-        if let Outcome::Failed(error) = apply_add(target, request.no_confirm, &sink) {
-            return Err(anyhow::anyhow!(error));
-        }
-    }
-    Ok(())
+    let sink = Sink::human();
+    let reports = apply_all(&plan_writes(base, &write)?, &write, &sink);
+    first_failure(&reports)
 }
 
 #[cfg(test)]
@@ -1562,7 +1669,14 @@ mod tests {
             ("sudo", NO_NEWLINE_BEFORE, NO_NEWLINE_AFTER),
         ] {
             let via_alias = seeded(&[(service, before)]);
-            install_one_in(via_alias.path(), service, true, true).unwrap();
+            install_one_in(
+                via_alias.path(),
+                &PamRequest {
+                    allow_sensitive: true,
+                    ..add(&[service])
+                },
+            )
+            .unwrap();
 
             let via_verb = seeded(&[(service, before)]);
             write_in(via_verb.path(), &add(&[service])).unwrap();
@@ -1840,13 +1954,17 @@ mod tests {
             json: true,
             ..add(&["sudo", "omarchy-lock-face"])
         };
-        let services = requested_services(&request.services);
-        let targets = plan_writes(dir.path(), PamAction::Add, &services, &request, "--x").unwrap();
+        let write = WriteRequest {
+            action: WriteAction::Add,
+            request: &request,
+            remedy: "--x",
+        };
+        let targets = plan_writes(dir.path(), &write).unwrap();
 
-        let sink = Sink { json: true };
+        let sink = Sink::verb(true);
         let words: Vec<&str> = targets
             .iter()
-            .map(|t| report_plan(t, &sink).word())
+            .map(|t| report_plan(t, WriteAction::Add, &sink).word())
             .collect();
 
         assert_eq!(words, ["installed", "unchanged"]);
@@ -1960,7 +2078,7 @@ mod tests {
     #[test]
     fn a_rejected_name_reports_a_locale_independent_reason() {
         let dir = tempfile::TempDir::new().unwrap();
-        let sink = Sink { json: true };
+        let sink = Sink::verb(true);
 
         let reports = status_reports(dir.path(), &["../escape".to_string()], &sink);
 
@@ -2141,11 +2259,11 @@ mod tests {
         // `message::tests::quiet_silences_stdout_except_notice`, which pins
         // that `--quiet` does not reach it.
         assert_eq!(
-            Sink { json: false }.notice_route(),
+            Sink::human().notice_route(),
             Route::Notice,
             "the rollback advice must not be silenceable by --quiet"
         );
-        assert_eq!(Sink { json: true }.notice_route(), Route::Dropped);
+        assert_eq!(Sink::verb(true).notice_route(), Route::Dropped);
 
         let dir = seeded(&[("sudo", SUDO_BEFORE)]);
         write_in(dir.path(), &add(&["sudo"])).unwrap();
@@ -2269,7 +2387,7 @@ mod tests {
         fs::write(&outside, OMARCHY_PRESENT).unwrap();
         std::os::unix::fs::symlink(&outside, base.join("system-auth")).unwrap();
 
-        let sink = Sink { json: true };
+        let sink = Sink::verb(true);
         let reports = status_reports(&base, &["system-auth".to_string()], &sink);
 
         assert_eq!(
@@ -2346,7 +2464,7 @@ mod tests {
         fs::write(dir.path().join("second-name"), OMARCHY_PRESENT).unwrap();
         fs::hard_link(dir.path().join("second-name"), base.join("sudo")).unwrap();
 
-        let sink = Sink { json: true };
+        let sink = Sink::verb(true);
         let reports = status_reports(&base, &["sudo".to_string()], &sink);
 
         assert_eq!(
@@ -2461,8 +2579,16 @@ mod tests {
             return; // the check cannot fire; nothing to assert
         }
         for error in [
-            install_for_setup(&["sudo".to_string()], true, true).unwrap_err(),
-            remove_for_setup(&["sudo".to_string()], true).unwrap_err(),
+            install_for_setup(&PamRequest {
+                allow_sensitive: true,
+                ..add(&["sudo"])
+            })
+            .unwrap_err(),
+            remove_for_setup(&PamRequest {
+                if_present: true,
+                ..remove(&["sudo"])
+            })
+            .unwrap_err(),
         ] {
             let error = error.to_string();
             assert!(
