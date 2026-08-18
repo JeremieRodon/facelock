@@ -170,6 +170,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The CLI defaults to `warn`, and the daemon still logs at `info`.** Every
+  command used to emit INFO on stderr, so the setup wizard's questions arrived
+  interleaved with timestamped log lines and a run that was succeeding looked
+  broken. Diagnostics now start at `warn`, and the new global `-v` raises them
+  one step per repeat (`-v` info, `-vv` debug, `-vvv` trace). `facelock daemon
+  run` is unchanged at `info`, because it writes to the journal, where nothing
+  competes with it. `RUST_LOG` still outranks both, and unlike the environment
+  variable, `-v` survives `sudo`. Exit codes and stdout payloads are untouched
+  at every level, and every degradation worth acting on was already WARN or
+  above.
 - **`--quiet` has one implementation and one meaning** (#179/#193): it
   suppresses informational stdout and, on a command whose stdout is the payload,
   the payload too, so `facelock --quiet devices --json` writes nothing and the

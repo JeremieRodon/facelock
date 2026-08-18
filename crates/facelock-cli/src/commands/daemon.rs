@@ -287,21 +287,25 @@ pub fn restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `verbose` is the count of the global `-v`, and raises this process's log
+/// level one rung per repeat from the daemon's own INFO default.
+///
 /// `--config` is honored through the process-level override `main` installs
 /// before dispatch, which is what `Config::load()` and
 /// `paths::config_path()` both read — so startup, the live reload and the
 /// mtime watch cannot disagree about which file is the config.
-pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
+pub fn run(notifier_factory: NotifierFactory, verbose: u8) -> anyhow::Result<()> {
     crate::ipc_client::require_root("sudo facelock daemon run")?;
 
-    // Init tracing (the daemon is the one caller that wants targets rendered).
-    // See crate::logging's module doc for why this must not build its own
-    // subscriber by hand. The writer is stderr rather than the previous
+    // Init tracing (the daemon is the one caller that wants targets rendered,
+    // and the one that keeps INFO by default: the journal is its reader, and
+    // nothing competes with it there). See crate::logging's module doc for why
+    // this must not build its own subscriber by hand. The writer is stderr rather than the previous
     // stdout: the shipped unit sets `StandardOutput=journal` *and*
     // `StandardError=journal`, so the journal sees exactly what it saw before,
     // and a daemon run in the foreground now behaves like every other
     // subcommand.
-    crate::logging::init_stderr(true);
+    crate::logging::init_stderr(crate::logging::Program::Daemon, verbose);
 
     info!("facelock daemon starting");
 

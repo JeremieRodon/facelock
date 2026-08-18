@@ -116,7 +116,7 @@ kill %1             # stop daemon
 Control via `RUST_LOG` environment variable:
 ```bash
 RUST_LOG=facelock_daemon=debug facelock daemon    # verbose daemon
-RUST_LOG=facelock_cli=debug facelock test         # verbose CLI
+RUST_LOG=facelock=debug facelock test             # verbose CLI (or: facelock -vv test)
 ```
 
 ## Dev Config

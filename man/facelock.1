@@ -30,6 +30,16 @@ Path to the config file. Takes precedence over
 .TP
 .B \-q\fR, \fB\-\-quiet
 Suppress informational stdout; errors, prompts and exit codes are unchanged.
+.TP
+.B \-v\fR, \fB\-\-verbose
+Raise diagnostic verbosity on stderr, one level per repeat. A command starts at
+.BR warn ,
+so it prints warnings and errors and nothing quieter;
+.B facelock daemon run
+starts at info, because it writes to the journal.
+.B RUST_LOG
+outranks both. The level changes output volume only: exit codes and the
+payloads on stdout are identical at every level.
 .SH COMMANDS
 .TP
 .B setup
@@ -507,6 +517,9 @@ Number of recent entries to show (default: 20).
 .B RUST_LOG
 Controls log verbosity via the tracing/env_filter crate. Example:
 .BR RUST_LOG=debug .
+Outranks both the built-in default and
+.BR \-\-verbose ;
+a value that cannot be parsed is reported at warn level and ignored.
 .TP
 .B FACELOCK_CONFIG
 Override path to the configuration file.

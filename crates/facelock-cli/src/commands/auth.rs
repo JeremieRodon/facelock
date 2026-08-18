@@ -18,7 +18,7 @@ use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
 use tracing::{debug, error, info};
 
-pub fn run(user: String, config_path: Option<String>) -> i32 {
+pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
     // Deliberate parse (D7): `facelock auth` is its own one-shot process
     // spawned by PAM, so this is its top-of-process read — not a re-read.
     let config = match config_path {
@@ -35,7 +35,13 @@ pub fn run(user: String, config_path: Option<String>) -> i32 {
 
     // See crate::logging's module doc for why this must not build its own
     // subscriber by hand: it owns both the filter and the stderr writer.
-    crate::logging::init_stderr(false);
+    //
+    // `Program::Cli`, not `Daemon`: this process is spawned by
+    // `pam_facelock.so` with its stderr on a pipe nothing ever drains, and is
+    // otherwise something a person ran in a terminal. Neither reader wants
+    // INFO by default, and `facelock -v auth --user X` is how a run being
+    // debugged asks for it.
+    crate::logging::init_stderr(crate::logging::Program::Cli, verbose);
 
     // Loaded once, up front: auto-detection and the interrogation below must
     // be decided by the SAME quirk set, or the device picked and the device

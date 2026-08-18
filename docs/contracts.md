@@ -122,10 +122,14 @@ The invariants it pins:
   fall back to the process owner. Every other `--user` defaults to the current user
 - `--yes` is `-y` and accepts `--no-confirm` everywhere (it was `setup`-only)
 - `--json` and `--dry-run` take no short letter
-- `--config` (`-c`) and `--quiet` (`-q`) are declared once, `global = true`, and
-  are accepted on either side of the subcommand name. No command re-declares
-  them. `facelock daemon -c X` and `facelock -c X daemon` are equivalent, as are
-  `facelock is-enrolled --quiet` and `facelock --quiet is-enrolled`
+- `--config` (`-c`), `--quiet` (`-q`) and `--verbose` (`-v`) are declared once,
+  `global = true`, and are accepted on either side of the subcommand name. No
+  command re-declares them. `facelock daemon -c X` and `facelock -c X daemon`
+  are equivalent, as are `facelock is-enrolled --quiet` and
+  `facelock --quiet is-enrolled`
+- `--verbose` counts its repeats, one level per `-v` from the program's own
+  starting level (`warn` for the CLI, `info` for `daemon run`). `RUST_LOG`
+  outranks it
 - every subcommand has non-empty `about` text
 
 `legacy_invocations_still_parse`, alongside it, is a table of real argv — the PAM
@@ -148,6 +152,22 @@ JSON (#149).
 
 An unparseable `RUST_LOG` is reported at WARN (on stderr) and the built-in
 filter is used, rather than the value being silently discarded.
+
+**Diagnostics default to `warn` in the CLI and `info` in the daemon.** Someone
+typing a command reads its prompts and its report on the same terminal these
+events land on, so the CLI prints warnings and errors and nothing quieter.
+`facelock daemon run` keeps `info`, because the journal is its reader and
+nothing competes with it there. `-v` raises the level one step per repeat from
+whichever of the two this process started at. `RUST_LOG` outranks both,
+including when it is the quieter of them: an override a flag can shout over is
+not an override.
+
+The level governs output volume and nothing else. Exit codes and stdout
+payloads are identical at every level, so a consumer needs no flag it did not
+need before. Every degradation an operator has to act on is WARN or above and
+so survives the default: the D-Bus fallback in `backend::select`, an ONNX
+Runtime that would not load, a provider that could not be queried, an
+unreadable quirks file, an ignored `RUST_LOG`.
 
 **`--quiet` suppresses informational chatter, and on commands whose stdout is
 the payload, the payload too; errors, prompts and exit codes are unchanged.** A
