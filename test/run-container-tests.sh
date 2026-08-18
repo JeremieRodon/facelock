@@ -241,10 +241,114 @@ run_test "setup --pam --remove --if-present succeeds on an absent service file" 
     "facelock setup --pam --service facelock-scratch --remove --yes --if-present" \
     0
 
+# --- P1: vendor pam.d resolution ---
+#
+# Linux-PAM reads /etc/pam.d first and /usr/lib/pam.d second, and packages have
+# moved their configuration there: on this image `polkit` ships
+# /usr/lib/pam.d/polkit-1 and /etc/pam.d/polkit-1 does not exist. No tempdir
+# test can prove the real directories are the ones facelock reaches, and no row
+# above ever exercised a service that exists *only* in a vendor directory —
+# which is exactly how the bug shipped.
+#
+# The vendor file is hashed before and after every row. Exit status alone would
+# not catch the failure that matters: a successful-looking run that edited the
+# package's own file.
+
+VENDOR_PAM_DIR=/usr/lib/pam.d
+mkdir -p "$VENDOR_PAM_DIR"
+rm -f "$VENDOR_PAM_DIR/facelock-vendor-scratch" \
+      "$VENDOR_PAM_DIR/facelock-vendor-scratch.facelock-backup" \
+      /etc/pam.d/facelock-vendor-scratch \
+      /etc/pam.d/facelock-vendor-scratch.facelock-backup
+cat > "$VENDOR_PAM_DIR/facelock-vendor-scratch" <<'EOF'
+#%PAM-1.0
+auth       include        system-auth
+account    include        system-auth
+session    include        system-auth
+EOF
+chmod 644 "$VENDOR_PAM_DIR/facelock-vendor-scratch"
+sha256sum "$VENDOR_PAM_DIR/facelock-vendor-scratch" > /tmp/pam-vendor.sha
+# The file's bytes are one assertion; the directory's contents are another. A
+# stray temp file, a backup, or any new entry in a package-owned directory
+# passes every per-file hash, so the whole listing is snapshotted too.
+ls -a "$VENDOR_PAM_DIR" | LC_ALL=C sort > /tmp/pam-vendor-dir.before
+
+run_test "pam status: a vendor-only service is 'vendor-only', exit 1" \
+    "facelock pam status --service facelock-vendor-scratch --json > /tmp/pam-vendor-status.json 2>/dev/null; test \$? -eq 1 && python3 /tmp/pam-action.py /tmp/pam-vendor-status.json | grep -qx vendor-only && grep -q '$VENDOR_PAM_DIR/facelock-vendor-scratch' /tmp/pam-vendor-status.json && sha256sum -c --status /tmp/pam-vendor.sha" \
+    0
+
+# The headline row: the service is configured without the package's file being
+# touched, and the override says in its own bytes where it came from.
+run_test "pam add on a vendor-only service creates an /etc override" \
+    "facelock pam add --service facelock-vendor-scratch --json > /tmp/pam-vendor-add.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-add.json | grep -qx overridden && test -f /etc/pam.d/facelock-vendor-scratch && python3 /tmp/pam-first-auth.py /etc/pam.d/facelock-vendor-scratch && test \$(grep -c '^# Copied from $VENDOR_PAM_DIR/facelock-vendor-scratch' /etc/pam.d/facelock-vendor-scratch) -eq 1 && sha256sum -c --status /tmp/pam-vendor.sha && ! test -e $VENDOR_PAM_DIR/facelock-vendor-scratch.facelock-backup" \
+    0
+
+# Second add: the override now shadows the vendor file, so this is an ordinary
+# in-place no-op — one header, not two, and still nothing written to /usr.
+run_test "pam add again edits the override, writes no second header" \
+    "facelock pam add --service facelock-vendor-scratch --json > /tmp/pam-vendor-add2.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-add2.json | grep -qx unchanged && test \$(grep -c '^# Copied from ' /etc/pam.d/facelock-vendor-scratch) -eq 1 && sha256sum -c --status /tmp/pam-vendor.sha" \
+    0
+
+run_test "pam remove takes the line out of the override, not the vendor file" \
+    "facelock pam remove --service facelock-vendor-scratch --json > /tmp/pam-vendor-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-remove.json | grep -qx removed && test -f /etc/pam.d/facelock-vendor-scratch && ! grep -q pam_facelock.so /etc/pam.d/facelock-vendor-scratch && sha256sum -c --status /tmp/pam-vendor.sha" \
+    0
+
+rm -f /etc/pam.d/facelock-vendor-scratch /etc/pam.d/facelock-vendor-scratch.facelock-backup
+
+run_test "pam remove on a vendor-only service is a no-op, exit 0" \
+    "facelock pam remove --service facelock-vendor-scratch --json > /tmp/pam-vendor-remove2.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-remove2.json | grep -qx vendor-only && ! test -e /etc/pam.d/facelock-vendor-scratch && sha256sum -c --status /tmp/pam-vendor.sha" \
+    0
+
+# A genuinely absent service still errors — and the message names every
+# directory searched, not just the first. "Not found in /etc/pam.d" would send
+# an operator to create a file a vendor directory may already hold.
+run_test "an absent service names every directory searched" \
+    "facelock pam add --service facelock-nowhere-scratch > /tmp/pam-nowhere.out 2>&1; test \$? -ne 0 && grep -q '/etc/pam.d/facelock-nowhere-scratch' /tmp/pam-nowhere.out && grep -q '$VENDOR_PAM_DIR/facelock-nowhere-scratch' /tmp/pam-nowhere.out" \
+    0
+
+run_test "the vendor directory gained and lost nothing" \
+    "ls -a $VENDOR_PAM_DIR | LC_ALL=C sort > /tmp/pam-vendor-dir.after && diff -u /tmp/pam-vendor-dir.before /tmp/pam-vendor-dir.after" \
+    0
+
+rm -f "$VENDOR_PAM_DIR/facelock-vendor-scratch" /tmp/pam-vendor.sha \
+      /tmp/pam-vendor-dir.before /tmp/pam-vendor-dir.after \
+      /tmp/pam-vendor-status.json /tmp/pam-vendor-add.json \
+      /tmp/pam-vendor-add2.json /tmp/pam-vendor-remove.json \
+      /tmp/pam-vendor-remove2.json /tmp/pam-nowhere.out
+
+# The real thing, on the stock image: `sudo facelock setup --pam --service
+# polkit-1` is the invocation omarchy#7040 runs under `set -e`, and it exited 1
+# on every current Arch box. The guard is not a way out of the assertion — if
+# the layout is not the one this row exists for, it says so loudly rather than
+# passing quietly.
+if [ -f /usr/lib/pam.d/polkit-1 ] && [ ! -e /etc/pam.d/polkit-1 ]; then
+    sha256sum /usr/lib/pam.d/polkit-1 > /tmp/pam-polkit.sha
+    run_test "polkit-1 ships in the vendor directory and setup --pam configures it" \
+        "facelock setup --pam --service polkit-1 --yes > /tmp/pam-polkit.out 2>&1; test \$? -eq 0 && grep -qxF '$PAM_LINE_TEXT' /etc/pam.d/polkit-1 && python3 /tmp/pam-first-auth.py /etc/pam.d/polkit-1 && sha256sum -c --status /tmp/pam-polkit.sha" \
+        0
+    run_test "pam status now answers 0 for polkit-1" \
+        "facelock pam status --service polkit-1" \
+        0
+    rm -f /etc/pam.d/polkit-1 /etc/pam.d/polkit-1.facelock-backup \
+          /tmp/pam-polkit.sha /tmp/pam-polkit.out
+else
+    # Not a skip. This is the only end-to-end row for the bug the whole gap
+    # exists to fix, so an image that stops presenting the layout must cost a
+    # red suite rather than quietly delete the coverage.
+    echo "FAIL: polkit-1 is not vendor-only in this image \
+(expected /usr/lib/pam.d/polkit-1 to exist and /etc/pam.d/polkit-1 not to) — \
+the end-to-end vendor row did not run; fix the image or move the row to a \
+service that is vendor-only"
+    FAIL=$((FAIL + 1))
+fi
+
 rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
       /etc/pam.d/facelock-scratch.facelock-backup \
       /etc/pam.d/facelock-scratch2.facelock-backup \
       /etc/pam.d/facelock-scratch-link /tmp/facelock-outside \
+      /etc/pam.d/facelock-vendor-scratch \
+      /etc/pam.d/facelock-vendor-scratch.facelock-backup \
+      /usr/lib/pam.d/facelock-vendor-scratch \
       /tmp/pam-action.py /tmp/pam-first-auth.py
 
 # --- Spec 29: Smart PAM skip (no enrolled faces) ---

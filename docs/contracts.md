@@ -261,6 +261,45 @@ never a prompt.
 `setup --pam` is an alias onto it (above), and the wizard's step 9 calls the
 same writer, so there is one implementation of the edit and one set of rules.
 
+**Resolution order: `/etc/pam.d`, then `/usr/lib/pam.d`. First hit wins.** That
+is Linux-PAM's own precedence, and it is not academic: on current Arch `polkit`
+ships its configuration as `/usr/lib/pam.d/polkit-1` and `/etc/pam.d/polkit-1`
+does not exist, so a writer that looked only in `/etc/pam.d` could not
+configure the service at all. The list is `[pam] config_dirs` (Config Schema
+below) for a distribution whose vendor directory is somewhere else; there is no
+way to ask Linux-PAM at run time which one it was compiled with, so the default
+is the pair above and configuration is never required. A hit that is *refused* —
+a hard link, a symlink out of its directory — is still a hit: the search does
+not fall through to the next directory, because that would let a vendor file
+silently take over from an `/etc` entry facelock declined to follow.
+
+**Only the first directory is ever written to.** The rest are package-owned: an
+edit there is clobbered by the next upgrade and makes `pacman -Qkk` report a
+modified file. A service that resolves only in a vendor directory is **copied**
+into `/etc/pam.d` with the facelock line already in it — one atomic write of
+the final content, not a copy followed by an edit — and the copy carries a
+two-line provenance header naming the file it was forked from and saying that
+it shadows it and will not track vendor updates. The copy reports `overridden`
+rather than `installed`, and the operator is told at the time, on the
+unsuppressible `notice` stream, because a new shadowing file in `/etc` is a
+durable change with a maintenance consequence. Deleting the override restores
+the vendor file; `pam remove` takes the line out and leaves the override in
+place. The vendor file is never read-modified-written, never backed up, and
+never renamed over.
+
+**A vendor file that already carries the line needs no override.** `add`
+reports `unchanged` and writes nothing, and `status` reports `present`: a
+distribution that ships face auth in its own PAM stack is configured, and
+saying otherwise would send an integrator off to create a copy that adds
+nothing.
+
+**Direct service-file editing is the Arch-family path.** Debian and Ubuntu
+compose their stacks with `pam-auth-update` from profiles in
+`/usr/share/pam-configs/`, and Fedora and RHEL with `authselect` (see
+`dist/authselect/facelock`); on those systems a hand-inserted line is
+overwritten by the tool that owns the file. Being able to resolve a vendor
+directory does not make this command idiomatic there.
+
 **Confinement.** A service name is **one path component**: not empty, no `/`,
 not `.` or `..`, no interior NUL. Rejected before any I/O, on `add`, `remove`
 and `status` alike. `base.join(service)` is not a confinement primitive — an
@@ -268,19 +307,27 @@ absolute name *replaces* the base — so this is the check, not the join.
 Anything else is accepted: `PAM_CANDIDATES` is the wizard's menu, **not** an
 allowlist, and a service that is not on it must keep working.
 
-**Symlinks are followed only inside `/etc/pam.d`.** A well-formed name still
-has to survive the filesystem: on an authselect system `/etc/pam.d/system-auth`
-and `/etc/pam.d/password-auth` are symlinks into `/etc/authselect`, and read,
-copy and write all follow a link without being asked to. So the entry is
-`lstat`ed, and a link is canonicalized: a target **under** `/etc/pam.d` is
-followed — the real file is what gets read, rewritten and backed up, so the
+**Symlinks are followed only inside the directory the entry was found in.** A
+well-formed name still has to survive the filesystem: on an authselect system
+`/etc/pam.d/system-auth` and `/etc/pam.d/password-auth` are symlinks into
+`/etc/authselect`, and read, copy and write all follow a link without being
+asked to. So the entry is `lstat`ed, and a link is canonicalized: a target
+**under that same directory** is followed — the real file is what gets read, rewritten and backed up, so the
 `.facelock-backup` lands beside the file that changed rather than beside the
-link — and a target anywhere else is a validation failure. So is a link that
-cannot be resolved at all; the rule is "prove it stays inside", and a dangling
-link proves nothing. Being a validation failure, it writes nothing for the
+link — and a target anywhere else is a validation failure — **including a target in a
+directory later on the search path.** `/etc/pam.d/polkit-1 ->
+/usr/lib/pam.d/polkit-1`, wired up by hand, is therefore refused rather than
+treated as a vendor hit: it is a link out of `/etc`, and following it would put
+the edit in the package's own file, which is the one thing this must never do.
+The fix is to delete the link and let `pam add` create a real override. So is a
+link that cannot be resolved at all; the rule is "prove it stays inside", and a
+dangling link proves nothing. Being a validation failure, it writes nothing for the
 whole run, and `pam status` reports the service as `unknown` with the fixed
 reason `symlinked outside /etc/pam.d` (the human message on stderr names the
-target). Editing through such a link would edit a file authselect regenerates,
+target). That reason is a fixed name for the class, not a rendering of the
+directory that was violated: an entry in a vendor directory pointing out of
+*that* directory reports the same string, and the human message is what names
+the real one. Editing through such a link would edit a file authselect regenerates,
 so the change would disappear on the next `authselect apply-changes` with
 nothing to say it had.
 
@@ -291,9 +338,11 @@ cannot be shown to stay inside the directory. `pam status` reports it as
 `unknown` with the fixed reason `hard-linked service file`. This is
 conservative rather than adversarial: a `/etc` that has been through a
 deduplicating backup or `jdupes -L` can trip it with nobody attacking anything,
-so the message says how to break the link. The atomic replace under "Limits"
-retires the rule, since a temp file and a rename write a new inode and leave
-the other name alone.
+so the message says how to break the link. The atomic replace does **not**
+retire the rule: a rename writes a new inode, so it leaves the other name
+holding the *old* content — one of a file's names carrying the line and the
+rest not is a worse answer than a refusal, and still a change to a file
+facelock cannot name.
 
 **`--if-present` does not forgive a link fault.** A dangling or looping symlink
 is not an absent service file: absence is a fact about the directory, and an
@@ -354,12 +403,12 @@ validation phase, before any prompt exists to skip, so an unattended
 | Command | Code | Meaning |
 |---------|------|---------|
 | `pam status` | 0 | every requested service carries the line |
-| `pam status` | 1 | at least one requested service exists without it |
+| `pam status` | 1 | at least one requested service exists without it, in `/etc/pam.d` (`missing`) or only in a vendor directory (`vendor-only`) |
 | `pam status` | 2 | at least one is absent, unreadable, misnamed, symlinked out of the directory, or hard-linked |
 | `pam status --if-present` | 0 | every requested service **that exists** carries the line |
 | `pam status --if-present` | 1 | at least one existing service carries no line |
 | `pam status --if-present` | 2 | as above, minus the absent case, which no longer forces 2 |
-| `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `absent` under `--if-present`, and `declined` |
+| `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `overridden` (`add` created the `/etc/pam.d` copy), `vendor-only` (`remove` had nothing of its own to take out of a package-owned file), `absent` under `--if-present`, and `declined` |
 | `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure |
 
 `pam status` is on `grep`'s scale and `is-enrolled`'s: a boolean query whose
@@ -370,6 +419,13 @@ asked, and `--json` is how a script tells it from an install.
 **`--dry-run`** prints the resolved plan, writes nothing, and exits 0. It is
 honoured *after* the root check (see DEC-6 above).
 
+**A service that exists in no directory names them all.** The refusal `add`
+and `remove` raise, and the line `status` prints, both list every path tried:
+the same question must not be answered two ways by two verbs. The machine
+`path` field on a `status` row stays a single path — the first directory's,
+where an override would go — because the field is one string and always has
+been.
+
 **`--if-present` means the same thing on all three verbs.** A service file that
 is not there is not an error: on `add` and `remove` the service is reported
 `absent` and the exit code is unaffected, and on `status` the `absent` row no
@@ -379,14 +435,29 @@ exist. That is what lets "install the optional integrations with
 nothing else — an unreadable file, a rejected name, or a link out of the
 directory is still an error on every verb.
 
-**Limits.** Two, both deliberate and neither hidden. The write is
-truncate-in-place rather than a temp file and a rename, so a process killed
-between the truncate and the last byte leaves a short service file; the
-recovery is the `.facelock-backup` taken immediately before. And `remove` takes
-no backup of its own — it relies on the one `add` wrote, which is why nothing
-in this command ever deletes a backup. An atomic replace has to carry the mode,
-owner and SELinux context across, which is the same primitive the
-vendor-to-`/etc` copy needs, and lands with it.
+**Every write is atomic.** A temp file in the destination's own directory,
+`fsync`, then a rename — so a reader sees the old file or the new one and never
+a short one, which matters because a truncated `/etc/pam.d/polkit-1` breaks
+polkit auth machine-wide and a truncated `system-auth` breaks the machine. The
+new file carries the mode and owner of the file it replaces (of the vendor
+original, for a copy) and the SELinux context of the file being replaced; a
+copy has no context to inherit and takes the destination directory's, which is
+what SELinux's own type transition would have given it. **POSIX ACLs and every
+xattr other than the SELinux label are not carried across** — a `setfacl`'d
+service file loses its ACL on the first `pam add`, which is written down rather
+than guessed at. A failed write removes its temp file, so a refusal leaves no
+debris in `/etc/pam.d`.
+
+**The `.facelock-backup` is written the same way**, and that is what makes it
+safe: a rename replaces the *name*, so a symlink standing at
+`<service>.facelock-backup` is replaced rather than followed — the confinement
+rules cover the service file, and nothing covered its backup while the backup
+was a `copy`. It also means the file `add` tells the operator to restore from
+cannot be a short one.
+
+**Limit.** One, deliberate and not hidden: `remove` takes no backup of its own.
+It relies on the one `add` wrote, which is why nothing in this command ever
+deletes a backup.
 
 **`--json`** emits exactly one document on stdout and no human text; `--quiet`
 suppresses even that, leaving the exit code as the whole answer, as it does for
@@ -429,13 +500,22 @@ new top-level field is additive. Field names do not change and are not removed;
 object, and `error` is present when `action` is `failed` or `unknown`. **`error` is a
 diagnostic, not a contract** — branch on `action`, never on `error`'s text. A
 rejected service name reports the fixed C-locale string `invalid service name`,
-a service symlinked out of the directory `symlinked outside /etc/pam.d`, and a
+a service symlinked out of the directory it was found in
+`symlinked outside /etc/pam.d` — a fixed name for the class, whichever
+directory it was — and a
 hard-linked one `hard-linked service file`, but the OS-level failures (`failed` on a write, `unknown` on an unreadable
 file) interpolate a `strerror` string, which follows the operator's
 `LC_MESSAGES` like any other C library message. Nothing else in a `--json`
 document is locale-dependent. `backup`
 is the `.facelock-backup` path when one exists on disk after the operation and
-`null` otherwise — always `null` under `--dry-run`, which writes none. `path`
+`null` otherwise — always `null` under `--dry-run`, which writes none, and
+always `null` for an `overridden` service: the copy preserved nothing, so it
+took no backup, and a `.facelock-backup` left at the override path by an
+earlier run is not this run's rollback and is not reported as one. Deleting the
+override is its undo, and the vendor original is untouched.
+`path` on an `overridden` row is the **override that was created**, not the
+vendor file it was read from; on a `vendor-only` row it is the vendor file,
+which is the one that exists. `path`
 is itself `null` when `action` is `unknown` because the *name* was rejected: no
 path was ever resolved, and reporting `/etc/pam.d/../escape` named a path
 nothing went near, which reads as one that was acted on. A service rejected for
@@ -449,6 +529,8 @@ one it does not know rather than treat it as an error**:
 | `action` | Verb | Meaning |
 |----------|------|---------|
 | `installed` | `add` | the line was written (under `--dry-run`, would be) |
+| `overridden` | `add` | the service resolved only in a vendor directory, so an `/etc/pam.d` copy carrying the line was created from it (under `--dry-run`, would be) |
+| `vendor-only` | `remove`, `status` | the service resolves only in a vendor directory: nothing was written, and there is no local override to carry a line |
 | `removed` | `remove` | the line was deleted (under `--dry-run`, would be) |
 | `unchanged` | `add`, `remove` | already in the requested state |
 | `absent` | all three | the service file does not exist |
@@ -873,6 +955,7 @@ TOML format. All keys optional — camera auto-detected, sensible defaults for e
 | `[audit]` | `enabled`, `path`, `rotate_size_mb` |
 | `[tpm]` | `seal_database`, `pcr_binding`, `pcr_indices`, `tcti` |
 | `[polkit]` | `face_eligible_actions` |
+| `[pam]` | `config_dirs` |
 
 `[polkit].face_eligible_actions` is the allowlist of polkit `action_id`s for which
 the face authentication agent may offer face auth. Default:
@@ -894,6 +977,27 @@ fallthrough to a password dialog. The intended UX (non-eligible actions
 handled by the desktop's normal password agent) is unverified pending
 live-desktop testing and may require a design change. Behavior here is
 fail-closed: a non-eligible action is never face-authorized.
+
+`[pam].config_dirs` is where `facelock pam add | remove | status` looks for PAM
+service files, in search order — Linux-PAM's own precedence, earliest wins.
+Default: `["/etc/pam.d", "/usr/lib/pam.d"]`. **The first entry is the override
+directory: every write lands there and every later entry is read-only**, so a
+service that resolves only in a later one is copied into the first before the
+line is inserted. Setting a package-owned directory first would make facelock
+edit package files. An empty list is treated as the default rather than as a
+request to disable the writer, and so is **any list with a non-absolute entry**
+— a relative first entry would resolve the write target against the invoking
+shell's working directory — and **any list whose first entry is also one of the
+later ones**, spelled twice or reached through a symlink, which would collapse
+the override layer onto a read-only one. `pam` is dispatched before the process-wide config
+parse, so a missing or broken config yields the default list rather than an
+error — editing `/etc/pam.d` must not be blocked by an unrelated config
+mistake. `FACELOCK_CONFIG` is ignored in a privileged process, so the
+environment cannot redirect where a root `pam add` writes; the global
+`--config` flag is a process override and *is* honoured under `sudo`, which is
+root naming a different file on purpose rather than the environment doing it
+behind root's back. See "facelock pam
+Semantics" above for the resolution rules themselves.
 
 **Encryption defaults (Plan 04).** `encryption.method` defaults to `keyfile`: face
 templates are encrypted at rest by default. The keyfile is auto-generated at mode `0600`

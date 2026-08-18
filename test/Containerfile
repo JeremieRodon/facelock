@@ -5,7 +5,10 @@ FROM archlinux:latest
 # `sqlite` provides the sqlite3 CLI used by the device-coupling E2E assertions
 # (Plan 02) to inspect/seed face_models.device_id deterministically.
 # `python`/`python-gobject` back the fake-daemon harness for the PAM trust-boundary tests (Plan 05).
-RUN pacman -Syu --noconfirm pam sudo base-devel libxkbcommon just dbus onnxruntime-cpu protobuf python python-gobject sqlite && pacman -Scc --noconfirm
+# `polkit` is what makes the vendor-directory rows real rather than synthetic: it ships its PAM
+# configuration as /usr/lib/pam.d/polkit-1 with no /etc/pam.d/polkit-1, which is the exact layout
+# `facelock pam add --service polkit-1` used to fail on.
+RUN pacman -Syu --noconfirm pam polkit sudo base-devel libxkbcommon just dbus onnxruntime-cpu protobuf python python-gobject sqlite && pacman -Scc --noconfirm
 
 # Build pamtester from upstream source (curl and the toolchain come from base-devel above)
 COPY test/install-pamtester.sh /tmp/install-pamtester.sh

@@ -81,15 +81,36 @@
 //! — on the name as typed and on the file it resolved to ([`gate_sensitive`]).
 //! Otherwise `alias -> system-auth` is an ungated name for a gated file.
 //!
+//! # Vendor directories
+//!
+//! A service name is not a file in one directory. Linux-PAM reads `/etc/pam.d`
+//! first and a compile-time *vendor* directory second — `/usr/lib/pam.d` on
+//! every distribution that enables the feature — and packages have moved their
+//! configuration there: on current Arch, `polkit` ships
+//! `/usr/lib/pam.d/polkit-1` and `/etc/pam.d/polkit-1` does not exist. So
+//! [`PamDirs`] is an ordered search path, [`Target::locate`] takes the whole of
+//! it, and the first directory holding the name wins.
+//!
+//! **Only the first directory is ever written to.** The rest are package-owned:
+//! an edit there is clobbered by the next upgrade and makes `pacman -Qkk`
+//! report a modified file. A service that resolves only in a vendor directory
+//! is *copied* into `/etc/pam.d` with the facelock line already in it — one
+//! atomic write of the final content — and the copy carries a provenance
+//! header saying what it was forked from. That is what the `/etc` layer is
+//! for.
+//!
 //! # Limits
 //!
-//! The write is `fs::write`: truncate in place, not a temp file and a rename,
-//! so a kill between the truncate and the last byte leaves a short service
-//! file. `remove` takes no backup of its own and relies on the one `add`
-//! wrote. Both are stated in `docs/contracts.md` ("facelock pam Semantics",
-//! Limits) rather than fixed here, because an atomic replace has to carry the
-//! mode, owner and SELinux context across, which is the same primitive the
-//! vendor-to-`/etc` copy needs; see the `TODO(P1)` markers below.
+//! `remove` takes no backup of its own and relies on the one `add` wrote.
+//! Stated in `docs/contracts.md` ("facelock pam Semantics", Limits) rather
+//! than fixed here.
+//!
+//! A replace writes a new inode, so it carries what it is told to carry: mode,
+//! owner and the SELinux label. **POSIX ACLs and every other xattr are not
+//! carried** — a `setfacl`'d service file loses its ACL on the first `pam
+//! add`. No distribution ships one, and reconstructing an arbitrary ACL is not
+//! something this should be guessing at, so it is written down rather than
+//! attempted.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -100,8 +121,12 @@ use dialoguer::Confirm;
 
 use crate::message::{Message, PamMessage, Terminal, fail};
 
-/// The real PAM configuration directory. Every engine function takes it as a
-/// parameter so tests drive the whole writer against a tempdir, unprivileged.
+/// The PAM configuration directory every write lands in — the *first* entry of
+/// the search path, and the only one this module ever modifies.
+///
+/// The search path itself is [`PamDirs`], which every engine function takes as
+/// a parameter so tests drive the whole writer against a tempdir,
+/// unprivileged.
 pub const PAM_DIR: &str = "/etc/pam.d";
 
 /// The line this command adds and removes. Matching is by module name rather
@@ -165,15 +190,170 @@ const BACKUP_SUFFIX: &str = ".facelock-backup";
 const INVALID_SERVICE_NAME: &str = "invalid service name";
 
 /// The `--json` `error` value for a service file that is a symlink leading out
-/// of [`PAM_DIR`]. Fixed C-locale text for the same reason as
-/// [`INVALID_SERVICE_NAME`]; the human gets the localized message, which names
-/// the target, on stderr. It spells the real directory rather than the `base`
-/// under test because it is a documented constant, not a rendering.
+/// of the directory it was found in. Fixed C-locale text for the same reason
+/// as [`INVALID_SERVICE_NAME`]; the human gets the localized message, which
+/// names the target, on stderr.
+///
+/// **It is a fixed name for the class, not a rendering of the directory that
+/// was violated.** It spells [`PAM_DIR`] because that is the directory the
+/// case is about in practice and because a documented constant may not vary
+/// with the machine — an entry in a vendor directory pointing outside *that*
+/// directory reports this same token, and the human message
+/// ([`Rejected::message`], which carries the base) is what names the real
+/// one.
 const SYMLINKED_OUT_OF_DIR: &str = "symlinked outside /etc/pam.d";
 
 /// The `--json` `error` value for a service file with more than one name.
 /// Fixed C-locale text, as above.
 const HARD_LINKED: &str = "hard-linked service file";
+
+// ---------------------------------------------------------------------------
+// The search path
+// ---------------------------------------------------------------------------
+
+/// Where a service name is looked up, in order, and where a write may land.
+///
+/// A newtype rather than a bare slice for one reason: **the first entry is the
+/// override directory**, the only one this module writes to, and that is an
+/// invariant worth a constructor. An empty list would leave no directory to
+/// write to at all, so [`PamDirs::new`] substitutes the defaults for one —
+/// `config_dirs = []` is a mistake, not a request to disable the writer.
+///
+/// Every engine function takes it as a parameter, which is what lets the whole
+/// writer be driven against a tempdir pair by an unprivileged test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PamDirs {
+    dirs: Vec<PathBuf>,
+}
+
+impl PamDirs {
+    /// The search path, or [`PamConfig`]'s default when the list cannot be
+    /// used.
+    ///
+    /// Three ways it cannot be. **Empty** is a mistake rather than a request to
+    /// disable the writer — there would be no directory left to write to. **A
+    /// first entry that is also a later entry** (spelled twice, or reached
+    /// through a symlink) collapses the override layer onto a read-only one,
+    /// which is how "never write to a vendor directory" would stop being true
+    /// without anyone editing this file. **Any non-absolute entry** poisons
+    /// the whole list: a relative first
+    /// entry would resolve the write target against the invoking shell's
+    /// working directory, so `cd /tmp && sudo facelock pam add` would edit
+    /// `/tmp/<dir>/sudo` and report it as though it were the real thing. Only
+    /// root can write `/etc/facelock/config.toml`, so this is a mistake to
+    /// catch rather than an attack to defend against, and catching it is the
+    /// same policy a broken config gets: fall back to the default and say so.
+    ///
+    /// The whole list is rejected rather than the offending entry filtered
+    /// out, because a list with a hole in it is not the search order anyone
+    /// wrote down.
+    ///
+    /// [`PamConfig`]: facelock_core::config::PamConfig
+    pub(crate) fn new(dirs: Vec<PathBuf>) -> Self {
+        if dirs.is_empty() {
+            return Self::default();
+        }
+        if let Some(relative) = dirs.iter().find(|dir| !dir.is_absolute()) {
+            tracing::warn!(
+                entry = %relative.display(),
+                "ignoring [pam] config_dirs: every entry must be an absolute path"
+            );
+            return Self::default();
+        }
+        // The write directory may not *be* one of the read-only ones, however
+        // it is spelled. `Origin::Local` is decided by comparing the current
+        // base against the first entry, which is a comparison of paths, so
+        // `["/etc/pam.d", "/etc/pam.d"]` — or a first entry that is a symlink
+        // onto a later one — would make the vendor layer and the override
+        // layer the same directory and quietly turn "never write to a vendor
+        // directory" into a write to one. Canonicalized because that is the
+        // question: two names for one directory are one directory.
+        let canonical: Vec<PathBuf> = dirs
+            .iter()
+            .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+            .collect();
+        if let Some(alias) = canonical[1..].iter().find(|dir| **dir == canonical[0]) {
+            tracing::warn!(
+                first = %dirs[0].display(),
+                alias = %alias.display(),
+                "ignoring [pam] config_dirs: the override directory is also a search directory"
+            );
+            return Self::default();
+        }
+        PamDirs { dirs }
+    }
+
+    /// The machine's search path: `[pam] config_dirs` when the config file
+    /// parses, the defaults when it does not.
+    ///
+    /// This is the module's own read of the config, and the exception is
+    /// deliberate: `main` dispatches `pam` *ahead* of the process-wide parse
+    /// precisely so a missing or broken config cannot be the thing that stops
+    /// an operator editing `/etc/pam.d` (see the dispatch comment in
+    /// `main.rs`). A config that does not parse therefore yields the default
+    /// list rather than an error — the same policy `is-enrolled` has for its
+    /// unprivileged path. The path itself is resolved by
+    /// `facelock_core::paths::config_path`, which ignores `FACELOCK_CONFIG` in
+    /// a privileged process, so the environment cannot redirect where a root
+    /// `pam add` writes.
+    pub(crate) fn system() -> Self {
+        let dirs = crate::resolved::ConfigLoad::read()
+            .config()
+            .map(|config| config.pam.config_dirs.clone())
+            .unwrap_or_else(|| facelock_core::config::PamConfig::default().config_dirs);
+        Self::new(dirs.into_iter().map(PathBuf::from).collect())
+    }
+
+    /// The directory writes land in: the first entry.
+    fn overrides(&self) -> &Path {
+        // `new` and `default` both guarantee a non-empty list; the fallback
+        // keeps the guarantee total rather than trusting it.
+        self.dirs.first().map_or(Path::new(PAM_DIR), |dir| dir)
+    }
+
+    /// The directories, in search order.
+    fn iter(&self) -> impl Iterator<Item = &Path> {
+        self.dirs.iter().map(|dir| dir.as_path())
+    }
+
+    /// The whole search path for a message that names where it looked.
+    pub(crate) fn display(&self) -> String {
+        self.dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<String>>()
+            .join(", ")
+    }
+}
+
+/// A one-directory search path: what every test that predates vendor
+/// resolution means by "the PAM directory", and still the shape of a machine
+/// with no vendor `pam.d`. Shared with `setup.rs`'s tests, which drive the
+/// wizard's step 9 against a tempdir the same way.
+#[cfg(test)]
+pub(crate) fn only(dir: impl AsRef<Path>) -> PamDirs {
+    PamDirs::from(dir.as_ref())
+}
+
+impl Default for PamDirs {
+    fn default() -> Self {
+        PamDirs {
+            dirs: facelock_core::config::PamConfig::default()
+                .config_dirs
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        }
+    }
+}
+
+/// One directory, which is what a test — and the setup wizard's tempdir-driven
+/// step 9 — means by "the PAM directory".
+impl From<&Path> for PamDirs {
+    fn from(dir: &Path) -> Self {
+        PamDirs::new(vec![dir.to_path_buf()])
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Exit codes
@@ -305,8 +485,24 @@ struct WriteRequest<'a> {
 enum Outcome {
     /// `add`: the line was written (or, under `--dry-run`, would be).
     Installed,
+    /// `add`: the service resolved only in a vendor directory, so an
+    /// `/etc/pam.d` copy carrying the line was created from it (or would be).
+    ///
+    /// A new word rather than `installed`, because what happened to the
+    /// machine is different: a file that did not exist now shadows a
+    /// package-owned one and will not track its updates.
+    Overridden,
     /// `remove`: the line was deleted (or would be).
     Removed,
+    /// The service resolves only in a vendor directory and nothing was
+    /// written. What `remove` reports (there is nothing of facelock's to take
+    /// out of a file it never wrote) and what `status` reports for a service
+    /// that has no `/etc/pam.d` copy and no facelock line.
+    ///
+    /// **Not `absent`.** The service file exists; it is the local override
+    /// that does not, and `add` would create one. Overloading `absent` would
+    /// change the meaning of a word integrators already branch on.
+    VendorOnly,
     /// The service was already in the requested state.
     Unchanged,
     /// The service file does not exist.
@@ -338,6 +534,8 @@ impl Outcome {
     fn word(&self) -> &'static str {
         match self {
             Outcome::Installed => "installed",
+            Outcome::Overridden => "overridden",
+            Outcome::VendorOnly => "vendor-only",
             Outcome::Removed => "removed",
             Outcome::Unchanged => "unchanged",
             Outcome::Absent => "absent",
@@ -392,57 +590,140 @@ struct ServiceReport {
 enum Plan {
     /// The file needs rewriting, from these bytes.
     Rewrite { content: String },
+    /// The service resolved only in a vendor directory and `add` will create
+    /// the local override from these bytes — the vendor file's, which the copy
+    /// carries the facelock line and a provenance header on top of.
+    ///
+    /// A plan of its own rather than a flag beside [`Plan::Rewrite`]: the two
+    /// write different files and print different things, and which one is
+    /// happening is decided once, in [`plan_writes`], rather than re-derived
+    /// by each applier from the target's origin.
+    Override { content: String },
+    /// The service resolves only in a vendor directory and this verb does not
+    /// write there. `remove`'s answer, and a no-op.
+    VendorOnly,
     /// Already in the requested state.
     NoChange,
     /// No service file, and `--if-present` said that is fine.
     Absent,
 }
 
-/// A validated service: which file the name resolves to, where its backup
-/// goes, and what is planned for it.
+/// Which directory of the search path a name was found in.
 ///
-/// [`Target::locate`] is the only place a service name becomes a path —
-/// `base.join`, the confinement rule and the symlink rule are applied there
-/// and nowhere else — so `status` cannot answer about a different file than
-/// `add` would write.
+/// The one fact that decides whether a write is an edit or a copy, kept beside
+/// the path rather than re-derived by comparing prefixes at each use site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Origin {
+    /// Found in the override directory, so the file is edited in place. Every
+    /// service on a machine with no vendor `pam.d` is this.
+    Local,
+    /// Found only in a vendor directory. Carries the override path a copy
+    /// would be written to, since that — not [`Target::path`] — is where any
+    /// write for this service lands.
+    Vendor { override_path: PathBuf },
+    /// Found in no directory at all. Carries every path tried, because the
+    /// refusal has to name them: "not found in `/etc/pam.d`" is a misleading
+    /// half-answer once there is more than one place to look.
+    Nowhere { tried: Vec<PathBuf> },
+}
+
+/// A validated service: which file the name resolves to, where it was found,
+/// where its backup goes, and what is planned for it.
+///
+/// [`Target::locate`] is the only place a service name becomes a path — the
+/// join, the confinement rule, the symlink rule and the search order are
+/// applied there and nowhere else — so `status` cannot answer about a
+/// different file than `add` would write.
 #[derive(Debug, Clone)]
 struct Target {
     service: String,
+    /// The file the name resolved to: the override file when one exists, the
+    /// vendor file when only that does, and the path the override *would* have
+    /// when nothing exists anywhere.
     path: PathBuf,
+    origin: Origin,
     backup: PathBuf,
     plan: Plan,
 }
 
 impl Target {
-    /// Resolve one service against `base`, or say why it cannot be.
+    /// Resolve one service against `dirs`, or say why it cannot be.
     ///
     /// The plan starts as [`Plan::NoChange`], which is the truth for a caller
     /// that is not going to write — `status` uses this and leaves it alone.
     /// [`plan_writes`] fills it in.
-    fn locate(base: &Path, service: &str) -> Result<Self, Rejected> {
+    fn locate(dirs: &PamDirs, service: &str) -> Result<Self, Rejected> {
         if confined(service).is_err() {
             return Err(Rejected::Name);
         }
-        let path = resolve_service_path(base, service)?;
+        let (path, origin) = resolve_service_path(dirs, service)?;
         Ok(Target {
             service: service.to_string(),
-            backup: backup_path(&path),
+            backup: backup_path(write_target(&path, &origin)),
             path,
+            origin,
             plan: Plan::NoChange,
         })
+    }
+
+    /// The file a write for this target lands in: the resolved file for an
+    /// in-place edit, the override path for a vendor copy. Never a vendor
+    /// directory.
+    fn write_path(&self) -> &Path {
+        write_target(&self.path, &self.origin)
     }
 
     fn path_string(&self) -> String {
         self.path.display().to_string()
     }
 
+    /// The `path` field of this target's report row: the file the operation
+    /// acted on. That is the resolved file for every plan but
+    /// [`Plan::Override`], whose subject is the override it creates rather
+    /// than the vendor file it read.
+    fn reported_path(&self) -> String {
+        match self.plan {
+            Plan::Override { .. } => self.write_path().display().to_string(),
+            _ => self.path_string(),
+        }
+    }
+
     fn backup_string(&self) -> String {
         self.backup.display().to_string()
     }
 
+    /// Whether the service file exists anywhere on the search path.
+    fn exists(&self) -> bool {
+        !matches!(self.origin, Origin::Nowhere { .. })
+    }
+
+    /// Every path the resolver looked at, for the not-found refusal. A service
+    /// that *was* found and then vanished — deleted between the resolve and
+    /// the read — reports the one path it was found at, which is the only one
+    /// that would tell the operator anything.
+    fn tried_paths(&self) -> String {
+        match &self.origin {
+            Origin::Nowhere { tried } => tried
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<String>>()
+                .join(", "),
+            Origin::Local | Origin::Vendor { .. } => self.path_string(),
+        }
+    }
+
     /// The backup path if it exists on disk, for the report's `backup` field.
     fn existing_backup(&self) -> Option<String> {
-        existing_backup_for(&self.path)
+        existing_backup_for(self.write_path())
+    }
+}
+
+/// Where a write lands, as a free function so [`Target::locate`] can derive the
+/// backup path before the `Target` exists.
+fn write_target<'a>(path: &'a Path, origin: &'a Origin) -> &'a Path {
+    match origin {
+        Origin::Vendor { override_path } => override_path,
+        Origin::Local | Origin::Nowhere { .. } => path,
     }
 }
 
@@ -459,9 +740,20 @@ impl Target {
 enum Rejected {
     /// The name is not one path component, so nothing was resolved at all.
     Name,
-    /// The entry is a symlink whose target is outside `base`, or one that
-    /// cannot be resolved to prove otherwise.
-    OutOfBase { link: PathBuf, target: PathBuf },
+    /// The entry is a symlink whose target is outside the directory the entry
+    /// itself was found in, or one that cannot be resolved to prove otherwise.
+    ///
+    /// `base` is that directory rather than the whole search path: with
+    /// several directories the rule is **per directory**, so
+    /// `/etc/pam.d/polkit-1 -> /usr/lib/pam.d/polkit-1` is out of base and
+    /// refused, even though the target sits in a directory facelock would have
+    /// searched next. Carrying it here is what lets the refusal name the
+    /// directory that was actually violated.
+    OutOfBase {
+        link: PathBuf,
+        target: PathBuf,
+        base: PathBuf,
+    },
     /// The entry is a regular file reachable by more than one name. Which
     /// other names is exactly what a link count does not say, so the edit
     /// cannot be shown to stay inside the directory.
@@ -480,12 +772,12 @@ impl Rejected {
     }
 
     /// The localized refusal, for a human on stderr.
-    fn message(&self, base: &Path, service: &str) -> PamMessage {
+    fn message(&self, service: &str) -> PamMessage {
         match self {
             Rejected::Name => PamMessage::PamInvalidServiceName {
                 service: service.to_string(),
             },
-            Rejected::OutOfBase { link, target } => PamMessage::PamServiceSymlinkedOutside {
+            Rejected::OutOfBase { link, target, base } => PamMessage::PamServiceSymlinkedOutside {
                 path: link.display().to_string(),
                 target: target.display().to_string(),
                 dir: base.display().to_string(),
@@ -556,14 +848,30 @@ fn confined(service: &str) -> anyhow::Result<()> {
     }))
 }
 
-/// The file a validated `service` names under `base`, or the reason it cannot
-/// be written through.
+/// The file a validated `service` names on the search path, and which
+/// directory it came from — or the reason it cannot be written through.
+///
+/// **First hit wins, and a hit that is refused is still a hit.** Each
+/// directory is asked in turn; the first one holding an entry for the name
+/// answers, whether the answer is a path or a refusal. Falling through to the
+/// next directory after a refusal would let a vendor file silently take over
+/// from an `/etc` entry this declined to follow, which is the opposite of what
+/// the refusal is for.
+///
+/// The per-entry rules below are unchanged from the single-directory writer,
+/// with one restatement forced by there being several: a symlink must resolve
+/// under **the directory the entry was found in**, not under some union of
+/// them. `/etc/pam.d/polkit-1 -> /usr/lib/pam.d/polkit-1` is therefore
+/// [`Rejected::OutOfBase`] and refused, even though the target is in a
+/// directory the search would have reached next: it is a link out of `/etc`,
+/// and following it would put an edit in a package-owned file.
 ///
 /// `confined` checks the *name*; this checks what the filesystem does with it,
 /// and there are two ways for a well-formed name to reach a file this cannot
 /// account for.
 ///
-/// **Symlinks.** `read_to_string`, `fs::copy` and `fs::write` all follow one,
+/// **Symlinks.** `read_to_string` follows one, and so does every write that is
+/// not a `rename`,
 /// so on an authselect system `/etc/pam.d/system-auth -> /etc/authselect/…`
 /// would be edited in place — a file authselect regenerates, with the backup
 /// left beside the link rather than beside the file that changed. A link that
@@ -579,43 +887,114 @@ fn confined(service: &str) -> anyhow::Result<()> {
 /// **Hard links.** A symlink can be followed to somewhere and checked. A
 /// second *hard* link cannot: `nlink > 1` says another name for this inode
 /// exists and says nothing about where, so an edit here silently changes a
-/// file this cannot name — the confinement rule's whole subject. Refusing is
-/// the conservative reading, and it is temporary: the atomic temp-and-rename
-/// replace under "Limits" writes a new inode and leaves the other name alone,
-/// which makes the question moot. A `/etc` that has been through a
+/// file this cannot name — the confinement rule's whole subject. The atomic
+/// replace does not retire the rule, as this comment once said it would: a
+/// rename writes a *new* inode, so it does not corrupt the other name, it
+/// silently leaves it holding the old content — an operator who asked for one
+/// file to carry the line gets one of its names carrying it and the rest not,
+/// which is a worse answer than a refusal. A `/etc` that has been through a
 /// deduplicating backup or `jdupes -L` can trip this without any adversary
 /// involved, so the message says how to break the link.
-fn resolve_service_path(base: &Path, service: &str) -> Result<PathBuf, Rejected> {
-    use std::os::unix::fs::MetadataExt;
+fn resolve_service_path(dirs: &PamDirs, service: &str) -> Result<(PathBuf, Origin), Rejected> {
+    let overrides = dirs.overrides();
+    let mut tried = Vec::new();
 
-    let path = base.join(service);
-    // No entry, or an entry this cannot stat: there is nothing to follow. The
-    // read that follows reports the error, or `--if-present` forgives it.
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return Ok(path);
+    for base in dirs.iter() {
+        let entry = base.join(service);
+        let Some(resolved) = resolve_in(base, &entry) else {
+            tried.push(entry);
+            continue;
+        };
+        let path = resolved?;
+        let origin = if base == overrides {
+            Origin::Local
+        } else {
+            Origin::Vendor {
+                override_path: overrides.join(service),
+            }
+        };
+        return Ok((path, origin));
+    }
+
+    // Nothing anywhere. The path is where an override would go, which is what
+    // every message about a service that is not installed should name; `tried`
+    // is what the not-found refusal lists.
+    Ok((overrides.join(service), Origin::Nowhere { tried }))
+}
+
+/// One directory's answer for one entry: `None` when there is nothing there,
+/// otherwise the file to act on or the reason not to.
+fn resolve_in(base: &Path, entry: &Path) -> Option<Result<PathBuf, Rejected>> {
+    let metadata = match fs::symlink_metadata(entry) {
+        Ok(metadata) => metadata,
+        // Nothing here. This is the *only* reason the search moves on: an
+        // absence is a fact about the directory.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        // An entry that exists but cannot be examined — `EACCES` on a
+        // hardened `/etc/pam.d`, `EIO` or `ESTALE` on a network mount — is not
+        // an absence, and treating it as one turns an honest failure into a
+        // confident wrong answer: the service would resolve to the *vendor*
+        // copy and `status` would report `vendor-only` for a service the
+        // override configures. So the search stops here and the entry is
+        // returned unexamined; the read that follows reports the error, which
+        // is what the single-directory writer did with the same input
+        // (`status` → `unknown`, exit 2; `add` → the read error).
+        Err(_) => return Some(Ok(entry.to_path_buf())),
     };
 
     if !metadata.file_type().is_symlink() {
-        // `is_file` matters: a directory's link count is its subdirectory
-        // count, and a directory where a service file should be is a read
-        // error reported as one, not a link fault.
-        if metadata.is_file() && metadata.nlink() > 1 {
-            return Err(Rejected::HardLinked {
-                link: path,
-                links: metadata.nlink(),
-            });
-        }
-        return Ok(path);
+        return Some(hard_link_checked(entry.to_path_buf()));
     }
 
-    match (fs::canonicalize(&path), fs::canonicalize(base)) {
-        (Ok(target), Ok(root)) if target.starts_with(&root) => Ok(target),
-        (Ok(target), _) => Err(Rejected::OutOfBase { link: path, target }),
-        (Err(_), _) => Err(Rejected::OutOfBase {
-            target: fs::read_link(&path).unwrap_or_else(|_| path.clone()),
-            link: path,
+    Some(match (fs::canonicalize(entry), fs::canonicalize(base)) {
+        // The link stays inside the directory, so the *target* is the file
+        // that will be read, written and backed up — and therefore the file
+        // the link-count rule is about. Checking only the entry would let
+        // `alias -> real` reach a multiply-named inode under a name that
+        // looks single, which is the same hole the sensitive gate's second
+        // call exists to close.
+        (Ok(target), Ok(root)) if target.starts_with(&root) => hard_link_checked(target),
+        (Ok(target), _) => Err(Rejected::OutOfBase {
+            link: entry.to_path_buf(),
+            target,
+            base: base.to_path_buf(),
         }),
+        (Err(_), _) => Err(Rejected::OutOfBase {
+            target: fs::read_link(entry).unwrap_or_else(|_| entry.to_path_buf()),
+            link: entry.to_path_buf(),
+            base: base.to_path_buf(),
+        }),
+    })
+}
+
+/// `path`, or the refusal if the file it names has more than one name.
+///
+/// One implementation for both ways a name reaches a file — the entry itself
+/// and the target of an in-directory symlink — because the rule is about the
+/// *inode*, and under an atomic replace a second name is not a theoretical
+/// concern: `rename` writes a new inode, so an edit made through one name
+/// leaves every other name holding the old content. A `remove` that reported
+/// `removed` while a hard-linked `password-auth-ac` kept the facelock line
+/// would be a fail-open on the shared auth stack, reported as success.
+///
+/// A path this cannot `stat` is passed through: the read that follows reports
+/// the error, which is the same answer every other unexaminable entry gets.
+fn hard_link_checked(path: PathBuf) -> Result<PathBuf, Rejected> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = fs::metadata(&path) else {
+        return Ok(path);
+    };
+    // `is_file` matters: a directory's link count is its subdirectory count,
+    // and a directory where a service file should be is a read error reported
+    // as one, not a link fault.
+    if metadata.is_file() && metadata.nlink() > 1 {
+        return Err(Rejected::HardLinked {
+            links: metadata.nlink(),
+            link: path,
+        });
     }
+    Ok(path)
 }
 
 /// Refuse a [`SENSITIVE_SERVICES`] entry unless the caller accepted the risk.
@@ -677,7 +1056,7 @@ fn requested_services(services: &[String]) -> Vec<String> {
 /// handed in one list while the request named another had two lists to keep
 /// in step, and `install_one_in` did exactly that — it acted on one service
 /// while its request said "none, so `sudo`".
-fn plan_writes(base: &Path, write: &WriteRequest) -> anyhow::Result<Vec<Target>> {
+fn plan_writes(dirs: &PamDirs, write: &WriteRequest) -> anyhow::Result<Vec<Target>> {
     let services = requested_services(&write.request.services);
     let mut targets = Vec::with_capacity(services.len());
 
@@ -685,11 +1064,12 @@ fn plan_writes(base: &Path, write: &WriteRequest) -> anyhow::Result<Vec<Target>>
         // On the name as typed, before any I/O.
         gate_sensitive(service, write)?;
 
-        let located =
-            Target::locate(base, service).map_err(|why| fail(why.message(base, service)))?;
-        // ...and again on the file the name reached. A link `alias ->
-        // system-auth` inside the directory is a gated file behind an ungated
-        // name, and the gate is on the file.
+        let located = Target::locate(dirs, service).map_err(|why| fail(why.message(service)))?;
+        // ...and again on the file the name reached — in whichever directory
+        // that was. A link `alias -> system-auth` inside the directory is a
+        // gated file behind an ungated name, and so is a vendor
+        // `/usr/lib/pam.d/system-auth` reached under an ungated alias. The
+        // gate is on the file.
         gate_sensitive(&file_name_of(&located.path), write)?;
 
         let display = located.path_string();
@@ -698,7 +1078,12 @@ fn plan_writes(base: &Path, write: &WriteRequest) -> anyhow::Result<Vec<Target>>
             Ok(content) => Some(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !write.request.if_present {
-                    return Err(fail(PamMessage::PamFileNotFound { path: display }));
+                    // Every path tried, not just the override directory's:
+                    // "not found in /etc/pam.d" is a misleading half-answer on
+                    // a machine that also has a vendor directory.
+                    return Err(fail(PamMessage::PamFileNotFound {
+                        paths: located.tried_paths(),
+                    }));
                 }
                 None
             }
@@ -709,11 +1094,34 @@ fn plan_writes(base: &Path, write: &WriteRequest) -> anyhow::Result<Vec<Target>>
             }
         };
 
-        let plan = match content {
-            None => Plan::Absent,
+        let plan = match (content, &located.origin) {
+            (None, _) => Plan::Absent,
+            // A service whose only copy is package-owned. `remove` has
+            // nothing to do — it never wrote there — and says so rather than
+            // reporting a file it did not touch as `unchanged`.
+            (Some(_), Origin::Vendor { .. }) if write.action == WriteAction::Remove => {
+                Plan::VendorOnly
+            }
+            // ...and `add` creates the local override instead of editing the
+            // package's file, unless the vendor file already carries the line,
+            // in which case there is nothing an override would add.
+            (Some(content), Origin::Vendor { override_path }) => {
+                if content.lines().any(is_facelock_pam_line) {
+                    Plan::NoChange
+                } else {
+                    // Phase one, so the copy's destination is validated before
+                    // anything is written — including under `--dry-run`, which
+                    // is a preview of the real run and must not promise a write
+                    // into a directory that cannot take one. The in-place edit
+                    // has no equivalent check because its destination is the
+                    // file it just read.
+                    writable_override_dir(override_path)?;
+                    Plan::Override { content }
+                }
+            }
             // The same question for both verbs — "does the line exist?" — and
             // opposite answers about whether that means work to do.
-            Some(content) => {
+            (Some(content), Origin::Local | Origin::Nowhere { .. }) => {
                 let present = content.lines().any(is_facelock_pam_line);
                 if present == (write.action == WriteAction::Remove) {
                     Plan::Rewrite { content }
@@ -727,6 +1135,47 @@ fn plan_writes(base: &Path, write: &WriteRequest) -> anyhow::Result<Vec<Target>>
     }
 
     Ok(targets)
+}
+
+/// Refuse in phase one if the override a vendor-only service needs cannot be
+/// created — the directory is missing, or not writable by this process.
+///
+/// `faccessat` with `AT_EACCESS` rather than a mode check: what matters is
+/// whether *this* process may write there, which mode bits alone do not answer
+/// (root ignores them, a read-only mount overrides them).
+fn writable_override_dir(override_path: &Path) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = override_path.parent().unwrap_or(Path::new("/"));
+    let refuse = |error: std::io::Error| {
+        fail(PamMessage::PamOverrideDirUnwritable {
+            dir: dir.display().to_string(),
+            path: override_path.display().to_string(),
+            error: error.to_string(),
+        })
+    };
+
+    let c_dir = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        refuse(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains embedded NUL",
+        ))
+    })?;
+    // SAFETY: `c_dir` is a NUL-terminated C string that outlives the call, and
+    // `faccessat` only reads it.
+    let ok = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_dir.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    } == 0;
+    if ok {
+        return Ok(());
+    }
+    Err(refuse(std::io::Error::last_os_error()))
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -801,6 +1250,202 @@ fn with_line_removed(content: &str) -> String {
         output.push('\n');
     }
     output
+}
+
+/// The two comment lines a vendor copy carries, so the next reader knows the
+/// file is a local override and what it was forked from.
+///
+/// Above everything, including the facelock line: it is provenance for the
+/// whole file, not for the line. `is_facelock_pam_line` skips comments, so it
+/// never affects what `remove` takes out or what `status` sees.
+fn provenance_header(vendor: &Path) -> String {
+    format!(
+        "# Copied from {} by facelock {} on {}.\n\
+         # This local override shadows the vendor file and will not track vendor updates.\n",
+        vendor.display(),
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The atomic replace
+// ---------------------------------------------------------------------------
+
+/// Write `content` to `path` as a temp file and a rename, carrying `model`'s
+/// mode and owner — and `path`'s own SELinux context — onto the new file.
+///
+/// **Every write this module makes goes through here** — the in-place edit,
+/// the vendor copy, and the `.facelock-backup` — and there is one
+/// implementation rather than one per verb because they need the same
+/// property: a `/etc/pam.d/polkit-1` truncated by a kill between the truncate
+/// and the last byte breaks polkit auth machine-wide, and a half-written
+/// `system-auth` breaks the machine. A rename is atomic, so a reader sees
+/// either the old file or the new one and never a short one. It is also what
+/// makes the destination safe to *name*: a rename replaces the name rather
+/// than following it, so neither a service file nor a backup path that someone
+/// has turned into a symlink can redirect the bytes.
+///
+/// `model` is the file whose ownership the result must have: the target itself
+/// for an in-place edit — where this preserves what was already there — and
+/// the vendor file for a copy, where it is the only provenance available. The
+/// temp file is created in the destination's own directory, because a rename
+/// across filesystems is not a rename at all, and it is removed on any failure
+/// so a refused write leaves no debris in `/etc/pam.d`.
+///
+/// The SELinux context is taken from the file being **replaced**, not from
+/// `model`: an in-place edit must keep the label it had, and a copy into
+/// `/etc/pam.d` must *not* inherit the vendor file's `/usr` label. When there
+/// is no file to take one from — the copy case — the temp file already has the
+/// destination directory's type by SELinux's own type-transition rules, which
+/// is the label the new file should have. So the copy is best-effort by
+/// construction: failing it degrades to the label the file would have had
+/// anyway.
+fn replace_atomically(path: &Path, content: &str, model: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no parent directory"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no file name"))?;
+    let model = fs::metadata(model)?;
+
+    // A dotted name so that even a reader enumerating the directory mid-write
+    // sees something obviously not a service file, and unique per process and
+    // instant so two concurrent runs cannot collide on it. `create_new` is the
+    // check that they did not.
+    let temp = dir.join(format!(
+        ".{}.facelock-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default(),
+    ));
+
+    // Every piece of metadata is applied to the **open descriptor**, before
+    // the `fsync` and before the rename. By path it would be a window — a
+    // `chmod` on a name, which is a different question from a `chmod` on the
+    // file this just wrote — and it would leave the mode, owner and label
+    // outside the `fsync` that is supposed to make the new file durable.
+    let written = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(model.mode())
+            .open(&temp)?;
+        file.write_all(content.as_bytes())?;
+
+        // `OpenOptions::mode` is masked by the umask, so the mode is set again
+        // rather than trusted: a service file that came out 0600 because the
+        // caller's umask was 0177 is unreadable to every PAM stack that uses
+        // it.
+        file.set_permissions(fs::Permissions::from_mode(model.mode()))?;
+        let current = file.metadata()?;
+        if (model.uid(), model.gid()) != (current.uid(), current.gid()) {
+            fchown(&file, model.uid(), model.gid())?;
+        }
+        copy_selinux_context(path, &file);
+
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+
+    if written.is_err() {
+        // Best effort: the write already failed, and the report names that
+        // failure rather than whatever went wrong tidying up after it.
+        let _ = fs::remove_file(&temp);
+        return written;
+    }
+
+    // The rename is what makes the content visible; this is what makes it
+    // survive a power cut, and it is best-effort for the same reason `fsync`
+    // on a directory is optional on every filesystem that matters.
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+/// `fchown(2)`, which `std::fs` does not expose.
+///
+/// On the descriptor rather than on the path: `chown(2)` follows symlinks and
+/// resolves the name again, so it answers a question about whatever the name
+/// points at *now* instead of about the file this just wrote.
+fn fchown(file: &fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // SAFETY: the descriptor is owned by `file` and stays open for the call.
+    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Carry the label of the file at `from` onto the open `to`, if there is one
+/// to carry.
+///
+/// The destination is the descriptor, like the mode and the owner: the label
+/// belongs to the file this wrote, not to a name that could be something else
+/// by the time the call lands. The source is read by path with `lgetxattr`,
+/// which is a read of a file that already exists and is not required to be the
+/// one being replaced — it simply is, in every case this has.
+///
+/// Silent when the source has no label (no SELinux, or a filesystem without
+/// xattrs), because that is the overwhelmingly common case and it is not a
+/// failure. Noisy only when a label existed and could not be set, which is the
+/// one combination that leaves the new file labelled differently from the old.
+fn copy_selinux_context(from: &Path, to: &fs::File) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+
+    const SELINUX_XATTR: &std::ffi::CStr = c"security.selinux";
+    // Longer than any policy's context; a label that does not fit is left to
+    // the type transition rather than truncated, which would be worse.
+    let mut context = [0u8; 256];
+
+    let Ok(c_from) = CString::new(from.as_os_str().as_bytes()) else {
+        return;
+    };
+
+    // SAFETY: the C string outlives the call, and the buffer's length is
+    // passed as its capacity, so the call cannot write past it.
+    let read = unsafe {
+        libc::lgetxattr(
+            c_from.as_ptr(),
+            SELINUX_XATTR.as_ptr(),
+            context.as_mut_ptr().cast(),
+            context.len(),
+        )
+    };
+    if read <= 0 {
+        return;
+    }
+
+    // SAFETY: as above; `read` bytes were just written into `context`, and the
+    // descriptor is owned by `to` and stays open for the call.
+    let set = unsafe {
+        libc::fsetxattr(
+            to.as_raw_fd(),
+            SELINUX_XATTR.as_ptr(),
+            context.as_ptr().cast(),
+            read as usize,
+            0,
+        )
+    };
+    if set != 0 {
+        tracing::warn!(
+            source = %from.display(),
+            error = %std::io::Error::last_os_error(),
+            "could not carry the SELinux context onto the new PAM service file"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -973,9 +1618,13 @@ fn should_prompt(no_confirm: bool, stdin_is_tty: bool, stderr_is_tty: bool) -> b
 /// already-present notice, or the preview, the confirmation, the backup line
 /// and the installed line with its rollback instructions.
 fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
-    let path = target.path_string();
+    let path = target.reported_path();
 
-    let content = match &target.plan {
+    // A vendor copy is `Plan::Override`: a different destination, no backup —
+    // there is no `/etc` file to preserve — and a notice of its own, since
+    // creating a shadowing file is a durable change with a maintenance
+    // consequence the operator has to be told about.
+    let (content, from_vendor) = match &target.plan {
         Plan::NoChange => {
             sink.info(&PamMessage::PamLineAlreadyPresent { path });
             return Outcome::Unchanged;
@@ -984,7 +1633,17 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
             sink.info(&PamMessage::PamServiceAbsentSkipped { path });
             return Outcome::Absent;
         }
-        Plan::Rewrite { content } => content.as_str(),
+        // `plan_writes` builds `VendorOnly` for `remove` alone, so `add`
+        // cannot reach it. Answered as the no-op it names rather than with an
+        // invented write; the assertion is where a debug build says the
+        // invariant broke.
+        Plan::VendorOnly => {
+            debug_assert!(false, "a vendor-only plan reached `add`");
+            sink.info(&PamMessage::PamVendorOnly { path });
+            return Outcome::VendorOnly;
+        }
+        Plan::Rewrite { content } => (content.as_str(), false),
+        Plan::Override { content } => (content.as_str(), true),
     };
     let backup = target.backup_string();
 
@@ -996,15 +1655,30 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
         std::io::stderr().is_terminal(),
     );
 
-    sink.preview(
-        &PamMessage::PamModifyPreview {
-            path: path.clone(),
-            line: PAM_LINE.to_string(),
-            hint: insertion_hint(content).localized(),
-            backup: backup.clone(),
-        },
-        prompting,
-    );
+    // Two previews, because they promise different things: the in-place edit
+    // names the backup it is about to take, and the copy has none to name —
+    // its undo is deleting the file it is about to create.
+    if from_vendor {
+        sink.preview(
+            &PamMessage::PamOverridePreview {
+                path: path.clone(),
+                vendor: target.path_string(),
+                line: PAM_LINE.to_string(),
+                hint: insertion_hint(content).localized(),
+            },
+            prompting,
+        );
+    } else {
+        sink.preview(
+            &PamMessage::PamModifyPreview {
+                path: path.clone(),
+                line: PAM_LINE.to_string(),
+                hint: insertion_hint(content).localized(),
+                backup: backup.clone(),
+            },
+            prompting,
+        );
+    }
 
     let proceed = if !prompting {
         true
@@ -1024,27 +1698,57 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
         return Outcome::Declined;
     }
 
-    if let Err(error) = fs::copy(&target.path, &target.backup) {
-        return Outcome::Failed(format!("failed to back up {path} to {backup}: {error}"));
+    // No backup for a copy: there is no `/etc` file to preserve, and copying
+    // the *vendor* file to `<service>.facelock-backup` would name a backup of
+    // a file nothing changed. Deleting the override is the undo, and the
+    // notice below says so.
+    //
+    // The backup goes through the same atomic replace as the edit it protects,
+    // and for two reasons beyond symmetry. `fs::copy` opens its destination
+    // `O_CREAT|O_TRUNC` and **follows symlinks**, so a symlink planted at
+    // `<service>.facelock-backup` sent the copy's bytes to wherever it pointed
+    // — the confinement rules cover the service path and never covered this
+    // one, and `rename` replaces the *name* rather than following it. And a
+    // `copy` killed halfway leaves a short backup, which is exactly the file
+    // `PamInstalled` tells the operator to restore from. `content` is the
+    // bytes phase one read, so the backup is the file this is about to
+    // replace, not whatever the path holds by the time the copy runs.
+    if !from_vendor {
+        if let Err(error) = replace_atomically(&target.backup, content, &target.path) {
+            return Outcome::Failed(format!("failed to back up {path} to {backup}: {error}"));
+        }
+        sink.info(&PamMessage::PamBackedUp {
+            path: path.clone(),
+            backup: backup.clone(),
+        });
     }
-    sink.info(&PamMessage::PamBackedUp {
-        path: path.clone(),
-        backup: backup.clone(),
-    });
 
-    // TODO(P1): truncate-in-place. A kill between the truncate and the last
-    // byte leaves a short service file; the fix is a temp file and a rename
-    // that carries mode, owner and SELinux context across, which is the same
-    // primitive the vendor-to-/etc copy needs. Documented under "Limits" in
-    // docs/contracts.md until then; the backup above is the recovery.
-    if let Err(error) = fs::write(&target.path, with_line_inserted(content)) {
+    // The copy and the line-insert are one write of the final content: two
+    // renames where one will do is two chances to leave a service file
+    // half-configured. `target.path` is the mode-and-owner model either way —
+    // the file itself for an edit, the vendor original for a copy.
+    let with_line = with_line_inserted(content);
+    let written = if from_vendor {
+        format!("{}{with_line}", provenance_header(&target.path))
+    } else {
+        with_line
+    };
+    if let Err(error) = replace_atomically(target.write_path(), &written, &target.path) {
         return Outcome::Failed(format!("failed to write {path}: {error}"));
     }
 
-    // `notice`, not `info`: this is the one message that tells an operator who
+    // `notice`, not `info`: these are the messages that tell an operator who
     // has just changed an auth stack how to undo it, so `--quiet` must not
-    // take it. Still stdout, so a normal run prints the same bytes it always
+    // take them. Still stdout, so a normal run prints the same bytes it always
     // did. Under `--json` the row's `backup` field carries the same fact.
+    if from_vendor {
+        sink.notice(&PamMessage::PamVendorOverridden {
+            path,
+            vendor: target.path_string(),
+            service: target.service.clone(),
+        });
+        return Outcome::Overridden;
+    }
     sink.notice(&PamMessage::PamInstalled {
         path,
         backup,
@@ -1069,21 +1773,40 @@ fn apply_remove(target: &Target, sink: &Sink) -> Outcome {
             // Returns before the backup notice, as the old writer did.
             return Outcome::Absent;
         }
+        // The service exists only as a package-owned file. `remove` never
+        // writes to a vendor directory, so there is nothing to take out —
+        // reported as itself rather than as `unchanged`, which would claim
+        // this had looked at a file in `/etc/pam.d`.
+        Plan::VendorOnly => {
+            sink.info(&PamMessage::PamVendorOnly { path });
+            return Outcome::VendorOnly;
+        }
         Plan::NoChange => {
             sink.info(&PamMessage::PamNoLineFound { path: path.clone() });
             Outcome::Unchanged
         }
-        // TODO(P1): truncate-in-place, and `remove` takes no backup of its
-        // own — it relies on the one `add` wrote. Both are stated under
-        // "Limits" in docs/contracts.md; the atomic replace is the same work
-        // as in `apply_add`.
-        Plan::Rewrite { content } => match fs::write(&target.path, with_line_removed(content)) {
-            Ok(()) => {
-                sink.info(&PamMessage::PamRemoved { path: path.clone() });
-                Outcome::Removed
+        // `remove` still takes no backup of its own — it relies on the one
+        // `add` wrote, which is the remaining entry under "Limits" in
+        // docs/contracts.md. The write itself is atomic, like every other.
+        Plan::Rewrite { content } => {
+            match replace_atomically(&target.path, &with_line_removed(content), &target.path) {
+                Ok(()) => {
+                    sink.info(&PamMessage::PamRemoved { path: path.clone() });
+                    Outcome::Removed
+                }
+                Err(error) => Outcome::Failed(format!("failed to write {path}: {error}")),
             }
-            Err(error) => Outcome::Failed(format!("failed to write {path}: {error}")),
-        },
+        }
+        // `plan_writes` builds `Override` for `add` alone. Answered like
+        // `VendorOnly` rather than with a failure of its own: if that ever
+        // stopped being true, the safe answer is still "write nothing to a
+        // vendor directory", and the assertion is where a debug build says the
+        // invariant broke.
+        Plan::Override { .. } => {
+            debug_assert!(false, "an override plan reached `remove`");
+            sink.info(&PamMessage::PamVendorOnly { path });
+            return Outcome::VendorOnly;
+        }
     };
 
     if let Some(backup) = target.existing_backup() {
@@ -1095,7 +1818,7 @@ fn apply_remove(target: &Target, sink: &Sink) -> Outcome {
 
 /// Render the resolved plan for `--dry-run`, writing nothing.
 fn report_plan(target: &Target, action: WriteAction, sink: &Sink) -> Outcome {
-    let path = target.path_string();
+    let path = target.reported_path();
     match (&target.plan, action) {
         (Plan::Rewrite { content }, WriteAction::Add) => {
             sink.info(&PamMessage::PamPlanAdd {
@@ -1107,6 +1830,18 @@ fn report_plan(target: &Target, action: WriteAction, sink: &Sink) -> Outcome {
         (Plan::Rewrite { .. }, WriteAction::Remove) => {
             sink.info(&PamMessage::PamPlanRemove { path });
             Outcome::Removed
+        }
+        (Plan::Override { content }, _) => {
+            sink.info(&PamMessage::PamPlanOverride {
+                path,
+                vendor: target.path_string(),
+                hint: insertion_hint(content).localized(),
+            });
+            Outcome::Overridden
+        }
+        (Plan::VendorOnly, _) => {
+            sink.info(&PamMessage::PamVendorOnly { path });
+            Outcome::VendorOnly
         }
         (Plan::NoChange, _) => {
             sink.info(&PamMessage::PamPlanNoChange { path });
@@ -1193,10 +1928,16 @@ fn emit_json(request: &PamRequest, dry_run: bool, reports: &[ServiceReport]) {
 /// re-running a `/etc/pam.d` edit under `sudo` from a wrapper script is a
 /// surprise, not a convenience.
 pub fn run(request: PamRequest) -> anyhow::Result<i32> {
+    // `status` needs no root and returns before the check, as it always has.
     if request.action == PamAction::Status {
-        return Ok(status_in(Path::new(PAM_DIR), &request));
+        return Ok(status_in(&PamDirs::system(), &request));
     }
 
+    // C6: the first statement of the write path, before the config read the
+    // search path needs. Resolving the search path first would be harmless
+    // today — the read is silent and cannot fail — but "first statement" is
+    // the property this rule pins, and a rule that has to be re-argued from
+    // the current implementation is not a rule.
     crate::ipc_client::require_root_scripted(&format!(
         "sudo facelock pam {}",
         request.action.word()
@@ -1206,7 +1947,7 @@ pub fn run(request: PamRequest) -> anyhow::Result<i32> {
         require_module_installed()?;
     }
 
-    write_in(Path::new(PAM_DIR), &request)
+    write_in(&PamDirs::system(), &request)
 }
 
 /// Whether the PAM module is where the line needs it to be.
@@ -1229,7 +1970,19 @@ fn require_module_installed() -> anyhow::Result<()> {
     }))
 }
 
-/// Whether `service` under `base` carries the facelock line.
+/// Whether `service` has a file anywhere on the search path.
+///
+/// The wizard's menu question (`setup.rs`'s `candidates_in`), asked through the
+/// resolver rather than with a `base.join(name).exists()` of its own: a
+/// candidate that ships only in a vendor directory — `polkit-1` on current
+/// Arch — is offerable, and `pam add` will configure it. An entry this refuses
+/// to follow is *not* offered: the menu should not propose a service the
+/// writer will then decline.
+pub(crate) fn service_exists(dirs: &PamDirs, service: &str) -> bool {
+    Target::locate(dirs, service).is_ok_and(|target| target.exists())
+}
+
+/// Whether `service` under `dirs` carries the facelock line.
 ///
 /// The question `status` answers, for a caller that wants the boolean and has
 /// no exit code to produce — `setup`'s hyprlock handoff, which read
@@ -1237,8 +1990,8 @@ fn require_module_installed() -> anyhow::Result<()> {
 /// name resolve to" beside this module's. An unreadable or unresolvable
 /// service is `false`: the caller decides whether to *offer* something, and
 /// "cannot tell" is not a reason to.
-pub(crate) fn is_configured(base: &Path, service: &str) -> bool {
-    let Ok(target) = Target::locate(base, service) else {
+pub(crate) fn is_configured(dirs: &PamDirs, service: &str) -> bool {
+    let Ok(target) = Target::locate(dirs, service) else {
         return false;
     };
     fs::read_to_string(&target.path).is_ok_and(|content| content.lines().any(is_facelock_pam_line))
@@ -1276,11 +2029,18 @@ fn apply_all(targets: &[Target], write: &WriteRequest, sink: &Sink) -> Vec<Servi
 
             ServiceReport {
                 service: target.service.clone(),
-                path: Some(target.path_string()),
+                path: Some(target.reported_path()),
+                // An `overridden` row has no backup **by construction**: the
+                // copy preserved nothing, so a `.facelock-backup` sitting at
+                // the override path is some earlier run's, and offering it as
+                // this run's rollback would promise a restore of a file this
+                // did not touch. Deleting the override is the undo, and the
+                // notice says so.
+                backup: match (&outcome, write.request.dry_run) {
+                    (_, true) | (Outcome::Overridden, _) => None,
+                    _ => target.existing_backup(),
+                },
                 outcome,
-                backup: (!write.request.dry_run)
-                    .then(|| target.existing_backup())
-                    .flatten(),
             }
         })
         .collect()
@@ -1310,12 +2070,12 @@ fn first_failure(reports: &[ServiceReport]) -> anyhow::Result<()> {
 
 /// `add` / `remove` against `base`. The engine tests drive this directly, so
 /// it performs no root or module check — [`run`] owns those.
-fn write_in(base: &Path, request: &PamRequest) -> anyhow::Result<i32> {
+fn write_in(dirs: &PamDirs, request: &PamRequest) -> anyhow::Result<i32> {
     let Some(action) = WriteAction::of(request.action) else {
         // `run` routes `status` to `status_in` and never gets here. Delegating
         // rather than falling through is what stops a future caller from
         // getting a *removal* out of a request that asked to read.
-        return Ok(status_in(base, request));
+        return Ok(status_in(dirs, request));
     };
     let write = WriteRequest {
         action,
@@ -1325,7 +2085,7 @@ fn write_in(base: &Path, request: &PamRequest) -> anyhow::Result<i32> {
     let sink = Sink::verb(request.json);
 
     // Phase one. An `Err` here has written nothing, by construction.
-    let targets = plan_writes(base, &write)?;
+    let targets = plan_writes(dirs, &write)?;
     let reports = apply_all(&targets, &write, &sink);
 
     if action == WriteAction::Add {
@@ -1350,9 +2110,9 @@ fn write_in(base: &Path, request: &PamRequest) -> anyhow::Result<i32> {
 /// The exit code is the answer, on `grep`'s scale and `is-enrolled`'s: 0 every
 /// service has the line, 1 at least one does not, 2 at least one could not be
 /// answered. The worst outcome wins.
-fn status_in(base: &Path, request: &PamRequest) -> i32 {
+fn status_in(dirs: &PamDirs, request: &PamRequest) -> i32 {
     let sink = Sink::verb(request.json);
-    let reports = status_reports(base, &requested_services(&request.services), &sink);
+    let reports = status_reports(dirs, &requested_services(&request.services), &sink);
 
     emit_json(request, false, &reports);
 
@@ -1365,7 +2125,7 @@ fn status_in(base: &Path, request: &PamRequest) -> i32 {
 
 /// One report row per service. Split out from [`status_in`] so the rows —
 /// which are the `--json` payload — are assertable without capturing stdout.
-fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceReport> {
+fn status_reports(dirs: &PamDirs, services: &[String], sink: &Sink) -> Vec<ServiceReport> {
     services
         .iter()
         .map(|service| {
@@ -1374,10 +2134,10 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
             // no answer this may go and look for. Not an `Err` return either
             // — `status` owns its exit codes, and a usage error is exit 2
             // rather than the generic exit 1 `main` gives an `anyhow` failure.
-            let target = match Target::locate(base, service) {
+            let target = match Target::locate(dirs, service) {
                 Ok(target) => target,
                 Err(why) => {
-                    sink.error(&why.message(base, service));
+                    sink.error(&why.message(service));
                     return ServiceReport {
                         service: service.clone(),
                         path: why.path(),
@@ -1388,12 +2148,29 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
             };
             let display = target.path_string();
 
+            let vendor_only = matches!(target.origin, Origin::Vendor { .. });
+
             let outcome = match fs::read_to_string(&target.path) {
+                // Read before the vendor test, not after: a service whose
+                // vendor file already carries the line — a distribution that
+                // ships face auth in its own PAM stack — *is* configured, and
+                // reporting it `vendor-only` would send an integrator off to
+                // create an override that adds nothing.
                 Ok(content) if content.lines().any(is_facelock_pam_line) => {
                     sink.info(&PamMessage::PamStatusPresent {
                         path: display.clone(),
                     });
                     Outcome::Present
+                }
+                // Exists, carries no line, and has no `/etc/pam.d` copy for
+                // one to be added to. `missing` would be true of the file and
+                // misleading about the machine: `add` will create an override
+                // here rather than edit what `status` just named.
+                Ok(_) if vendor_only => {
+                    sink.info(&PamMessage::PamStatusVendorOnly {
+                        path: display.clone(),
+                    });
+                    Outcome::VendorOnly
                 }
                 Ok(_) => {
                     sink.info(&PamMessage::PamStatusMissing {
@@ -1402,8 +2179,13 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
                     Outcome::Missing
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Every path tried, like `add`'s refusal: the same
+                    // question must not be answered two ways by two verbs.
+                    // The row's `path` field stays the first directory's —
+                    // where an override would go — because it is one string,
+                    // and `contracts.md` says which of the two it is.
                     sink.info(&PamMessage::PamStatusAbsent {
-                        path: display.clone(),
+                        paths: target.tried_paths(),
                     });
                     Outcome::Absent
                 }
@@ -1439,11 +2221,17 @@ fn status_code(outcome: &Outcome, if_present: bool) -> i32 {
         // exist. It converts *absence* and nothing else.
         Outcome::Absent if if_present => STATUS_PRESENT,
         Outcome::Absent | Outcome::Unknown(_) => STATUS_ERROR,
-        // Not reachable: `status_reports` produces the four words above and no
+        // The service exists and does not carry the line, which is exactly
+        // what `missing` means to a caller branching on the exit code. The
+        // word is what says *why* `add` will behave differently here, and
+        // `--if-present` does not convert it: this is not an absence.
+        Outcome::VendorOnly => STATUS_MISSING,
+        // Not reachable: `status_reports` produces the five words above and no
         // other. Spelled out rather than left to a `_` arm so that a word
         // added to the vocabulary has to be given a code here on purpose —
         // under a wildcard, a new `status` outcome would silently be exit 2.
         Outcome::Installed
+        | Outcome::Overridden
         | Outcome::Removed
         | Outcome::Unchanged
         | Outcome::Declined
@@ -1484,7 +2272,7 @@ pub(crate) fn install_for_setup(request: &PamRequest) -> anyhow::Result<()> {
         remedy: "--yes",
     };
     let sink = Sink::human();
-    let reports = apply_all(&plan_writes(Path::new(PAM_DIR), &write)?, &write, &sink);
+    let reports = apply_all(&plan_writes(&PamDirs::system(), &write)?, &write, &sink);
     // Before the hint, which the alias has never printed after a failure —
     // unlike the verb, whose closing hint fires whatever the rows say.
     first_failure(&reports)?;
@@ -1503,7 +2291,7 @@ pub(crate) fn remove_for_setup(request: &PamRequest) -> anyhow::Result<()> {
         remedy: "--yes",
     };
     let sink = Sink::human();
-    let reports = apply_all(&plan_writes(Path::new(PAM_DIR), &write)?, &write, &sink);
+    let reports = apply_all(&plan_writes(&PamDirs::system(), &write)?, &write, &sink);
     first_failure(&reports)
 }
 
@@ -1511,7 +2299,7 @@ pub(crate) fn remove_for_setup(request: &PamRequest) -> anyhow::Result<()> {
 /// already *is* the per-service consent, and the module check already ran, so
 /// neither is repeated here — nor is the closing hint, which the wizard emits
 /// itself once, after step 9, whatever that step decided.
-pub(crate) fn install_one_in(base: &Path, request: &PamRequest) -> anyhow::Result<()> {
+pub(crate) fn install_one_in(dirs: &PamDirs, request: &PamRequest) -> anyhow::Result<()> {
     debug_assert_eq!(request.action, PamAction::Add);
     let write = WriteRequest {
         action: WriteAction::Add,
@@ -1519,7 +2307,7 @@ pub(crate) fn install_one_in(base: &Path, request: &PamRequest) -> anyhow::Resul
         remedy: "--yes",
     };
     let sink = Sink::human();
-    let reports = apply_all(&plan_writes(base, &write)?, &write, &sink);
+    let reports = apply_all(&plan_writes(dirs, &write)?, &write, &sink);
     first_failure(&reports)
 }
 
@@ -1618,7 +2406,7 @@ mod tests {
             ("sudo", NO_NEWLINE_BEFORE, NO_NEWLINE_AFTER),
         ] {
             let dir = seeded(&[(service, before)]);
-            let code = write_in(dir.path(), &add(&[service])).unwrap();
+            let code = write_in(&only(dir.path()), &add(&[service])).unwrap();
 
             assert_eq!(code, WRITE_OK, "{service}");
             assert_eq!(read(&dir, service), after, "{service} content");
@@ -1630,12 +2418,12 @@ mod tests {
     #[test]
     fn add_backup_is_the_original_and_only_exists_on_a_real_write() {
         let dir = seeded(&[("sudo", SUDO_BEFORE)]);
-        write_in(dir.path(), &add(&["sudo"])).unwrap();
+        write_in(&only(dir.path()), &add(&["sudo"])).unwrap();
         assert_eq!(read(&dir, "sudo.facelock-backup"), SUDO_BEFORE);
 
         let untouched = seeded(&[("omarchy-lock-face", OMARCHY_PRESENT)]);
         let before = snapshot(untouched.path());
-        write_in(untouched.path(), &add(&["omarchy-lock-face"])).unwrap();
+        write_in(&only(untouched.path()), &add(&["omarchy-lock-face"])).unwrap();
         assert_eq!(
             before,
             snapshot(untouched.path()),
@@ -1649,7 +2437,7 @@ mod tests {
             ("omarchy-lock-face", OMARCHY_PRESENT),
             ("sudo", SUDO_BEFORE),
         ]);
-        let code = write_in(dir.path(), &remove(&["omarchy-lock-face", "sudo"])).unwrap();
+        let code = write_in(&only(dir.path()), &remove(&["omarchy-lock-face", "sudo"])).unwrap();
 
         assert_eq!(code, WRITE_OK);
         assert_eq!(read(&dir, "omarchy-lock-face"), OMARCHY_REMOVED);
@@ -1670,7 +2458,7 @@ mod tests {
         ] {
             let via_alias = seeded(&[(service, before)]);
             install_one_in(
-                via_alias.path(),
+                &only(via_alias.path()),
                 &PamRequest {
                     allow_sensitive: true,
                     ..add(&[service])
@@ -1679,7 +2467,7 @@ mod tests {
             .unwrap();
 
             let via_verb = seeded(&[(service, before)]);
-            write_in(via_verb.path(), &add(&[service])).unwrap();
+            write_in(&only(via_verb.path()), &add(&[service])).unwrap();
 
             assert_eq!(read(&via_alias, service), after, "{service} via the alias");
             assert_eq!(
@@ -1696,8 +2484,8 @@ mod tests {
     fn add_then_remove_restores_the_original_bytes() {
         for before in [SUDO_BEFORE, POLKIT_BEFORE, NO_NEWLINE_BEFORE] {
             let dir = seeded(&[("sudo", before)]);
-            write_in(dir.path(), &add(&["sudo"])).unwrap();
-            write_in(dir.path(), &remove(&["sudo"])).unwrap();
+            write_in(&only(dir.path()), &add(&["sudo"])).unwrap();
+            write_in(&only(dir.path()), &remove(&["sudo"])).unwrap();
             assert_eq!(read(&dir, "sudo"), before);
         }
     }
@@ -1746,7 +2534,7 @@ mod tests {
                 if_present: true,
                 ..PamRequest::default()
             };
-            let error = write_in(&base, &request).unwrap_err().to_string();
+            let error = write_in(&only(&base), &request).unwrap_err().to_string();
 
             assert!(error.contains("Invalid PAM service name"), "got: {error}");
             assert_eq!(fs::read_to_string(&outside).unwrap(), OMARCHY_PRESENT);
@@ -1769,7 +2557,7 @@ mod tests {
                 if_present: true,
                 ..PamRequest::default()
             };
-            assert!(write_in(&base, &request).is_err());
+            assert!(write_in(&only(&base), &request).is_err());
         }
         assert_eq!(
             fs::read_to_string(dir.path().join("shadow")).unwrap(),
@@ -1789,7 +2577,7 @@ mod tests {
             let dir = seeded(&[("sudo", SUDO_BEFORE), ("sshd", SUDO_BEFORE)]);
             let before = snapshot(dir.path());
 
-            let error = write_in(dir.path(), &add(&["sudo", second])).unwrap_err();
+            let error = write_in(&only(dir.path()), &add(&["sudo", second])).unwrap_err();
 
             assert_eq!(
                 before,
@@ -1803,7 +2591,7 @@ mod tests {
     fn a_valid_multi_service_add_writes_every_service() {
         let dir = seeded(&[("sudo", SUDO_BEFORE), ("polkit-1", POLKIT_BEFORE)]);
 
-        let code = write_in(dir.path(), &add(&["sudo", "polkit-1"])).unwrap();
+        let code = write_in(&only(dir.path()), &add(&["sudo", "polkit-1"])).unwrap();
 
         assert_eq!(code, WRITE_OK);
         assert_eq!(read(&dir, "sudo"), SUDO_AFTER);
@@ -1821,7 +2609,7 @@ mod tests {
             let dir = seeded(&[(service, SUDO_BEFORE)]);
             let before = snapshot(dir.path());
 
-            let error = write_in(dir.path(), &add(&[service]))
+            let error = write_in(&only(dir.path()), &add(&[service]))
                 .unwrap_err()
                 .to_string();
 
@@ -1845,7 +2633,7 @@ mod tests {
             ..add(&["sshd"])
         };
 
-        assert_eq!(write_in(dir.path(), &request).unwrap(), WRITE_OK);
+        assert_eq!(write_in(&only(dir.path()), &request).unwrap(), WRITE_OK);
         assert_eq!(read(&dir, "sshd"), SUDO_AFTER);
     }
 
@@ -1857,7 +2645,7 @@ mod tests {
         let dir = seeded(&[("system-auth", OMARCHY_PRESENT)]);
 
         assert_eq!(
-            write_in(dir.path(), &remove(&["system-auth"])).unwrap(),
+            write_in(&only(dir.path()), &remove(&["system-auth"])).unwrap(),
             WRITE_OK
         );
         assert_eq!(read(&dir, "system-auth"), OMARCHY_REMOVED);
@@ -1877,7 +2665,7 @@ mod tests {
                 ..PamRequest::default()
             };
 
-            assert_eq!(write_in(dir.path(), &request).unwrap(), WRITE_OK);
+            assert_eq!(write_in(&only(dir.path()), &request).unwrap(), WRITE_OK);
             assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
         }
     }
@@ -1887,7 +2675,9 @@ mod tests {
         for request in [add(&["omarchy-lock-face"]), remove(&["omarchy-lock-face"])] {
             let dir = tempfile::TempDir::new().unwrap();
 
-            let error = write_in(dir.path(), &request).unwrap_err().to_string();
+            let error = write_in(&only(dir.path()), &request)
+                .unwrap_err()
+                .to_string();
 
             assert!(
                 error.contains("PAM service file not found:"),
@@ -1913,7 +2703,9 @@ mod tests {
                 ..request
             };
 
-            let error = write_in(dir.path(), &request).unwrap_err().to_string();
+            let error = write_in(&only(dir.path()), &request)
+                .unwrap_err()
+                .to_string();
 
             assert!(error.contains("failed to read"), "got: {error}");
         }
@@ -1937,7 +2729,7 @@ mod tests {
                 no_confirm: true,
                 ..PamRequest::default()
             };
-            assert_eq!(write_in(dir.path(), &request).unwrap(), WRITE_OK);
+            assert_eq!(write_in(&only(dir.path()), &request).unwrap(), WRITE_OK);
         }
 
         assert_eq!(before, snapshot(dir.path()));
@@ -1959,7 +2751,7 @@ mod tests {
             request: &request,
             remedy: "--x",
         };
-        let targets = plan_writes(dir.path(), &write).unwrap();
+        let targets = plan_writes(&only(dir.path()), &write).unwrap();
 
         let sink = Sink::verb(true);
         let words: Vec<&str> = targets
@@ -1980,7 +2772,7 @@ mod tests {
         ]);
         let status = |services: &[&str]| {
             status_in(
-                dir.path(),
+                &only(dir.path()),
                 &PamRequest {
                     action: PamAction::Status,
                     services: services.iter().map(|s| s.to_string()).collect(),
@@ -2008,7 +2800,7 @@ mod tests {
         let before = snapshot(dir.path());
 
         status_in(
-            dir.path(),
+            &only(dir.path()),
             &PamRequest {
                 action: PamAction::Status,
                 services: vec!["sudo".into(), "absent".into(), "../escape".into()],
@@ -2080,7 +2872,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let sink = Sink::verb(true);
 
-        let reports = status_reports(dir.path(), &["../escape".to_string()], &sink);
+        let reports = status_reports(&only(dir.path()), &["../escape".to_string()], &sink);
 
         assert_eq!(
             reports[0].outcome,
@@ -2120,6 +2912,8 @@ mod tests {
     fn outcome_vocabulary_is_pinned() {
         let words: Vec<&str> = [
             Outcome::Installed,
+            Outcome::Overridden,
+            Outcome::VendorOnly,
             Outcome::Removed,
             Outcome::Unchanged,
             Outcome::Absent,
@@ -2137,6 +2931,8 @@ mod tests {
             words,
             [
                 "installed",
+                "overridden",
+                "vendor-only",
                 "removed",
                 "unchanged",
                 "absent",
@@ -2227,7 +3023,7 @@ mod tests {
         let dir = seeded(&[("system-auth", SUDO_BEFORE)]);
         let before = snapshot(dir.path());
 
-        assert!(write_in(dir.path(), &add(&["system-auth"])).is_err());
+        assert!(write_in(&only(dir.path()), &add(&["system-auth"])).is_err());
         assert_eq!(before, snapshot(dir.path()));
     }
 
@@ -2266,7 +3062,7 @@ mod tests {
         assert_eq!(Sink::verb(true).notice_route(), Route::Dropped);
 
         let dir = seeded(&[("sudo", SUDO_BEFORE)]);
-        write_in(dir.path(), &add(&["sudo"])).unwrap();
+        write_in(&only(dir.path()), &add(&["sudo"])).unwrap();
         // ...and the fact it carries is the one the JSON row carries.
         assert_eq!(
             read(&dir, "sudo.facelock-backup"),
@@ -2298,7 +3094,7 @@ mod tests {
                 allow_sensitive: true,
                 ..PamRequest::default()
             };
-            let error = write_in(&base, &request).unwrap_err().to_string();
+            let error = write_in(&only(&base), &request).unwrap_err().to_string();
 
             assert!(error.contains("it is a symlink to"), "got: {error}");
             assert!(
@@ -2327,7 +3123,7 @@ mod tests {
         fs::write(dir.path().join("shadow"), "root:!:1::::::\n").unwrap();
         std::os::unix::fs::symlink("../shadow", base.join("sudo")).unwrap();
 
-        assert!(write_in(&base, &add(&["sudo"])).is_err());
+        assert!(write_in(&only(&base), &add(&["sudo"])).is_err());
         assert_eq!(
             fs::read_to_string(dir.path().join("shadow")).unwrap(),
             "root:!:1::::::\n"
@@ -2343,7 +3139,7 @@ mod tests {
         std::os::unix::fs::symlink("sudo", dir.path().join("sudo-alias")).unwrap();
 
         assert_eq!(
-            write_in(dir.path(), &add(&["sudo-alias"])).unwrap(),
+            write_in(&only(dir.path()), &add(&["sudo-alias"])).unwrap(),
             WRITE_OK
         );
 
@@ -2369,7 +3165,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dir.path().join("polkit-1")).unwrap();
         let before = snapshot(dir.path());
 
-        assert!(write_in(dir.path(), &add(&["sudo", "polkit-1"])).is_err());
+        assert!(write_in(&only(dir.path()), &add(&["sudo", "polkit-1"])).is_err());
 
         assert_eq!(before, snapshot(dir.path()));
         fs::remove_file(&outside).unwrap();
@@ -2388,7 +3184,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, base.join("system-auth")).unwrap();
 
         let sink = Sink::verb(true);
-        let reports = status_reports(&base, &["system-auth".to_string()], &sink);
+        let reports = status_reports(&only(&base), &["system-auth".to_string()], &sink);
 
         assert_eq!(
             reports[0].outcome,
@@ -2403,7 +3199,7 @@ mod tests {
         );
         assert_eq!(
             status_in(
-                &base,
+                &only(&base),
                 &PamRequest {
                     action: PamAction::Status,
                     services: vec!["system-auth".to_string()],
@@ -2417,6 +3213,78 @@ mod tests {
     /// A second *hard* link cannot be followed and checked the way a symlink
     /// can: the link count says another name exists and not where it is, so an
     /// edit here changes a file this cannot name.
+    /// The same rule, reached through an in-directory alias — which is how it
+    /// was bypassable: the link count was checked on the entry as typed and
+    /// not on the file the entry reached, exactly the hole `gate_sensitive`'s
+    /// second call exists to close.
+    ///
+    /// The shape is the one `SENSITIVE_SERVICES`' own doc describes: RHEL's
+    /// `authconfig` leaves `system-auth -> system-auth-ac`, and a dedupe pass
+    /// (`jdupes -L`, a hard-link-preserving restore) links `password-auth-ac`
+    /// onto the same inode. Under the atomic replace, `remove --service
+    /// system-auth` would then report `removed` while `password-auth-ac` — the
+    /// stack sshd reads on that distribution — kept the facelock line: a
+    /// fail-open on the shared auth stack, reported as success, with no backup
+    /// to show what happened.
+    #[test]
+    fn a_hard_link_reached_through_an_alias_is_refused_too() {
+        for action in [PamAction::Add, PamAction::Remove] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let base = dir.path().join("pam.d");
+            fs::create_dir(&base).unwrap();
+            let real = base.join("system-auth-ac");
+            fs::write(&real, OMARCHY_PRESENT).unwrap();
+            let sibling = base.join("password-auth-ac");
+            fs::hard_link(&real, &sibling).unwrap();
+            std::os::unix::fs::symlink("system-auth-ac", base.join("system-auth")).unwrap();
+            let before = snapshot(&base);
+
+            let request = PamRequest {
+                action,
+                services: vec!["system-auth".to_string()],
+                no_confirm: true,
+                allow_sensitive: true,
+                ..PamRequest::default()
+            };
+            let error = write_in(&only(&base), &request).unwrap_err().to_string();
+
+            assert!(error.contains("names for the same file"), "got: {error}");
+            assert!(
+                error.contains(real.to_str().unwrap()),
+                "the refusal names the file with two names, which is where the \
+                 fix has to be applied: {error}"
+            );
+            assert_eq!(
+                before,
+                snapshot(&base),
+                "{action:?}: nothing may be written for the whole run"
+            );
+            assert_eq!(
+                fs::read_to_string(&sibling).unwrap(),
+                OMARCHY_PRESENT,
+                "{action:?}: the other name still carries the facelock line, \
+                 which is the fail-open this refusal prevents"
+            );
+        }
+
+        // ...and `status`, which has no all-or-nothing phase, reports it as
+        // the same `unknown` an entry it will not follow always got.
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("pam.d");
+        fs::create_dir(&base).unwrap();
+        fs::write(base.join("real"), OMARCHY_PRESENT).unwrap();
+        fs::hard_link(base.join("real"), base.join("second-name")).unwrap();
+        std::os::unix::fs::symlink("real", base.join("alias")).unwrap();
+
+        let sink = Sink::verb(true);
+        let reports = status_reports(&only(&base), &["alias".to_string()], &sink);
+        assert_eq!(
+            reports[0].outcome,
+            Outcome::Unknown(HARD_LINKED.to_string())
+        );
+        assert_eq!(status_code(&reports[0].outcome, false), STATUS_ERROR);
+    }
+
     #[test]
     fn a_hard_linked_service_file_is_a_validation_failure() {
         for action in [PamAction::Add, PamAction::Remove] {
@@ -2433,7 +3301,7 @@ mod tests {
                 no_confirm: true,
                 ..PamRequest::default()
             };
-            let error = write_in(&base, &request).unwrap_err().to_string();
+            let error = write_in(&only(&base), &request).unwrap_err().to_string();
 
             assert!(error.contains("names for the same file"), "got: {error}");
             assert_eq!(
@@ -2450,7 +3318,10 @@ mod tests {
     #[test]
     fn a_single_linked_service_file_is_untouched_by_the_rule() {
         let dir = seeded(&[("sudo", SUDO_BEFORE)]);
-        assert_eq!(write_in(dir.path(), &add(&["sudo"])).unwrap(), WRITE_OK);
+        assert_eq!(
+            write_in(&only(dir.path()), &add(&["sudo"])).unwrap(),
+            WRITE_OK
+        );
         assert_eq!(read(&dir, "sudo"), SUDO_AFTER);
     }
 
@@ -2465,7 +3336,7 @@ mod tests {
         fs::hard_link(dir.path().join("second-name"), base.join("sudo")).unwrap();
 
         let sink = Sink::verb(true);
-        let reports = status_reports(&base, &["sudo".to_string()], &sink);
+        let reports = status_reports(&only(&base), &["sudo".to_string()], &sink);
 
         assert_eq!(
             reports[0].outcome,
@@ -2474,7 +3345,7 @@ mod tests {
         assert_eq!(HARD_LINKED, "hard-linked service file");
         assert_eq!(
             status_in(
-                &base,
+                &only(&base),
                 &PamRequest {
                     action: PamAction::Status,
                     services: vec!["sudo".to_string()],
@@ -2501,7 +3372,7 @@ mod tests {
 
         let refused = make();
         let before = snapshot(refused.path());
-        let error = write_in(refused.path(), &add(&["alias"]))
+        let error = write_in(&only(refused.path()), &add(&["alias"]))
             .unwrap_err()
             .to_string();
 
@@ -2518,7 +3389,7 @@ mod tests {
             allow_sensitive: true,
             ..add(&["alias"])
         };
-        assert_eq!(write_in(allowed.path(), &request).unwrap(), WRITE_OK);
+        assert_eq!(write_in(&only(allowed.path()), &request).unwrap(), WRITE_OK);
         assert_eq!(read(&allowed, "system-auth"), SUDO_AFTER);
     }
 
@@ -2529,7 +3400,10 @@ mod tests {
         let dir = seeded(&[("system-auth", OMARCHY_PRESENT)]);
         std::os::unix::fs::symlink("system-auth", dir.path().join("alias")).unwrap();
 
-        assert_eq!(write_in(dir.path(), &remove(&["alias"])).unwrap(), WRITE_OK);
+        assert_eq!(
+            write_in(&only(dir.path()), &remove(&["alias"])).unwrap(),
+            WRITE_OK
+        );
         assert_eq!(read(&dir, "system-auth"), OMARCHY_REMOVED);
     }
 
@@ -2546,7 +3420,7 @@ mod tests {
         ]);
         let status = |services: &[&str], if_present| {
             status_in(
-                dir.path(),
+                &only(dir.path()),
                 &PamRequest {
                     action: PamAction::Status,
                     services: services.iter().map(|s| s.to_string()).collect(),
@@ -2596,5 +3470,620 @@ mod tests {
                 "expected the root refusal before any other check, got: {error}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Vendor directories (P1)
+    //
+    // The bug these exist for: on current Arch `polkit` ships
+    // /usr/lib/pam.d/polkit-1 and /etc/pam.d/polkit-1 does not exist, so a
+    // writer that only ever looked in /etc/pam.d could not configure the
+    // service at all. Every case below is driven against a tempdir *pair*,
+    // which is what the search path being a parameter is for.
+    // -----------------------------------------------------------------------
+
+    /// An `/etc` directory and a vendor directory, in that order.
+    fn pair() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let etc = root.path().join("etc");
+        let vendor = root.path().join("vendor");
+        fs::create_dir(&etc).unwrap();
+        fs::create_dir(&vendor).unwrap();
+        (root, etc, vendor)
+    }
+
+    fn both(etc: &Path, vendor: &Path) -> PamDirs {
+        PamDirs::new(vec![etc.to_path_buf(), vendor.to_path_buf()])
+    }
+
+    fn header_lines(content: &str) -> usize {
+        content
+            .lines()
+            .filter(|line| line.starts_with("# Copied from "))
+            .count()
+    }
+
+    /// The headline case. The vendor file is read, an `/etc` override is
+    /// created from it with the line in place, and the package's own file is
+    /// byte-identical afterwards — asserted on the bytes, because the failure
+    /// this guards against is a successful-looking run that edited `/usr`.
+    #[test]
+    fn a_vendor_only_service_gets_an_etc_override() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        let before = snapshot(&vendor);
+
+        let sink = Sink::verb(false);
+        let write = WriteRequest {
+            action: WriteAction::Add,
+            request: &add(&["polkit-1"]),
+            remedy: "--allow-sensitive",
+        };
+        let targets = plan_writes(&both(&etc, &vendor), &write).unwrap();
+        let reports = apply_all(&targets, &write, &sink);
+
+        assert_eq!(reports[0].outcome, Outcome::Overridden);
+        assert_eq!(
+            reports[0].path.as_deref(),
+            Some(etc.join("polkit-1").to_str().unwrap()),
+            "the row is about the file that was created, not the one that was read"
+        );
+        assert_eq!(reports[0].backup, None, "a copy has nothing to back up");
+
+        let written = fs::read_to_string(etc.join("polkit-1")).unwrap();
+        assert_eq!(header_lines(&written), 1);
+        assert!(
+            written.ends_with(POLKIT_AFTER),
+            "below the header the bytes are what an in-place edit would have \
+             produced: {written}"
+        );
+        assert_eq!(before, snapshot(&vendor), "the vendor file is untouched");
+    }
+
+    /// Second `add`: the override now exists, so the service resolves in
+    /// `/etc` and is edited in place — no copy, no second header, and the
+    /// vendor file still untouched.
+    #[test]
+    fn a_second_add_edits_the_override_and_writes_no_second_header() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        let dirs = both(&etc, &vendor);
+        let before = snapshot(&vendor);
+
+        assert_eq!(write_in(&dirs, &add(&["polkit-1"])).unwrap(), WRITE_OK);
+        let first = fs::read_to_string(etc.join("polkit-1")).unwrap();
+        assert_eq!(write_in(&dirs, &add(&["polkit-1"])).unwrap(), WRITE_OK);
+        let second = fs::read_to_string(etc.join("polkit-1")).unwrap();
+
+        assert_eq!(first, second, "the second add is a no-op");
+        assert_eq!(header_lines(&second), 1);
+        assert_eq!(before, snapshot(&vendor));
+
+        // ...and a service that was in `/etc` all along never gains a header
+        // at all.
+        let (_root2, etc2, vendor2) = pair();
+        fs::write(etc2.join("sudo"), SUDO_BEFORE).unwrap();
+        fs::write(vendor2.join("sudo"), POLKIT_BEFORE).unwrap();
+        write_in(&both(&etc2, &vendor2), &add(&["sudo"])).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(etc2.join("sudo")).unwrap(),
+            SUDO_AFTER,
+            "an /etc entry shadows the vendor one and is edited byte for byte"
+        );
+        assert_eq!(
+            fs::read_to_string(vendor2.join("sudo")).unwrap(),
+            POLKIT_BEFORE
+        );
+    }
+
+    /// `remove` resolves the same way so it can *report* a vendor-only
+    /// service, and then writes nothing: exit 0, no `/etc` file invented, the
+    /// package's file untouched.
+    #[test]
+    fn remove_on_a_vendor_only_service_is_a_no_op() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), OMARCHY_PRESENT).unwrap();
+        let before = snapshot(&vendor);
+
+        let code = write_in(&both(&etc, &vendor), &remove(&["polkit-1"])).unwrap();
+
+        assert_eq!(code, WRITE_OK);
+        assert!(snapshot(&etc).is_empty(), "removal creates nothing");
+        assert_eq!(
+            before,
+            snapshot(&vendor),
+            "not even a vendor file that carries the line is edited"
+        );
+    }
+
+    /// The not-found refusal names **every** path tried. Naming only
+    /// `/etc/pam.d` would send an operator to create a file that a vendor
+    /// directory may already hold.
+    #[test]
+    fn an_absent_service_names_every_directory_searched() {
+        let (_root, etc, vendor) = pair();
+
+        let error = write_in(&both(&etc, &vendor), &add(&["polkit-1"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("PAM service file not found:"),
+            "got: {error}"
+        );
+        for dir in [&etc, &vendor] {
+            let path = dir.join("polkit-1");
+            assert!(
+                error.contains(path.to_str().unwrap()),
+                "the refusal must name {}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    /// `status` on a vendor-only service reports it as itself — not `absent`,
+    /// which would be false about the file, and not `missing`, which would be
+    /// misleading about what `add` is going to do. Exit 1: the service exists
+    /// and does not carry the line.
+    #[test]
+    fn status_reports_a_vendor_only_service_as_vendor_only() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+
+        let sink = Sink::verb(true);
+        let reports = status_reports(&both(&etc, &vendor), &["polkit-1".to_string()], &sink);
+
+        assert_eq!(reports[0].outcome, Outcome::VendorOnly);
+        assert_eq!(reports[0].outcome.word(), "vendor-only");
+        assert_eq!(
+            reports[0].path.as_deref(),
+            Some(vendor.join("polkit-1").to_str().unwrap()),
+            "the row names the file that exists"
+        );
+        assert_eq!(status_code(&reports[0].outcome, false), STATUS_MISSING);
+        // `--if-present` converts absence and nothing else; this is not one.
+        assert_eq!(status_code(&reports[0].outcome, true), STATUS_MISSING);
+    }
+
+    /// ...unless the vendor file already carries the line, which is a
+    /// distribution shipping face auth in its own PAM stack. That machine *is*
+    /// configured, and reporting `vendor-only` would send an integrator off to
+    /// create an override that adds nothing.
+    #[test]
+    fn a_vendor_file_that_carries_the_line_is_present() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("omarchy-lock-face"), OMARCHY_PRESENT).unwrap();
+        let dirs = both(&etc, &vendor);
+
+        let sink = Sink::verb(true);
+        let reports = status_reports(&dirs, &["omarchy-lock-face".to_string()], &sink);
+        assert_eq!(reports[0].outcome, Outcome::Present);
+        assert!(is_configured(&dirs, "omarchy-lock-face"));
+
+        // ...and `add` writes no override for it, because there is nothing an
+        // override would add.
+        assert_eq!(
+            write_in(&dirs, &add(&["omarchy-lock-face"])).unwrap(),
+            WRITE_OK
+        );
+        assert!(snapshot(&etc).is_empty());
+    }
+
+    /// First hit wins, and only the first directory is ever written to.
+    #[test]
+    fn the_first_directory_holding_the_name_answers() {
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_BEFORE).unwrap();
+        fs::write(vendor.join("sudo"), OMARCHY_PRESENT).unwrap();
+        let dirs = both(&etc, &vendor);
+
+        let target = Target::locate(&dirs, "sudo").unwrap();
+
+        assert_eq!(target.path, etc.join("sudo"));
+        assert_eq!(target.origin, Origin::Local);
+        assert_eq!(target.write_path(), etc.join("sudo"));
+    }
+
+    /// The multi-directory restatement of #194's symlink rule: the target must
+    /// be under the directory the *entry* was found in, so an `/etc` entry
+    /// pointing into a vendor directory is out of base and refused. Decided
+    /// deliberately, and written down in contracts.md: following it would put
+    /// an edit in a package-owned file, which is the one thing this must never
+    /// do.
+    #[test]
+    fn an_etc_entry_symlinked_into_a_vendor_directory_is_refused() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        std::os::unix::fs::symlink(vendor.join("polkit-1"), etc.join("polkit-1")).unwrap();
+        let before = snapshot(&vendor);
+
+        let error = write_in(&both(&etc, &vendor), &add(&["polkit-1"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("it is a symlink to"), "got: {error}");
+        assert!(
+            error.contains(etc.to_str().unwrap()),
+            "the refusal names the directory that was violated: {error}"
+        );
+        assert_eq!(before, snapshot(&vendor));
+        assert!(!backup_path(&vendor.join("polkit-1")).exists());
+    }
+
+    /// The sensitive gate is applied to the file the name resolved to, in
+    /// whichever directory that was: a vendor `system-auth` reached under an
+    /// ungated alias still refuses.
+    #[test]
+    fn the_sensitive_gate_reaches_a_vendor_file() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("system-auth"), SUDO_BEFORE).unwrap();
+        std::os::unix::fs::symlink("system-auth", vendor.join("harmless")).unwrap();
+        let dirs = both(&etc, &vendor);
+
+        for service in ["system-auth", "harmless"] {
+            let error = write_in(&dirs, &add(&[service])).unwrap_err().to_string();
+            assert!(
+                error.contains("sensitive PAM service"),
+                "{service}: got {error}"
+            );
+        }
+        assert!(snapshot(&etc).is_empty(), "a refusal writes nothing");
+    }
+
+    /// `--dry-run` previews the copy and writes nothing — including the
+    /// override it says it would create.
+    #[test]
+    fn dry_run_on_a_vendor_only_service_writes_nothing() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        let before = snapshot(&vendor);
+
+        let request = PamRequest {
+            dry_run: true,
+            ..add(&["polkit-1"])
+        };
+        let sink = Sink::verb(false);
+        let write = WriteRequest {
+            action: WriteAction::Add,
+            request: &request,
+            remedy: "--allow-sensitive",
+        };
+        let targets = plan_writes(&both(&etc, &vendor), &write).unwrap();
+        let reports = apply_all(&targets, &write, &sink);
+
+        assert_eq!(reports[0].outcome, Outcome::Overridden);
+        assert!(snapshot(&etc).is_empty());
+        assert_eq!(before, snapshot(&vendor));
+    }
+
+    /// The wizard's menu asks the resolver, so a candidate that ships only in
+    /// a vendor directory is offered — which is the half of this bug that
+    /// would otherwise have kept `polkit-1` out of `setup`'s multi-select on
+    /// exactly the machines where `pam add` had just started working.
+    #[test]
+    fn a_vendor_only_candidate_is_visible_to_the_wizard() {
+        let (_root, etc, vendor) = pair();
+        let dirs = both(&etc, &vendor);
+
+        assert!(!service_exists(&dirs, "polkit-1"));
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        assert!(service_exists(&dirs, "polkit-1"));
+
+        // An entry the writer would refuse is not offered: the menu must not
+        // propose a service that then fails.
+        std::os::unix::fs::symlink(vendor.join("polkit-1"), etc.join("hyprlock")).unwrap();
+        assert!(!service_exists(&dirs, "hyprlock"));
+    }
+
+    // -- the atomic replace -------------------------------------------------
+
+    /// Mode and owner are carried across, because the replace writes a *new*
+    /// inode: a service file that came back 0644 when it was 0640, or owned by
+    /// the wrong group, is a permissions regression on the file that decides
+    /// whether the machine can be logged into.
+    #[test]
+    fn an_in_place_edit_keeps_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = seeded(&[("sudo", SUDO_BEFORE)]);
+        let path = dir.path().join("sudo");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_in(&only(dir.path()), &add(&["sudo"])).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(read(&dir, "sudo"), SUDO_AFTER);
+    }
+
+    /// A vendor copy takes the vendor file's mode: it is the only provenance
+    /// there is for a file that did not exist a moment ago.
+    #[test]
+    fn a_vendor_copy_takes_the_vendor_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_root, etc, vendor) = pair();
+        let source = vendor.join("polkit-1");
+        fs::write(&source, POLKIT_BEFORE).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_in(&both(&etc, &vendor), &add(&["polkit-1"])).unwrap();
+
+        assert_eq!(
+            fs::metadata(etc.join("polkit-1"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    /// A failed replace leaves no debris. The temp file is what a reader of
+    /// `/etc/pam.d` would otherwise find sitting next to the service files.
+    #[test]
+    fn a_failed_replace_removes_its_temp_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A directory where the destination file should be: the rename cannot
+        // land, so the write fails after the temp file has been created.
+        fs::create_dir(dir.path().join("sudo")).unwrap();
+
+        assert!(replace_atomically(&dir.path().join("sudo"), "x\n", dir.path()).is_err());
+
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "sudo")
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    /// A successful run leaves none either — the assertion the goldens cannot
+    /// make, since `snapshot` compares two runs and a temp file present in
+    /// both would cancel out.
+    #[test]
+    fn a_successful_write_leaves_no_temp_file() {
+        let dir = seeded(&[("sudo", SUDO_BEFORE)]);
+        write_in(&only(dir.path()), &add(&["sudo"])).unwrap();
+
+        let names: Vec<String> = snapshot(dir.path()).into_keys().collect();
+        assert_eq!(names, ["sudo", "sudo.facelock-backup"]);
+    }
+
+    /// An override that cannot be created is refused in **phase one**, so a
+    /// run naming a good service and a vendor-only one on a read-only `/etc`
+    /// writes nothing at all.
+    #[test]
+    fn an_unwritable_override_directory_is_a_phase_one_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root ignores the mode bits, so the check this asserts cannot fail
+        // for root and the test would be vacuous.
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_BEFORE).unwrap();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        fs::set_permissions(&etc, fs::Permissions::from_mode(0o555)).unwrap();
+        let before = snapshot(&etc);
+
+        let error = write_in(&both(&etc, &vendor), &add(&["sudo", "polkit-1"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("not writable"), "got: {error}");
+        assert_eq!(before, snapshot(&etc), "phase one writes nothing at all");
+        fs::set_permissions(&etc, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// An `overridden` row never reports a backup, even when a
+    /// `.facelock-backup` is lying at the override path from an earlier run:
+    /// the copy preserved nothing, so that file is not this run's rollback and
+    /// offering it would promise a restore of a file this did not touch.
+    #[test]
+    fn an_override_reports_no_backup_even_when_a_stale_one_exists() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        // What an earlier add-then-`rm`-the-override leaves behind.
+        fs::write(etc.join("polkit-1.facelock-backup"), SUDO_BEFORE).unwrap();
+
+        let sink = Sink::verb(false);
+        let write = WriteRequest {
+            action: WriteAction::Add,
+            request: &add(&["polkit-1"]),
+            remedy: "--allow-sensitive",
+        };
+        let targets = plan_writes(&both(&etc, &vendor), &write).unwrap();
+        let reports = apply_all(&targets, &write, &sink);
+
+        assert_eq!(reports[0].outcome, Outcome::Overridden);
+        assert_eq!(reports[0].backup, None);
+        assert_eq!(
+            fs::read_to_string(etc.join("polkit-1.facelock-backup")).unwrap(),
+            SUDO_BEFORE,
+            "and the stale file is left exactly as it was found"
+        );
+    }
+
+    /// `status` answers "where did you look?" the way `add` does. The row's
+    /// machine `path` stays the single first-directory path, which is where an
+    /// override would go.
+    #[test]
+    fn status_on_an_absent_service_names_every_directory_searched() {
+        let (_root, etc, vendor) = pair();
+        let dirs = both(&etc, &vendor);
+
+        let target = Target::locate(&dirs, "polkit-1").unwrap();
+        let tried = target.tried_paths();
+
+        for dir in [&etc, &vendor] {
+            let path = dir.join("polkit-1");
+            assert!(
+                tried.contains(path.to_str().unwrap()),
+                "{} unnamed: {tried}",
+                path.display()
+            );
+        }
+
+        let sink = Sink::verb(true);
+        let reports = status_reports(&dirs, &["polkit-1".to_string()], &sink);
+        assert_eq!(reports[0].outcome, Outcome::Absent);
+        assert_eq!(
+            reports[0].path.as_deref(),
+            Some(etc.join("polkit-1").to_str().unwrap()),
+            "the machine field is one path: where an override would go"
+        );
+    }
+
+    /// A relative `config_dirs` entry poisons the whole list. A relative first
+    /// entry would resolve the write target against the invoking shell's
+    /// working directory, so `cd /tmp && sudo facelock pam add` would edit
+    /// `/tmp/<dir>/sudo` and report it as though it were `/etc/pam.d/sudo`.
+    #[test]
+    fn a_relative_config_dir_falls_back_to_the_default_list() {
+        for list in [
+            vec![PathBuf::from("pam.d")],
+            // ...and a relative entry anywhere poisons it, not just first: a
+            // list with a hole in it is not the search order anyone wrote.
+            vec![PathBuf::from("/etc/pam.d"), PathBuf::from("vendor/pam.d")],
+        ] {
+            assert_eq!(
+                PamDirs::new(list.clone()),
+                PamDirs::default(),
+                "{list:?} must not be used as a search path"
+            );
+        }
+
+        assert_eq!(
+            PamDirs::new(vec![PathBuf::from("/a"), PathBuf::from("/b")]),
+            PamDirs::new(vec![PathBuf::from("/a"), PathBuf::from("/b")]),
+            "an absolute list is taken as written"
+        );
+        assert_eq!(
+            PamDirs::new(vec![PathBuf::from("/a")]).overrides(),
+            Path::new("/a")
+        );
+    }
+
+    /// The backup is a write like any other, so it goes through the same
+    /// atomic replace — which is what makes a symlink planted at
+    /// `<service>.facelock-backup` harmless. `fs::copy` opened its destination
+    /// `O_CREAT|O_TRUNC` and followed the link, sending the service file's
+    /// bytes wherever it pointed; `rename` replaces the name.
+    #[test]
+    fn a_symlinked_backup_path_is_replaced_not_followed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("pam.d");
+        fs::create_dir(&base).unwrap();
+        fs::write(base.join("sudo"), SUDO_BEFORE).unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "SECRET-CONTENT\n").unwrap();
+        std::os::unix::fs::symlink(&victim, backup_path(&base.join("sudo"))).unwrap();
+
+        assert_eq!(write_in(&only(&base), &add(&["sudo"])).unwrap(), WRITE_OK);
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "SECRET-CONTENT\n",
+            "the file the planted link pointed at must not be written"
+        );
+        let backup = backup_path(&base.join("sudo"));
+        assert!(!backup.is_symlink(), "the link is replaced, not followed");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), SUDO_BEFORE);
+        assert_eq!(fs::read_to_string(base.join("sudo")).unwrap(), SUDO_AFTER);
+    }
+
+    /// An entry that exists but cannot be examined is **not** an absence. It
+    /// stops the search where it is, so the read that follows reports the
+    /// error — the answer the single-directory writer gave for the same input.
+    /// Falling through instead made `status` report `vendor-only` for a
+    /// service the unreadable override configures: an honest failure turned
+    /// into a confident wrong answer, and on `add` it would have renamed a
+    /// copy of the vendor file over the override without taking a backup.
+    #[test]
+    fn an_unreadable_first_directory_is_not_an_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root traverses a 0000 directory, so the stat would succeed and the
+        // assertion would be vacuous.
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("polkit-1"), OMARCHY_PRESENT).unwrap();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        let dirs = both(&etc, &vendor);
+        fs::set_permissions(&etc, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let sink = Sink::verb(true);
+        let reports = status_reports(&dirs, &["polkit-1".to_string()], &sink);
+        let outcome = reports[0].outcome.clone();
+        let path = reports[0].path.clone();
+        // Restore before asserting, so a failure does not leave a 0000
+        // directory behind for the tempdir teardown to trip over.
+        fs::set_permissions(&etc, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(outcome, Outcome::Unknown(_)),
+            "expected an honest non-answer, got {outcome:?}"
+        );
+        assert_eq!(status_code(&outcome, false), STATUS_ERROR);
+        assert_eq!(
+            path.as_deref(),
+            Some(etc.join("polkit-1").to_str().unwrap()),
+            "and it is about the entry it could not examine, not the vendor copy"
+        );
+    }
+
+    /// The override directory may not also be one of the read-only ones,
+    /// however it is spelled: that would make "never write to a vendor
+    /// directory" false without anyone editing this module.
+    #[test]
+    fn an_override_directory_that_aliases_a_search_directory_is_rejected() {
+        let (_root, etc, vendor) = pair();
+        let link = etc.parent().unwrap().join("etclink");
+        std::os::unix::fs::symlink(&vendor, &link).unwrap();
+
+        for list in [
+            // Spelled twice.
+            vec![etc.clone(), vendor.clone(), etc.clone()],
+            // ...and reached through a symlink, which is the same directory.
+            vec![link.clone(), vendor.clone()],
+        ] {
+            assert_eq!(
+                PamDirs::new(list.clone()),
+                PamDirs::default(),
+                "{list:?} must not be used as a search path"
+            );
+        }
+
+        // A distinct pair is still taken as written.
+        assert_eq!(
+            PamDirs::new(vec![etc.clone(), vendor.clone()]).overrides(),
+            etc.as_path()
+        );
+    }
+
+    /// The search path is a value with an invariant: there is always a
+    /// directory to write to, and it is the first one.
+    #[test]
+    fn the_write_target_is_the_first_directory() {
+        assert_eq!(PamDirs::default().overrides(), Path::new(PAM_DIR));
+        assert_eq!(
+            PamDirs::default(),
+            PamDirs::new(Vec::new()),
+            "an empty list is a mistake, not a request to disable the writer"
+        );
+        assert_eq!(
+            PamDirs::default().iter().collect::<Vec<&Path>>(),
+            [Path::new("/etc/pam.d"), Path::new("/usr/lib/pam.d")],
+            "Linux-PAM's own precedence: /etc first, the vendor directory second"
+        );
     }
 }

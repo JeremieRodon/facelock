@@ -7,8 +7,11 @@
 //!   not re-read the file mid-flow; the deliberate exceptions each carry a
 //!   comment at their load site (`daemon` reloads on mtime change, `auth` is
 //!   its own one-shot process, `setup` bootstraps and edits the file,
-//!   `config` displays/edits the file itself, and `is-enrolled` tolerates a
-//!   missing config on its unprivileged path).
+//!   `config` displays/edits the file itself, `is-enrolled` tolerates a
+//!   missing config on its unprivileged path, and `pam` — dispatched ahead of
+//!   this read — takes the default `[pam] config_dirs` when the file is
+//!   missing or broken, so an unrelated config mistake cannot stop an
+//!   operator repairing an auth stack).
 //!
 //! - [`Fact`] — **what is actually true.** A config value like
 //!   `execution_provider = "cuda"` or `device.path = "/dev/video2"` is a
@@ -594,6 +597,47 @@ mod tests {
                      resolved::ConfigLoad)."
                 );
             }
+        }
+    }
+
+    /// The third spelling of the same question: [`ConfigLoad::read`] itself.
+    ///
+    /// `Config::load()` and `load_from(config_path())` are pinned above, and
+    /// neither matches the canonical read — so a command that reaches for
+    /// `ConfigLoad::read()` passes both pins silently, which is exactly what
+    /// happened when `pam` grew a config read of its own. Per file, with the
+    /// reason beside it, so the next one is a decision someone makes here.
+    #[test]
+    fn canonical_config_reads_are_pinned() {
+        let allowed: &[(&str, &str)] = &[
+            // The one read for the process (D7).
+            ("main.rs", "the parse every other command consumes"),
+            // Dispatched ahead of main's parse and must survive a missing or
+            // broken file: `[pam] config_dirs` decides where a service name
+            // resolves, and the default list is the answer when the read
+            // fails. See `commands::pam::PamDirs::system`.
+            ("commands/pam.rs", "the PAM search path, best-effort"),
+        ];
+
+        // Assembled at runtime so this test's own prose does not count.
+        let needle = format!("ConfigLoad::read{}", "(");
+        for (path, content) in source_files() {
+            let rel = path
+                .to_string_lossy()
+                .split("/src/")
+                .last()
+                .unwrap()
+                .to_string();
+            if count_code_occurrences(&content, &needle) == 0 {
+                continue;
+            }
+            assert!(
+                allowed.iter().any(|(p, _)| *p == rel),
+                "{rel}: reads the config through {needle}), which only the \
+                 files listed in this test may do. Commands receive &Config \
+                 from main (see resolved::ConfigLoad); a second read is a D7 \
+                 exception and belongs in that list with its reason."
+            );
         }
     }
 

@@ -35,8 +35,12 @@ pub enum PamMessage {
         error: String,
     },
     NoPamServicesSelected,
+    /// Every path the resolver tried, comma-separated. Not one path: a
+    /// service can be absent from `/etc/pam.d` and present in a vendor
+    /// directory, so naming only the first place looked would send the
+    /// operator to create a file that already exists somewhere else.
     PamFileNotFound {
-        path: String,
+        paths: String,
     },
     PamLineAlreadyPresent {
         path: String,
@@ -80,6 +84,50 @@ pub enum PamMessage {
     PamBackupExists {
         path: String,
         backup: String,
+    },
+
+    // -- vendor directories (P1) -------------------------------------------
+    /// The preview of a vendor copy. Names no backup, because there is none:
+    /// the file being created did not exist, and the vendor original is left
+    /// alone, so deleting the new file is the undo.
+    PamOverridePreview {
+        path: String,
+        vendor: String,
+        line: String,
+        hint: String,
+    },
+    /// A local override was created from a vendor file. On
+    /// [`super::Terminal::notice`], like [`PamMessage::PamInstalled`] and for
+    /// the same reason: the operator has changed an auth stack and needs to
+    /// know how to undo it — and here also that the new file shadows a
+    /// package's and will not follow its updates.
+    PamVendorOverridden {
+        path: String,
+        vendor: String,
+        service: String,
+    },
+    /// A service whose only copy is package-owned, on a verb that does not
+    /// write there.
+    PamVendorOnly {
+        path: String,
+    },
+    /// `status`: the service exists only as a vendor file and carries no
+    /// facelock line.
+    PamStatusVendorOnly {
+        path: String,
+    },
+    /// `--dry-run`: the override that would be created.
+    PamPlanOverride {
+        path: String,
+        vendor: String,
+        hint: String,
+    },
+    /// The override a vendor-only service needs cannot be created. A phase-one
+    /// refusal, so nothing is written for the whole run.
+    PamOverrideDirUnwritable {
+        dir: String,
+        path: String,
+        error: String,
     },
 
     // -- `facelock pam` (#174) ---------------------------------------------
@@ -141,8 +189,12 @@ pub enum PamMessage {
     PamStatusMissing {
         path: String,
     },
+    /// Every path the resolver tried, comma-separated — the same answer
+    /// [`PamMessage::PamFileNotFound`] gives on `add` and `remove`, so the two
+    /// verbs do not answer "where did you look?" differently. The row's
+    /// machine `path` field is still the single first-directory path.
     PamStatusAbsent {
-        path: String,
+        paths: String,
     },
     PamStatusUnknown {
         path: String,
@@ -188,9 +240,9 @@ impl Message for PamMessage {
                 &[("service", service.clone()), ("error", error.clone())],
             ),
             NoPamServicesSelected => translate("  No PAM services selected."),
-            PamFileNotFound { path } => fill(
-                translate("PAM service file not found: {path}"),
-                &[("path", path.clone())],
+            PamFileNotFound { paths } => fill(
+                translate("PAM service file not found: {paths}"),
+                &[("paths", paths.clone())],
             ),
             PamLineAlreadyPresent { path } => fill(
                 translate("PAM line already present in {path}. Nothing to do."),
@@ -253,6 +305,64 @@ impl Message for PamMessage {
             PamBackupExists { path, backup } => fill(
                 translate("Backup exists at {backup}\nTo restore: sudo cp {backup} {path}"),
                 &[("path", path.clone()), ("backup", backup.clone())],
+            ),
+            PamOverridePreview {
+                path,
+                vendor,
+                line,
+                hint,
+            } => fill(
+                translate(
+                    "\nAbout to create {path} from the vendor file {vendor}:\n  + {line}    ({hint})\n  {vendor} is package-owned and is not modified.\n\n(To configure manually instead, copy that file and add the line above yourself.)",
+                ),
+                &[
+                    ("path", path.clone()),
+                    ("vendor", vendor.clone()),
+                    ("line", line.clone()),
+                    ("hint", hint.clone()),
+                ],
+            ),
+            PamVendorOverridden {
+                path,
+                vendor,
+                service,
+            } => fill(
+                translate(
+                    "Created {path} from {vendor} with the facelock PAM line.\nThis local override shadows the vendor file and will not track vendor updates.\n\nTo rollback:\n  sudo rm {path}\n  # or, to keep the override and drop the line: sudo facelock pam remove --service {service}",
+                ),
+                &[
+                    ("path", path.clone()),
+                    ("vendor", vendor.clone()),
+                    ("service", service.clone()),
+                ],
+            ),
+            PamVendorOnly { path } => fill(
+                translate(
+                    "PAM service file exists only at {path}, which is package-owned and never modified by facelock. Nothing to remove.",
+                ),
+                &[("path", path.clone())],
+            ),
+            PamStatusVendorOnly { path } => fill(
+                translate("{path}: vendor file only, no facelock PAM line"),
+                &[("path", path.clone())],
+            ),
+            PamPlanOverride { path, vendor, hint } => fill(
+                translate("Would create {path} from {vendor} with the facelock PAM line ({hint})."),
+                &[
+                    ("path", path.clone()),
+                    ("vendor", vendor.clone()),
+                    ("hint", hint.clone()),
+                ],
+            ),
+            PamOverrideDirUnwritable { dir, path, error } => fill(
+                translate(
+                    "Cannot create the local override {path}: {dir} is not writable ({error}).\nThe vendor copy of this service is package-owned, so facelock will not edit it in place.",
+                ),
+                &[
+                    ("dir", dir.clone()),
+                    ("path", path.clone()),
+                    ("error", error.clone()),
+                ],
             ),
             PamExtensionHint { line } => fill(
                 translate(
@@ -322,9 +432,9 @@ impl Message for PamMessage {
                 translate("{path}: no facelock PAM line"),
                 &[("path", path.clone())],
             ),
-            PamStatusAbsent { path } => fill(
-                translate("{path}: service file absent"),
-                &[("path", path.clone())],
+            PamStatusAbsent { paths } => fill(
+                translate("{paths}: service file absent"),
+                &[("paths", paths.clone())],
             ),
             PamStatusUnknown { path, error } => fill(
                 translate("{path}: unreadable ({error})"),
@@ -342,7 +452,7 @@ impl Message for PamMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for PamMessage {
-    const VARIANT_COUNT: usize = 36;
+    const VARIANT_COUNT: usize = 42;
 
     fn samples() -> Vec<Self> {
         use PamMessage::*;
@@ -360,7 +470,7 @@ impl super::Samples for PamMessage {
                 error: s("e"),
             },
             NoPamServicesSelected,
-            PamFileNotFound { path: s("/p") },
+            PamFileNotFound { paths: s("/p") },
             PamLineAlreadyPresent { path: s("/p") },
             PamInsertBeforeAuthHint,
             PamInsertAtTopHint,
@@ -387,6 +497,33 @@ impl super::Samples for PamMessage {
             PamBackupExists {
                 path: s("/p"),
                 backup: s("/b"),
+            },
+            PamOverridePreview {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+                line: s("auth"),
+                hint: s("h"),
+            },
+            PamVendorOverridden {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+                service: s("polkit-1"),
+            },
+            PamVendorOnly {
+                path: s("/usr/lib/pam.d/polkit-1"),
+            },
+            PamStatusVendorOnly {
+                path: s("/usr/lib/pam.d/polkit-1"),
+            },
+            PamPlanOverride {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+                hint: s("h"),
+            },
+            PamOverrideDirUnwritable {
+                dir: s("/etc/pam.d"),
+                path: s("/etc/pam.d/polkit-1"),
+                error: s("e"),
             },
             PamExtensionHint {
                 line: s("auth ..."),
@@ -416,7 +553,7 @@ impl super::Samples for PamMessage {
             PamPlanAbsent { path: s("/p") },
             PamStatusPresent { path: s("/p") },
             PamStatusMissing { path: s("/p") },
-            PamStatusAbsent { path: s("/p") },
+            PamStatusAbsent { paths: s("/p") },
             PamStatusUnknown {
                 path: s("/p"),
                 error: s("e"),

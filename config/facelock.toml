@@ -422,6 +422,25 @@ notify_on_failure = false
 # face_eligible_actions = ["org.freedesktop.login1.lock-sessions"]
 
 
+# ── PAM service files ──────────────────────────────────────────────
+#
+# Where `facelock pam add | remove | status` looks for PAM service
+# files, in search order — Linux-PAM's own precedence, earliest wins.
+#
+# The FIRST entry is the override directory: every write lands there,
+# and every later entry is read-only. A service that exists only in a
+# later directory (polkit ships /usr/lib/pam.d/polkit-1 on Arch) is
+# copied into the first one before the facelock line is inserted; the
+# package-owned file is never modified.
+#
+# The default matches what Linux-PAM reads on a distribution that
+# enables the vendor directory. Set this only if yours was compiled
+# with a different one — never to put a package-owned directory first.
+#
+# [pam]
+# config_dirs = ["/etc/pam.d", "/usr/lib/pam.d"]
+
+
 # ── TPM ────────────────────────────────────────────────────────────
 #
 # TPM 2.0 settings for sealing the AES encryption key.

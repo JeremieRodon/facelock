@@ -555,6 +555,8 @@ Manage the facelock line in `/etc/pam.d` service files. This command owns every 
 
 `add` and `remove` require root and never offer to re-exec under `sudo` — silently re-running an `/etc/pam.d` edit on a wrapper script's behalf is a surprise, not a convenience. `status` reads only and needs no root.
 
+A service name is looked up in `/etc/pam.d` first and `/usr/lib/pam.d` second — Linux-PAM's own order, first hit wins — because packages ship their configuration there: on current Arch `polkit` installs `/usr/lib/pam.d/polkit-1` and there is no `/etc/pam.d/polkit-1` at all. Only `/etc/pam.d` is ever written to. A service that exists only in a vendor directory is copied there first, with the facelock line already in it and a two-line header saying what it was forked from; the package's own file is left byte for byte. That copy reports `overridden` rather than `installed`, and `pam status` reports a service with no local copy as `vendor-only` rather than as `missing`. Deleting the override restores the vendor file. Set `[pam] config_dirs` if your distribution's vendor directory is somewhere else.
+
 ### facelock pam add
 
 ```bash

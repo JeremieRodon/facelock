@@ -42,6 +42,8 @@ pub struct Config {
     pub audit: AuditConfig,
     #[serde(default)]
     pub polkit: PolkitConfig,
+    #[serde(default)]
+    pub pam: PamConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -706,6 +708,43 @@ impl PolkitConfig {
     pub fn is_face_eligible(&self, action_id: &str) -> bool {
         self.face_eligible_actions.iter().any(|a| a == action_id)
     }
+}
+
+/// Where `facelock pam` looks for PAM service files.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PamConfig {
+    /// The PAM configuration directories, in search order — Linux-PAM's own
+    /// precedence, earliest wins.
+    ///
+    /// **The first entry is the override directory: every write lands there,
+    /// and every later entry is read-only.** A service that resolves only in a
+    /// later directory is copied into the first one before the facelock line
+    /// is inserted, because the later ones are package-owned — an edit there
+    /// is clobbered on the next upgrade and makes the package manager report a
+    /// modified file. Putting a package-owned directory first would therefore
+    /// make facelock edit package files; do not.
+    ///
+    /// The default covers what Linux-PAM itself reads on a distribution that
+    /// enables the vendor directory (Arch, Fedora): `/etc/pam.d` first, then
+    /// `/usr/lib/pam.d`. There is no way to ask Linux-PAM at run time which
+    /// vendor directory it was compiled with, which is what this key is for —
+    /// auto-detection is the default and configuration is never required.
+    #[serde(default = "default_pam_config_dirs")]
+    pub config_dirs: Vec<String>,
+}
+
+impl Default for PamConfig {
+    fn default() -> Self {
+        Self {
+            config_dirs: default_pam_config_dirs(),
+        }
+    }
+}
+
+/// `/etc/pam.d` then `/usr/lib/pam.d`. The single copy of the list: the CLI's
+/// PAM writer takes its defaults from here rather than keeping its own.
+fn default_pam_config_dirs() -> Vec<String> {
+    vec!["/etc/pam.d".to_string(), "/usr/lib/pam.d".to_string()]
 }
 
 /// Default polkit actions eligible for face authentication.
