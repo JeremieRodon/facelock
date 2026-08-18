@@ -63,6 +63,8 @@ fn unseal_check(config: &Config) -> Result<()> {
 }
 
 fn status(config: &Config) -> Result<()> {
+    crate::ipc_client::require_root("sudo facelock tpm status")?;
+
     // Extract device path from TCTI string (e.g., "device:/dev/tpmrm0" -> "/dev/tpmrm0")
     let device_path = config
         .tpm
@@ -385,6 +387,8 @@ pub fn run_reseal(config: &Config) -> Result<()> {
 }
 
 fn pcr_baseline(config: &Config) -> Result<()> {
+    crate::ipc_client::require_root("sudo facelock tpm pcr-baseline")?;
+
     println!("PCR Baseline (indices: {:?})", config.tpm.pcr_indices);
     println!("----------");
 

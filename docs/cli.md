@@ -298,7 +298,7 @@ TPM integration status and management.
 Report TPM availability and configuration.
 
 ```bash
-facelock tpm status
+sudo facelock tpm status
 ```
 
 ### facelock tpm seal-key
@@ -306,7 +306,7 @@ facelock tpm status
 Seal the AES encryption key with the TPM, migrating from a plaintext keyfile to TPM-backed storage.
 
 ```bash
-facelock tpm seal-key
+sudo facelock tpm seal-key
 ```
 
 ### facelock tpm unseal-key
@@ -314,7 +314,7 @@ facelock tpm seal-key
 Unseal the AES key from the TPM back to a plaintext keyfile, migrating from TPM-backed to keyfile storage.
 
 ```bash
-facelock tpm unseal-key
+sudo facelock tpm unseal-key
 ```
 
 ### facelock tpm unseal-check
@@ -332,7 +332,7 @@ sudo facelock tpm unseal-check
 Display the current PCR values for all configured PCR indices.
 
 ```bash
-facelock tpm pcr-baseline
+sudo facelock tpm pcr-baseline
 ```
 
 ## facelock bench
