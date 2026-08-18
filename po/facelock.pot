@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: facelock\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-17 21:46-0700\n"
+"POT-Creation-Date: 2026-08-17 23:08-0700\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -399,29 +399,29 @@ msgstr ""
 msgid "Face auth failed: {reason}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:219
+#: crates/facelock-cli/src/message/pam.rs:258
 msgid ""
 "  Skipping PAM configuration (--no-pam).\n"
 "  No file under {dir} is read or modified."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:225
+#: crates/facelock-cli/src/message/pam.rs:264
 msgid ""
 "  PAM module not found. Tried: {paths}\n"
 "  Install it first, then run: sudo facelock setup --pam"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:230
+#: crates/facelock-cli/src/message/pam.rs:269
 #, python-brace-format
 msgid "  Configuring PAM for {service}..."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:234
+#: crates/facelock-cli/src/message/pam.rs:273
 #, python-brace-format
 msgid "  No supported PAM service files found in {dir}/."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:239
+#: crates/facelock-cli/src/message/pam.rs:278
 msgid ""
 "  The following line will be added to each selected /etc/pam.d/<service>:\n"
 "\n"
@@ -432,38 +432,38 @@ msgid ""
 "  to confirm each file individually.\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:244
+#: crates/facelock-cli/src/message/pam.rs:283
 msgid "Select services to enable face authentication for"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:247
+#: crates/facelock-cli/src/message/pam.rs:286
 #, python-brace-format
 msgid "  Failed to configure {service}: {error}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:250
+#: crates/facelock-cli/src/message/pam.rs:289
 msgid "  No PAM services selected."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:252
+#: crates/facelock-cli/src/message/pam.rs:291
 #, python-brace-format
 msgid "PAM service file not found: {paths}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:256
+#: crates/facelock-cli/src/message/pam.rs:295
 #, python-brace-format
 msgid "PAM line already present in {path}. Nothing to do."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:259
+#: crates/facelock-cli/src/message/pam.rs:298
 msgid "inserted before the first 'auth' line"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:261
+#: crates/facelock-cli/src/message/pam.rs:300
 msgid "no 'auth' line found — inserted at the top of the file"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:270
+#: crates/facelock-cli/src/message/pam.rs:309
 msgid ""
 "\n"
 "About to modify {path}:\n"
@@ -473,21 +473,21 @@ msgid ""
 "(To configure manually instead, add the line above to each service yourself.)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:279
+#: crates/facelock-cli/src/message/pam.rs:318
 msgid "Proceed?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:281
+#: crates/facelock-cli/src/message/pam.rs:320
 #, python-brace-format
 msgid "Skipped {path}."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:284
+#: crates/facelock-cli/src/message/pam.rs:323
 #, python-brace-format
 msgid "Backed up {path} -> {backup}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:293
+#: crates/facelock-cli/src/message/pam.rs:332
 msgid ""
 "Installed facelock PAM line into {path}\n"
 "\n"
@@ -496,28 +496,28 @@ msgid ""
 "  # or: sudo facelock pam remove --service {service}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:302
+#: crates/facelock-cli/src/message/pam.rs:341
 #, python-brace-format
 msgid "Removed facelock PAM line from {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:306
+#: crates/facelock-cli/src/message/pam.rs:345
 #, python-brace-format
 msgid "No facelock PAM line found in {path}. Nothing to remove."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:310
+#: crates/facelock-cli/src/message/pam.rs:349
 #, python-brace-format
 msgid "PAM service file absent: {path}. Nothing to remove."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:314
+#: crates/facelock-cli/src/message/pam.rs:353
 msgid ""
 "Backup exists at {backup}\n"
 "To restore: sudo cp {backup} {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:324
+#: crates/facelock-cli/src/message/pam.rs:363
 msgid ""
 "\n"
 "About to create {path} from the vendor file {vendor}:\n"
@@ -527,7 +527,7 @@ msgid ""
 "(To configure manually instead, copy that file and add the line above yourself.)"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:339
+#: crates/facelock-cli/src/message/pam.rs:378
 msgid ""
 "Created {path} from {vendor} with the facelock PAM line.\n"
 "This local override shadows the vendor file and will not track vendor updates.\n"
@@ -537,28 +537,28 @@ msgid ""
 "  # or, to keep the override and drop the line: sudo facelock pam remove --service {service}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:349
+#: crates/facelock-cli/src/message/pam.rs:388
 #, python-brace-format
 msgid "PAM service file exists only at {path}, which is package-owned and never modified by facelock. Nothing to remove."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:354
+#: crates/facelock-cli/src/message/pam.rs:393
 #, python-brace-format
 msgid "{path}: vendor file only, no facelock PAM line"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:358
+#: crates/facelock-cli/src/message/pam.rs:397
 #, python-brace-format
 msgid "Would create {path} from {vendor} with the facelock PAM line ({hint})."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:367
+#: crates/facelock-cli/src/message/pam.rs:406
 msgid ""
 "Cannot create the local override {path}: {dir} is not writable ({error}).\n"
 "The vendor copy of this service is package-owned, so facelock will not edit it in place."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:377
+#: crates/facelock-cli/src/message/pam.rs:416
 msgid ""
 "\n"
 "==> facelock PAM line for manual extension to other services:\n"
@@ -566,78 +566,103 @@ msgid ""
 "==> Add the above line above the first 'auth' line in any /etc/pam.d/<service> file."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:383
+#: crates/facelock-cli/src/message/pam.rs:422
 #, python-brace-format
 msgid "Invalid PAM service name '{service}': a service is one file name under /etc/pam.d, so it may not be empty, contain '/', or be '.' or '..'."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:389
+#: crates/facelock-cli/src/message/pam.rs:428
 msgid ""
 "Refusing to touch {path}: it is a symlink to {target}, which is not inside {dir}.\n"
 "Edit that file directly, or the tool that generates it — authselect regenerates system-auth and password-auth from /etc/authselect."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:399
+#: crates/facelock-cli/src/message/pam.rs:438
 msgid ""
 "Refusing to touch {path}: it is one of {links} names for the same file, so an edit here would change a file outside /etc/pam.d that facelock cannot name.\n"
 "Break the link first: sudo cp -p {path} {path}.new && sudo mv {path}.new {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:405
+#: crates/facelock-cli/src/message/pam.rs:444
 msgid ""
 "Refusing to modify '{service}': this is a sensitive PAM service.\n"
 "Re-run with {remedy} to accept the risk of locking yourself out."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:411
+#: crates/facelock-cli/src/message/pam.rs:450
 msgid ""
 "PAM module not found. Tried: {paths}\n"
 "Install it first: cargo build --release -p pam-facelock && sudo cp target/release/libpam_facelock.so {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:416
+#: crates/facelock-cli/src/message/pam.rs:455
 #, python-brace-format
 msgid "PAM service file absent: {path}. Nothing to add."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:420
+#: crates/facelock-cli/src/message/pam.rs:459
 #, python-brace-format
 msgid "Would add the facelock PAM line to {path} ({hint})."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:424
+#: crates/facelock-cli/src/message/pam.rs:463
 #, python-brace-format
 msgid "Would remove the facelock PAM line from {path}."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:428
+#: crates/facelock-cli/src/message/pam.rs:467
 #, python-brace-format
 msgid "No change needed for {path}."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:432
+#: crates/facelock-cli/src/message/pam.rs:471
 #, python-brace-format
 msgid "PAM service file absent: {path}. Nothing to do."
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:436
+#: crates/facelock-cli/src/message/pam.rs:475
 #, python-brace-format
 msgid "{path}: facelock PAM line present"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:440
+#: crates/facelock-cli/src/message/pam.rs:479
 #, python-brace-format
 msgid "{path}: no facelock PAM line"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:444
+#: crates/facelock-cli/src/message/pam.rs:483
 #, python-brace-format
 msgid "{paths}: service file absent"
 msgstr ""
 
-#: crates/facelock-cli/src/message/pam.rs:448
+#: crates/facelock-cli/src/message/pam.rs:487
 #, python-brace-format
 msgid "{path}: unreadable ({error})"
+msgstr ""
+
+#: crates/facelock-cli/src/message/pam.rs:491
+#, python-brace-format
+msgid "{path}: facelock PAM line present (local override of {vendor})"
+msgstr ""
+
+#: crates/facelock-cli/src/message/pam.rs:495
+#, python-brace-format
+msgid "{dir}: directory not checked ({error})"
+msgstr ""
+
+#: crates/facelock-cli/src/message/pam.rs:499
+#, python-brace-format
+msgid "No service file under {dirs} carries the facelock PAM line."
+msgstr ""
+
+#: crates/facelock-cli/src/message/pam.rs:504
+#, python-brace-format
+msgid "No service file under {dirs} carries the facelock PAM line, but {unchecked} could not be checked, so this is not an answer about the whole machine."
+msgstr ""
+
+#: crates/facelock-cli/src/message/pam.rs:509
+#, python-brace-format
+msgid "No directory on the search path could be read: {dirs}."
 msgstr ""
 
 #: crates/facelock-cli/src/message/setup.rs:196

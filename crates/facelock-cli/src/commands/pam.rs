@@ -99,6 +99,26 @@
 //! header saying what it was forked from. That is what the `/etc` layer is
 //! for.
 //!
+//! # Enumeration
+//!
+//! `status` answers about the services it is *given*, which leaves the same
+//! blind spot from the other side: it will report `sudo` fine while a
+//! configured `polkit-1` or `omarchy-lock-face` is broken, because nobody
+//! named it. `pam status --all` is the enumerating form — [`scan_directories`]
+//! walks the resolved directories for files that name `pam_facelock.so` and
+//! feeds the names it finds to the same [`status_reports`] the explicit form
+//! uses, so the two cannot answer differently about one service.
+//!
+//! **It parses; it keeps no manifest.** A state file listing what facelock has
+//! edited drifts the moment anyone edits `/etc/pam.d` by hand, restores a
+//! backup, or removes a package — and then `status` reports fiction with
+//! confidence. A directory scan is ground truth.
+//!
+//! **A directory that could not be listed is reported, not treated as empty.**
+//! "Nothing is configured here" and "I could not look here" are different
+//! answers, and rendering them the same is what made a broken lock stack and a
+//! healthy one look identical. See [`DirState`].
+//!
 //! # Limits
 //!
 //! `remove` takes no backup of its own and relies on the one `add` wrote.
@@ -318,11 +338,27 @@ impl PamDirs {
     /// a privileged process, so the environment cannot redirect where a root
     /// `pam add` writes.
     pub(crate) fn system() -> Self {
-        let dirs = crate::resolved::ConfigLoad::read()
+        crate::resolved::ConfigLoad::read()
             .config()
-            .map(|config| config.pam.config_dirs.clone())
-            .unwrap_or_else(|| facelock_core::config::PamConfig::default().config_dirs);
-        Self::new(dirs.into_iter().map(PathBuf::from).collect())
+            .map_or_else(Self::default, Self::from_config)
+    }
+
+    /// The search path a config that has *already been parsed* names.
+    ///
+    /// `facelock status` holds a [`crate::resolved::ConfigLoad`] before it
+    /// probes anything, so it reads `[pam] config_dirs` from that rather than
+    /// opening the file a second time through [`PamDirs::system`] — which is
+    /// also what keeps `health.rs` out of the canonical-config-read pin in
+    /// `resolved.rs`.
+    pub(crate) fn from_config(config: &facelock_core::Config) -> Self {
+        Self::new(
+            config
+                .pam
+                .config_dirs
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<PathBuf>>(),
+        )
     }
 
     /// The directory writes land in: the first entry.
@@ -432,6 +468,17 @@ pub struct PamRequest {
     /// Requested services, in the order given. Empty means
     /// [`DEFAULT_PAM_SERVICE`].
     pub services: Vec<String>,
+    /// `status` only: report every service on the search path that carries the
+    /// facelock line instead of the named ones.
+    ///
+    /// A flag rather than a new meaning for a bare `pam status`, because that
+    /// invocation's exit code is 0/1/2 *about `sudo`* today and an integrator
+    /// may already branch on it; making it 0/1/2 about whatever happens to be
+    /// on the machine would change an answer without changing a command line.
+    /// It is mutually exclusive with `services` — enumerating and naming are
+    /// two different questions, and a request that did both would have to pick
+    /// one silently.
+    pub all: bool,
     /// Suppress prompts. **Never** unlocks [`SENSITIVE_SERVICES`].
     ///
     /// `--json` implies it (the conversion in the binary's `args.rs` sets it):
@@ -590,6 +637,16 @@ struct ServiceReport {
     /// operation. `null` otherwise — including for every `--dry-run` service,
     /// which writes no backup.
     backup: Option<String>,
+    /// The vendor file this row's `/etc` entry hides, when it hides one.
+    ///
+    /// The fact `status` needs to say "configured, and this copy will not
+    /// track the package's updates" — and the reason it is on the row rather
+    /// than derived by the reporter is that [`Target::locate`] is where the
+    /// search path is walked, so anywhere else would be a second walk that
+    /// could disagree with the first. `None` on every machine with no vendor
+    /// directory, which is why the `--json` key is omitted rather than
+    /// emitted as `null`.
+    shadows: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +720,13 @@ struct Target {
     /// when nothing exists anywhere.
     path: PathBuf,
     origin: Origin,
+    /// The vendor file an [`Origin::Local`] hit hides, if it hides one.
+    ///
+    /// Not folded into [`Origin`]: `Local` is the fact that decides *how to
+    /// write* — in place, never a copy — and that decision is the same whether
+    /// or not a package also ships the name. What shadowing decides is what to
+    /// *say*, and only `status` says it.
+    shadowed: Option<PathBuf>,
     backup: PathBuf,
     plan: Plan,
 }
@@ -681,6 +745,7 @@ impl Target {
         Ok(Target {
             service: service.to_string(),
             backup: backup_path(write_target(&path, &origin)),
+            shadowed: shadowed_vendor(dirs, service, &origin),
             path,
             origin,
             plan: Plan::NoChange,
@@ -737,6 +802,31 @@ impl Target {
     fn existing_backup(&self) -> Option<String> {
         existing_backup_for(self.write_path())
     }
+
+    /// The row's `shadows` field: the vendor file this entry hides.
+    fn shadows_string(&self) -> Option<String> {
+        self.shadowed
+            .as_ref()
+            .map(|vendor| vendor.display().to_string())
+    }
+}
+
+/// The package-owned file an `/etc` entry hides, if the same name also exists
+/// further down the search path.
+///
+/// Only an [`Origin::Local`] hit can shadow anything: `Vendor` *is* the
+/// package's file, and `Nowhere` is no file at all. The probe is one `lstat`
+/// per remaining directory and it deliberately does **not** look inside the
+/// files — an entry that exists is enough to hide the name from Linux-PAM,
+/// whatever it contains.
+fn shadowed_vendor(dirs: &PamDirs, service: &str, origin: &Origin) -> Option<PathBuf> {
+    if !matches!(origin, Origin::Local) {
+        return None;
+    }
+    dirs.iter()
+        .skip(1)
+        .map(|base| base.join(service))
+        .find(|path| fs::symlink_metadata(path).is_ok())
 }
 
 /// Where a write lands, as a free function so [`Target::locate`] can derive the
@@ -1016,6 +1106,232 @@ fn hard_link_checked(path: PathBuf) -> Result<PathBuf, Rejected> {
         });
     }
     Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Enumeration
+// ---------------------------------------------------------------------------
+
+/// What happened to one directory of the search path.
+///
+/// The distinction this type exists for is [`DirState::Unreadable`] against
+/// [`DirState::Scanned`] with nothing in it: a directory that could not be
+/// listed has told us **nothing**, and folding that into "no services here"
+/// is how a broken lock stack and a healthy one came to render identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirState {
+    /// Listed. Whatever it holds is in the scan's names.
+    Scanned,
+    /// Not there. A directory that does not exist demonstrably holds no
+    /// service files, so this is a fact rather than the absence of one — and
+    /// it is **not** an error: the default search path names a vendor
+    /// directory many machines simply do not have, so treating its absence as
+    /// unanswerable would make every one of them report exit 2 forever.
+    Absent,
+    /// There, and not listable — a permission, mount or I/O failure. The
+    /// answer for this directory is unknown, so the scan's answer is
+    /// incomplete and its exit code says so.
+    Unreadable(String),
+}
+
+impl DirState {
+    /// The word this state reports in `--json`.
+    fn word(&self) -> &'static str {
+        match self {
+            DirState::Scanned => "scanned",
+            DirState::Absent => "absent",
+            DirState::Unreadable(_) => "unreadable",
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            DirState::Unreadable(error) => Some(error),
+            DirState::Scanned | DirState::Absent => None,
+        }
+    }
+}
+
+/// One directory of the search path, and what came of listing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryScan {
+    path: PathBuf,
+    state: DirState,
+}
+
+/// The result of walking the whole search path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Scan {
+    /// Every service **name** worth reporting on, sorted and de-duplicated.
+    /// Names, not paths: which file a name resolves to is [`Target::locate`]'s
+    /// answer and must not be decided twice.
+    names: Vec<String>,
+    /// Every directory searched, in search order, whether or not it yielded
+    /// anything. In the document so a reader can see what was looked at
+    /// rather than infer it.
+    directories: Vec<DirectoryScan>,
+}
+
+impl Scan {
+    /// The directories that stop this scan being a complete answer.
+    fn unreadable(&self) -> impl Iterator<Item = (&Path, &str)> {
+        self.directories
+            .iter()
+            .filter_map(|dir| dir.state.error().map(|error| (dir.path.as_path(), error)))
+    }
+
+    /// The directories that produced an answer — listed, or proven not to
+    /// exist. What "nothing is configured" may be said *about*: a directory
+    /// this could not open supports no such claim.
+    fn answered(&self) -> Vec<String> {
+        self.directories
+            .iter()
+            .filter(|dir| dir.state.error().is_none())
+            .map(|dir| dir.path.display().to_string())
+            .collect()
+    }
+}
+
+/// Names that live in a `pam.d` directory and are not services.
+///
+/// Every one of these can carry the facelock line — `sudo.facelock-backup` is
+/// a byte copy of a configured file, and a `.pacsave` is the configuration a
+/// removed package left behind — and none of them is a service Linux-PAM will
+/// ever be asked for. Reporting them as configured services would be the
+/// report being confidently wrong, which is the failure mode enumeration
+/// exists to remove rather than add.
+const NON_SERVICE_SUFFIXES: &[&str] = &[
+    BACKUP_SUFFIX,
+    ".pacnew",
+    ".pacsave",
+    ".pacorig",
+    ".rpmnew",
+    ".rpmsave",
+    ".rpmorig",
+    ".dpkg-old",
+    ".dpkg-new",
+    ".dpkg-dist",
+    "~",
+];
+
+/// Whether a directory entry's name is worth resolving as a service.
+///
+/// Dotfiles are excluded as a class: this module's own in-flight temp file is
+/// `.<service>.facelock-<pid>-<nanos>`, and nothing else that starts with a
+/// dot is a service anyone authenticates against.
+fn is_service_name(name: &str) -> bool {
+    !name.starts_with('.')
+        && !NON_SERVICE_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        && confined(name).is_ok()
+}
+
+/// Whether this file is one the scan should report on: it carries the facelock
+/// line, or it could not be read to find out.
+///
+/// The second half is the point. Omitting a file this could not read would
+/// report "not configured" for a machine that is configured — the exact
+/// confident wrongness enumeration is for — so an unreadable entry is carried
+/// into the report, where [`status_reports`] turns it into an `unknown` row
+/// with the errno and exit 2. A file that vanished between the listing and the
+/// read is not carried: it is gone, which is an answer.
+///
+/// **Only a regular file is read, and the metadata that decides it is the
+/// *followed* one.** `read_to_string` on a FIFO blocks until a writer appears,
+/// which is forever on a `/etc/pam.d` nobody is writing to — and this scan is
+/// what `facelock status` runs, so the command whose whole job is to report a
+/// broken machine would hang on one. A socket or a device node is the same
+/// class. The `is_dir` check at the call site cannot cover it: that one is
+/// `lstat`, so a symlink to a directory or to a FIFO survives it. A
+/// non-regular entry in a `pam.d` directory is not a service file under any
+/// reading, so skipping it loses nothing.
+///
+/// **"Not a regular file" and "could not be examined" are different answers**,
+/// and only the first is a skip. A `stat` that *fails* — a symlink into a
+/// directory this may not traverse, a symlink loop, a dead network mount —
+/// says nothing about what is there, so the entry falls through to the read,
+/// which reports it. Treating a failed `stat` as "not a regular file" made an
+/// entry the named form calls `unknown` vanish from `--all` entirely, which is
+/// the same rule `resolve_in` already refuses to apply one layer down. It
+/// cannot reintroduce the hang: the hang needs an `open` that blocks, and an
+/// entry whose `stat` cannot resolve the path cannot `open` through it either.
+fn worth_reporting(path: &Path) -> bool {
+    match fs::metadata(path) {
+        // Stat-ed, and it is not something a PAM stack could ever read.
+        Ok(metadata) if !metadata.is_file() => return false,
+        // Gone between the listing and now. Absence is an answer.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        // A regular file, or an entry this could not examine. Both go to the
+        // read, which distinguishes them.
+        _ => {}
+    }
+    match fs::read_to_string(path) {
+        Ok(content) => content.lines().any(is_facelock_pam_line),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// Walk the search path for every service that names `pam_facelock.so`.
+///
+/// Names are collected across **all** directories and resolved afterwards, so
+/// a vendor file carrying the line puts its name in the report even when
+/// `/etc/pam.d` shadows it — and the row then says `missing`, because the file
+/// Linux-PAM actually reads has no line in it. Dropping the name instead would
+/// hide precisely the machine an operator cannot otherwise explain.
+fn scan_directories(dirs: &PamDirs) -> Scan {
+    let mut names: Vec<String> = Vec::new();
+    let mut directories = Vec::new();
+
+    for base in dirs.iter() {
+        let state = match fs::read_dir(base) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    // A subdirectory is not a service file. `file_type` here
+                    // does not follow symlinks, so a link is kept and handed
+                    // to `Target::locate`, which is what owns the rule about
+                    // where a link may point.
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        continue;
+                    }
+                    // A name this cannot spell is a name it cannot resolve.
+                    // `to_string_lossy` would substitute U+FFFD and hand
+                    // `Target::locate` a name no file has, which reports a
+                    // configured service as `absent` — a path that does not
+                    // exist, presented as the answer. Skipped and logged
+                    // instead: a PAM service name is looked up by a byte
+                    // string PAM itself takes from a config file, and nothing
+                    // that is not UTF-8 is a service this can act on.
+                    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                        tracing::warn!(
+                            path = %entry.path().display(),
+                            "skipping a PAM service file whose name is not valid UTF-8"
+                        );
+                        continue;
+                    };
+                    if !is_service_name(&name) || !worth_reporting(&entry.path()) {
+                        continue;
+                    }
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                DirState::Scanned
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirState::Absent,
+            Err(error) => DirState::Unreadable(error.to_string()),
+        };
+        directories.push(DirectoryScan {
+            path: base.to_path_buf(),
+            state,
+        });
+    }
+
+    // Sorted so two runs on one machine print the same report: `read_dir`
+    // yields whatever order the filesystem happens to hold.
+    names.sort();
+    Scan { names, directories }
 }
 
 /// Refuse a [`SENSITIVE_SERVICES`] entry unless the caller accepted the risk.
@@ -1888,7 +2204,12 @@ fn report_plan(target: &Target, action: WriteAction, sink: &Sink) -> Outcome {
 /// `commands::list::list_json`): a service name reaches here from argv, and
 /// confinement rejects `/` but not `"`, so `--service 'a"b'` would otherwise
 /// emit invalid JSON.
-fn report_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) -> String {
+fn report_json(
+    action: PamAction,
+    dry_run: bool,
+    reports: &[ServiceReport],
+    directories: &[DirectoryScan],
+) -> String {
     let services: Vec<serde_json::Value> = reports
         .iter()
         .map(|report| {
@@ -1900,6 +2221,16 @@ fn report_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) -> S
             });
             if let (Some(error), Some(object)) = (report.outcome.error(), value.as_object_mut()) {
                 object.insert("error".to_string(), serde_json::Value::String(error.into()));
+            }
+            // Omitted rather than `null` when there is nothing shadowed: every
+            // row on a machine with no vendor directory would otherwise carry
+            // a key that is always null, and the absent-key form is the one
+            // `error` already established for a field that is sometimes there.
+            if let (Some(vendor), Some(object)) = (&report.shadows, value.as_object_mut()) {
+                object.insert(
+                    "shadows".to_string(),
+                    serde_json::Value::String(vendor.clone()),
+                );
             }
             value
         })
@@ -1923,6 +2254,28 @@ fn report_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) -> S
         object.insert("module_path".to_string(), serde_json::json!(found));
     }
 
+    // `--all` alone carries `directories`: it is the only form that claims to
+    // have looked everywhere, so it is the only one that owes the reader an
+    // account of where it looked and which of those places answered. A named
+    // request resolves through the search path without listing it, and an
+    // empty array there would read as "nothing searched".
+    if let (false, Some(object)) = (directories.is_empty(), document.as_object_mut()) {
+        let scanned: Vec<serde_json::Value> = directories
+            .iter()
+            .map(|dir| {
+                let mut value = serde_json::json!({
+                    "path": dir.path.display().to_string(),
+                    "status": dir.state.word(),
+                });
+                if let (Some(error), Some(object)) = (dir.state.error(), value.as_object_mut()) {
+                    object.insert("error".to_string(), serde_json::Value::String(error.into()));
+                }
+                value
+            })
+            .collect();
+        object.insert("directories".to_string(), serde_json::Value::Array(scanned));
+    }
+
     document.to_string()
 }
 
@@ -1937,9 +2290,14 @@ fn report_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) -> S
 /// `dry_run` is a parameter rather than read off the request because `status`
 /// has no dry run: it reports `false` whatever a library caller left in the
 /// field, since a read that always happens cannot have been a preview.
-fn emit_json(request: &PamRequest, dry_run: bool, reports: &[ServiceReport]) {
+fn emit_json(
+    request: &PamRequest,
+    dry_run: bool,
+    reports: &[ServiceReport],
+    directories: &[DirectoryScan],
+) {
     if request.json {
-        crate::message::payload(&report_json(request.action, dry_run, reports));
+        crate::message::payload(&report_json(request.action, dry_run, reports, directories));
     }
 }
 
@@ -2097,6 +2455,18 @@ fn apply_all(targets: &[Target], write: &WriteRequest, sink: &Sink) -> Vec<Servi
                     (_, true) | (Outcome::Overridden, _) => None,
                     _ => target.existing_backup(),
                 },
+                // The row that *creates* the shadow is the one the resolver
+                // could not report it for: at `locate` time there was no
+                // `/etc` entry, so `Origin::Vendor` has nothing to hide yet.
+                // After the copy, the file it was read from is exactly what
+                // it hides — and under `--dry-run` exactly what it would.
+                // Leaving this `None` would put the key on every later
+                // `status` row and withhold it from the one that made the
+                // fact true.
+                shadows: match &outcome {
+                    Outcome::Overridden => Some(target.path_string()),
+                    _ => target.shadows_string(),
+                },
                 outcome,
             }
         })
@@ -2148,7 +2518,7 @@ fn write_in(dirs: &PamDirs, request: &PamRequest) -> anyhow::Result<i32> {
     if action == WriteAction::Add {
         emit_extension_hint(&sink);
     }
-    emit_json(request, request.dry_run, &reports);
+    emit_json(request, request.dry_run, &reports, &[]);
 
     Ok(if first_failure(&reports).is_err() {
         WRITE_FAILED
@@ -2169,15 +2539,102 @@ fn write_in(dirs: &PamDirs, request: &PamRequest) -> anyhow::Result<i32> {
 /// answered. The worst outcome wins.
 fn status_in(dirs: &PamDirs, request: &PamRequest) -> i32 {
     let sink = Sink::verb(request.json);
+    if request.all {
+        return status_all_in(dirs, request, &sink);
+    }
     let reports = status_reports(dirs, &requested_services(&request.services), &sink);
 
-    emit_json(request, false, &reports);
+    emit_json(request, false, &reports, &[]);
 
     reports
         .iter()
         .map(|report| status_code(&report.outcome, request.if_present))
         .max()
         .unwrap_or(STATUS_PRESENT)
+}
+
+/// `pam status --all`: every service on the search path that names the module.
+///
+/// The rows come from the same [`status_reports`] the named form uses, so a
+/// service reported here is reported identically when it is asked for by name.
+/// Three things decide the exit code, and each is a different question:
+///
+/// - the worst row, exactly as in the named form;
+/// - **nothing configured is [`STATUS_MISSING`]**, not 0. A machine with no
+///   facelock line anywhere is not "fine", it is not set up, and it is the
+///   same answer `pam status` gives for a service file with no line in it.
+///   `--if-present` does not change it either: there are no `absent` rows to
+///   forgive here — a name only reaches the report by having been found — so
+///   the flag has nothing to convert;
+/// - **a directory that would not list is [`STATUS_ERROR`]**, because the
+///   enumeration is then incomplete and a 0 or a 1 would be a claim about
+///   services this never saw.
+fn status_all_in(dirs: &PamDirs, request: &PamRequest, sink: &Sink) -> i32 {
+    let scan = scan_directories(dirs);
+    let reports = status_reports(dirs, &scan.names, sink);
+
+    // After the rows: the services are the answer, and this is why the answer
+    // may be short. On stderr, like every other "could not tell" line here.
+    let unchecked: Vec<String> = scan
+        .unreadable()
+        .map(|(path, error)| {
+            sink.error(&PamMessage::PamStatusDirUnreadable {
+                dir: path.display().to_string(),
+                error: error.to_string(),
+            });
+            path.display().to_string()
+        })
+        .collect();
+
+    // **The empty answer has to be qualified by what could not be looked at.**
+    // An unqualified "no service file under <every directory> carries the
+    // line" is a claim about a directory this failed to open, and read
+    // `2>/dev/null` — the ordinary way to take the human answer — it asserts
+    // exactly what enumeration exists to stop it asserting. Three cases, and
+    // the third is why this is not a one-line guard: when *nothing* could be
+    // read there is no set of directories to say "none here" about, and the
+    // per-directory lines above are already the whole answer.
+    if reports.is_empty() {
+        let answered = scan.answered();
+        if unchecked.is_empty() {
+            sink.info(&PamMessage::PamStatusNoServices {
+                dirs: dirs.display(),
+            });
+        } else if !answered.is_empty() {
+            sink.info(&PamMessage::PamStatusNoServicesIncomplete {
+                dirs: answered.join(", "),
+                unchecked: unchecked.join(", "),
+            });
+        } else {
+            // Nothing was read, so there is no set of directories to say
+            // "none here" about. stdout still gets a line: a human reading it
+            // alone would otherwise get a sentence in the other two branches
+            // and silence in the one where the machine is worst off. It
+            // asserts only what is true — that nothing could be read.
+            sink.info(&PamMessage::PamStatusNothingReadable {
+                dirs: unchecked.join(", "),
+            });
+        }
+    }
+
+    emit_json(request, false, &reports, &scan.directories);
+
+    let worst = reports
+        .iter()
+        .map(|report| status_code(&report.outcome, request.if_present))
+        .max()
+        .unwrap_or(STATUS_PRESENT);
+    let nothing_configured = if reports.is_empty() {
+        STATUS_MISSING
+    } else {
+        STATUS_PRESENT
+    };
+    let unreadable = if unchecked.is_empty() {
+        STATUS_PRESENT
+    } else {
+        STATUS_ERROR
+    };
+    worst.max(nothing_configured).max(unreadable)
 }
 
 /// One report row per service. Split out from [`status_in`] so the rows —
@@ -2200,6 +2657,9 @@ fn status_reports(dirs: &PamDirs, services: &[String], sink: &Sink) -> Vec<Servi
                         path: why.path(),
                         outcome: Outcome::Unknown(why.reason().to_string()),
                         backup: why.backup(),
+                        // Nothing was resolved, so there is nothing this could
+                        // be shadowing.
+                        shadows: None,
                     };
                 }
             };
@@ -2214,9 +2674,18 @@ fn status_reports(dirs: &PamDirs, services: &[String], sink: &Sink) -> Vec<Servi
                 // reporting it `vendor-only` would send an integrator off to
                 // create an override that adds nothing.
                 Ok(content) if content.lines().any(is_facelock_pam_line) => {
-                    sink.info(&PamMessage::PamStatusPresent {
-                        path: display.clone(),
-                    });
+                    // Configured either way; the second line says the copy is
+                    // a local override, which is what tells an operator it
+                    // will not follow the package's updates.
+                    match &target.shadowed {
+                        Some(vendor) => sink.info(&PamMessage::PamStatusOverride {
+                            path: display.clone(),
+                            vendor: vendor.display().to_string(),
+                        }),
+                        None => sink.info(&PamMessage::PamStatusPresent {
+                            path: display.clone(),
+                        }),
+                    }
                     Outcome::Present
                 }
                 // Exists, carries no line, and has no `/etc/pam.d` copy for
@@ -2260,6 +2729,7 @@ fn status_reports(dirs: &PamDirs, services: &[String], sink: &Sink) -> Vec<Servi
                 path: Some(display),
                 outcome,
                 backup: target.existing_backup(),
+                shadows: target.shadows_string(),
             }
         })
         .collect()
@@ -2877,9 +3347,10 @@ mod tests {
             path: Some("/etc/pam.d/sudo".into()),
             outcome: Outcome::Installed,
             backup: Some("/etc/pam.d/sudo.facelock-backup".into()),
+            shadows: None,
         }];
         let value: serde_json::Value =
-            serde_json::from_str(&report_json(PamAction::Add, false, &reports)).unwrap();
+            serde_json::from_str(&report_json(PamAction::Add, false, &reports, &[])).unwrap();
 
         assert_eq!(value["command"], "add");
         assert_eq!(value["dry_run"], false);
@@ -2901,16 +3372,18 @@ mod tests {
                 path: Some("/etc/pam.d/sudo".into()),
                 outcome: Outcome::Failed("disk full".into()),
                 backup: None,
+                shadows: None,
             },
             ServiceReport {
                 service: "polkit-1".into(),
                 path: Some("/etc/pam.d/polkit-1".into()),
                 outcome: Outcome::Unchanged,
                 backup: None,
+                shadows: None,
             },
         ];
         let value: serde_json::Value =
-            serde_json::from_str(&report_json(PamAction::Add, false, &reports)).unwrap();
+            serde_json::from_str(&report_json(PamAction::Add, false, &reports, &[])).unwrap();
 
         assert_eq!(value["services"][0]["action"], "failed");
         assert_eq!(value["services"][0]["error"], "disk full");
@@ -2938,7 +3411,7 @@ mod tests {
         assert_eq!(INVALID_SERVICE_NAME, "invalid service name");
         // ...and it is what lands in the document.
         let value: serde_json::Value =
-            serde_json::from_str(&report_json(PamAction::Status, false, &reports)).unwrap();
+            serde_json::from_str(&report_json(PamAction::Status, false, &reports, &[])).unwrap();
         assert_eq!(value["services"][0]["error"], "invalid service name");
         assert_eq!(value["services"][0]["action"], "unknown");
         // N3: a name that was rejected is never resolved, so nothing — not
@@ -2956,8 +3429,9 @@ mod tests {
             path: Some("/etc/pam.d/a\"b".into()),
             outcome: Outcome::Missing,
             backup: None,
+            shadows: None,
         }];
-        let rendered = report_json(PamAction::Status, false, &reports);
+        let rendered = report_json(PamAction::Status, false, &reports, &[]);
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["services"][0]["service"], "a\"b");
@@ -4244,10 +4718,11 @@ mod tests {
             path: Some("/etc/pam.d/sudo".to_string()),
             outcome: Outcome::Present,
             backup: None,
+            shadows: None,
         }];
 
         let status: serde_json::Value =
-            serde_json::from_str(&report_json(PamAction::Status, false, &rows)).unwrap();
+            serde_json::from_str(&report_json(PamAction::Status, false, &rows, &[])).unwrap();
         assert!(
             status.get("module_path").is_some(),
             "the key is always present on status, null when nothing hit"
@@ -4261,8 +4736,554 @@ mod tests {
 
         for action in [PamAction::Add, PamAction::Remove] {
             let document: serde_json::Value =
-                serde_json::from_str(&report_json(action, false, &rows)).unwrap();
+                serde_json::from_str(&report_json(action, false, &rows, &[])).unwrap();
             assert!(document.get("module_path").is_none(), "{action:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Enumeration — `pam status --all` (P3)
+    //
+    // The blind spot these exist for: `status` could only answer about names
+    // it was given, so a configured `omarchy-lock-face` was invisible and
+    // "not configured" and "not checked" rendered identically.
+    // -----------------------------------------------------------------------
+
+    fn status_all(dirs: &PamDirs, if_present: bool) -> i32 {
+        status_in(
+            dirs,
+            &PamRequest {
+                action: PamAction::Status,
+                all: true,
+                if_present,
+                ..PamRequest::default()
+            },
+        )
+    }
+
+    /// The headline: every configured service is listed, from both
+    /// directories, whether or not anyone named it.
+    #[test]
+    fn all_lists_every_configured_service() {
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_AFTER).unwrap();
+        fs::write(etc.join("uninvolved"), SUDO_BEFORE).unwrap();
+        fs::write(vendor.join("omarchy-lock-face"), OMARCHY_PRESENT).unwrap();
+
+        let scan = scan_directories(&both(&etc, &vendor));
+        assert_eq!(
+            scan.names,
+            ["omarchy-lock-face", "sudo"],
+            "sorted, and the \
+             service with no facelock line is not in the report at all"
+        );
+
+        let reports = status_reports(&both(&etc, &vendor), &scan.names, &Sink::verb(true));
+        assert!(reports.iter().all(|row| row.outcome == Outcome::Present));
+        assert_eq!(status_all(&both(&etc, &vendor), false), STATUS_PRESENT);
+    }
+
+    /// A service configured through an `/etc` copy of a package's file is
+    /// reported as such: still `present`, and the row names the vendor file it
+    /// hides — which is what says the copy will not follow the package's
+    /// updates.
+    #[test]
+    fn an_etc_override_is_reported_as_one() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        fs::write(etc.join("polkit-1"), POLKIT_AFTER).unwrap();
+
+        let reports = status_reports(
+            &both(&etc, &vendor),
+            &["polkit-1".to_string()],
+            &Sink::verb(true),
+        );
+
+        assert_eq!(reports[0].outcome, Outcome::Present);
+        assert_eq!(
+            reports[0].shadows.as_deref(),
+            Some(vendor.join("polkit-1").to_str().unwrap())
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&report_json(PamAction::Status, false, &reports, &[])).unwrap();
+        assert_eq!(
+            value["services"][0]["shadows"],
+            vendor.join("polkit-1").to_str().unwrap()
+        );
+    }
+
+    /// ...and a service that shadows nothing carries no key at all, so a
+    /// machine with no vendor directory emits the document it always did.
+    #[test]
+    fn a_service_that_shadows_nothing_carries_no_shadows_key() {
+        let dir = seeded(&[("sudo", SUDO_AFTER)]);
+        let reports = status_reports(&only(dir.path()), &["sudo".to_string()], &Sink::verb(true));
+
+        assert_eq!(reports[0].shadows, None);
+        let value: serde_json::Value =
+            serde_json::from_str(&report_json(PamAction::Status, false, &reports, &[])).unwrap();
+        assert!(value["services"][0].get("shadows").is_none());
+    }
+
+    /// A vendor file carrying the line while `/etc` shadows it without one is
+    /// **not configured**, and the name still has to appear: the file
+    /// Linux-PAM reads has no line in it, and dropping the name would hide
+    /// exactly the machine an operator cannot otherwise explain.
+    #[test]
+    fn a_shadowed_vendor_line_is_reported_as_missing_not_as_configured() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), OMARCHY_PRESENT).unwrap();
+        fs::write(etc.join("polkit-1"), POLKIT_BEFORE).unwrap();
+
+        let dirs = both(&etc, &vendor);
+        let scan = scan_directories(&dirs);
+        assert_eq!(scan.names, ["polkit-1"]);
+
+        let reports = status_reports(&dirs, &scan.names, &Sink::verb(true));
+        assert_eq!(
+            reports[0].outcome,
+            Outcome::Missing,
+            "the /etc file is the one PAM reads, and it has no line"
+        );
+        assert_eq!(status_all(&dirs, false), STATUS_MISSING);
+    }
+
+    /// Nothing configured is exit 1, not 0 — a machine with no facelock line
+    /// anywhere is not "fine", it is not set up — and `--if-present` does not
+    /// convert it, because there is no `absent` row here to forgive.
+    #[test]
+    fn nothing_configured_is_exit_one_with_and_without_if_present() {
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_BEFORE).unwrap();
+
+        let dirs = both(&etc, &vendor);
+        assert!(scan_directories(&dirs).names.is_empty());
+        assert_eq!(status_all(&dirs, false), STATUS_MISSING);
+        assert_eq!(status_all(&dirs, true), STATUS_MISSING);
+    }
+
+    /// **The distinction the gap exists for.** A directory that could not be
+    /// listed is reported as unread and forces exit 2; it never reads as "no
+    /// services here". Skipped as root, where the mode bits are ignored and
+    /// the assertion would be vacuous.
+    #[test]
+    fn an_unreadable_directory_is_not_checked_rather_than_not_configured() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_AFTER).unwrap();
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let dirs = both(&etc, &vendor);
+        let scan = scan_directories(&dirs);
+        assert_eq!(scan.names, ["sudo"], "what could be read is still reported");
+        assert_eq!(
+            scan.unreadable().map(|(path, _)| path).collect::<Vec<_>>(),
+            [vendor.as_path()]
+        );
+        assert_eq!(
+            status_all(&dirs, false),
+            STATUS_ERROR,
+            "a configured service and an unread directory is still an \
+             incomplete answer"
+        );
+
+        let document: serde_json::Value = serde_json::from_str(&report_json(
+            PamAction::Status,
+            false,
+            &[],
+            &scan.directories,
+        ))
+        .unwrap();
+        assert_eq!(document["directories"][0]["status"], "scanned");
+        assert!(document["directories"][0].get("error").is_none());
+        assert_eq!(document["directories"][1]["status"], "unreadable");
+        assert!(document["directories"][1]["error"].is_string());
+
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A directory that is *not there* is a different answer from one that
+    /// would not open: it demonstrably holds no service files, so it is
+    /// reported as absent and does not raise the exit code. The default search
+    /// path names a vendor directory many machines do not have, and treating
+    /// that as unanswerable would make every one of them exit 2 forever.
+    #[test]
+    fn a_missing_directory_is_absent_rather_than_unreadable() {
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_AFTER).unwrap();
+        fs::remove_dir(&vendor).unwrap();
+
+        let dirs = both(&etc, &vendor);
+        let scan = scan_directories(&dirs);
+        assert_eq!(scan.directories[1].state, DirState::Absent);
+        assert_eq!(scan.unreadable().count(), 0);
+        assert_eq!(status_all(&dirs, false), STATUS_PRESENT);
+    }
+
+    /// The `--json` document is the same document, with one additive
+    /// top-level key. A named request does not carry it — it never claimed to
+    /// have looked everywhere.
+    #[test]
+    fn only_all_carries_the_directories_key() {
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_AFTER).unwrap();
+
+        let dirs = both(&etc, &vendor);
+        let scan = scan_directories(&dirs);
+        let reports = status_reports(&dirs, &scan.names, &Sink::verb(true));
+
+        let named: serde_json::Value =
+            serde_json::from_str(&report_json(PamAction::Status, false, &reports, &[])).unwrap();
+        assert!(named.get("directories").is_none());
+
+        let enumerated: serde_json::Value = serde_json::from_str(&report_json(
+            PamAction::Status,
+            false,
+            &reports,
+            &scan.directories,
+        ))
+        .unwrap();
+        assert_eq!(enumerated["command"], "status");
+        assert_eq!(enumerated["dry_run"], false);
+        assert_eq!(enumerated["services"][0]["action"], "present");
+        assert_eq!(
+            enumerated["directories"][0]["path"],
+            etc.to_str().unwrap(),
+            "the directories are in search order"
+        );
+        assert_eq!(
+            enumerated["directories"][1]["path"],
+            vendor.to_str().unwrap()
+        );
+    }
+
+    /// A `.facelock-backup` is a byte copy of a configured file and is not a
+    /// service. Neither is a `.pacsave`, a `~` file, or this module's own
+    /// in-flight temp file. Reporting one as configured would be the report
+    /// being confidently wrong, which is what enumeration is for removing.
+    #[test]
+    fn backups_and_package_manager_leftovers_are_not_services() {
+        let dir = seeded(&[
+            ("sudo", SUDO_AFTER),
+            ("sudo.facelock-backup", SUDO_AFTER),
+            ("polkit-1.pacsave", SUDO_AFTER),
+            ("hyprlock.rpmsave", SUDO_AFTER),
+            ("login.dpkg-old", SUDO_AFTER),
+            ("swaylock~", SUDO_AFTER),
+            (".sudo.facelock-1234-5678", SUDO_AFTER),
+        ]);
+
+        assert_eq!(scan_directories(&only(dir.path())).names, ["sudo"]);
+    }
+
+    /// A service file that could not be read is carried into the report, not
+    /// omitted: leaving it out would report "not configured" for a machine
+    /// this could not check. It lands as `unknown`, which is exit 2. Skipped
+    /// as root, which ignores the mode bits.
+    #[test]
+    fn an_unreadable_service_file_is_reported_rather_than_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = seeded(&[("sudo", SUDO_AFTER)]);
+        fs::set_permissions(dir.path().join("sudo"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let dirs = only(dir.path());
+        assert_eq!(scan_directories(&dirs).names, ["sudo"]);
+        let reports = status_reports(&dirs, &["sudo".to_string()], &Sink::verb(true));
+        assert!(matches!(reports[0].outcome, Outcome::Unknown(_)));
+        assert_eq!(status_all(&dirs, false), STATUS_ERROR);
+
+        fs::set_permissions(dir.path().join("sudo"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// The scan reports what the resolver would accept: an entry symlinked out
+    /// of its directory is neither followed nor silently dropped — it becomes
+    /// the same `unknown` row a named request gets for it.
+    #[test]
+    fn an_escaping_symlink_found_by_the_scan_is_reported_as_unknown() {
+        let (_root, etc, vendor) = pair();
+        let outside = vendor.join("elsewhere");
+        fs::write(&outside, SUDO_AFTER).unwrap();
+        std::os::unix::fs::symlink(&outside, etc.join("hyprlock")).unwrap();
+
+        // The scan reads *through* the link to decide the name is worth
+        // reporting; the resolver is what refuses to act on it.
+        let dirs = PamDirs::new(vec![etc.clone()]);
+        assert_eq!(scan_directories(&dirs).names, ["hyprlock"]);
+
+        let reports = status_reports(&dirs, &["hyprlock".to_string()], &Sink::verb(true));
+        assert_eq!(
+            reports[0].outcome,
+            Outcome::Unknown(SYMLINKED_OUT_OF_DIR.to_string())
+        );
+        assert_eq!(status_all(&dirs, false), STATUS_ERROR);
+    }
+
+    /// `--all` and a named request answer identically about one service. They
+    /// share [`status_reports`], and this is the assertion that says so —
+    /// a second row builder for the enumerating form is the drift this
+    /// forbids.
+    #[test]
+    fn all_and_a_named_request_agree_about_one_service() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+        fs::write(etc.join("polkit-1"), POLKIT_AFTER).unwrap();
+
+        let dirs = both(&etc, &vendor);
+        let enumerated = status_reports(&dirs, &scan_directories(&dirs).names, &Sink::verb(true));
+        let named = status_reports(&dirs, &["polkit-1".to_string()], &Sink::verb(true));
+
+        assert_eq!(enumerated, named);
+    }
+
+    /// **Nothing found is not "nothing configured" when something could not be
+    /// read.** The unqualified sentence names every directory on the search
+    /// path, so under `2>/dev/null` — the ordinary way to take the human
+    /// answer — it asserted the one thing this flag exists to stop it
+    /// asserting. Skipped as root, which ignores the mode bits.
+    #[test]
+    fn an_empty_answer_is_qualified_by_what_could_not_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("plain"), SUDO_BEFORE).unwrap();
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let dirs = both(&etc, &vendor);
+        let scan = scan_directories(&dirs);
+        assert!(scan.names.is_empty());
+        assert_eq!(
+            scan.answered(),
+            [etc.display().to_string()],
+            "only the directory that produced an answer may be spoken for"
+        );
+        assert_eq!(status_all(&dirs, false), STATUS_ERROR);
+
+        // The two sentences are different, and the qualified one names the
+        // unread directory as unread rather than as searched.
+        let qualified = PamMessage::PamStatusNoServicesIncomplete {
+            dirs: etc.display().to_string(),
+            unchecked: vendor.display().to_string(),
+        }
+        .localized();
+        assert!(qualified.contains("could not be checked"), "{qualified}");
+        assert!(
+            !PamMessage::PamStatusNoServices {
+                dirs: dirs.display()
+            }
+            .localized()
+            .contains("could not be checked")
+        );
+
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// ...and when *no* directory could be read there is no set to scope an
+    /// emptiness to, so the line says only that — never that nothing is
+    /// configured. stdout still carries one, because a human reading it alone
+    /// would otherwise get a sentence in the other two branches and silence in
+    /// the one where the machine is worst off.
+    #[test]
+    fn nothing_readable_at_all_says_so_without_claiming_nothing_is_configured() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_root, etc, vendor) = pair();
+        for dir in [&etc, &vendor] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let dirs = both(&etc, &vendor);
+        let scan = scan_directories(&dirs);
+        assert!(scan.answered().is_empty());
+        assert_eq!(scan.unreadable().count(), 2);
+        assert_eq!(status_all(&dirs, false), STATUS_ERROR);
+
+        let line = PamMessage::PamStatusNothingReadable {
+            dirs: dirs.display(),
+        }
+        .localized();
+        assert!(
+            line.contains("No directory on the search path could be read"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("carries the facelock PAM line"),
+            "it must not assert anything about what is configured: {line}"
+        );
+
+        for dir in [&etc, &vendor] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// **An entry that exists and cannot be examined must not vanish.** The
+    /// followed-metadata guard first treated every `stat` failure as "not a
+    /// regular file", so a symlink into a directory the caller may not
+    /// traverse dropped out of `--all` and out of `facelock status` while
+    /// `--service` on the same name still said `unknown`, exit 2 — the two
+    /// forms disagreeing about one service, which is what sharing a row
+    /// builder is supposed to make impossible. Skipped as root, which
+    /// traverses anything.
+    #[test]
+    fn a_symlink_into_an_untraversable_directory_is_unknown_not_invisible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_AFTER).unwrap();
+        fs::write(vendor.join("real"), SUDO_AFTER).unwrap();
+        std::os::unix::fs::symlink(vendor.join("real"), etc.join("hyprlock")).unwrap();
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let dirs = PamDirs::new(vec![etc.clone()]);
+        let scan = scan_directories(&dirs);
+        assert_eq!(
+            scan.names,
+            ["hyprlock", "sudo"],
+            "the entry this could not examine is carried, not dropped"
+        );
+
+        let reports = status_reports(&dirs, &scan.names, &Sink::verb(true));
+        assert!(matches!(reports[0].outcome, Outcome::Unknown(_)));
+        assert_eq!(status_all(&dirs, false), STATUS_ERROR);
+
+        // The invariant the hole falsified: both forms answer the same.
+        let named = status_reports(&dirs, &["hyprlock".to_string()], &Sink::verb(true));
+        assert_eq!(reports[0], named[0]);
+
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The same hole reached by a route root cannot escape either: a symlink
+    /// loop, whose `stat` fails with `ELOOP` for every caller.
+    #[test]
+    fn a_symlink_loop_is_unknown_not_invisible() {
+        let dir = seeded(&[("sudo", SUDO_AFTER)]);
+        std::os::unix::fs::symlink(dir.path().join("loop-b"), dir.path().join("loop-a")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("loop-a"), dir.path().join("loop-b")).unwrap();
+
+        let dirs = only(dir.path());
+        let scan = scan_directories(&dirs);
+        assert_eq!(scan.names, ["loop-a", "loop-b", "sudo"]);
+
+        let reports = status_reports(&dirs, &scan.names, &Sink::verb(true));
+        assert!(matches!(reports[0].outcome, Outcome::Unknown(_)));
+        assert_eq!(status_all(&dirs, false), STATUS_ERROR);
+
+        let named = status_reports(&dirs, &["loop-a".to_string()], &Sink::verb(true));
+        assert_eq!(reports[0], named[0]);
+    }
+
+    /// **A FIFO in a scanned directory must not hang the command.**
+    /// `read_to_string` on one blocks until a writer appears, which is forever
+    /// on a `/etc/pam.d` nobody is writing to — and this scan is what
+    /// `facelock status` runs, so the diagnostic command would hang on exactly
+    /// the broken machine it exists to describe. The test *is* the assertion:
+    /// before the followed-metadata check it did not return.
+    #[test]
+    fn a_fifo_entry_is_skipped_rather_than_read() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = seeded(&[("sudo", SUDO_AFTER)]);
+        let fifo = dir.path().join("fifo-service");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call; `mkfifo` only
+        // reads it.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) }, 0);
+
+        // A symlink onto the FIFO too: `file_type` at the call site is an
+        // lstat, so a link is the way a non-regular file gets past it.
+        std::os::unix::fs::symlink(&fifo, dir.path().join("linked-fifo")).unwrap();
+
+        assert_eq!(scan_directories(&only(dir.path())).names, ["sudo"]);
+    }
+
+    /// A directory reached through a symlink is not an unreadable service
+    /// file. It used to survive the `lstat` skip, fail the read with EISDIR,
+    /// and land as `unknown` — a real directory reported as a service this
+    /// could not answer for.
+    #[test]
+    fn a_symlink_to_a_directory_is_not_a_service() {
+        let (_root, etc, vendor) = pair();
+        fs::write(etc.join("sudo"), SUDO_AFTER).unwrap();
+        std::os::unix::fs::symlink(&vendor, etc.join("linked-dir")).unwrap();
+
+        let dirs = PamDirs::new(vec![etc.clone()]);
+        assert_eq!(scan_directories(&dirs).names, ["sudo"]);
+        assert_eq!(status_all(&dirs, false), STATUS_PRESENT);
+    }
+
+    /// A name this cannot spell is a name it cannot resolve. `to_string_lossy`
+    /// substituted U+FFFD and handed the resolver a name no file has, so a
+    /// configured service was reported `absent` at a path that does not exist
+    /// — and under `--if-present` that scored 0, which is "everything fine".
+    #[test]
+    fn a_non_utf8_entry_name_is_skipped_not_mangled() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = seeded(&[("sudo", SUDO_AFTER)]);
+        let bad = dir.path().join(OsStr::from_bytes(b"bad\xffname"));
+        fs::write(&bad, SUDO_AFTER).unwrap();
+
+        let dirs = only(dir.path());
+        assert_eq!(
+            scan_directories(&dirs).names,
+            ["sudo"],
+            "the unspellable name is skipped, not reported at a path that does not exist"
+        );
+        assert_eq!(status_all(&dirs, true), STATUS_PRESENT);
+    }
+
+    /// The row that *creates* the shadow carries it. `Origin::Vendor` has
+    /// nothing to hide at resolve time, so without this the `overridden` row —
+    /// the one that makes the fact true — was the only row without the key,
+    /// while `status` reported it a second later.
+    #[test]
+    fn an_overridden_row_names_the_vendor_file_it_now_shadows() {
+        let (_root, etc, vendor) = pair();
+        fs::write(vendor.join("polkit-1"), POLKIT_BEFORE).unwrap();
+
+        let request = add(&["polkit-1"]);
+        let write = WriteRequest {
+            action: WriteAction::Add,
+            request: &request,
+            remedy: "--allow-sensitive",
+        };
+        let dirs = both(&etc, &vendor);
+        let targets = plan_writes(&dirs, &write).unwrap();
+        let reports = apply_all(&targets, &write, &Sink::verb(true));
+
+        assert_eq!(reports[0].outcome, Outcome::Overridden);
+        assert_eq!(
+            reports[0].shadows.as_deref(),
+            Some(vendor.join("polkit-1").to_str().unwrap())
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&report_json(PamAction::Add, false, &reports, &[])).unwrap();
+        assert_eq!(
+            value["services"][0]["shadows"],
+            vendor.join("polkit-1").to_str().unwrap()
+        );
+
+        // ...and the next `status` agrees, now through the resolver.
+        let after = status_reports(&dirs, &["polkit-1".to_string()], &Sink::verb(true));
+        assert_eq!(after[0].shadows, reports[0].shadows);
     }
 }

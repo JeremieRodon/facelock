@@ -360,6 +360,181 @@ service that is vendor-only"
     FAIL=$((FAIL + 1))
 fi
 
+# --- P3: `pam status --all` against the real directories ---
+#
+# The blind spot: `pam status` answers only about names it is given, so a
+# configured polkit-1 or omarchy-lock-face was invisible, and "not configured"
+# and "not checked" rendered identically. No tempdir test can prove the scan
+# reaches the machine's real /etc/pam.d and /usr/lib/pam.d, and the unreadable
+# case needs a directory a real process is really refused.
+#
+# The scan is run against a scratch pair through `[pam] config_dirs` for the
+# rows that need to control what is in the directories, and against the real
+# ones for the rows that must prove the defaults.
+
+cat > /tmp/pam-all-services.py <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+print(" ".join(sorted(s["service"] for s in doc["services"])))
+EOF
+
+# One directory's `status` word from a --all document, by path.
+cat > /tmp/pam-all-dir.py <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for d in doc.get("directories", []):
+    if d["path"] == sys.argv[2]:
+        print(d["status"])
+        break
+EOF
+
+# The `shadows` value of one service, or the empty string.
+cat > /tmp/pam-all-shadows.py <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for s in doc["services"]:
+    if s["service"] == sys.argv[2]:
+        print(s.get("shadows", ""))
+        break
+EOF
+
+PAM_ALL_ROOT=/tmp/pam-all
+rm -rf "$PAM_ALL_ROOT"
+mkdir -p "$PAM_ALL_ROOT/etc" "$PAM_ALL_ROOT/vendor"
+cat > "$PAM_ALL_ROOT/config.toml" <<EOF
+[pam]
+config_dirs = ["$PAM_ALL_ROOT/etc", "$PAM_ALL_ROOT/vendor"]
+EOF
+PAM_ALL="facelock --config $PAM_ALL_ROOT/config.toml pam status --all"
+
+# Nothing configured: says so, and exits 1 — with and without --if-present,
+# which has no absent case to forgive here.
+cat > "$PAM_ALL_ROOT/etc/plain" <<'EOF'
+#%PAM-1.0
+auth       include        system-auth
+EOF
+
+run_test "pam status --all: nothing configured says so and exits 1" \
+    "$PAM_ALL > /tmp/pam-all-none.out 2>&1; test \$? -eq 1 && grep -q 'carries the facelock PAM line' /tmp/pam-all-none.out" \
+    0
+
+run_test "pam status --all --if-present: still exit 1 when nothing is configured" \
+    "$PAM_ALL --if-present > /dev/null 2>&1; test \$? -eq 1" \
+    0
+
+# Several services, from both directories, none of them named on the command
+# line. This is the whole point of the flag.
+cat > "$PAM_ALL_ROOT/etc/scratch-a" <<'EOF'
+#%PAM-1.0
+auth      sufficient pam_facelock.so
+auth       include        system-auth
+EOF
+cat > "$PAM_ALL_ROOT/vendor/scratch-b" <<'EOF'
+#%PAM-1.0
+auth      sufficient pam_facelock.so
+auth       include        system-auth
+EOF
+# A backup of a configured file carries the line and is not a service.
+cp "$PAM_ALL_ROOT/etc/scratch-a" "$PAM_ALL_ROOT/etc/scratch-a.facelock-backup"
+cp "$PAM_ALL_ROOT/etc/scratch-a" "$PAM_ALL_ROOT/etc/scratch-c.pacsave"
+
+run_test "pam status --all lists every configured service and no backup" \
+    "$PAM_ALL --json > /tmp/pam-all.json 2>/dev/null; test \$? -eq 0 && test \"\$(python3 /tmp/pam-all-services.py /tmp/pam-all.json)\" = 'scratch-a scratch-b'" \
+    0
+
+# An /etc copy shadowing a vendor file is configured *and* says so, in both
+# renderings. The whole reason the note exists is that the copy will not
+# follow the package's updates.
+cat > "$PAM_ALL_ROOT/vendor/scratch-a" <<'EOF'
+#%PAM-1.0
+auth       include        system-auth
+EOF
+
+run_test "pam status --all marks an /etc override of a vendor file" \
+    "$PAM_ALL --json > /tmp/pam-all-shadow.json 2>/dev/null && test \"\$(python3 /tmp/pam-all-shadows.py /tmp/pam-all-shadow.json scratch-a)\" = '$PAM_ALL_ROOT/vendor/scratch-a'" \
+    0
+
+run_test "pam status --all says 'local override' in the human output too" \
+    "$PAM_ALL 2>/dev/null | grep -q 'local override of $PAM_ALL_ROOT/vendor/scratch-a'" \
+    0
+
+# The distinction the gap exists for: a directory that could not be read is
+# reported as unchecked and forces exit 2, rather than reading as "nothing
+# configured here". Root ignores the mode bits, so this runs as testuser —
+# which also proves the probe is genuinely unprivileged.
+chmod 755 "$PAM_ALL_ROOT" "$PAM_ALL_ROOT/etc" "$PAM_ALL_ROOT/vendor"
+chmod 644 "$PAM_ALL_ROOT/config.toml" "$PAM_ALL_ROOT"/etc/* "$PAM_ALL_ROOT"/vendor/*
+chmod 000 "$PAM_ALL_ROOT/vendor"
+
+run_test "pam status --all: an unreadable directory is 'not checked', exit 2" \
+    "su -s /bin/bash testuser -c '$PAM_ALL > /tmp/pam-all-unreadable.out 2>&1'; test \$? -eq 2 && grep -q 'directory not checked' /tmp/pam-all-unreadable.out" \
+    0
+
+run_test "pam status --all --json distinguishes scanned from unreadable" \
+    "su -s /bin/bash testuser -c '$PAM_ALL --json > /tmp/pam-all-unreadable.json 2>/dev/null'; test \"\$(python3 /tmp/pam-all-dir.py /tmp/pam-all-unreadable.json $PAM_ALL_ROOT/etc)\" = scanned && test \"\$(python3 /tmp/pam-all-dir.py /tmp/pam-all-unreadable.json $PAM_ALL_ROOT/vendor)\" = unreadable" \
+    0
+
+# The state the human sentence used to get wrong: nothing configured AND a
+# directory unread. Read 2>/dev/null -- the ordinary way to take the answer --
+# an unqualified "no service file under <both dirs> carries the line" asserts
+# the very thing this flag exists to stop it asserting. stdout alone is
+# captured here on purpose.
+mv "$PAM_ALL_ROOT/etc/scratch-a" "$PAM_ALL_ROOT/scratch-a.parked"
+rm -f "$PAM_ALL_ROOT/etc/scratch-a.facelock-backup"
+
+run_test "pam status --all: nothing found + a dir unread never reads as 'none'" \
+    "su -s /bin/bash testuser -c '$PAM_ALL > /tmp/pam-all-partial.out 2>/dev/null'; test \$? -eq 2 && grep -q 'could not be checked' /tmp/pam-all-partial.out && ! grep -q \"carries the facelock PAM line.\$\" /tmp/pam-all-partial.out" \
+    0
+
+mv "$PAM_ALL_ROOT/scratch-a.parked" "$PAM_ALL_ROOT/etc/scratch-a"
+chmod 644 "$PAM_ALL_ROOT/etc/scratch-a"
+chmod 755 "$PAM_ALL_ROOT/vendor"
+
+# A FIFO where a service file should be must not hang the scan. read_to_string
+# on one blocks until a writer appears, which is forever here -- and the same
+# scan backs `facelock status`, so the diagnostic command would hang on exactly
+# the broken machine it exists to describe. The timeout IS the assertion.
+mkfifo "$PAM_ALL_ROOT/etc/fifo-service"
+ln -sfn "$PAM_ALL_ROOT/etc/fifo-service" "$PAM_ALL_ROOT/etc/linked-fifo"
+ln -sfn "$PAM_ALL_ROOT/vendor" "$PAM_ALL_ROOT/etc/linked-dir"
+
+run_test "pam status --all returns on a FIFO, a linked FIFO and a linked dir" \
+    "timeout 15 $PAM_ALL --json > /tmp/pam-all-fifo.json 2>/dev/null; test \$? -eq 0 && test \"\$(python3 /tmp/pam-all-services.py /tmp/pam-all-fifo.json)\" = 'scratch-a scratch-b'" \
+    0
+
+rm -f "$PAM_ALL_ROOT/etc/fifo-service" "$PAM_ALL_ROOT/etc/linked-fifo" \
+      "$PAM_ALL_ROOT/etc/linked-dir" /tmp/pam-all-fifo.json /tmp/pam-all-partial.out
+
+# A directory that is not there is a different answer: it demonstrably holds no
+# service files, so it is 'absent' and does not raise the exit code. Without
+# this the default search path would make every machine with no /usr/lib/pam.d
+# exit 2 forever.
+rm -rf "$PAM_ALL_ROOT/vendor"
+
+run_test "pam status --all: a missing directory is 'absent', not an error" \
+    "$PAM_ALL --json > /tmp/pam-all-absent.json 2>/dev/null; test \$? -eq 0 && test \"\$(python3 /tmp/pam-all-dir.py /tmp/pam-all-absent.json $PAM_ALL_ROOT/vendor)\" = absent" \
+    0
+
+# And against the real directories, unprivileged, with the defaults: sudo is
+# configured by the rows above having been cleaned up, so this asserts the
+# scan reaches /etc/pam.d at all rather than a specific service.
+cat > /etc/pam.d/facelock-all-scratch <<'EOF'
+#%PAM-1.0
+auth      sufficient pam_facelock.so
+auth       include        system-auth
+EOF
+chmod 644 /etc/pam.d/facelock-all-scratch
+
+run_test "pam status --all reaches the real /etc/pam.d without root" \
+    "su -s /bin/bash testuser -c 'facelock pam status --all --json > /tmp/pam-all-real.json 2>/dev/null'; test \$? -eq 0 && python3 /tmp/pam-all-services.py /tmp/pam-all-real.json | grep -qw facelock-all-scratch" \
+    0
+
+rm -f /etc/pam.d/facelock-all-scratch /tmp/pam-all-services.py /tmp/pam-all-dir.py \
+      /tmp/pam-all-shadows.py /tmp/pam-all.json /tmp/pam-all-shadow.json \
+      /tmp/pam-all-none.out /tmp/pam-all-unreadable.out /tmp/pam-all-unreadable.json \
+      /tmp/pam-all-absent.json /tmp/pam-all-real.json
+rm -rf "$PAM_ALL_ROOT"
+
 rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
       /etc/pam.d/facelock-scratch.facelock-backup \
       /etc/pam.d/facelock-scratch2.facelock-backup \

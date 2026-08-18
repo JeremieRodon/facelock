@@ -245,10 +245,18 @@ only take away a way to authenticate, and the .facelock-backup file written by \
 Reads only; needs no root. This is the probe to branch on instead of grepping \
 /etc/pam.d yourself. --if-present has the same meaning it has on add and \
 remove, so `pam add --if-present` for optional integrations can be verified \
-with `pam status --if-present` rather than with exit 2.")]
+with `pam status --if-present` rather than with exit 2. --all replaces the \
+service list with every service in the resolved directories that carries the \
+line, which is the question a bare `pam status` cannot answer: it reports only \
+about names you give it, so a configured polkit-1 is invisible to it. --all \
+exits 1 when nothing at all is configured and 2 when a directory could not be \
+read, so 'not configured' and 'not checked' are never the same answer.")]
     Status {
         #[command(flatten)]
         service: PamServiceArg,
+        /// Report every service in the resolved directories that carries the facelock line
+        #[arg(long, conflicts_with = "service")]
+        all: bool,
         /// Treat a missing service file as success instead of an error
         #[arg(long = "if-present")]
         if_present: bool,
@@ -270,6 +278,7 @@ impl From<PamCli> for PamRequest {
             } => PamRequest {
                 action: PamAction::Add,
                 services: service.service,
+                all: false,
                 // `--json` implies `--no-confirm` and never `--allow-sensitive`:
                 // the prompt is on stderr while a parser waits on stdout, so
                 // asking is a hang, but the gate is an authorization and a
@@ -289,6 +298,7 @@ impl From<PamCli> for PamRequest {
             } => PamRequest {
                 action: PamAction::Remove,
                 services: service.service,
+                all: false,
                 // Symmetry with `add`; `remove` has nothing to suppress today.
                 no_confirm: confirm.yes || json.json,
                 allow_sensitive: false,
@@ -298,11 +308,13 @@ impl From<PamCli> for PamRequest {
             },
             PamCli::Status {
                 service,
+                all,
                 if_present,
                 json,
             } => PamRequest {
                 action: PamAction::Status,
                 services: service.service,
+                all,
                 if_present,
                 json: json.json,
                 ..PamRequest::default()

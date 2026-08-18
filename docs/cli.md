@@ -625,12 +625,14 @@ is left in place.
 facelock pam status                                          # /etc/pam.d/sudo
 facelock pam status --service sudo --service polkit-1
 facelock pam status --service sudo --json
+facelock pam status --all                                    # everything configured
+facelock pam status --all --json
 ```
 
 Unprivileged, and the probe to branch on instead of grepping `/etc/pam.d`
 yourself: it answers from the same file, without root, and reports "absent" and
 "unreadable" as themselves rather than as "not configured". It offers
-`--service`, `--if-present` and `--json`, and neither `--dry-run` nor
+`--service`, `--all`, `--if-present` and `--json`, and neither `--dry-run` nor
 `--allow-sensitive` — there is no write to preview or gate. The exit code is
 the answer, on the same 0/1/2 scale as `is-enrolled` and `grep`:
 
@@ -653,6 +655,13 @@ sudo facelock pam add --service hyprlock --service swaylock --if-present
 facelock pam status --service hyprlock --service swaylock --if-present
 ```
 
+A service whose file is a local copy hiding a package's own of the same name
+reads `facelock PAM line present (local override of <vendor path>)` rather than
+`facelock PAM line present`, and its JSON row carries a `shadows` key naming
+that file. It is configured either way; the note says the copy will not follow
+the package's updates. This is a property of the row, so it appears with
+`--service` as it does with `--all`, and on `pam add` and `pam remove` rows too.
+
 `--json` emits one document:
 
 ```json
@@ -670,6 +679,48 @@ must tolerate an `action` it does not recognize rather than treat it as an
 error, are a stability contract — see [`contracts.md`](contracts.md), "facelock
 pam Semantics", along with the exit codes for `add` and `remove` and what
 `--json` does on a validation failure.
+
+### facelock pam status --all
+
+`--all` answers the other question: not "is this name configured?" but "what is
+configured on this machine?". It replaces `--service` (the two conflict) with
+every service in the resolved directories whose file names `pam_facelock.so`,
+so a `polkit-1` or an `omarchy-lock-face` nobody thought to ask about is
+reported. It scans rather than reading a list of what facelock has edited,
+because such a list drifts the moment `/etc/pam.d` is edited by hand.
+
+```bash
+facelock pam status --all
+facelock pam status --all --json
+```
+
+Nothing configured exits 1: a machine with no facelock line anywhere is not
+configured, and `--if-present` does not convert that — a name reaches the report
+by having been found, so there is nothing to forgive. The one exception is a
+file deleted between the listing and the read, which reports `absent` like any
+other.
+
+A directory that could not be listed exits 2 and is named, rather than being
+reported as holding nothing. The "nothing is configured" sentence is scoped to
+the directories that *were* read and names the rest as unread in the same
+breath, so taking the human answer with `2>/dev/null` cannot turn "I could not
+look" into "nothing is there". A directory that does not exist is neither
+case: it demonstrably holds no service files, and the default search path names
+a vendor directory many machines do not have. `--all --json` adds a
+`directories` key listing every directory searched with a `status` of
+`scanned`, `absent` or `unreadable`.
+
+Only regular files are read. A FIFO, socket, device node or symlink to a
+directory in a `pam.d` directory is skipped rather than opened, since reading a
+FIFO blocks until a writer appears and a diagnostic that hangs on a malformed
+`/etc/pam.d` is worse than one that omits an entry no PAM stack could use. An
+entry that merely *could not be examined* — a symlink into a directory you may
+not traverse, a symlink loop, a dead mount — is not skipped: it is reported
+`unknown`, exit 2, which is what `--service` says about it too. The exception
+is a path that is simply not there, which is an absence rather than an
+unanswerable question: a dangling symlink is skipped by `--all` and reported
+`unknown` by `--service`. An entry whose name is not valid UTF-8 is skipped
+and logged.
 
 ## facelock hyprlock
 
