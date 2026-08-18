@@ -319,13 +319,17 @@ edit, which nothing in this command deletes.
 
 **`--no-confirm` never implies `--allow-sensitive`.** They are separate
 authorizations: "do not ask me" and "yes, edit the shared auth stack". The
-gated services are `common-auth`, `login`, `password-auth`, `sshd`,
-`system-auth` and `system-login`. Four of the six are *shared stacks* — files
-that other service files `include`, so one edit reaches `su`, `passwd`, `chsh`
-and the display manager at once — and which name a distribution uses is the
-only difference between them (`system-auth`/`password-auth` on Fedora, RHEL and
-Arch, `common-auth` on Debian and Ubuntu, `system-login` on Arch). Gating one
-spelling made the gate depend on the operator's distribution. `--yes` and
+gated services are `common-auth`, `login`, `password-auth`,
+`password-auth-ac`, `sshd`, `system-auth`, `system-auth-ac` and
+`system-login`. Six of the eight are *shared stacks* — files that other
+service files `include`, so one edit reaches `su`, `passwd`, `chsh` and the
+display manager at once — and which name a distribution uses is the only
+difference between them (`system-auth`/`password-auth` on Fedora, RHEL and
+Arch, the `-ac` spellings where `authconfig` wrote the real file,
+`common-auth` on Debian and Ubuntu, `system-login` on Arch). Gating one
+spelling made the gate depend on the operator's distribution. `login` and
+`sshd` are the two that are not: each locks one specific door — the TTY, the
+network — rather than every one at once. `--yes` and
 `--no-confirm` are the same flag (the shared `ConfirmArg` spelling, so "skip
 prompts" reads the same on `pam add` as on `remove` and `clear`) and neither
 unlocks the gate. `setup --yes` keeps the combined meaning and is the sole
