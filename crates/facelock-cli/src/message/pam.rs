@@ -296,86 +296,84 @@ impl Message for PamMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for PamMessage {
-    fn first_sample() -> Self {
-        use PamMessage::*;
-        PamSkippedFlag { dir: s("/d") }
-    }
+    const VARIANT_COUNT: usize = 34;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use PamMessage::*;
-        Some(match self {
-            PamSkippedFlag { .. } => PamModuleMissing { path: s("/p") },
-            PamModuleMissing { .. } => ConfiguringPamFor { service: s("sudo") },
-            ConfiguringPamFor { .. } => NoPamCandidates { dir: s("/d") },
-            NoPamCandidates { .. } => PamLinePreview {
+        vec![
+            PamSkippedFlag { dir: s("/d") },
+            PamModuleMissing { path: s("/p") },
+            ConfiguringPamFor { service: s("sudo") },
+            NoPamCandidates { dir: s("/d") },
+            PamLinePreview {
                 line: s("auth ..."),
             },
-            PamLinePreview { .. } => PromptSelectPamServices,
-            PromptSelectPamServices => PamConfigureFailed {
+            PromptSelectPamServices,
+            PamConfigureFailed {
                 service: s("sudo"),
                 error: s("e"),
             },
-            PamConfigureFailed { .. } => NoPamServicesSelected,
-            NoPamServicesSelected => PamFileNotFound { path: s("/p") },
-            PamFileNotFound { .. } => PamLineAlreadyPresent { path: s("/p") },
-            PamLineAlreadyPresent { .. } => PamInsertBeforeAuthHint,
-            PamInsertBeforeAuthHint => PamInsertAtTopHint,
-            PamInsertAtTopHint => PamModifyPreview {
+            NoPamServicesSelected,
+            PamFileNotFound { path: s("/p") },
+            PamLineAlreadyPresent { path: s("/p") },
+            PamInsertBeforeAuthHint,
+            PamInsertAtTopHint,
+            PamModifyPreview {
                 path: s("/p"),
                 line: s("auth"),
                 hint: s("h"),
                 backup: s("/b"),
             },
-            PamModifyPreview { .. } => ConfirmProceed,
-            ConfirmProceed => PamSkippedFile { path: s("/p") },
-            PamSkippedFile { .. } => PamBackedUp {
+            ConfirmProceed,
+            PamSkippedFile { path: s("/p") },
+            PamBackedUp {
                 path: s("/p"),
                 backup: s("/b"),
             },
-            PamBackedUp { .. } => PamInstalled {
+            PamInstalled {
                 path: s("/p"),
                 backup: s("/b"),
                 service: s("sudo"),
             },
-            PamInstalled { .. } => PamRemoved { path: s("/p") },
-            PamRemoved { .. } => PamNoLineFound { path: s("/p") },
-            PamNoLineFound { .. } => PamServiceAbsent { path: s("/p") },
-            PamServiceAbsent { .. } => PamBackupExists {
+            PamRemoved { path: s("/p") },
+            PamNoLineFound { path: s("/p") },
+            PamServiceAbsent { path: s("/p") },
+            PamBackupExists {
                 path: s("/p"),
                 backup: s("/b"),
             },
-            PamBackupExists { .. } => PamExtensionHint {
+            PamExtensionHint {
                 line: s("auth ..."),
             },
-            PamExtensionHint { .. } => PamInvalidServiceName { service: s("../x") },
-            PamInvalidServiceName { .. } => PamSensitiveRefused {
+            PamInvalidServiceName { service: s("../x") },
+            PamSensitiveRefused {
                 service: s("sshd"),
                 remedy: s("--allow-sensitive"),
             },
-            PamSensitiveRefused { .. } => PamModuleNotInstalled { path: s("/p") },
-            PamModuleNotInstalled { .. } => PamServiceAbsentSkipped { path: s("/p") },
-            PamServiceAbsentSkipped { .. } => PamPlanAdd {
+            PamModuleNotInstalled { path: s("/p") },
+            PamServiceAbsentSkipped { path: s("/p") },
+            PamPlanAdd {
                 path: s("/p"),
                 hint: s("h"),
             },
-            PamPlanAdd { .. } => PamPlanRemove { path: s("/p") },
-            PamPlanRemove { .. } => PamPlanNoChange { path: s("/p") },
-            PamPlanNoChange { .. } => PamPlanAbsent { path: s("/p") },
-            PamPlanAbsent { .. } => PamStatusPresent { path: s("/p") },
-            PamStatusPresent { .. } => PamStatusMissing { path: s("/p") },
-            PamStatusMissing { .. } => PamStatusAbsent { path: s("/p") },
-            PamStatusAbsent { .. } => PamStatusUnknown {
+            PamPlanRemove { path: s("/p") },
+            PamPlanNoChange { path: s("/p") },
+            PamPlanAbsent { path: s("/p") },
+            PamStatusPresent { path: s("/p") },
+            PamStatusMissing { path: s("/p") },
+            PamStatusAbsent { path: s("/p") },
+            PamStatusUnknown {
                 path: s("/p"),
                 error: s("e"),
             },
-            PamStatusUnknown { .. } => return None,
-        })
+        ]
     }
 }

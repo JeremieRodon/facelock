@@ -396,107 +396,105 @@ impl Message for SetupMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SetupMessage {
-    fn first_sample() -> Self {
-        use SetupMessage::*;
-        SetupIntro { version: s("1.0") }
-    }
+    const VARIANT_COUNT: usize = 71;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use SetupMessage::*;
-        Some(match self {
-            SetupIntro { .. } => SetupStepCamera,
-            SetupStepCamera => SetupStepModelQuality,
-            SetupStepModelQuality => SetupStepInferenceDevice,
-            SetupStepInferenceDevice => SetupStepModelDownload,
-            SetupStepModelDownload => SetupStepEncryption,
-            SetupStepEncryption => SetupStepEnrollment,
-            SetupStepEnrollment => SetupStepEnrollmentSkipped,
-            SetupStepEnrollmentSkipped => SetupStepTest,
-            SetupStepTest => SetupStepTestSkipped,
-            SetupStepTestSkipped => SetupStepDaemon,
-            SetupStepDaemon => SetupStepPam,
-            SetupStepPam => SetupCompleteHeader,
-            SetupCompleteHeader => CameraStepFailed {
+        vec![
+            SetupIntro { version: s("1.0") },
+            SetupStepCamera,
+            SetupStepModelQuality,
+            SetupStepInferenceDevice,
+            SetupStepModelDownload,
+            SetupStepEncryption,
+            SetupStepEnrollment,
+            SetupStepEnrollmentSkipped,
+            SetupStepTest,
+            SetupStepTestSkipped,
+            SetupStepDaemon,
+            SetupStepPam,
+            SetupCompleteHeader,
+            CameraStepFailed {
                 error: s("e"),
                 current: s("c"),
             },
-            CameraStepFailed { .. } => ModelQualityStepFailed {
+            ModelQualityStepFailed {
                 error: s("e"),
                 current: s("c"),
             },
-            ModelQualityStepFailed { .. } => InferenceStepFailed {
+            InferenceStepFailed {
                 error: s("e"),
                 current: s("c"),
             },
-            InferenceStepFailed { .. } => ModelDownloadStepFailed { error: s("e") },
-            ModelDownloadStepFailed { .. } => EncryptionStepFailed { error: s("e") },
-            EncryptionStepFailed { .. } => EnrollStepFailed { error: s("e") },
-            EnrollStepFailed { .. } => TestStepFailed { error: s("e") },
-            TestStepFailed { .. } => SystemdStepFailed { error: s("e") },
-            SystemdStepFailed { .. } => GroupStepFailed { error: s("e") },
-            GroupStepFailed { .. } => PamStepFailed { error: s("e") },
-            PamStepFailed { .. } => ConfirmEnrollNow,
-            ConfirmEnrollNow => EnrollSkipped,
-            EnrollSkipped => ConfirmTestRecognition,
-            ConfirmTestRecognition => TestSkipped,
-            TestSkipped => SummaryCamera { value: s("v") },
-            SummaryCamera { .. } => SummaryModels {
+            ModelDownloadStepFailed { error: s("e") },
+            EncryptionStepFailed { error: s("e") },
+            EnrollStepFailed { error: s("e") },
+            TestStepFailed { error: s("e") },
+            SystemdStepFailed { error: s("e") },
+            GroupStepFailed { error: s("e") },
+            PamStepFailed { error: s("e") },
+            ConfirmEnrollNow,
+            EnrollSkipped,
+            ConfirmTestRecognition,
+            TestSkipped,
+            SummaryCamera { value: s("v") },
+            SummaryModels {
                 dir: s("/d"),
                 quality: s("q"),
             },
-            SummaryModels { .. } => SummaryInference { value: s("v") },
-            SummaryInference { .. } => SummaryDatabase { value: s("v") },
-            SummaryDatabase { .. } => SummaryEncryption { value: s("v") },
-            SummaryEncryption { .. } => SummaryDaemon { status: s("st") },
-            SummaryDaemon { .. } => DaemonStatusNotConfiguredNoSystemd,
-            DaemonStatusNotConfiguredNoSystemd => DaemonStatusDeferred,
-            DaemonStatusDeferred => DaemonStatusEnabled,
-            DaemonStatusEnabled => DaemonStatusNotConfigured,
-            DaemonStatusNotConfigured => SummaryPam {
+            SummaryInference { value: s("v") },
+            SummaryDatabase { value: s("v") },
+            SummaryEncryption { value: s("v") },
+            SummaryDaemon { status: s("st") },
+            DaemonStatusNotConfiguredNoSystemd,
+            DaemonStatusDeferred,
+            DaemonStatusEnabled,
+            DaemonStatusNotConfigured,
+            SummaryPam {
                 services: s("sudo"),
             },
-            SummaryPam { .. } => SummaryPamSkipped,
-            SummaryPamSkipped => SummaryPamNone,
-            SummaryPamNone => SummaryFaceEnrolled,
-            SummaryFaceEnrolled => SummaryFaceNotEnrolledNoEnroll,
-            SummaryFaceNotEnrolledNoEnroll => SummaryFaceNotEnrolled,
-            SummaryFaceNotEnrolled => NonInteractivePreparing,
-            NonInteractivePreparing => CheckingModels { count: 2 },
-            CheckingModels { .. } => SetupCompleteShort,
-            SetupCompleteShort => SetupCompleteEnroll,
-            SetupCompleteEnroll => DirectoriesCreated,
-            DirectoriesCreated => CreatedDefaultConfig { path: s("/c") },
-            CreatedDefaultConfig { .. } => EnrollingFace,
-            EnrollingFace => EncryptionIntro,
-            EncryptionIntro => TpmDetected,
-            TpmDetected => TpmSealedKeyPresent { path: s("/k") },
-            TpmSealedKeyPresent { .. } => GeneratingTpmSealedKey,
-            GeneratingTpmSealedKey => TpmSealedKeyWritten { path: s("/k") },
-            TpmSealedKeyWritten { .. } => EncryptionEnabledTpm,
-            EncryptionEnabledTpm => KeyfilePresent { path: s("/k") },
-            KeyfilePresent { .. } => GeneratingKeyfile,
-            GeneratingKeyfile => KeyfileWritten { path: s("/k") },
-            KeyfileWritten { .. } => EncryptionEnabledKeyfile,
-            EncryptionEnabledKeyfile => EncryptionDisabledWarning,
-            EncryptionDisabledWarning => EncryptionAlreadyConfigured { method: s("Tpm") },
-            EncryptionAlreadyConfigured { .. } => GeneratedTpmKeyAt { path: s("/k") },
-            GeneratedTpmKeyAt { .. } => EncryptionEnabledTpmAuto,
-            EncryptionEnabledTpmAuto => GeneratedKeyfileAt { path: s("/k") },
-            GeneratedKeyfileAt { .. } => EncryptionEnabledKeyfileAuto,
-            EncryptionEnabledKeyfileAuto => OrphanModelsWarning { db_path: s("/db") },
-            OrphanModelsWarning { .. } => OrphanModelsRemoved { count: 2 },
-            OrphanModelsRemoved { .. } => HyprlockHint,
-            HyprlockHint => HyprlockApplied { user: s("u") },
-            HyprlockApplied { .. } => BlankLine,
-            BlankLine => return None,
-        })
+            SummaryPamSkipped,
+            SummaryPamNone,
+            SummaryFaceEnrolled,
+            SummaryFaceNotEnrolledNoEnroll,
+            SummaryFaceNotEnrolled,
+            NonInteractivePreparing,
+            CheckingModels { count: 2 },
+            SetupCompleteShort,
+            SetupCompleteEnroll,
+            DirectoriesCreated,
+            CreatedDefaultConfig { path: s("/c") },
+            EnrollingFace,
+            EncryptionIntro,
+            TpmDetected,
+            TpmSealedKeyPresent { path: s("/k") },
+            GeneratingTpmSealedKey,
+            TpmSealedKeyWritten { path: s("/k") },
+            EncryptionEnabledTpm,
+            KeyfilePresent { path: s("/k") },
+            GeneratingKeyfile,
+            KeyfileWritten { path: s("/k") },
+            EncryptionEnabledKeyfile,
+            EncryptionDisabledWarning,
+            EncryptionAlreadyConfigured { method: s("Tpm") },
+            GeneratedTpmKeyAt { path: s("/k") },
+            EncryptionEnabledTpmAuto,
+            GeneratedKeyfileAt { path: s("/k") },
+            EncryptionEnabledKeyfileAuto,
+            OrphanModelsWarning { db_path: s("/db") },
+            OrphanModelsRemoved { count: 2 },
+            HyprlockHint,
+            HyprlockApplied { user: s("u") },
+            BlankLine,
+        ]
     }
 }
 
@@ -513,7 +511,7 @@ mod tests {
     /// change is a separate decision with its own review, because container
     /// suites and downstream integrations grep this output.
     #[test]
-    fn english_fallback_is_byte_identical() {
+    fn setup_fallback_is_byte_identical() {
         use SetupMessage::*;
 
         // -- bootstrap --

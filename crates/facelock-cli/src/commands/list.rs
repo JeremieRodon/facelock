@@ -65,8 +65,11 @@ fn print_table(user: &str, models: &[FaceModelInfo]) {
     println!("\n  Total: {} model(s)", models.len());
 }
 
+/// The `--json` payload, through the seam's machine sink: never localized,
+/// and silenced by `--quiet` like every other payload (before #140 this
+/// command ignored the flag outright).
 fn print_json(models: &[FaceModelInfo]) {
-    println!("{}", list_json(models));
+    crate::message::payload(&list_json(models));
 }
 
 /// `[{"id", "label", "user", "created_at", "embedder_model", "device_id"}, ...]`.

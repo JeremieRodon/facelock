@@ -181,13 +181,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     // `--quiet` is likewise global, and lands at the message sink rather than
-    // at any call site: it silences `Terminal::info` and nothing else, so
-    // errors, prompts, exit codes and the `RUST_LOG` event stream are
-    // unchanged. `is-enrolled` reads the same flag directly for its
-    // exit-code-only mode, which predates the sink.
-    if quiet {
-        message::set_verbosity(message::Verbosity::Quiet);
-    }
+    // at any call site: it silences the two suppressible stdout sinks
+    // (`Terminal::info` for human text, `message::payload` for machine
+    // output) and nothing else, so errors, prompts, exit codes and the
+    // `RUST_LOG` event stream are unchanged. Written unconditionally so the
+    // global is initialised exactly once, on either branch.
+    message::set_verbosity(if quiet {
+        message::Verbosity::Quiet
+    } else {
+        message::Verbosity::Normal
+    });
 
     match command {
         // Daemon and auth init their own tracing, so handle them separately.
@@ -243,11 +246,11 @@ fn main() -> anyhow::Result<()> {
                 // tree and constants. It reads no file at all, so it sits
                 // ahead even of `is-enrolled`, which at least opens a marker.
                 Commands::Capabilities { json } => {
-                    commands::capabilities::run(json.json, quiet);
+                    commands::capabilities::run(json.json);
                     Ok(())
                 }
                 Commands::IsEnrolled { user, json } => {
-                    std::process::exit(commands::is_enrolled::run(user.user, json.json, quiet))
+                    std::process::exit(commands::is_enrolled::run(user.user, json.json))
                 }
                 // `pam` consumes no `Config` either: `add`/`remove` edit
                 // `/etc/pam.d` and `status` reads it, and neither wants a
@@ -255,7 +258,7 @@ fn main() -> anyhow::Result<()> {
                 // them. Its exit code is its own — `status` answers on grep's
                 // 0/1/2 scale — so it exits here rather than returning `()`.
                 Commands::Pam { command } => {
-                    std::process::exit(commands::pam::run(command.into(), quiet)?)
+                    std::process::exit(commands::pam::run(command.into())?)
                 }
                 Commands::Hyprlock { command } => commands::hyprlock::run(command),
                 // `config show` (and bare `config`) is the unprivileged read

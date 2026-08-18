@@ -701,13 +701,14 @@ fn report_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) -> S
     .to_string()
 }
 
-/// Emit the machine document, unless `--quiet` said the exit code is the whole
-/// answer. That is `is-enrolled --quiet --json`'s existing rule, generalized:
-/// `--quiet` leaves only the exit code, whatever the format.
-fn emit_json(action: PamAction, dry_run: bool, reports: &[ServiceReport], quiet: bool) {
-    if !quiet {
-        println!("{}", report_json(action, dry_run, reports));
-    }
+/// Emit the machine document on stdout.
+///
+/// Through [`message::payload`], so `--quiet` reaches it without this function
+/// knowing the flag exists: under it the document is dropped and the exit code
+/// is the whole answer, which is `is-enrolled --quiet --json`'s rule
+/// generalized to every payload.
+fn emit_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) {
+    crate::message::payload(&report_json(action, dry_run, reports));
 }
 
 // ---------------------------------------------------------------------------
@@ -728,9 +729,9 @@ fn emit_json(action: PamAction, dry_run: bool, reports: &[ServiceReport], quiet:
 /// `setup::needs_root_precheck` says so and a test pins it — and silently
 /// re-running a `/etc/pam.d` edit under `sudo` from a wrapper script is a
 /// surprise, not a convenience.
-pub fn run(request: PamRequest, quiet: bool) -> anyhow::Result<i32> {
+pub fn run(request: PamRequest) -> anyhow::Result<i32> {
     if request.action == PamAction::Status {
-        return Ok(status_in(Path::new(PAM_DIR), &request, quiet));
+        return Ok(status_in(Path::new(PAM_DIR), &request));
     }
 
     crate::ipc_client::require_root_scripted(&format!(
@@ -742,7 +743,7 @@ pub fn run(request: PamRequest, quiet: bool) -> anyhow::Result<i32> {
         require_module_installed()?;
     }
 
-    write_in(Path::new(PAM_DIR), &request, quiet)
+    write_in(Path::new(PAM_DIR), &request)
 }
 
 /// The precondition the line is useless without. Hoisted out of the per-service
@@ -758,13 +759,13 @@ fn require_module_installed() -> anyhow::Result<()> {
 
 /// `add` / `remove` against `base`. The engine tests drive this directly, so
 /// it performs no root or module check — [`run`] owns those.
-fn write_in(base: &Path, request: &PamRequest, quiet: bool) -> anyhow::Result<i32> {
+fn write_in(base: &Path, request: &PamRequest) -> anyhow::Result<i32> {
     let action = request.action;
     if action == PamAction::Status {
         // `run` routes `status` to `status_in` and never gets here. Delegating
         // rather than falling through is what stops a future caller from
         // getting a *removal* out of a request that asked to read.
-        return Ok(status_in(base, request, quiet));
+        return Ok(status_in(base, request));
     }
     let services = requested_services(&request.services);
     let sink = Sink { json: request.json };
@@ -811,7 +812,7 @@ fn write_in(base: &Path, request: &PamRequest, quiet: bool) -> anyhow::Result<i3
     }
 
     if request.json {
-        emit_json(action, request.dry_run, &reports, quiet);
+        emit_json(action, request.dry_run, &reports);
     }
 
     Ok(
@@ -836,12 +837,12 @@ fn write_in(base: &Path, request: &PamRequest, quiet: bool) -> anyhow::Result<i3
 /// The exit code is the answer, on `grep`'s scale and `is-enrolled`'s: 0 every
 /// service has the line, 1 at least one does not, 2 at least one could not be
 /// answered. The worst outcome wins.
-fn status_in(base: &Path, request: &PamRequest, quiet: bool) -> i32 {
+fn status_in(base: &Path, request: &PamRequest) -> i32 {
     let sink = Sink { json: request.json };
     let reports = status_reports(base, &requested_services(&request.services), &sink);
 
     if request.json {
-        emit_json(PamAction::Status, false, &reports, quiet);
+        emit_json(PamAction::Status, false, &reports);
     }
 
     reports
@@ -1131,7 +1132,7 @@ mod tests {
             ("sudo", NO_NEWLINE_BEFORE, NO_NEWLINE_AFTER),
         ] {
             let dir = seeded(&[(service, before)]);
-            let code = write_in(dir.path(), &add(&[service]), false).unwrap();
+            let code = write_in(dir.path(), &add(&[service])).unwrap();
 
             assert_eq!(code, WRITE_OK, "{service}");
             assert_eq!(read(&dir, service), after, "{service} content");
@@ -1143,12 +1144,12 @@ mod tests {
     #[test]
     fn add_backup_is_the_original_and_only_exists_on_a_real_write() {
         let dir = seeded(&[("sudo", SUDO_BEFORE)]);
-        write_in(dir.path(), &add(&["sudo"]), false).unwrap();
+        write_in(dir.path(), &add(&["sudo"])).unwrap();
         assert_eq!(read(&dir, "sudo.facelock-backup"), SUDO_BEFORE);
 
         let untouched = seeded(&[("omarchy-lock-face", OMARCHY_PRESENT)]);
         let before = snapshot(untouched.path());
-        write_in(untouched.path(), &add(&["omarchy-lock-face"]), false).unwrap();
+        write_in(untouched.path(), &add(&["omarchy-lock-face"])).unwrap();
         assert_eq!(
             before,
             snapshot(untouched.path()),
@@ -1162,7 +1163,7 @@ mod tests {
             ("omarchy-lock-face", OMARCHY_PRESENT),
             ("sudo", SUDO_BEFORE),
         ]);
-        let code = write_in(dir.path(), &remove(&["omarchy-lock-face", "sudo"]), false).unwrap();
+        let code = write_in(dir.path(), &remove(&["omarchy-lock-face", "sudo"])).unwrap();
 
         assert_eq!(code, WRITE_OK);
         assert_eq!(read(&dir, "omarchy-lock-face"), OMARCHY_REMOVED);
@@ -1185,7 +1186,7 @@ mod tests {
             install_one_in(via_alias.path(), service, true, true).unwrap();
 
             let via_verb = seeded(&[(service, before)]);
-            write_in(via_verb.path(), &add(&[service]), false).unwrap();
+            write_in(via_verb.path(), &add(&[service])).unwrap();
 
             assert_eq!(read(&via_alias, service), after, "{service} via the alias");
             assert_eq!(
@@ -1202,8 +1203,8 @@ mod tests {
     fn add_then_remove_restores_the_original_bytes() {
         for before in [SUDO_BEFORE, POLKIT_BEFORE, NO_NEWLINE_BEFORE] {
             let dir = seeded(&[("sudo", before)]);
-            write_in(dir.path(), &add(&["sudo"]), false).unwrap();
-            write_in(dir.path(), &remove(&["sudo"]), false).unwrap();
+            write_in(dir.path(), &add(&["sudo"])).unwrap();
+            write_in(dir.path(), &remove(&["sudo"])).unwrap();
             assert_eq!(read(&dir, "sudo"), before);
         }
     }
@@ -1252,7 +1253,7 @@ mod tests {
                 if_present: true,
                 ..PamRequest::default()
             };
-            let error = write_in(&base, &request, false).unwrap_err().to_string();
+            let error = write_in(&base, &request).unwrap_err().to_string();
 
             assert!(error.contains("Invalid PAM service name"), "got: {error}");
             assert_eq!(fs::read_to_string(&outside).unwrap(), OMARCHY_PRESENT);
@@ -1275,7 +1276,7 @@ mod tests {
                 if_present: true,
                 ..PamRequest::default()
             };
-            assert!(write_in(&base, &request, false).is_err());
+            assert!(write_in(&base, &request).is_err());
         }
         assert_eq!(
             fs::read_to_string(dir.path().join("shadow")).unwrap(),
@@ -1295,7 +1296,7 @@ mod tests {
             let dir = seeded(&[("sudo", SUDO_BEFORE), ("sshd", SUDO_BEFORE)]);
             let before = snapshot(dir.path());
 
-            let error = write_in(dir.path(), &add(&["sudo", second]), false).unwrap_err();
+            let error = write_in(dir.path(), &add(&["sudo", second])).unwrap_err();
 
             assert_eq!(
                 before,
@@ -1309,7 +1310,7 @@ mod tests {
     fn a_valid_multi_service_add_writes_every_service() {
         let dir = seeded(&[("sudo", SUDO_BEFORE), ("polkit-1", POLKIT_BEFORE)]);
 
-        let code = write_in(dir.path(), &add(&["sudo", "polkit-1"]), false).unwrap();
+        let code = write_in(dir.path(), &add(&["sudo", "polkit-1"])).unwrap();
 
         assert_eq!(code, WRITE_OK);
         assert_eq!(read(&dir, "sudo"), SUDO_AFTER);
@@ -1327,7 +1328,7 @@ mod tests {
             let dir = seeded(&[(service, SUDO_BEFORE)]);
             let before = snapshot(dir.path());
 
-            let error = write_in(dir.path(), &add(&[service]), false)
+            let error = write_in(dir.path(), &add(&[service]))
                 .unwrap_err()
                 .to_string();
 
@@ -1351,7 +1352,7 @@ mod tests {
             ..add(&["sshd"])
         };
 
-        assert_eq!(write_in(dir.path(), &request, false).unwrap(), WRITE_OK);
+        assert_eq!(write_in(dir.path(), &request).unwrap(), WRITE_OK);
         assert_eq!(read(&dir, "sshd"), SUDO_AFTER);
     }
 
@@ -1363,7 +1364,7 @@ mod tests {
         let dir = seeded(&[("system-auth", OMARCHY_PRESENT)]);
 
         assert_eq!(
-            write_in(dir.path(), &remove(&["system-auth"]), false).unwrap(),
+            write_in(dir.path(), &remove(&["system-auth"])).unwrap(),
             WRITE_OK
         );
         assert_eq!(read(&dir, "system-auth"), OMARCHY_REMOVED);
@@ -1383,7 +1384,7 @@ mod tests {
                 ..PamRequest::default()
             };
 
-            assert_eq!(write_in(dir.path(), &request, false).unwrap(), WRITE_OK);
+            assert_eq!(write_in(dir.path(), &request).unwrap(), WRITE_OK);
             assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
         }
     }
@@ -1393,9 +1394,7 @@ mod tests {
         for request in [add(&["omarchy-lock-face"]), remove(&["omarchy-lock-face"])] {
             let dir = tempfile::TempDir::new().unwrap();
 
-            let error = write_in(dir.path(), &request, false)
-                .unwrap_err()
-                .to_string();
+            let error = write_in(dir.path(), &request).unwrap_err().to_string();
 
             assert!(
                 error.contains("PAM service file not found:"),
@@ -1421,9 +1420,7 @@ mod tests {
                 ..request
             };
 
-            let error = write_in(dir.path(), &request, false)
-                .unwrap_err()
-                .to_string();
+            let error = write_in(dir.path(), &request).unwrap_err().to_string();
 
             assert!(error.contains("failed to read"), "got: {error}");
         }
@@ -1447,7 +1444,7 @@ mod tests {
                 no_confirm: true,
                 ..PamRequest::default()
             };
-            assert_eq!(write_in(dir.path(), &request, false).unwrap(), WRITE_OK);
+            assert_eq!(write_in(dir.path(), &request).unwrap(), WRITE_OK);
         }
 
         assert_eq!(before, snapshot(dir.path()));
@@ -1492,7 +1489,6 @@ mod tests {
                     services: services.iter().map(|s| s.to_string()).collect(),
                     ..PamRequest::default()
                 },
-                false,
             )
         };
 
@@ -1521,7 +1517,6 @@ mod tests {
                 services: vec!["sudo".into(), "absent".into(), "../escape".into()],
                 ..PamRequest::default()
             },
-            false,
         );
 
         assert_eq!(before, snapshot(dir.path()));

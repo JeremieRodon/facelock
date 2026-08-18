@@ -116,14 +116,27 @@ JSON (#149).
 An unparseable `RUST_LOG` is reported at WARN (on stderr) and the built-in
 filter is used, rather than the value being silently discarded.
 
-**`--quiet` suppresses informational stdout only; errors and exit codes are
-unchanged.** A quiet run that fails still says why on stderr and still exits
-non-zero, and prompts are unaffected — a silenced question is a hang, not a
-quieter program. This generalizes `is-enrolled --quiet`, which has always meant
-"leave only the exit code". The flag is read once at the message sink
-(`message::set_verbosity`), so it covers every command whose output goes
-through that seam; commands still printing directly are tracked by
-[#140](https://github.com/tyvsmith/facelock/issues/140).
+**`--quiet` suppresses informational chatter, and on commands whose stdout is
+the payload, the payload too; errors, prompts and exit codes are unchanged.** A
+quiet run that fails still says why on stderr and still exits non-zero, and a
+prompt still asks — a silenced question is a hang, not a quieter program. This
+is `is-enrolled --quiet`'s rule ("leave only the exit code") generalized to
+every payload: `facelock --quiet devices --json` writes nothing on stdout, and
+the exit code is the answer. `list --json` and `devices --json` printed their
+payload under `--quiet` before this rule; they no longer do.
+
+The flag is read once, by the two suppressible stdout sinks of the message seam
+— `Terminal::info` for human text, `message::payload` for machine output — so
+no command implements it and no command can forget it. There is a third stdout
+sink, `Terminal::notice`, which `--quiet` deliberately does not reach: it is
+for the human lines that must be seen and must stay on stdout (rollback
+instructions, the plaintext-embeddings warning). The messages that belong on it
+move across as part of [#140](https://github.com/tyvsmith/facelock/issues/140),
+which also tracks the commands still printing human text directly.
+
+`preview --json` is the one payload outside this rule: it emits a document per
+frame until interrupted, so silencing it would leave a command that produces
+nothing forever.
 
 ### CLI Machine Output
 
@@ -160,10 +173,13 @@ is a schema question rather than a flag question, since nothing in `health.rs`
 derives `Serialize` yet, and it is tracked separately.
 
 Machine output does not pass through the translation seam: every `--json`
-payload is built with `serde_json` and is C-locale by construction. The one
-documented exception is `pam`'s `error` field, which can interpolate a
-`strerror` string (see "facelock pam Semantics"), and which is a diagnostic
-rather than something to branch on.
+payload is built with `serde_json` and is C-locale by construction. It reaches
+stdout through `message::payload`, which takes an already-rendered `&str` and
+consults no catalog, so routing a payload through the seam to pick up `--quiet`
+cannot translate it on the way. The one documented exception to the C-locale
+rule is `pam`'s `error` field, which can interpolate a `strerror` string (see
+"facelock pam Semantics"), and which is a diagnostic rather than something to
+branch on.
 
 ### facelock setup Flag Composition
 

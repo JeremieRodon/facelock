@@ -67,7 +67,9 @@ pub fn run(config: &Config, json: bool) -> anyhow::Result<()> {
 /// breaking anything that reads `--json`.
 fn print_json(devices: &[IpcDeviceInfo]) {
     let json = serde_json::to_string(devices).unwrap_or_else(|_| "[]".to_string());
-    println!("{json}");
+    // The seam's machine sink: never localized, and silenced by `--quiet`
+    // like every other payload (before #140 this command ignored the flag).
+    crate::message::payload(&json);
 }
 
 #[cfg(test)]

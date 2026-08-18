@@ -222,81 +222,79 @@ impl Message for StatusMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for StatusMessage {
-    fn first_sample() -> Self {
-        use StatusMessage::*;
-        StatusHeader
-    }
+    const VARIANT_COUNT: usize = 56;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use StatusMessage::*;
-        Some(match self {
-            StatusHeader => StatusLabelConfigFile,
-            StatusLabelConfigFile => StatusLabelDaemon,
-            StatusLabelDaemon => StatusLabelOneshotFallback,
-            StatusLabelOneshotFallback => StatusLabelCameraDevice,
-            StatusLabelCameraDevice => StatusLabelModelDirectory,
-            StatusLabelModelDirectory => StatusLabelExecutionProvider,
-            StatusLabelExecutionProvider => StatusLabelEncryption,
-            StatusLabelEncryption => StatusLabelEnrolledFaces,
-            StatusLabelEnrolledFaces => StatusLabelSecurity,
-            StatusLabelSecurity => StatusLabelNotifications,
-            StatusLabelNotifications => StatusLabelPamModule,
-            StatusLabelPamModule => StatusUnknown { why: s("w") },
-            StatusUnknown { .. } => StatusWhyConfigNotAvailable,
-            StatusWhyConfigNotAvailable => StatusConfigValid,
-            StatusConfigValid => StatusConfigNotFound,
-            StatusConfigNotFound => StatusConfigInvalid { error: s("e") },
-            StatusConfigInvalid { .. } => StatusDaemonOneshot,
-            StatusDaemonOneshot => StatusDaemonResponding,
-            StatusDaemonResponding => StatusDaemonNotResponding { error: s("e") },
-            StatusDaemonNotResponding { .. } => StatusFallbackUsable,
-            StatusFallbackUsable => StatusFallbackNotUsable,
-            StatusFallbackNotUsable => StatusCameraDeviceExists,
-            StatusCameraDeviceExists => StatusCameraDeviceNotFound,
-            StatusCameraDeviceNotFound => StatusCameraAutoDetect,
-            StatusCameraAutoDetect => StatusModelsDirNotFound,
-            StatusModelsDirNotFound => StatusModelsAllPresent,
-            StatusModelsAllPresent => StatusModelsSomeMissing,
-            StatusModelsSomeMissing => StatusPresent,
-            StatusPresent => StatusMissing,
-            StatusMissing => StatusEpSupported,
-            StatusEpSupported => StatusEpNotBuiltIn,
-            StatusEpNotBuiltIn => StatusEpUnknownName,
-            StatusEpUnknownName => StatusEpUnqueryable { error: s("e") },
-            StatusEpUnqueryable { .. } => StatusSealedKey { path: s("/p") },
-            StatusSealedKey { .. } => StatusSealedKeyMissing { path: s("/p") },
-            StatusSealedKeyMissing { .. } => StatusTpmDeviceMissing { path: s("/p") },
-            StatusTpmDeviceMissing { .. } => StatusKeyFile { path: s("/p") },
-            StatusKeyFile { .. } => StatusKeyFileMissing { path: s("/p") },
-            StatusKeyFileMissing { .. } => StatusPlaintextEmbeddings,
-            StatusPlaintextEmbeddings => StatusNoFacesEnrolled,
-            StatusNoFacesEnrolled => StatusModelCount { count: 2 },
-            StatusModelCount { .. } => StatusMarkerMismatch {
+        vec![
+            StatusHeader,
+            StatusLabelConfigFile,
+            StatusLabelDaemon,
+            StatusLabelOneshotFallback,
+            StatusLabelCameraDevice,
+            StatusLabelModelDirectory,
+            StatusLabelExecutionProvider,
+            StatusLabelEncryption,
+            StatusLabelEnrolledFaces,
+            StatusLabelSecurity,
+            StatusLabelNotifications,
+            StatusLabelPamModule,
+            StatusUnknown { why: s("w") },
+            StatusWhyConfigNotAvailable,
+            StatusConfigValid,
+            StatusConfigNotFound,
+            StatusConfigInvalid { error: s("e") },
+            StatusDaemonOneshot,
+            StatusDaemonResponding,
+            StatusDaemonNotResponding { error: s("e") },
+            StatusFallbackUsable,
+            StatusFallbackNotUsable,
+            StatusCameraDeviceExists,
+            StatusCameraDeviceNotFound,
+            StatusCameraAutoDetect,
+            StatusModelsDirNotFound,
+            StatusModelsAllPresent,
+            StatusModelsSomeMissing,
+            StatusPresent,
+            StatusMissing,
+            StatusEpSupported,
+            StatusEpNotBuiltIn,
+            StatusEpUnknownName,
+            StatusEpUnqueryable { error: s("e") },
+            StatusSealedKey { path: s("/p") },
+            StatusSealedKeyMissing { path: s("/p") },
+            StatusTpmDeviceMissing { path: s("/p") },
+            StatusKeyFile { path: s("/p") },
+            StatusKeyFileMissing { path: s("/p") },
+            StatusPlaintextEmbeddings,
+            StatusNoFacesEnrolled,
+            StatusModelCount { count: 2 },
+            StatusMarkerMismatch {
                 marker: 3,
                 store: 2,
             },
-            StatusMarkerMismatch { .. } => StatusMarkerUnreadable { why: s("w") },
-            StatusMarkerUnreadable { .. } => StatusSecurityDisabled,
-            StatusSecurityDisabled => StatusYes,
-            StatusYes => StatusNo,
-            StatusNo => StatusNotifyOff,
-            StatusNotifyOff => StatusNotifyTerminal,
-            StatusNotifyTerminal => StatusNotifyDesktop,
-            StatusNotifyDesktop => StatusNotifyBoth,
-            StatusNotifyBoth => StatusPamInstalled,
-            StatusPamInstalled => StatusPamInstalledAt { path: s("/p") },
-            StatusPamInstalledAt { .. } => StatusPamNotInstalled,
-            StatusPamNotInstalled => StatusPamSudoConfigured,
-            StatusPamSudoConfigured => StatusPamSudoNotConfigured,
-            StatusPamSudoNotConfigured => return None,
-        })
+            StatusMarkerUnreadable { why: s("w") },
+            StatusSecurityDisabled,
+            StatusYes,
+            StatusNo,
+            StatusNotifyOff,
+            StatusNotifyTerminal,
+            StatusNotifyDesktop,
+            StatusNotifyBoth,
+            StatusPamInstalled,
+            StatusPamInstalledAt { path: s("/p") },
+            StatusPamNotInstalled,
+            StatusPamSudoConfigured,
+            StatusPamSudoNotConfigured,
+        ]
     }
 }
 

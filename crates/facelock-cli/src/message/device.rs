@@ -119,53 +119,51 @@ impl Message for DeviceMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for DeviceMessage {
-    fn first_sample() -> Self {
-        use DeviceMessage::*;
-        NoVideoDevices
-    }
+    const VARIANT_COUNT: usize = 19;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use DeviceMessage::*;
-        Some(match self {
-            NoVideoDevices => AutoSelectedIrCamera {
+        vec![
+            NoVideoDevices,
+            AutoSelectedIrCamera {
                 path: s("/d"),
                 name: s("n"),
             },
-            AutoSelectedIrCamera { .. } => AutoSelectedIrCameraPath { path: s("/d") },
-            AutoSelectedIrCameraPath { .. } => SelectedCamera {
+            AutoSelectedIrCameraPath { path: s("/d") },
+            SelectedCamera {
                 path: s("/d"),
                 name: s("n"),
             },
-            SelectedCamera { .. } => SelectedValue { value: s("v") },
-            SelectedValue { .. } => PromptSelectCameraDevice,
-            PromptSelectCameraDevice => AutoCameraNoDevices,
-            AutoCameraNoDevices => AutoCameraNoIr {
+            SelectedValue { value: s("v") },
+            PromptSelectCameraDevice,
+            AutoCameraNoDevices,
+            AutoCameraNoIr {
                 listed: s("l"),
                 example: s("/d"),
             },
-            AutoCameraNoIr { .. } => AutoCameraManyIr {
+            AutoCameraManyIr {
                 count: 2,
                 listed: s("l"),
             },
-            AutoCameraManyIr { .. } => CameraDeviceMissing { path: s("/d") },
-            CameraDeviceMissing { .. } => PromptSelectModelQuality,
-            PromptSelectModelQuality => PromptSelectInferenceDevice,
-            PromptSelectInferenceDevice => SelectedModelsStandard,
-            SelectedModelsStandard => SelectedModelsBalanced,
-            SelectedModelsBalanced => SelectedModelsHigh,
-            SelectedModelsHigh => DetectedProvider { detail: s("d") },
-            DetectedProvider { .. } => ProviderQueryFailed { error: s("e") },
-            ProviderQueryFailed { .. } => NvidiaDriverMissing,
-            NvidiaDriverMissing => CudaRuntimeMissing,
-            CudaRuntimeMissing => return None,
-        })
+            CameraDeviceMissing { path: s("/d") },
+            PromptSelectModelQuality,
+            PromptSelectInferenceDevice,
+            SelectedModelsStandard,
+            SelectedModelsBalanced,
+            SelectedModelsHigh,
+            DetectedProvider { detail: s("d") },
+            ProviderQueryFailed { error: s("e") },
+            NvidiaDriverMissing,
+            CudaRuntimeMissing,
+        ]
     }
 }
 
@@ -178,7 +176,7 @@ mod tests {
     /// [`super::super::setup`] for why a failing pin is fixed by restoring
     /// the string, never by editing the expectation.
     #[test]
-    fn english_fallback_is_byte_identical() {
+    fn device_fallback_is_byte_identical() {
         use DeviceMessage::*;
 
         assert_eq!(

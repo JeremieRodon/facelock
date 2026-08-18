@@ -30,9 +30,11 @@
 //! dispatched ahead of every config-consuming command in `main`.
 //!
 //! Output is **not** localized. A capability name is an identifier, not prose,
-//! so it goes out through `println!` and never through the message seam
-//! (`message/mod.rs`, §"What must NOT come through here") — the same rule
-//! `is-enrolled` follows for its state words.
+//! so it goes out through `message::payload` — the seam's machine sink, which
+//! consults no catalog (`message/mod.rs`, §"What must NOT come through
+//! here") — and never through `Terminal::info`. That is the same rule
+//! `is-enrolled` follows for its state words, and it is what makes `--quiet`
+//! one implementation instead of a `bool` threaded through this file.
 //!
 //! # Why the list has to be provable
 //!
@@ -42,6 +44,8 @@
 //! `capability_names_are_all_implemented` in `main.rs` maps every name to the
 //! clap subcommand or argument that declares the surface it names, and a name
 //! nothing backs fails the build rather than shipping.
+
+use crate::message;
 
 /// The capability names this build emits. Sorted and deduplicated — the
 /// contract says the array is, and a const that is already sorted is the
@@ -91,26 +95,24 @@ fn payload_json() -> String {
     .to_string()
 }
 
-/// What [`run`] prints, or `None` under `--quiet`. The whole of this command's
-/// logic, with the printing left to the caller so a test can assert on it
-/// without capturing stdout (the `is_enrolled::report` split).
-fn rendered(json: bool, quiet: bool) -> Option<String> {
-    if quiet {
-        return None;
-    }
-    Some(if json {
+/// What [`run`] prints. The whole of this command's logic, with the printing
+/// left to the caller so a test can assert on it without capturing stdout (the
+/// `is_enrolled::report` split).
+///
+/// `--quiet` is not consulted here: both forms are machine output, so they go
+/// out through [`message::payload`], which is where the flag acts.
+fn rendered(json: bool) -> String {
+    if json {
         payload_json()
     } else {
         CAPABILITIES.join("\n")
-    })
+    }
 }
 
 /// Run `facelock capabilities`. Infallible by construction: no file, no
 /// socket, no camera, so there is no error to return and no exit code but 0.
-pub fn run(json: bool, quiet: bool) {
-    if let Some(text) = rendered(json, quiet) {
-        println!("{text}");
-    }
+pub fn run(json: bool) {
+    message::payload(&rendered(json));
 }
 
 #[cfg(test)]
@@ -252,15 +254,12 @@ mod tests {
         }
     }
 
+    /// The two rendering modes. `--quiet` is absent on purpose: it is the
+    /// payload sink's business now, pinned in `message::mod`'s
+    /// `quiet_silences_stdout_except_notice`.
     #[test]
     fn capabilities_output_modes() {
-        for json in [false, true] {
-            assert!(
-                rendered(json, true).is_none(),
-                "`--quiet` prints nothing, whatever `--json` says"
-            );
-        }
-        assert_eq!(rendered(false, false), Some(CAPABILITIES.join("\n")));
-        assert_eq!(rendered(true, false), Some(payload_json()));
+        assert_eq!(rendered(false), CAPABILITIES.join("\n"));
+        assert_eq!(rendered(true), payload_json());
     }
 }
