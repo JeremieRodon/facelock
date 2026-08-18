@@ -715,9 +715,72 @@ run_test "env_clear: oneshot child PATH pinned to /usr/bin:/bin" \
     "grep -qx 'PATH=/usr/bin:/bin' /tmp/oneshot-child-env" \
     0
 
-# (c) Peer-UID check: a non-root process owning org.facelock.Daemon and
+# (c) Bus policy (ADR 010): the default context may call Authenticate and
+# nothing else; the facelock group grants signals only. A fake daemon owned by
+# ROOT stands in for the real one — the real daemon needs a camera to start,
+# and the bus enforces the policy regardless of who answers. `outsider` is a
+# plain account: not root, not in the facelock group. The daemon-side check
+# that a caller may only name its own username has its own unit tests
+# (facelock-daemon server.rs) and runs live in the integration tier.
+useradd -m outsider 2>/dev/null || true
+mkdir -p /run/dbus
+dbus-uuidgen --ensure=/etc/machine-id > /dev/null 2>&1 || true
+dbus-daemon --system --fork --nopidfile
+
+wait_for_daemon_name() {
+    for _ in $(seq 1 40); do
+        dbus-send --system --print-reply --dest=org.freedesktop.DBus \
+            /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+            string:org.facelock.Daemon 2>/dev/null | grep -q 'boolean true' && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+python3 /fake-facelock-daemon.py > /tmp/fake-daemon-root.log 2>&1 &
+FAKE_ROOT_PID=$!
+wait_for_daemon_name || echo "warning: root fake daemon did not claim the name"
+
+run_test "bus policy: a non-member user may call Authenticate" \
+    "runuser -u outsider -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:outsider | grep -q 'boolean true'" \
+    0
+
+# PAM addresses the daemon by its unique name (GetNameOwner), so the policy's
+# send_destination must match the owner, not just the well-known name.
+FAKE_OWNER=$(dbus-send --system --print-reply --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
+    string:org.facelock.Daemon 2>/dev/null | awk '/string/ {gsub(/"/, "", $2); print $2}')
+run_test "bus policy: a non-member user may call Authenticate on the daemon's unique name" \
+    "[ -n '$FAKE_OWNER' ] && runuser -u outsider -- dbus-send --system --print-reply --dest=$FAKE_OWNER /org/facelock/Daemon org.facelock.Daemon.Authenticate string:outsider | grep -q 'boolean true'" \
+    0
+run_test "bus policy: a non-member user cannot call Ping on the unique name either" \
+    "[ -n '$FAKE_OWNER' ] && runuser -u outsider -- dbus-send --system --print-reply --dest=$FAKE_OWNER /org/facelock/Daemon org.facelock.Daemon.Ping 2>&1 | grep -q AccessDenied" \
+    0
+
+run_test "bus policy: a non-member user cannot call Ping" \
+    "runuser -u outsider -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Ping 2>&1 | grep -q AccessDenied" \
+    0
+
+run_test "bus policy: a non-member user cannot call ListModels" \
+    "runuser -u outsider -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.ListModels 2>&1 | grep -q AccessDenied" \
+    0
+
+usermod -aG facelock testuser
+run_test "bus policy: a group member cannot call Ping either (group grants signals only)" \
+    "runuser -u testuser -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Ping 2>&1 | grep -q AccessDenied" \
+    0
+
+run_test "bus policy: a group member may still call Authenticate" \
+    "runuser -u testuser -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:testuser | grep -q 'boolean true'" \
+    0
+
+kill "$FAKE_ROOT_PID" 2>/dev/null || true
+wait "$FAKE_ROOT_PID" 2>/dev/null || true
+
+# (d) Peer-UID check: a non-root process owning org.facelock.Daemon and
 # replying matched=true must never produce PAM_SUCCESS. A deliberately
-# loosened bus policy simulates a broken/compromised policy file.
+# loosened bus policy simulates a broken/compromised policy file. The bus is
+# already running, so ask it to re-read the policy directory.
 cat > /usr/share/dbus-1/system.d/zz-facelock-peer-test.conf <<'EOF'
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -730,9 +793,9 @@ cat > /usr/share/dbus-1/system.d/zz-facelock-peer-test.conf <<'EOF'
   </policy>
 </busconfig>
 EOF
-mkdir -p /run/dbus
-dbus-uuidgen --ensure=/etc/machine-id > /dev/null 2>&1 || true
-dbus-daemon --system --fork --nopidfile
+dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig
+sleep 1
 runuser -u testuser -- python3 /fake-facelock-daemon.py > /tmp/fake-daemon.log 2>&1 &
 FAKE_PID=$!
 for _ in $(seq 1 40); do

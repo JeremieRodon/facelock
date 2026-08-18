@@ -449,9 +449,10 @@ impl Method {
     }
 }
 
-/// Who may call a D-Bus method. The bus policy admits root and the facelock
-/// group to the whole interface; this in-daemon check (keyed on the caller
-/// UID from `GetConnectionUnixUser`) is the per-method decision.
+/// Who may call a D-Bus method. The bus policy admits root to the whole
+/// interface and every local user to `Authenticate` only (ADR 010); this
+/// in-daemon check (keyed on the caller UID from `GetConnectionUnixUser`) is
+/// the per-method decision, and for `Authenticate` it is the boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Scope {
     /// Root only.

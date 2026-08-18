@@ -164,7 +164,7 @@
           <div class="security-marker">DB</div>
           <div>
             <h4>D-Bus Policy</h4>
-            <p>D-Bus system bus policy restricts daemon access. Only root and facelock group members can send messages to the daemon interface.</p>
+            <p>D-Bus system bus policy restricts daemon access. Any local user may request authentication for itself; the daemon verifies the caller's UID and every other method is root-only.</p>
           </div>
         </div>
 

@@ -1584,13 +1584,15 @@ hill-climbing oracle by construction rather than by redacting fields):
   what makes a budget-free endpoint safe to expose.
 - Every other method — `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`,
   `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`,
-  `Ping`, `Shutdown` — is root only. The bus policy
-  (`dbus/org.facelock.Daemon.conf`) stays interface-scoped (grants send
-  access to root and the `facelock` group for the whole interface, so adding
-  a method needs no policy edit); the per-method root/user-scoped decision is
-  the in-daemon check on the caller UID from `GetConnectionUnixUser`, keyed
-  by a table-driven scope (`authorize_method` in `facelock_daemon::server`)
-  so a new method is root-only by default until deliberately opened up.
+  `Ping`, `Shutdown` — is root only.
+  The bus policy (`dbus/org.facelock.Daemon.conf`) grants root the whole
+  interface and every local user exactly `Authenticate` (ADR 010) — so
+  adding a root-only method needs no policy edit, and a future user-scoped
+  method needs one deliberately; the `facelock` group grants signal receipt
+  only. The per-method root/user-scoped decision is the in-daemon check on
+  the caller UID from `GetConnectionUnixUser`, keyed by a table-driven scope
+  (`authorize_method` in `facelock_daemon::server`) so a new method is
+  root-only by default until deliberately opened up.
 
 Raw camera frames require privilege. Both `PreviewFrame` and
 `PreviewDetectFrame` are root-only, so a non-root caller is denied with
@@ -1626,7 +1628,8 @@ to the next auth mechanism (password), never a lockout.
   intentionally carries **no similarity score** (the raw biometric score is
   an information leak / spoof-tuning oracle). The system bus policy
   (`dbus/org.facelock.Daemon.conf`) denies signal reception from the daemon
-  by default; only root and members of the `facelock` group may receive it.
+  by default; only root and members of the `facelock` group may receive it —
+  signal receipt is the group's only grant (ADR 010).
 
 ### Response types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`
