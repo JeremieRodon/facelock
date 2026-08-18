@@ -2195,27 +2195,34 @@ Fill in as you go. A fresh session resumes from here.
 
 | When | What | Result / sha / verdict |
 |---|---|---|
-| | Baseline `origin/main` sha | |
-| | Task 0 `just check` on baseline | |
-| | Task 0 `adversarial-validate` verdict + confidence | |
-| | Task 1 ADR commit | |
-| | Lane A Task 2 sha + rungs | |
-| | Lane A Task 3 sha + `test-arch-layout` | |
-| | Lane B Task 4 sha + `test-arch-pam` | |
-| | Merge B, merge A, post-merge rungs | |
-| | Task 5 sha + rungs + pot | |
-| | Task 6 sha + sweep residual + ladder | |
-| | Task 7 ousterhout findings: accepted / rejected | |
-| | Task 7 apply sha | |
-| | Task 8 skeptic verdicts (14 claims) | |
-| | Task 8 apply sha | |
-| | Task 9 security-review, code-review outcomes | |
-| | Task 9 PR URL | |
-| | Task 10 (Ty) camera tiers, host checks, hyprlock | |
+| 2026-08-18 | Baseline `origin/main` sha | 2fd65f0 (plan written at 23908db; symbols unchanged, line numbers drifted); later merged origin/main 7c4b3e9 (#200/#208/#210) into the branch at 7d91ce5 |
+| 2026-08-18 | Task 0 `just check` on baseline | exit 0 (plan copy commit b0d165e) |
+| 2026-08-18 | Task 0 `adversarial-validate` verdict + confidence | WEAKENED WITH CAVEATS (skill: UNCERTAIN as worded). Parts (a)–(d) each HOLD, high confidence; (d) proven at runtime on dbus-broker 37 and dbus-daemon 1.16.2. Umbrella "loses no protection" false on availability: capture slot is taken before `pre_check`, unenrolled calls are unmetered, `maybe_reload_handler` runs pre-authz. No ADR Decision refuted. Caveats → ADR "New surface" bullet amended (not verbatim), Task 4/5/8 briefs. |
+| 2026-08-18 | Task 1 ADR commit | 7f4101b (verbatim except the amended "New surface" bullet) |
+| 2026-08-18 | Lane A Task 2 sha + rungs | 1470beb; fmt/clippy/test 0; `state_layout.rs` body verbatim |
+| 2026-08-18 | Lane A Task 3 sha + `test-arch-layout` | a82fe69; 24 passed 0 failed. Deviations accepted: `install-files` modes 710→711 root:root (plan gap); `[ … -eq 010 ]` decimal/octal bug in the plan's script fixed with `$(( ))` |
+| 2026-08-18 | Lane B Task 4 sha + `test-arch-pam` | f293b3e; 70 passed 0 failed (7 bus-policy tests incl. two unique-name checks from the pre-flight caveats) |
+| 2026-08-18 | Merge B, merge A, post-merge rungs | 976e9cf, 7bcd6a3; no conflicts; fmt/clippy/test 0, layout 24/0, pam 70/0 |
+| 2026-08-18 | Task 5 sha + rungs + pot | 3dd863a; fmt/clippy/test/pot 0, pot diff clean, pam 70/0; sweep = two negative test assertions only |
+| 2026-08-18 | Task 6 sha + sweep residual + ladder | 096931a; 12 misses fixed + `book/src/security.md` three-grants rewrite; residual = accepted list; build/test/clippy/fmt/pot/`check-pam-standalone` 0, pam 70/0, layout 24/0 |
+| 2026-08-18 | Task 7 ousterhout findings: accepted / rejected | 8 findings. Accepted: `secure_setup_paths`→`ensure_state_layout_or_bail`; drop `MARKER_DIR_MODE` alias; reuse `wait_for_daemon_name`; merge § 4 A double lead-in; banner rename. Rejected: drop `chown_to_root` bool (fixed decision); single failure policy for `ensure_facelock_group` (behaviour change); § 3 A3 bullet and contracts second block (plan text); `/run/facelock` (scope) |
+| 2026-08-18 | Task 7 apply sha | bb28a36; fmt/clippy/test 0, pam 70/0, layout 24/0 |
+| 2026-08-18 | Task 8 skeptic verdicts (14 claims) | 1 HOLDS h; 2 HOLDS+CAVEAT h (guard test sliced first default block only); 3 HOLDS h; 4 HOLDS h; 5 HOLDS+CAVEAT h (`maybe_reload_handler` pre-authz undocumented); 6 HOLDS h; 7 HOLDS+CAVEAT h; 8 HOLDS h; 9 HOLDS+CAVEAT m (rpm `%post` tmpfiles macro no-op); 10 HOLDS h; 11 HOLDS h; 12 HOLDS h; 13 HOLDS+CAVEAT m (two stale security.md sentences; audit-rotation amplifier unstated); 14 HOLDS h. None refuted. 7 doc/test/spec fixes accepted |
+| 2026-08-18 | Task 8 apply sha | aca0923; then 1efe54e (`%tmpfiles_create_compat` does not exist in systemd-rpm-macros — verified in a fedora container — replaced by `%tmpfiles_create`) |
+| 2026-08-18 | Task 9 security-review, code-review outcomes | security-review: no findings ≥0.7. code-review (high): 10 findings; accepted 6 → 1e048b8 (legacy `/etc/dbus-1` copy refresh in scriptlets; `install-files` reload; `.install` helper), 1337671 (`FAKE_OWNER` under `set -e`; non-root `pamtester` through `pam_facelock` vs root fake daemon — passes), f55f463 (probe-by-name residual wording; `/run/facelock` clause). Rejected/deferred: daemon per-UID budget, plan-copy location, `chown_root` into core, `apply_layout` bool, `secure_setup_paths` re-apply, `install -d` belt-and-braces, non-interactive `?`, deb `dbus` Depends. Final ladder at f55f463: fmt/clippy/test/pot/`just check` 0, pam 71/0, layout 24/0 |
+| 2026-08-18 | Task 9 PR URL | https://github.com/tyvsmith/facelock/pull/215 (draft) |
+| | Task 10 (Ty) camera tiers, host checks, hyprlock | owed |
 
 Open decisions for Ty (append here, do not resolve silently):
 
-- (none yet)
+- Daemon-side availability margin (pre-flight + skeptic + code-review, all accepted as documented, none applied — daemon change out of plan scope): (i) move `last_activity.store` and `maybe_reload_handler()` below `authorize_method` in `server.rs::run_authentication`, and store the config mtime on the failing-rebuild arm; (ii) take the capture slot after a cheap `has_models`, or add a per-UID token bucket in front of it (an unenrolled UID's `Authenticate` is never charged and can hold the slot in a loop; hyprlock then falls back to the password); (iii) audit rows are written per unmetered call, so a loop can rotate `audit.jsonl` (off by default). Follow-up PR or accept as recorded.
+- ADR 010 Consequences "New surface" bullet was amended from the plan's verbatim text (the original "every attempt is audited and rate-limited per user" is false for unenrolled UIDs). Revert or keep.
+- `ensure_facelock_group`: wizard reports on failure, `--non-interactive` bails (`?`). Plan-mandated; two reviewers asked for one policy. Keep or unify.
+- Plan copy committed under `docs/superpowers/plans/` per Task 0; code-review notes prior convention keeps plans untracked in `.omc/`. Keep in the PR or drop the file.
+- `dist/debian/control` has no `dbus` (→ `dbus-bin`) Depends, so the postinst `dbus-send … ReloadConfig` may silently no-op on Debian (guarded by `|| true`; inotify covers it). Add the dependency or leave.
+- `dist/facelock.spec` `%pre` `%sysusers_create_compat dist/facelock.sysusers` is `%nil` on current Fedora (rpm handles sysusers.d natively); left alone.
+- Authz guard test `interface_methods_and_the_authz_matrix_are_the_same_set` scans `async fn ` only (a `pub async fn` in the `#[interface]` block would be invisible); daemon SSH gate reads the daemon's own environment (dead on the systemd path; PAM enforces client-side); `chown_root` is a third `libc::chown` wrapper in facelock-cli. All pre-existing; follow-ups.
+- Group as a per-user off-switch: removing a user from `facelock` no longer disables face unlock for them (troubleshooting says remove their models). Documented; no other per-user disable exists.
 
 ---
 
