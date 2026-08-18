@@ -190,13 +190,14 @@ screen still reports `AccessDenied` right after an upgrade, the bus has not
 re-read the policy yet — `sudo facelock setup --systemd` rewrites it and asks
 for a reload, or reboot.
 
-Membership in the `facelock` group is optional (it only lets a member receive
-the daemon's `AuthAttempted` signals) and is safe to drop. Dropping it does not
-turn face unlock off for that user — remove their models
-(`sudo facelock remove` / `clear`) to do that:
+The `facelock` group is no longer used (ADR 010). `sudo facelock setup`, `just
+install-files` and the package scriptlets remove a leftover group; if it
+lingers:
 ```bash
-sudo gpasswd -d $USER facelock
+sudo groupdel facelock
 ```
+Face unlock is turned off per user by removing that user's models
+(`sudo facelock remove` / `sudo facelock clear`).
 
 ### Database permission errors
 

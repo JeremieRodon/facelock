@@ -1,4 +1,4 @@
-# ADR 010: `Authenticate` Open to Every Local User; the `facelock` Group Grants Nothing on the Auth Path
+# ADR 010: `Authenticate` Open to Every Local User; the `facelock` Group Retired
 
 ## Status
 
@@ -38,17 +38,17 @@ database exists to avoid.
 
 1. **Bus policy** (`dbus/org.facelock.Daemon.conf`): the `default` context
    may send `org.facelock.Daemon.Authenticate` to `org.facelock.Daemon` and
-   nothing else. Root keeps the whole interface. The `facelock` group policy
-   shrinks to signal receipt (`AuthAttempted`); it no longer grants method
-   calls.
+   nothing else. Root keeps the whole interface, including signal receipt;
+   there is no group policy.
 2. **State directory**: `/var/lib/facelock` and `/var/lib/facelock/enrolled`
    become `0711 root:root` — traverse for everyone, list for nobody. The
    database, its sidecars, the markers, the audit log and the snapshots keep
    their modes. `is-enrolled` needs no group.
-3. **Setup**: `facelock setup` and `just install-files` stop adding users to
-   the group. Setup still creates the system group (packaging does via
-   sysusers) because the policy names it. Existing memberships are harmless
-   and left alone.
+3. **Setup and packaging**: `facelock setup` and `just install-files` stop
+   adding users to the group and stop creating it; packaging ships no
+   sysusers fragment; `/run/facelock` is `root:root`. A group left behind by
+   an older install is removed best-effort by setup, `install-files` and the
+   package scriptlets (`groupdel`); it owns nothing by the time that runs.
 4. **No daemon authorization change.** `Authenticate(other_user)` from a
    non-root caller is denied by `require_user_authorized`, as before.
 
@@ -78,8 +78,9 @@ database exists to avoid.
   the daemon's own denial.
 - **Upgrade**: modes and ownership converge through the existing channels
   (tmpfiles, package scriptlets, `ensure_state_layout` on daemon start,
-  best-effort on the auth path). The policy file is replaced by the package
-  or by `sudo facelock setup --systemd`; both bus implementations watch the
+  best-effort on the auth path), and the legacy group is removed best-effort.
+  The policy file is replaced by the package or by
+  `sudo facelock setup --systemd`; both bus implementations watch the
   policy directory, and setup and the scriptlets also ask for
   `org.freedesktop.DBus.ReloadConfig`, best-effort.
 
@@ -93,3 +94,6 @@ database exists to avoid.
   can be added later without touching the bus policy.
 - **Keep the group's whole-interface grant**: every method it would admit is
   denied by the daemon anyway; keeping it only complicates the story.
+- **Keep the group for signal receipt only**: no consumer of `AuthAttempted`
+  runs as a non-root non-daemon process; keeping a group nobody needs kept a
+  `usermod` story alive in every doc.
