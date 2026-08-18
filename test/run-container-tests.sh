@@ -798,12 +798,7 @@ dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
 sleep 1
 runuser -u testuser -- python3 /fake-facelock-daemon.py > /tmp/fake-daemon.log 2>&1 &
 FAKE_PID=$!
-for _ in $(seq 1 40); do
-    dbus-send --system --print-reply --dest=org.freedesktop.DBus \
-        /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
-        string:org.facelock.Daemon 2>/dev/null | grep -q 'boolean true' && break
-    sleep 0.25
-done
+wait_for_daemon_name || echo "warning: fake non-root daemon did not claim the name"
 
 run_test "Peer-UID harness: fake non-root daemon replies matched=true" \
     "dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:testuser | grep -q 'boolean true'" \

@@ -529,10 +529,10 @@ but `/usr/share/...` is the canonical install path. Three grants (ADR 010):
 - **the `facelock` group**: may receive the daemon's signals. It grants no
   method calls; membership is optional and facelock never adds anyone to it.
 
-Because the bus lets any local user reach `Authenticate`, the in-daemon
-per-method check is the boundary for it, not a second layer:
-
-The daemon verifies the caller UID via `GetConnectionUnixUser` on every method call and applies method-level authorization:
+Because the bus lets any local user reach `Authenticate`, the daemon's own
+check — it verifies the caller UID via `GetConnectionUnixUser` on every method
+call and applies method-level authorization — is the boundary for that method
+rather than a second layer:
 - `Authenticate`: root, or a non-root caller acting on their own username. This is the **only** user-scoped method, and it is architecture rather than policy: screen lockers run their PAM stack as the user, so a user must be able to request authentication for themselves.
 - Everything else is **root only**: `TestAuthenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`.
 

@@ -34,12 +34,10 @@ use serde::{Deserialize, Serialize};
 use facelock_core::Config;
 use facelock_core::fs_security::{ensure_private_dir, write_file};
 
+use crate::state_layout::ENROLLED_DIR_MODE;
+
 /// Fallback marker directory when the configured DB path yields no parent.
 pub const DEFAULT_MARKER_DIR: &str = "/var/lib/facelock/enrolled";
-
-/// Traversable by everyone, listable by nobody but root — equals
-/// [`crate::state_layout::ENROLLED_DIR_MODE`].
-pub const MARKER_DIR_MODE: u32 = crate::state_layout::ENROLLED_DIR_MODE;
 
 /// Readable only by the user the marker describes.
 pub const MARKER_FILE_MODE: u32 = 0o600;
@@ -206,7 +204,7 @@ pub fn write_marker_in(
     owner: Option<(u32, u32)>,
 ) -> io::Result<()> {
     let final_path = marker_path(base, user)?;
-    ensure_private_dir(base, MARKER_DIR_MODE)?;
+    ensure_private_dir(base, ENROLLED_DIR_MODE)?;
 
     let marker = Marker {
         models,
@@ -334,7 +332,7 @@ pub fn reconcile_all(config: &Config) -> anyhow::Result<()> {
     // No database yet: nothing to backfill. Do not create one as a side effect
     // of reconciling — setup calls this before anyone has enrolled.
     if !db_path.exists() {
-        ensure_private_dir(&base, MARKER_DIR_MODE)?;
+        ensure_private_dir(&base, ENROLLED_DIR_MODE)?;
         return Ok(());
     }
 
@@ -346,7 +344,7 @@ pub fn reconcile_all(config: &Config) -> anyhow::Result<()> {
         .list_users()
         .map_err(|e| anyhow::anyhow!("failed to list enrolled users: {e}"))?;
 
-    ensure_private_dir(&base, MARKER_DIR_MODE)?;
+    ensure_private_dir(&base, ENROLLED_DIR_MODE)?;
 
     let mut wanted: Vec<String> = Vec::new();
     for user in users {
@@ -819,7 +817,11 @@ mod tests {
             first[0].1
         );
         assert_eq!(first[0].2, MARKER_FILE_MODE);
-        assert_eq!(mode_of(&base), MARKER_DIR_MODE, "directory mode is stable");
+        assert_eq!(
+            mode_of(&base),
+            ENROLLED_DIR_MODE,
+            "directory mode is stable"
+        );
     }
 
     /// A marker the reconcile could not *write* must survive it.

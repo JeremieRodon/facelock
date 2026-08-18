@@ -2523,9 +2523,7 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     // database file modes — is owned by `state_layout`. Re-applied here so a
     // path created earlier in setup with a looser mode converges before the
     // marker reconcile runs.
-    if let Some(layout) = crate::state_layout::StateLayout::from_config(config) {
-        crate::state_layout::apply_layout(&layout, nix::unistd::Uid::current().is_root())?;
-    }
+    ensure_state_layout_or_bail(config)?;
     if let Some(parent) = audit_path.parent() {
         // Per-user auth history: root-only, like the snapshots.
         secure_dir_if_exists(parent, 0o700, 0)?;
