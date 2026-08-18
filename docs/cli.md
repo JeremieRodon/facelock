@@ -25,13 +25,14 @@ real combination (silent report, loud diagnostics) rather than a contradiction.
 
 `--quiet` is complete for every command whose output goes through the message
 seam: `setup`, `enroll`, `test`, `remove`, `clear`, `is-enrolled`,
-`capabilities`, `pam`, and the `--json` payloads of `list` and `devices`. Seven
-still write human text straight to stdout and stay noisy under it until
-[#140](https://github.com/tyvsmith/facelock/issues/140) is finished: `status`,
-`bench`, `tpm` (every verb, `encrypt`/`decrypt`/`reseal` included), `config`,
-`daemon restart`, `hyprlock` and `audit`, as do the human tables of `list` and
-`devices`. `preview --json` is on neither list: its frame stream is stdout by
-design and `--quiet` is documented not to reach it.
+`capabilities`, `pam`, and the `--json` payloads of `list`, `devices` and
+`status`. Seven still write human text straight to stdout and stay noisy under
+it until [#140](https://github.com/tyvsmith/facelock/issues/140) is finished:
+`status`, `bench`, `tpm` (every verb, `encrypt`/`decrypt`/`reseal` included),
+`config`, `daemon restart`, `hyprlock` and `audit`, as do the human tables of
+`list` and `devices` — so `status --json --quiet` is silent while a bare
+`status --quiet` is not. `preview --json` is on neither list: its frame stream
+is stdout by design and `--quiet` is documented not to reach it.
 
 ## Machine-readable output
 
@@ -39,7 +40,7 @@ Every command whose output a script would parse takes `--json`, and spells it
 exactly that — one flag family, no short letter, no `--output json`. It is not
 offered everywhere: a command gains it when it has a named consumer, which
 today means `facelock is-enrolled`, `facelock capabilities`, `facelock list`,
-`facelock devices`, `facelock preview`, `facelock pam add`,
+`facelock devices`, `facelock preview`, `facelock status`, `facelock pam add`,
 `facelock pam remove` and `facelock pam status`. Each payload is described in
 that command's section below; the rule behind the flag, and the promise each
 payload carries, are in [`contracts.md`](contracts.md) under "CLI Machine
@@ -47,9 +48,12 @@ Output".
 
 The payload goes to stdout and nothing else does — diagnostics are on stderr
 whatever `RUST_LOG` says — so `facelock devices --json` is safe to pipe at any
-log level. `--quiet` suppresses the payload, leaving the exit code as the whole
-answer, on every one of these except `preview`, whose frame stream runs until
-interrupted and would otherwise become a command that prints nothing forever.
+log level. `--quiet` suppresses the payload on every one of these except
+`preview`, whose frame stream runs until interrupted and would otherwise become
+a command that prints nothing forever. What that leaves behind depends on the
+command: where the exit code is the answer it is the whole answer, but `status`
+exits 0 whenever it produced a report, so `status --quiet --json` leaves nothing
+at all.
 **This changed:** `list --json --quiet` and `devices --json --quiet` used to
 print their payload and now print nothing; the exit code is unchanged.
 
@@ -373,7 +377,36 @@ reported as "cannot determine" — never as a guessed value.
 
 ```bash
 facelock status
+facelock status --json
+facelock status --json | jq -e '.daemon.reachability == "responding"'
 ```
+
+`--json` prints one object with a key per section of the report — `config`,
+`daemon`, `oneshot_fallback`, `camera`, `models`, `execution_provider`,
+`encryption`, `enrollment`, `security`, `notifications`, `pam` — each carrying
+a `state` of `ok`, `problem` or `unknown` and, when it is not `ok`, a `reason`.
+It is the same value the report is rendered from, and a test walks both outputs
+of one fixture, so a section cannot answer differently in the two. This is the
+form to branch on: the third line above is what replaces grepping the report
+for `[ok] responding`. A fact nobody established is `"state": "unknown"` with a
+reason and no value — never a `null` and never a `false`, so read a section's
+`state` before any field beside it: on an unreadable database `enrollment`
+carries no `models` key at all, and `(.enrollment.models // [])` would answer
+"not enrolled" for a machine nobody could check.
+
+**Two sections keep a narrower question than their name suggests**, and both
+have the specific answer nested one level down. Under auto-detection
+`.camera.state` reports only that detection is enabled, so it reads `ok` on a
+machine with no camera at all — `.camera.device.state` is the hardware fact.
+And `.pam.state` reports that `pam_facelock.so` is installed, not that anything
+uses it — `.pam.services` is the scan. The full schema, the per-section table
+of what each `state` answers, and the stability tier are in
+[`contracts.md`](contracts.md) under "facelock status Semantics".
+
+Exit codes do not change under `--json`: `status` exits 0 whenever it produced
+a report, and the verdicts are in the document. `--quiet` therefore suppresses
+the payload and leaves nothing behind, which makes `--quiet --json` a no-op
+rather than a terser query.
 
 The `PAM services:` line lists every service that carries the facelock line,
 from the same scan [`facelock pam status --all`](#facelock-pam-status---all)

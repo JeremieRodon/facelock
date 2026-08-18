@@ -130,7 +130,10 @@ enum Commands {
         command: Option<ConfigCommand>,
     },
     /// Check system status
-    Status,
+    Status {
+        #[command(flatten)]
+        json: JsonArg,
+    },
     /// List available camera devices
     Devices {
         #[command(flatten)]
@@ -310,8 +313,8 @@ fn main() -> anyhow::Result<()> {
 
                     // `status` reports on the config file itself, so a load
                     // failure is a finding to render, not an exit.
-                    if matches!(other, Commands::Status) {
-                        return commands::status::run(loaded);
+                    if let Commands::Status { json } = &other {
+                        return commands::status::run(loaded, json.json);
                     }
                     let config = loaded.require()?;
 
@@ -358,7 +361,7 @@ fn main() -> anyhow::Result<()> {
                         | Commands::Hyprlock { .. }
                         | Commands::Config { .. }
                         | Commands::Setup(..)
-                        | Commands::Status => unreachable!(),
+                        | Commands::Status { .. } => unreachable!(),
                     }
                 }
             }

@@ -392,7 +392,11 @@ reported as "cannot determine" -- never as a guessed value.
 
 ```bash
 facelock status
+facelock status --json
+facelock status --json | jq -e '.daemon.reachability == "responding"'
 ```
+
+`--json` prints one object with a key per section of the report -- `config`, `daemon`, `oneshot_fallback`, `camera`, `models`, `execution_provider`, `encryption`, `enrollment`, `security`, `notifications`, `pam` -- each carrying a `state` of `ok`, `problem` or `unknown` and, when it is not `ok`, a `reason`. It is the same value the report is rendered from, and a test walks both outputs of one fixture, so a section cannot answer differently in the two. This is the form to branch on rather than grepping the report. A fact nobody established is `"state": "unknown"` with a reason and no value -- never a `null` and never a `false`, so read a section's `state` before any field beside it: on an unreadable database `enrollment` carries no `models` key at all. Two sections keep a narrower question than their name suggests, with the specific answer nested one level down -- under auto-detection `.camera.state` reports only that detection is enabled (`.camera.device.state` is the hardware fact), and `.pam.state` reports that the module is installed, not that anything uses it (`.pam.services` is the scan). Exit codes are unchanged by the flag: `status` exits 0 whenever it produced a report, and the verdicts are in the document, which also makes `--quiet --json` a no-op rather than a terser query. The full schema and its stability tier are in [Contracts](contracts.md), "facelock status Semantics".
 
 The `PAM services:` line lists every service that carries the facelock line, from the same scan `facelock pam status --all` runs, and marks how many are a local override of a vendor file. It reads `none configured` only when every directory was read; when one could not be, it reads `not checked` and names the place on a line of its own, because "nothing is configured" and "I could not look" are different answers.
 
