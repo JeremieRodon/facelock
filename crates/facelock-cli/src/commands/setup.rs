@@ -2503,10 +2503,10 @@ fn retire_facelock_group() {
     match nix::unistd::Group::from_name("facelock") {
         Ok(Some(_)) => match run_cmd("groupdel", &["facelock"]) {
             Ok(()) => Terminal.info(&SystemMessage::RetiredFacelockGroup),
-            Err(e) => tracing::debug!("could not remove the legacy facelock group: {e}"),
+            Err(e) => tracing::warn!("could not remove the legacy facelock group: {e}"),
         },
         Ok(None) => {}
-        Err(e) => tracing::debug!("could not look up the facelock group: {e}"),
+        Err(e) => tracing::warn!("could not look up the facelock group: {e}"),
     }
 }
 

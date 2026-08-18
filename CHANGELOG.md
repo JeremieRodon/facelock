@@ -158,7 +158,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds without prompting, and prints a manual `usermod` command when no
   invoking user can be determined), so daemon commands like `facelock
   preview`/`test` work after setup without a manual `usermod`. A log-out/log-in
-  reminder is printed.
+  reminder is printed. Superseded in this release by ADR 010, which retired
+  the group.
 - **`facelock status` reports whether the PAM oneshot fallback is usable**: a
   new "Oneshot fallback" section says whether root-invoked PAM could
   authenticate via `/usr/bin/facelock auth` with the daemon unreachable — the
@@ -445,7 +446,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests in `crates/facelock-cli/src/state_layout.rs`. `just test-arch-layout`
   asserts the shipped modes end to end. See `docs/contracts.md` for the
   permission table as a contract change and `docs/security.md` §A2/§A3 for the
-  rationale.
+  rationale. ADR 010 (above) later changed the two directories to
+  `0711 root:root` and removed the group; the database, log and snapshot modes
+  here are unchanged.
 - **`facelock setup` flags now compose instead of being mutually exclusive**:
   `--pam` and/or `--systemd` on their own still perform just that action and
   touch nothing else, but any flag that only makes sense while the base setup
@@ -576,7 +579,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Bare D-Bus AccessDenied errors** (#89): when the system bus policy rejects
   a caller that is not root or in the `facelock` group, the CLI now appends an
   actionable hint (add user to group, re-login, or re-run setup) instead of a
-  bare "AccessDenied".
+  bare "AccessDenied". Superseded by ADR 010: the hint is now always "root
+  required" and there is no group.
 - **Uninstall left `pam_facelock.so` lines behind**: the Arch, RPM and
   `just uninstall` cleanup paths stripped the facelock line from three
   `/etc/pam.d` files (`sudo`, `polkit-1`, `hyprlock`) while `facelock setup`
@@ -617,7 +621,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and before the daemon creates its first thread, so no thread of the process
   holds it while anyone is being authenticated and no exec'd child inherits it.
   `systemd-analyze security` moves 2.6 → 2.8 (still OK); it scores the bounding
-  set and cannot see the in-process drop.
+  set and cannot see the in-process drop. Since ADR 010 the target is
+  `root:root`.
 - **The daemon's capability drop is now verified, and refuses to serve if it did
   not happen.** It used to log `failed to drop capabilities (continuing)` and
   carry on, which made "narrowed after initialization" a best-effort claim. That
