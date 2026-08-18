@@ -306,8 +306,10 @@ run_test "Rate limit: clear seeded attempts" \
 
 # --- D-Bus hardening assertions (security plan 06) ---
 
-# sigwatcher: unprivileged, NOT in the facelock group (signal eavesdropper).
-# testuser: added to the facelock group (bus policy allows it to send).
+# sigwatcher: unprivileged, NOT in the facelock group — a plain local user
+# under ADR 010 (may call Authenticate for itself, receives no signals).
+# testuser: added to the facelock group (may receive signals; the group grants
+# nothing else).
 useradd -m sigwatcher 2>/dev/null || true
 usermod -aG facelock testuser
 
@@ -334,6 +336,35 @@ run_test "AuthAttempted payload carries no similarity score" \
 
 run_test "Unprivileged user receives no AuthAttempted signal" \
     "! grep -q 'member=AuthAttempted' /tmp/sig-unpriv.log"
+
+# (a2) ADR 010: Authenticate is open to every local user for its own username
+# and nothing else is. sigwatcher is not enrolled and not in the group, so its
+# own Authenticate is answered by the enrollment pre-check (model_id -1, or -3
+# under suppress_unknown) without opening the camera; naming another user is
+# refused by the daemon; Ping is refused by the bus.
+run_test_contains "Non-member Authenticate for own user reaches the daemon (no model)" \
+    "runuser -u sigwatcher -- dbus-send --system --print-reply --reply-timeout=30000 --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:sigwatcher" \
+    "int32 -[13]"
+
+check_denied_as() {
+    # $1 = user, $2 = method, $3.. = dbus-send args
+    local user="$1" method="$2"
+    shift 2
+    local out rc
+    set +e
+    out=$(runuser -u "$user" -- dbus-send --system --print-reply --reply-timeout=30000 \
+        --dest=org.facelock.Daemon /org/facelock/Daemon "org.facelock.Daemon.$method" "$@" 2>&1)
+    rc=$?
+    set -e
+    echo "$out"
+    [ "$rc" -ne 0 ] || { echo "$method unexpectedly succeeded for $user"; return 1; }
+    echo "$out" | grep -qi "AccessDenied" || return 1
+    return 0
+}
+run_test "Non-member Authenticate for another user is denied by the daemon" \
+    "check_denied_as sigwatcher Authenticate string:testuser"
+run_test "Non-member Ping is denied by the bus" \
+    "check_denied_as sigwatcher Ping"
 
 # Policy: the default context explicitly denies owning the daemon name —
 # only root may own org.facelock.Daemon.

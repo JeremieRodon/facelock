@@ -56,7 +56,7 @@ Supported providers: `cpu` (default), `cuda` (NVIDIA), `rocm` (AMD), `openvino` 
 - `security.require_ir` defaults to **true**. Never weaken this default.
 - Frame variance checks must be in the auth path.
 - Model files SHA256-verified at load time.
-- D-Bus system bus policy: deny-all default, allow root and facelock group only.
+- D-Bus system bus policy: deny-all default; every local user may send `Authenticate` only (daemon checks caller UID == target user), root gets the whole interface, the `facelock` group gets signals only (ADR 010).
 - D-Bus daemon verifies caller UID via `GetConnectionUnixUser` before executing methods.
 - D-Bus message size limits enforced by the bus daemon.
 - PAM module logs all auth attempts to syslog.

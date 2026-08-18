@@ -222,7 +222,7 @@ See [docs/testing-safety.md](docs/testing-safety.md) before editing PAM config o
 - Constant-time embedding comparison via `subtle` crate
 - AES-256-GCM encryption at rest with optional TPM-sealed keys
 - Model SHA256 verification at every load
-- D-Bus system bus policy: deny-all default, facelock group ACL
+- D-Bus system bus policy: deny-all default; `Authenticate` open to every local user (daemon-checked UID), everything else root-only
 - D-Bus caller UID verification on all daemon methods
 - PAM audit logging to syslog
 - Rate limiting (5 attempts/user/60s)

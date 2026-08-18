@@ -525,11 +525,50 @@ enabling it is a deliberate operator choice that commits to the reseal workflow.
 
 #### A. D-Bus System Bus Policy (Required)
 
-Access to the daemon is restricted by the D-Bus system bus policy defined in `dbus/org.facelock.Daemon.conf`. Only root and members of the `facelock` group are allowed to send messages to the daemon interface. The policy file is installed to `/usr/share/dbus-1/system.d/` and enforced by the bus daemon itself. Setup and package install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present, but `/usr/share/...` is the canonical install path.
+Access to the daemon is governed by the D-Bus system bus policy in
+`dbus/org.facelock.Daemon.conf`, installed to `/usr/share/dbus-1/system.d/`
+and enforced by the bus itself (dbus-daemon or dbus-broker). Setup and package
+install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present,
+but `/usr/share/...` is the canonical install path. Three grants (ADR 010):
 
-The daemon must also verify the caller UID via `GetConnectionUnixUser` on every method call and apply method-level authorization:
+- **root**: may own the name and send anything on the interface.
+- **every local user** (`default` context): may send exactly one method,
+  `org.facelock.Daemon.Authenticate`. Screen lockers and the polkit agent run
+  their PAM stack as the user, so this is what lets face unlock work with no
+  group membership and no re-login. Everything else stays denied at the bus.
+- **the `facelock` group**: may receive the daemon's signals. It grants no
+  method calls; membership is optional and facelock never adds anyone to it.
+
+Because the bus lets any local user reach `Authenticate`, the in-daemon
+per-method check is the boundary for it, not a second layer:
+
+The daemon verifies the caller UID via `GetConnectionUnixUser` on every method call and applies method-level authorization:
 - `Authenticate`: root, or a non-root caller acting on their own username. This is the **only** user-scoped method, and it is architecture rather than policy: screen lockers run their PAM stack as the user, so a user must be able to request authentication for themselves.
 - Everything else is **root only**: `TestAuthenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`.
+
+What opening `Authenticate` exposes, and why it is acceptable: any local UID
+may ask the daemon to authenticate **itself**. An unenrolled UID is answered by
+`pre_check` from SQLite (`has_models`) before the camera is opened. An enrolled
+UID could already do this — it was in the group. No UID can name another user
+(`require_user_authorized`), learn another user's enrollment, or see a
+similarity score (redacted for non-root). Every attempt is audited when
+auditing is enabled; an enrolled UID's failed attempts are rate-limited per
+user, while an unenrolled UID's calls are answered before the limiter and are
+not charged. This is the same shape as fprintd, whose bus policy admits every
+user and whose daemon authorizes per call.
+
+What it costs, stated plainly: the bus policy also bounded *who could make the
+daemon do cheap work*. Any local UID can now (a) bus-activate the daemon (it
+already could — `StartServiceByName` is open to every context in
+`system.conf`), (b) reset its idle timer (`daemon.idle_timeout_secs` defaults
+to 0, so no default install idles out anyway), and (c) hold the single capture
+slot for the sub-millisecond an unenrolled `Authenticate` takes, so a tight
+loop from any local account can make a concurrent lock-screen `Authenticate`
+return `daemon busy` and fall back to the password prompt. That is a local
+availability margin on a convenience feature — face unlock fails closed to
+the password — and it is accepted (ADR 010). Note also that `abort_if_ssh` is
+enforced by the PAM client from its own environment; a direct bus caller is
+not subject to it, which was already true for group members.
 
 The scope table's catch-all arm is root-only, so a method added later is closed until it is deliberately opened up. Two entries are spelled out explicitly rather than left to that catch-all, because their root-only scope is load-bearing rather than incidental:
 - `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter. For any weaker caller it would be a continuous similarity feed at camera framerate; together with score redaction, denying non-root callers closes the hill-climbing oracle by construction (see A5 below).
@@ -599,7 +638,7 @@ is not redacted.
 
 #### A6. Capture Contention Guard (Implemented)
 
-**Attack**: Local DoS — an authorized caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request.
+**Attack**: Local DoS — a caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request. Under ADR 010 any local UID may call `Authenticate` for itself, so for that method the caller set the guard bounds is every local account, not root and the `facelock` group; `PreviewDetectFrame` remains root-only.
 
 **Mitigation**: A cheap in-flight capture guard is checked *before* the expensive handler lock. If a capture is already in flight, a concurrent `Authenticate`/`Enroll`/`PreviewFrame`/`PreviewDetectFrame` call is rejected **immediately** with a `daemon busy` error instead of queueing. PAM treats this like any daemon error (`PAM_IGNORE`) and falls through to password — degraded, never locked out. Per-user rate limiting is unchanged and orthogonal.
 

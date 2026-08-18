@@ -2967,6 +2967,28 @@ fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ask the running system bus to re-read its policy directory.
+///
+/// dbus-daemon and dbus-broker both watch the directory with inotify, so this
+/// is belt and braces for the one window that matters after ADR 010: a lock
+/// screen calling `Authenticate` between the policy file changing and the bus
+/// noticing. Best-effort — a bus that is not running has nothing to reload,
+/// and a missing `dbus-send` is not setup's problem.
+fn reload_dbus_config() {
+    if let Err(e) = run_cmd(
+        "dbus-send",
+        &[
+            "--system",
+            "--type=method_call",
+            "--dest=org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.ReloadConfig",
+        ],
+    ) {
+        tracing::debug!("D-Bus ReloadConfig not sent: {e}");
+    }
+}
+
 fn refresh_legacy_copy_if_present(path: &Path, contents: &str, marker: &str) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
@@ -3030,6 +3052,7 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
             DBUS_POLICY,
             "org.facelock.Daemon",
         )?;
+        reload_dbus_config();
 
         // Install D-Bus activation service
         let svc_dir = Path::new(DBUS_SYSTEM_SERVICES_DIR);
@@ -3728,6 +3751,73 @@ mod tests {
             "embedder_sha256 = \"4ab1d6435d639628a6f3e5008dd4f929edf4c4124b1a7169e1048f9fef534cdf\""
         ));
         assert!(result.contains("threshold = 0.75"));
+    }
+
+    /// ADR 010: the default context may call exactly `Authenticate`; the
+    /// group grants signals only. Pinned on the embedded policy so a "cleanup"
+    /// of the XML cannot silently close the lock screen out again or reopen
+    /// the whole interface. Order matters — dbus-daemon and dbus-broker apply
+    /// the last matching rule in a context — so the allow must follow the
+    /// deny.
+    #[test]
+    fn dbus_policy_opens_authenticate_to_the_default_context_only() {
+        let policy = DBUS_POLICY;
+        let default_start = policy
+            .find(r#"<policy context="default">"#)
+            .expect("default context policy");
+        let default_end = policy[default_start..]
+            .find("</policy>")
+            .map(|i| default_start + i)
+            .expect("default context closes");
+        let default = &policy[default_start..default_end];
+
+        let deny = default
+            .find(r#"<deny send_destination="org.facelock.Daemon"/>"#)
+            .expect("default context denies the interface");
+        assert_eq!(
+            default.matches("<allow").count(),
+            1,
+            "exactly one allow in the default context"
+        );
+        let allow_start = default.find("<allow").expect("the one allow");
+        let allow_end = default[allow_start..]
+            .find("/>")
+            .map(|i| allow_start + i)
+            .expect("allow element closes");
+        let allow = &default[allow_start..allow_end];
+        assert!(
+            allow_start > deny,
+            "the Authenticate allow must follow the deny"
+        );
+        for attr in [
+            r#"send_destination="org.facelock.Daemon""#,
+            r#"send_interface="org.facelock.Daemon""#,
+            r#"send_member="Authenticate""#,
+        ] {
+            assert!(allow.contains(attr), "allow lacks {attr}: {allow}");
+        }
+        assert!(
+            default
+                .contains(r#"<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>"#),
+            "signals stay denied to the default context"
+        );
+
+        let group_start = policy
+            .find(r#"<policy group="facelock">"#)
+            .expect("group policy");
+        let group_end = policy[group_start..]
+            .find("</policy>")
+            .map(|i| group_start + i)
+            .expect("group policy closes");
+        let group = &policy[group_start..group_end];
+        assert!(
+            !group.contains("send_destination"),
+            "the facelock group grants no method calls (ADR 010)"
+        );
+        assert!(
+            group.contains(r#"receive_type="signal""#),
+            "the facelock group may receive signals"
+        );
     }
 }
 
