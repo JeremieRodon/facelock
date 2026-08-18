@@ -440,6 +440,48 @@ fn top_level_commands_match_the_registry() {
     }
 }
 
+/// `-v` on every side of every command, and what it counts to.
+///
+/// Its own table rather than rows in `legacy_invocations_still_parse`: that
+/// one pins what parsed *before* the flag existed, and this flag is new.
+///
+/// The row a reader would expect to be a contradiction is the one that must
+/// not be: `--quiet -v` is a legitimate pair. They are two knobs on two
+/// streams — `--quiet` silences the stdout report, `-v` raises the stderr
+/// diagnostics — so neither cancels the other (docs/contracts.md, "CLI Output
+/// Streams").
+#[test]
+fn verbose_invocations_parse_and_count_repeats() {
+    for (argv, expected) in [
+        (&["facelock", "status"][..], 0u8),
+        (&["facelock", "-v", "status"], 1),
+        (&["facelock", "status", "-v"], 1),
+        (&["facelock", "--verbose", "status"], 1),
+        (&["facelock", "-vv", "status"], 2),
+        (&["facelock", "status", "-vvv"], 3),
+        (&["facelock", "--verbose", "--verbose", "status"], 2),
+        // The three init sites, each reached with the flag: the shared CLI
+        // path, the one-shot PAM helper, and the daemon.
+        (&["facelock", "-v", "setup", "--non-interactive"], 1),
+        (&["facelock", "auth", "--user", "alice", "-vv"], 2),
+        (&["facelock", "daemon", "run", "-v"], 1),
+    ] {
+        let cli = Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("`{}` must parse: {e}", argv.join(" ")));
+        assert_eq!(
+            cli.verbose,
+            expected,
+            "`{}`: -v must count its repeats",
+            argv.join(" ")
+        );
+    }
+
+    let cli = Cli::try_parse_from(["facelock", "--quiet", "-v", "list", "--json"])
+        .expect("`--quiet -v` must parse: quiet stdout and loud stderr are not a contradiction");
+    assert!(cli.quiet);
+    assert_eq!(cli.verbose, 1);
+}
+
 /// The short-letter registry.
 ///
 /// Short letters are a single namespace shared by every subcommand: once
@@ -451,9 +493,9 @@ fn top_level_commands_match_the_registry() {
 /// effect of adding a flag.
 ///
 /// `l` maps to two names because `enroll --label` and `audit --lines` both
-/// ship today and both must keep working. `v` has no site at all — it is a
-/// reservation for `--verbose`, held so the letter cannot be spent on
-/// something else first.
+/// ship today and both must keep working. `v` was held here as a reservation
+/// before `--verbose` existed, so that the letter could not be spent on
+/// something else first; the global flag now claims it.
 const SHORT_REGISTRY: &[(char, &[&str])] = &[
     ('u', &["user"]),
     ('y', &["yes"]),
@@ -577,6 +619,21 @@ fn cli_flag_conformance() {
                         "`{path} --quiet` must spell `-q`"
                     );
                     assert_eq!(long, Some("quiet"), "`{path}`: quiet arg spelled oddly");
+                }
+                "verbose" => {
+                    assert_eq!(
+                        arg.get_short(),
+                        Some('v'),
+                        "`{path} --verbose` must spell `-v`"
+                    );
+                    assert_eq!(long, Some("verbose"), "`{path}`: verbose arg spelled oddly");
+                    // Repeatable or the rungs above info are unreachable: a
+                    // `SetTrue` here would leave `-vv` a parse error and
+                    // debug/trace with no spelling at all.
+                    assert!(
+                        matches!(arg.get_action(), clap::ArgAction::Count),
+                        "`{path} --verbose` must count repeats"
+                    );
                 }
                 _ => {}
             }

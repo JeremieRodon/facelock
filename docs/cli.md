@@ -10,6 +10,18 @@ The following flags are accepted by every subcommand (declared `global = true`):
 |------|-------------|
 | `-c`, `--config <PATH>` | Override the config file path. Takes precedence over `FACELOCK_CONFIG`. |
 | `-q`, `--quiet` | Suppress stdout: informational text, and on commands whose stdout is the payload, the payload too. Errors (stderr), prompts and exit codes are unaffected. |
+| `-v`, `--verbose` | Raise diagnostic verbosity on stderr, one level per repeat. The CLI starts at `warn`, `daemon run` at `info`. `RUST_LOG` overrides it. |
+
+Diagnostics default to `warn`, so a command prints warnings and errors on
+stderr and nothing quieter. The setup wizard's questions and the `status`
+report are readable again, rather than interleaved with timestamped log lines.
+`-v` raises the level one step per repeat; `facelock daemon run` keeps `info`,
+because it writes to the journal, where nothing competes with it. `RUST_LOG`
+outranks both, and the level changes output volume only: exit codes and stdout
+payloads are identical at every level.
+
+`--quiet` and `-v` are separate knobs on separate streams, so `--quiet -v` is a
+real combination (silent report, loud diagnostics) rather than a contradiction.
 
 `--quiet` is complete for every command whose output goes through the message
 seam: `setup`, `enroll`, `test`, `remove`, `clear`, `is-enrolled`,
@@ -706,4 +718,4 @@ For commands that accept `--user`:
 | Variable | Purpose |
 |----------|---------|
 | `FACELOCK_CONFIG` | Override config file path for unprivileged CLI commands. Ignored by privileged PAM/root auth flows; use `--config` there. |
-| `RUST_LOG` | Control log verbosity (e.g., `facelock_daemon=debug`) |
+| `RUST_LOG` | Control log verbosity (e.g., `facelock_daemon=debug`). Outranks both the built-in default and `-v`. An unparseable value is reported at `warn` and ignored. |

@@ -22,6 +22,7 @@ use facelock_cli::commands::config::ConfigCommand;
 use facelock_cli::commands::daemon::DaemonCommand;
 use facelock_cli::commands::hyprlock::HyprlockCommand;
 use facelock_cli::commands::setup::{SetupArgs, resolve_setup_plan};
+use facelock_cli::logging::Program;
 use facelock_cli::{commands, logging, message, notifications, resolved};
 
 use args::{ConfirmArg, JsonArg, PamCli, SetupCli, UserArg};
@@ -35,6 +36,19 @@ struct Cli {
     /// Suppress informational stdout; errors, prompts and exit codes are unchanged
     #[arg(short = 'q', long, global = true)]
     quiet: bool,
+    /// Raise diagnostic verbosity on stderr, one level per repeat (the CLI starts at warn, the daemon at info)
+    //
+    // The help text names the starting points rather than a fixed
+    // level-per-repeat mapping, because there are two: `-v` is info on a CLI
+    // command and debug on `daemon run`, which starts a rung higher.
+    //
+    // Counted rather than a bool so the levels above the base are reachable
+    // without a second flag, and separate from `--quiet` on purpose: that one
+    // governs stdout, this one stderr, so `--quiet --verbose` is a legitimate
+    // pair (silent report, loud diagnostics) rather than a contradiction.
+    // `RUST_LOG` outranks it; see `logging::chosen_directives`.
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
     #[command(subcommand)]
     command: Commands,
 }
@@ -176,6 +190,7 @@ fn main() -> anyhow::Result<()> {
     let Cli {
         config,
         quiet,
+        verbose,
         command,
     } = Cli::parse();
 
@@ -215,21 +230,23 @@ fn main() -> anyhow::Result<()> {
         // and setup.rs's `ExecStart` marker all invoke the bare form (ADR 009 §4).
         Commands::Daemon { command } => match command {
             None | Some(DaemonCommand::Run) => {
-                commands::daemon::run(notifications::daemon_notifier_factory())
+                commands::daemon::run(notifications::daemon_notifier_factory(), verbose)
             }
             // `restart` only talks to systemd: no parsed Config, and nothing
             // from the D7 block it used to sit in except this tracing init
             // (`message::init` already ran at the top of `main`, for every
-            // command alike).
+            // command alike). It inits as `Program::Cli` — the daemon it
+            // restarts is a different process, and this one is answering the
+            // person who typed the verb.
             Some(DaemonCommand::Restart) => {
-                logging::init_stderr(false);
+                logging::init_stderr(Program::Cli, verbose);
                 commands::daemon::restart()
             }
         },
         Commands::Auth { user } => {
             // `auth` is its own one-shot process and loads the config itself,
             // so it takes the explicit path rather than re-deriving it.
-            let exit_code = commands::auth::run(user, config);
+            let exit_code = commands::auth::run(user, config, verbose);
             std::process::exit(exit_code);
         }
         other => {
@@ -237,7 +254,7 @@ fn main() -> anyhow::Result<()> {
             // stderr, which is what leaves stdout free for the payload these
             // commands print — `devices --json`, `list --json`,
             // `is-enrolled --json` (#149). See `crate::logging`.
-            logging::init_stderr(false);
+            logging::init_stderr(Program::Cli, verbose);
 
             match other {
                 // -- Dispatched before the shared config parse (D7). --

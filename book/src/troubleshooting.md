@@ -206,9 +206,24 @@ busctl status org.facelock.Daemon
 systemctl status facelock-daemon.service
 ```
 
+## Turning up the log level
+
+Commands print warnings and errors only. `-v` adds the informational lines,
+`-vv` debug, `-vvv` trace:
+
+```bash
+facelock -v test
+sudo facelock -vv daemon run
+```
+
+The flag is part of the command line, so it survives `sudo`, which strips
+`RUST_LOG` from the environment.
+
 ## Debugging with RUST_LOG
 
-Facelock uses the `tracing` crate with `RUST_LOG` env-filter syntax.
+Facelock uses the `tracing` crate with `RUST_LOG` env-filter syntax, which
+picks a level per crate rather than one level for all of them. It outranks
+`-v`.
 
 ```bash
 # Verbose output for all facelock crates:
