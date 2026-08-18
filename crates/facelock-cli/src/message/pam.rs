@@ -57,6 +57,12 @@ pub enum PamMessage {
         path: String,
         backup: String,
     },
+    /// The rollback instructions — the one message that tells an operator who
+    /// has just changed an auth stack how to get back in. On
+    /// [`super::Terminal::notice`]: stdout, so a normal run prints what it
+    /// always printed, and unsuppressible, so `--quiet` cannot take it.
+    /// `--json` drops it, because the document's `backup` field is the same
+    /// fact in the form that caller reads.
     PamInstalled {
         path: String,
         backup: String,
@@ -85,6 +91,22 @@ pub enum PamMessage {
     },
     PamInvalidServiceName {
         service: String,
+    },
+    /// A service file that is a symlink out of `/etc/pam.d`. Names the target
+    /// because that is the file the operator has to go and edit — on an
+    /// authselect system it is a generated one, and editing it is not the fix
+    /// either.
+    PamServiceSymlinkedOutside {
+        path: String,
+        target: String,
+        dir: String,
+    },
+    /// A service file reachable by more than one name. `links` is the link
+    /// count, pre-formatted: it is a number in a sentence, not a quantity to
+    /// compute with, and the seam's `fill` takes strings.
+    PamServiceHardLinked {
+        path: String,
+        links: String,
     },
     /// `remedy` is the flag that unlocks this surface: `--allow-sensitive` on
     /// `pam add`, `--yes` on the `setup --pam` alias, which keeps its
@@ -244,6 +266,22 @@ impl Message for PamMessage {
                 ),
                 &[("service", service.clone())],
             ),
+            PamServiceSymlinkedOutside { path, target, dir } => fill(
+                translate(
+                    "Refusing to touch {path}: it is a symlink to {target}, which is not inside {dir}.\nEdit that file directly, or the tool that generates it — authselect regenerates system-auth and password-auth from /etc/authselect.",
+                ),
+                &[
+                    ("path", path.clone()),
+                    ("target", target.clone()),
+                    ("dir", dir.clone()),
+                ],
+            ),
+            PamServiceHardLinked { path, links } => fill(
+                translate(
+                    "Refusing to touch {path}: it is one of {links} names for the same file, so an edit here would change a file outside /etc/pam.d that facelock cannot name.\nBreak the link first: sudo cp -p {path} {path}.new && sudo mv {path}.new {path}",
+                ),
+                &[("path", path.clone()), ("links", links.clone())],
+            ),
             PamSensitiveRefused { service, remedy } => fill(
                 translate(
                     "Refusing to modify '{service}': this is a sensitive PAM service.\nRe-run with {remedy} to accept the risk of locking yourself out.",
@@ -304,7 +342,7 @@ impl Message for PamMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for PamMessage {
-    const VARIANT_COUNT: usize = 34;
+    const VARIANT_COUNT: usize = 36;
 
     fn samples() -> Vec<Self> {
         use PamMessage::*;
@@ -354,6 +392,15 @@ impl super::Samples for PamMessage {
                 line: s("auth ..."),
             },
             PamInvalidServiceName { service: s("../x") },
+            PamServiceSymlinkedOutside {
+                path: s("/etc/pam.d/system-auth"),
+                target: s("/etc/authselect/system-auth"),
+                dir: s("/etc/pam.d"),
+            },
+            PamServiceHardLinked {
+                path: s("/etc/pam.d/sudo"),
+                links: s("2"),
+            },
             PamSensitiveRefused {
                 service: s("sshd"),
                 remedy: s("--allow-sensitive"),

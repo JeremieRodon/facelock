@@ -29,7 +29,7 @@ Path to the config file. Takes precedence over
 .BR FACELOCK_CONFIG .
 .TP
 .B \-q\fR, \fB\-\-quiet
-Suppress non-essential stdout and report the result through the exit code.
+Suppress informational stdout; errors, prompts and exit codes are unchanged.
 .SH COMMANDS
 .TP
 .B setup
@@ -54,7 +54,9 @@ requested.
 .TP
 .B \-y\fR, \fB\-\-yes
 Skip confirmation prompts, and unlock the gate that otherwise refuses to modify
-a sensitive PAM service file (\fBsystem\-auth\fR, \fBlogin\fR, \fBsshd\fR).
+a sensitive PAM service file (\fBcommon\-auth\fR, \fBlogin\fR,
+\fBpassword\-auth\fR, \fBpassword\-auth\-ac\fR, \fBsshd\fR,
+\fBsystem\-auth\fR, \fBsystem\-auth\-ac\fR, \fBsystem\-login\fR).
 \fB\-\-non\-interactive\fR suppresses the per-file confirmation on its own but
 does \fInot\fR unlock that gate. Also accepted as \fB\-\-no\-confirm\fR.
 .TP
@@ -415,12 +417,22 @@ in one process under one root check.
 Add the facelock line to one or more service files. Root. Accepts
 \fB\-\-service \fIname\fR (repeatable), \fB\-y\fR, \fB\-\-yes\fR
 (alias \fB\-\-no\-confirm\fR) to skip the per-file confirmation,
-\fB\-\-allow\-sensitive\fR to also permit \fBsystem\-auth\fR,
-\fBlogin\fR and \fBsshd\fR, \fB\-\-if\-present\fR to treat a missing
+\fB\-\-allow\-sensitive\fR to also permit \fBcommon\-auth\fR,
+\fBlogin\fR, \fBpassword\-auth\fR, \fBpassword\-auth\-ac\fR,
+\fBsshd\fR, \fBsystem\-auth\fR, \fBsystem\-auth\-ac\fR and
+\fBsystem\-login\fR, \fB\-\-if\-present\fR to treat a missing
 service file as success, \fB\-\-dry\-run\fR to print the resolved plan
-without writing, and \fB\-\-json\fR. \fB\-\-yes\fR never implies
+without writing, and \fB\-\-json\fR (which implies \fB\-\-no\-confirm\fR,
+since the prompt would block the pipeline reading the document).
+\fB\-\-yes\fR never implies
 \fB\-\-allow\-sensitive\fR: they are separate authorizations. Every service
-is validated before any file is written.
+is validated before any file is written. A service file that is a symlink out
+of
+.I /etc/pam.d
+is refused rather than written through; a link that stays inside the directory
+is followed, the gate is applied to the file it reaches, and the backup is
+written beside the real file. A file with more than one hard link is refused
+too \(em a link count says another name for it exists and not where.
 .TP
 .B remove
 Remove the facelock line. Root. Same flags as \fBadd\fR except
@@ -433,9 +445,12 @@ Report whether services carry the line. Reads only and needs
 .B no
 root: this is the probe to branch on instead of grepping
 .I /etc/pam.d
-yourself. Offers \fB\-\-service\fR and \fB\-\-json\fR, and neither
+yourself. Offers \fB\-\-service\fR, \fB\-\-if\-present\fR and
+\fB\-\-json\fR, and neither
 \fB\-\-dry\-run\fR nor \fB\-\-allow\-sensitive\fR \(em there is no write
-to preview or gate. The exit status is the answer; see
+to preview or gate. \fB\-\-if\-present\fR means what it means on
+\fBadd\fR and \fBremove\fR: an absent service file is reported and no longer
+forces exit 2. The exit status is the answer; see
 .B EXIT STATUS
 below.
 .RE
@@ -574,7 +589,11 @@ Every requested service carries the facelock line.
 At least one requested service exists without it.
 .TP
 .B 2
-At least one is absent, unreadable, or misnamed.
+At least one is absent, unreadable, misnamed, hard\-linked, or symlinked out of
+.IR /etc/pam.d .
+With \fB\-\-if\-present\fR an absent service file no longer forces this, and
+the status is decided by the services that do exist \(em absence only, so a
+dangling or looping symlink is still 2.
 .PP
 .B facelock capabilities
 always exits 0 \(em it has no failure mode. A build too old to have the command

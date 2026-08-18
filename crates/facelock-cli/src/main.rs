@@ -25,7 +25,7 @@ struct Cli {
     /// Path to config file
     #[arg(short = 'c', long, global = true)]
     config: Option<String>,
-    /// Suppress non-essential stdout; report the result through the exit code
+    /// Suppress informational stdout; errors, prompts and exit codes are unchanged
     #[arg(short = 'q', long, global = true)]
     quiet: bool,
     #[command(subcommand)]
@@ -1373,13 +1373,24 @@ mod tests {
                     sub(&root, "is-enrolled");
                 }
                 "is-enrolled-json" => assert_long(sub(&root, "is-enrolled"), "json", "json"),
+                "pam-allow-sensitive" => {
+                    assert_long(sub(pam, "add"), "allow_sensitive", "allow-sensitive");
+                    // The half that is not a spelling: `remove` must *not*
+                    // offer it, because removal is never gated.
+                    assert!(
+                        !sub(pam, "remove")
+                            .get_arguments()
+                            .any(|a| a.get_id() == "allow_sensitive"),
+                        "`pam remove` must not offer --allow-sensitive"
+                    );
+                }
                 "pam-dry-run" => {
                     for verb in ["add", "remove"] {
                         assert_long(sub(pam, verb), "dry_run", "dry-run");
                     }
                 }
                 "pam-if-present" => {
-                    for verb in ["add", "remove"] {
+                    for verb in ["add", "remove", "status"] {
                         assert_long(sub(pam, verb), "if_present", "if-present");
                     }
                 }

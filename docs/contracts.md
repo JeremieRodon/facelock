@@ -129,10 +129,14 @@ The flag is read once, by the two suppressible stdout sinks of the message seam
 — `Terminal::info` for human text, `message::payload` for machine output — so
 no command implements it and no command can forget it. There is a third stdout
 sink, `Terminal::notice`, which `--quiet` deliberately does not reach: it is
-for the human lines that must be seen and must stay on stdout (rollback
-instructions, the plaintext-embeddings warning). The messages that belong on it
-move across as part of [#140](https://github.com/tyvsmith/facelock/issues/140),
-which also tracks the commands still printing human text directly.
+for the human lines that must be seen and must stay on stdout: `pam add`'s
+rollback instructions, the plaintext-embeddings warning, and the context a
+confirmation needs to be answerable (`pam add`'s preview of the edit, and the
+orphaned-models warning ahead of setup's delete confirmation). Everything else
+informational stays on `Terminal::info` — a `notice` that did not have to be
+seen is just an unquietable one.
+[#140](https://github.com/tyvsmith/facelock/issues/140) tracks the commands
+still printing human text directly.
 
 `preview --json` is the one payload outside this rule: it emits a document per
 frame until interrupted, so silencing it would leave a command that produces
@@ -214,7 +218,7 @@ not a plain forward:
 - **`setup --yes` keeps its combined meaning** and is the one documented
   exception to the flag split below. It maps onto *both* of the writer's knobs:
   `--no-confirm` (skip the per-file question) **and** `--allow-sensitive`
-  (accept `system-auth`/`login`/`sshd`). `--non-interactive` maps onto
+  (accept the sensitive services listed below). `--non-interactive` maps onto
   `--no-confirm` alone, as it always has.
 - **The root refusal is a hard error, not a `sudo` re-exec.** Standalone
   `--pam` never offered the interactive escalation (`needs_root_precheck`), and
@@ -238,6 +242,45 @@ absolute name *replaces* the base — so this is the check, not the join.
 Anything else is accepted: `PAM_CANDIDATES` is the wizard's menu, **not** an
 allowlist, and a service that is not on it must keep working.
 
+**Symlinks are followed only inside `/etc/pam.d`.** A well-formed name still
+has to survive the filesystem: on an authselect system `/etc/pam.d/system-auth`
+and `/etc/pam.d/password-auth` are symlinks into `/etc/authselect`, and read,
+copy and write all follow a link without being asked to. So the entry is
+`lstat`ed, and a link is canonicalized: a target **under** `/etc/pam.d` is
+followed — the real file is what gets read, rewritten and backed up, so the
+`.facelock-backup` lands beside the file that changed rather than beside the
+link — and a target anywhere else is a validation failure. So is a link that
+cannot be resolved at all; the rule is "prove it stays inside", and a dangling
+link proves nothing. Being a validation failure, it writes nothing for the
+whole run, and `pam status` reports the service as `unknown` with the fixed
+reason `symlinked outside /etc/pam.d` (the human message on stderr names the
+target). Editing through such a link would edit a file authselect regenerates,
+so the change would disappear on the next `authselect apply-changes` with
+nothing to say it had.
+
+**A file with more than one hard link is refused.** A symlink can be followed
+to somewhere and checked; a second hard link cannot — a link count says another
+name for the inode exists and says nothing about where it is, so the edit
+cannot be shown to stay inside the directory. `pam status` reports it as
+`unknown` with the fixed reason `hard-linked service file`. This is
+conservative rather than adversarial: a `/etc` that has been through a
+deduplicating backup or `jdupes -L` can trip it with nobody attacking anything,
+so the message says how to break the link. The atomic replace under "Limits"
+retires the rule, since a temp file and a rename write a new inode and leave
+the other name alone.
+
+**`--if-present` does not forgive a link fault.** A dangling or looping symlink
+is not an absent service file: absence is a fact about the directory, and an
+unresolvable link is the absence of an *answer* about where a write would land.
+Both are phase-one failures on `add` and `remove` under `--if-present`, and
+exit 2 on `status --if-present`.
+
+**The sensitive gate is applied to the resolved file, not only to the typed
+name.** A symlink `alias -> system-auth` *inside* `/etc/pam.d` is followed, so
+without the second check `pam add --service alias` would be an ungated name for
+a gated file — which is the shape RHEL's older `authconfig` leaves behind, and
+why `system-auth-ac` and `password-auth-ac` are on the list as well.
+
 **Two-phase.** Every requested service is validated — name, existence
 (subject to `--if-present`), the sensitive gate, and what the edit would be —
 before **any** file is written. A validation failure writes nothing at all,
@@ -249,13 +292,21 @@ attempted. The rollback is the `.facelock-backup` file written before each
 edit, which nothing in this command deletes.
 
 **`--no-confirm` never implies `--allow-sensitive`.** They are separate
-authorizations: "do not ask me" and "yes, edit `system-auth`". `--yes` and
+authorizations: "do not ask me" and "yes, edit the shared auth stack". The
+gated services are `common-auth`, `login`, `password-auth`, `sshd`,
+`system-auth` and `system-login`. Four of the six are *shared stacks* — files
+that other service files `include`, so one edit reaches `su`, `passwd`, `chsh`
+and the display manager at once — and which name a distribution uses is the
+only difference between them (`system-auth`/`password-auth` on Fedora, RHEL and
+Arch, `common-auth` on Debian and Ubuntu, `system-login` on Arch). Gating one
+spelling made the gate depend on the operator's distribution. `--yes` and
 `--no-confirm` are the same flag (the shared `ConfirmArg` spelling, so "skip
 prompts" reads the same on `pam add` as on `remove` and `clear`) and neither
 unlocks the gate. `setup --yes` keeps the combined meaning and is the sole
-exception. `remove` is never gated at all — removal can only take away a way
-to authenticate — and never prompts, which is what `setup --pam --remove` has
-always done; `--yes`/`--no-confirm` is accepted there for symmetry and has
+exception. `remove` is never gated **on sensitivity** — removal can only take
+away a way to authenticate — and never prompts, which is what
+`setup --pam --remove` has always done; the confinement rules below apply to
+every verb, `remove` and `status` included. `--yes`/`--no-confirm` is accepted there for symmetry and has
 nothing to suppress today.
 
 **With no TTY on stdin, `pam add` proceeds as if `--no-confirm` were given.**
@@ -274,7 +325,10 @@ validation phase, before any prompt exists to skip, so an unattended
 |---------|------|---------|
 | `pam status` | 0 | every requested service carries the line |
 | `pam status` | 1 | at least one requested service exists without it |
-| `pam status` | 2 | at least one is absent, unreadable, or misnamed |
+| `pam status` | 2 | at least one is absent, unreadable, misnamed, symlinked out of the directory, or hard-linked |
+| `pam status --if-present` | 0 | every requested service **that exists** carries the line |
+| `pam status --if-present` | 1 | at least one existing service carries no line |
+| `pam status --if-present` | 2 | as above, minus the absent case, which no longer forces 2 |
 | `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `absent` under `--if-present`, and `declined` |
 | `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure |
 
@@ -287,9 +341,31 @@ operator asked — and `--json` is how a script tells it from an install.
 **`--dry-run`** prints the resolved plan, writes nothing, and exits 0. It is
 honoured *after* the root check (see DEC-6 above).
 
+**`--if-present` means the same thing on all three verbs.** A service file that
+is not there is not an error: on `add` and `remove` the service is reported
+`absent` and the exit code is unaffected, and on `status` the `absent` row no
+longer forces exit 2, so the exit code is decided by the services that do
+exist. That is what lets "install the optional integrations with
+`--if-present`, then verify" be written as a pair. It converts *absence* and
+nothing else — an unreadable file, a rejected name, or a link out of the
+directory is still an error on every verb.
+
+**Limits.** Two, both deliberate and neither hidden. The write is
+truncate-in-place rather than a temp file and a rename, so a process killed
+between the truncate and the last byte leaves a short service file; the
+recovery is the `.facelock-backup` taken immediately before. And `remove` takes
+no backup of its own — it relies on the one `add` wrote, which is why nothing
+in this command ever deletes a backup. An atomic replace has to carry the mode,
+owner and SELinux context across, which is the same primitive the
+vendor-to-`/etc` copy needs, and lands with it.
+
 **`--json`** emits exactly one document on stdout and no human text; `--quiet`
 suppresses even that, leaving the exit code as the whole answer, as it does for
-`is-enrolled`. Diagnostics stay on stderr either way.
+`is-enrolled`. Diagnostics stay on stderr either way. **`--json` implies
+`--no-confirm`**: the per-file question is drawn on stderr while a parser waits
+on stdout, so asking it would block the pipeline. It does **not** imply
+`--allow-sensitive` — that is an authorization, and a machine caller has not
+given one — so `pam add --service system-auth --json` still refuses.
 
 On `add` and `remove`, a validation failure produces **no** JSON document: it
 is reported as text on stderr and the process exits non-zero, matching
@@ -298,10 +374,10 @@ phase that rejects is the phase that would have decided every row, so there is
 no partial document to emit.
 
 `pam status` is the other way round and **always** emits a document: it has no
-all-or-nothing phase to fail, so a rejected service name becomes an `unknown`
-row inside the document (with the reason in `error`) alongside the rows for
-every other requested service, and the invalid-name message is *also* written
-to stderr for a human. Exit 2 either way.
+all-or-nothing phase to fail, so a rejected service name — or one whose entry
+this refuses to follow — becomes an `unknown` row inside the document (with the
+reason in `error`) alongside the rows for every other requested service, and
+the refusal is *also* written to stderr for a human. Exit 2 either way.
 
 ```json
 {
@@ -324,15 +400,19 @@ new top-level field is additive. Field names do not change and are not removed;
 object, and `error` is present when `action` is `failed` or `unknown`. **`error` is a
 diagnostic, not a contract** — branch on `action`, never on `error`'s text. A
 rejected service name reports the fixed C-locale string `invalid service name`,
-but the OS-level failures (`failed` on a write, `unknown` on an unreadable
+a service symlinked out of the directory `symlinked outside /etc/pam.d`, and a
+hard-linked one `hard-linked service file`, but the OS-level failures (`failed` on a write, `unknown` on an unreadable
 file) interpolate a `strerror` string, which follows the operator's
 `LC_MESSAGES` like any other C library message. Nothing else in a `--json`
 document is locale-dependent. `backup`
 is the `.facelock-backup` path when one exists on disk after the operation and
-`null` otherwise — always `null` under `--dry-run`, which writes none. When
-`action` is `unknown` because the *name* was rejected, `path` is the path that
-name would have resolved to (which is why it was rejected) and is not a path
-anything read or wrote.
+`null` otherwise — always `null` under `--dry-run`, which writes none. `path`
+is itself `null` when `action` is `unknown` because the *name* was rejected: no
+path was ever resolved, and reporting `/etc/pam.d/../escape` named a path
+nothing went near, which reads as one that was acted on. A service rejected for
+being a symlink out of the directory does carry a `path` — the link, which is a
+real entry this did `lstat` — and its `backup` field is probed, since a
+facelock version that wrote through the link left one there.
 
 The `action` vocabulary — **new words may be added, so a consumer must tolerate
 one it does not know rather than treat it as an error**:
@@ -347,7 +427,7 @@ one it does not know rather than treat it as an error**:
 | `failed` | `add`, `remove` | the write failed; see `error` |
 | `present` | `status` | the file exists and carries a facelock line |
 | `missing` | `status` | the file exists and carries none |
-| `unknown` | `status` | the file could not be read; see `error` |
+| `unknown` | `status` | the file could not be read, the name was rejected, or the entry is a symlink out of the directory or a hard link; see `error` |
 
 `pam status --json` is what replaces `grep -q pam_facelock.so
 /etc/pam.d/<service>` in an integration script: it answers from the same file,
@@ -433,8 +513,9 @@ that is not on this list is not being denied, only not yet promised.
 | `devices-json` | `devices --json` |
 | `is-enrolled` | `is-enrolled` exists — the unprivileged enrollment probe whose exit code is the contract |
 | `is-enrolled-json` | `is-enrolled --json` |
+| `pam-allow-sensitive` | `pam add` accepts `--allow-sensitive`, the gate on the sensitive services; `pam remove` does not offer it, because removal is never gated |
 | `pam-dry-run` | `pam add`/`pam remove` accept `--dry-run` |
-| `pam-if-present` | `pam add`/`pam remove` accept `--if-present` |
+| `pam-if-present` | `pam add`/`pam remove`/`pam status` accept `--if-present` |
 | `pam-json` | `pam add`/`pam remove`/`pam status` accept `--json` |
 | `pam-multi-service` | `pam add`/`pam remove`/`pam status` take a repeatable `--service` — several services in one process, one root check |
 | `pam-status` | `pam status` exists — the unprivileged `/etc/pam.d` read (DEC-6 below) |

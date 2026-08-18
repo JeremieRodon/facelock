@@ -1248,7 +1248,11 @@ fn handle_orphan_models_before_keygen(
         ),
     }
 
-    Terminal.info(&SetupMessage::OrphanModelsWarning {
+    // `notice`, not `info`: this is the context for the "Delete orphaned
+    // models and continue?" confirmation below, and on the non-interactive
+    // path it is the context for the refusal. A prompt whose subject `--quiet`
+    // swallowed is a question with no question in it.
+    Terminal.notice(&SetupMessage::OrphanModelsWarning {
         db_path: config.storage.db_path.clone(),
     });
 
@@ -1489,7 +1493,10 @@ fn setup_encryption_none(config: &mut Config) -> anyhow::Result<()> {
     config.encryption.method = EncryptionMethod::None;
     update_config_encryption(config, "none")?;
 
-    Terminal.info(&SetupMessage::EncryptionDisabledWarning);
+    // `notice`: biometric templates are about to be stored in plaintext, and
+    // that is not a line `--quiet` may take. Still stdout, so the bytes a
+    // normal run prints are the ones it always printed.
+    Terminal.notice(&SetupMessage::EncryptionDisabledWarning);
     Ok(())
 }
 
@@ -2716,8 +2723,12 @@ struct PamCandidate {
 }
 
 // Intentionally excluded from PAM_CANDIDATES:
-//   - system-auth (Arch) and common-auth (Debian): shared stacks included by many
-//     services. Editing them gives face auth to passwd, su, chsh, etc. — risky.
+//   - the shared stacks, under whichever name the distribution uses: system-auth
+//     and password-auth (Fedora/RHEL, Arch), the -ac spellings authconfig left
+//     behind, common-auth (Debian), system-login (Arch). Editing one gives face
+//     auth to passwd, su, chsh and the display manager at once — risky. They are
+//     SENSITIVE_SERVICES, and `no_candidate_is_a_sensitive_service` pins that
+//     nothing here is on that list.
 //   - login: TTY login. Cameras often aren't initialized at boot.
 //   - su, passwd, chsh, chfn: privilege/credential-change tools that should
 //     require a real password.
@@ -3399,7 +3410,11 @@ mod tests {
     fn no_excluded_services_in_candidates() {
         let excluded = [
             "system-auth",
+            "system-auth-ac",
             "common-auth",
+            "password-auth",
+            "password-auth-ac",
+            "system-login",
             "login",
             "su",
             "passwd",
@@ -3414,6 +3429,26 @@ mod tests {
         }
     }
 
+    /// The wizard's multi-select hands every selected service to the writer
+    /// with the sensitive gate already unlocked (`install_one_in(base,
+    /// &service, true, true)`), because the multi-select *is* the consent and
+    /// no candidate is gated. That argument is only true while the two lists
+    /// are disjoint, and they are two lists in two modules — so the emptiness
+    /// of the intersection is the thing to check, not the list above, which a
+    /// name added to `SENSITIVE_SERVICES` would not appear in.
+    #[test]
+    fn no_candidate_is_a_sensitive_service() {
+        for candidate in PAM_CANDIDATES {
+            assert!(
+                !super::super::pam::SENSITIVE_SERVICES.contains(&candidate.service),
+                "`{}` is offered by the wizard, which unlocks the sensitive \
+                 gate for every service it offers — remove it from one list or \
+                 the other",
+                candidate.service
+            );
+        }
+    }
+
     /// The uninstall paths of all four packagers each hardcode the set of
     /// `/etc/pam.d/<service>` files to strip `pam_facelock.so` out of, because
     /// they are shell run by a package manager and cannot read
@@ -3422,15 +3457,21 @@ mod tests {
     /// a stale facelock line after the package was removed. Nothing failed
     /// loudly — the drift is only visible on an uninstall nobody runs in CI.
     ///
-    /// This pins the direction that matters: every service setup *offers* must
-    /// be *covered* by every packager. It is deliberately a superset check and
-    /// not set equality — the packaging lists also carry `SENSITIVE_SERVICES`
-    /// (reachable via `setup --pam --service <name> --yes`) and services that
-    /// are not candidates yet, and naming a service that no host has is inert
-    /// because every loop is guarded by `[ -f "$PAM_FILE" ]`. Equality would
-    /// turn "packaging cleans up more than setup writes" — always safe — into
-    /// a failure, and would break whenever a candidate lands in one branch and
-    /// the packaging list in another.
+    /// This pins the direction that matters: every service the writer can put a
+    /// line into must be *covered* by every packager. That is two lists, not
+    /// one — `PAM_CANDIDATES`, which the wizard offers, and
+    /// `SENSITIVE_SERVICES`, which `--allow-sensitive` (or `setup --yes`)
+    /// unlocks. The second was the gap: adding a distribution's spelling of
+    /// the shared auth stack to the gate made it reachable, and nothing said
+    /// the uninstall had to learn about it.
+    ///
+    /// It is deliberately a superset check and not set equality — the
+    /// packaging lists also carry services that are not candidates yet, and
+    /// naming a service that no host has is inert because every loop is
+    /// guarded by `[ -f "$PAM_FILE" ]`. Equality would turn "packaging cleans
+    /// up more than setup writes" — always safe — into a failure, and would
+    /// break whenever a candidate lands in one branch and the packaging list
+    /// in another.
     #[test]
     fn packaging_uninstall_covers_every_pam_candidate() {
         // Assembled so this test's own prose is not what it matches on.
@@ -3460,6 +3501,18 @@ mod tests {
                          on it."
                     )
                 });
+
+            for gated in super::super::pam::SENSITIVE_SERVICES {
+                assert!(
+                    listed.contains(gated),
+                    "{rel} does not clean up /etc/pam.d/{gated}, but it is in \
+                     SENSITIVE_SERVICES, so `facelock pam add --service {gated} \
+                     --allow-sensitive` writes a pam_facelock.so line into it. \
+                     Add {gated} to FACELOCK_PAM_SERVICES in {rel} (naming a \
+                     service the host lacks is inert — the loops skip missing \
+                     files). Currently listed there: {listed:?}"
+                );
+            }
 
             for candidate in PAM_CANDIDATES {
                 assert!(

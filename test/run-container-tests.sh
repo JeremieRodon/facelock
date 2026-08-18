@@ -81,9 +81,10 @@ run_test "facelock daemon requires root" \
 # confinement, removal, and the `setup --pam` alias landing in the same file.
 #
 # It writes only to service files it creates itself (facelock-scratch*) and
-# removes them at the end, so it is safe to run twice; sudo, system-auth,
-# login and sshd are read and never written. jq is not in the image, so the
-# --json documents are asserted with python.
+# removes them at the end, so it is safe to run twice; sudo and the sensitive
+# services are read and never written — the one row that aims at a sensitive
+# service asserts a refusal, and saves and restores the file either way. jq is
+# not in the image, so the --json documents are asserted with python.
 
 PAM_LINE_TEXT='auth      sufficient pam_facelock.so'
 
@@ -120,6 +121,18 @@ run_test "pam status: existing file without the line is 'missing', exit 1" \
     "facelock pam status --service facelock-scratch --json > /tmp/pam-status.json 2>/dev/null; test \$? -eq 1 && python3 /tmp/pam-action.py /tmp/pam-status.json | grep -qx missing" \
     0
 
+run_test "pam status: an absent service file is exit 2" \
+    "facelock pam status --service facelock-does-not-exist > /dev/null 2>&1; test \$? -eq 2" \
+    0
+
+# The pair `pam add --if-present` was always half of: install the optional
+# integrations, then verify them. Without --if-present here, verifying an
+# integration the host does not have is exit 2 and a `set -e` script dies on a
+# service it deliberately made optional.
+run_test "pam status --if-present: an absent service file is exit 0" \
+    "facelock pam status --service facelock-does-not-exist --if-present" \
+    0
+
 run_test "pam add: 'installed', backup written, line is the first auth line" \
     "facelock pam add --service facelock-scratch --json > /tmp/pam-add.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-add.json | grep -qx installed && test -f /etc/pam.d/facelock-scratch.facelock-backup && python3 /tmp/pam-first-auth.py /etc/pam.d/facelock-scratch" \
     0
@@ -139,7 +152,7 @@ run_test "pam status exits 0 once the line is present" \
 # the base image ever changes which of the three exists. The refusal is decided
 # in the validation phase, before any prompt, so --no-confirm cannot unlock it.
 PAM_SENSITIVE=""
-for svc in system-auth login sshd; do
+for svc in system-auth password-auth common-auth system-login login sshd; do
     if [ -f "/etc/pam.d/$svc" ]; then
         PAM_SENSITIVE="$svc"
         break
@@ -156,10 +169,18 @@ if [ -n "$PAM_SENSITIVE" ]; then
     run_test "pam add refuses sensitive service $PAM_SENSITIVE under --no-confirm" \
         "facelock pam add --service $PAM_SENSITIVE --no-confirm > /tmp/pam-sensitive.out 2>&1; test \$? -ne 0 && grep -q 'sensitive PAM service' /tmp/pam-sensitive.out && sha256sum -c --status /tmp/pam-sensitive.sha" \
         0
+    # The alias has its own refusal, naming its own flag: `setup --yes` is the
+    # documented exception that means both "do not ask" and "unlock the gate",
+    # so the message has to say --yes and not --allow-sensitive. Without this
+    # row the alias could lose the gate entirely and only the verb would notice.
+    run_test "setup --pam refuses sensitive service $PAM_SENSITIVE without --yes" \
+        "facelock setup --pam --service $PAM_SENSITIVE > /tmp/pam-sensitive-alias.out 2>&1; test \$? -ne 0 && grep -q 'sensitive PAM service' /tmp/pam-sensitive-alias.out && grep -q -- '--yes' /tmp/pam-sensitive-alias.out && sha256sum -c --status /tmp/pam-sensitive.sha" \
+        0
     cp -p /tmp/pam-sensitive.orig "/etc/pam.d/$PAM_SENSITIVE"
-    rm -f "/etc/pam.d/$PAM_SENSITIVE.facelock-backup" /tmp/pam-sensitive.orig
+    rm -f "/etc/pam.d/$PAM_SENSITIVE.facelock-backup" /tmp/pam-sensitive.orig \
+          /tmp/pam-sensitive-alias.out
 else
-    echo "SKIP: no system-auth/login/sshd in the image to test the sensitive gate"
+    echo "SKIP: no sensitive service file in the image to test the gate"
 fi
 
 sha256sum /etc/pam.d/facelock-scratch2 > /tmp/pam-scratch2.sha
@@ -179,13 +200,35 @@ run_test "pam add rejects a service name that escapes /etc/pam.d" \
     "facelock pam add --service ../facelock-escape --dry-run > /tmp/pam-escape.out 2>&1; test \$? -ne 0 && grep -q 'Invalid PAM service name' /tmp/pam-escape.out && ! test -e /etc/facelock-escape && ! test -e /etc/facelock-escape.facelock-backup && ! test -e /etc/pam.d/facelock-escape" \
     0
 
+# The authselect shape, on a real /etc/pam.d rather than a tempdir: a service
+# file that is a symlink out of the directory is refused, not written through.
+# The target is checked by hash because the failure mode this guards against is
+# a *successful-looking* run that edited a file elsewhere — exit status alone
+# would not have caught it.
+cat > /tmp/facelock-outside <<'EOF'
+#%PAM-1.0
+auth       include        system-auth
+EOF
+sha256sum /tmp/facelock-outside > /tmp/facelock-outside.sha
+ln -sfn /tmp/facelock-outside /etc/pam.d/facelock-scratch-link
+
+run_test "pam add refuses a service file symlinked out of /etc/pam.d" \
+    "facelock pam add --service facelock-scratch-link --no-confirm > /tmp/pam-symlink.out 2>&1; test \$? -ne 0 && grep -q 'is a symlink to' /tmp/pam-symlink.out && sha256sum -c --status /tmp/facelock-outside.sha && ! test -e /tmp/facelock-outside.facelock-backup && ! test -e /etc/pam.d/facelock-scratch-link.facelock-backup" \
+    0
+
+rm -f /etc/pam.d/facelock-scratch-link /tmp/facelock-outside \
+      /tmp/facelock-outside.sha /tmp/pam-symlink.out
+
 run_test "pam remove: 'removed' and no facelock line left" \
     "facelock pam remove --service facelock-scratch --json > /tmp/pam-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-remove.json | grep -qx removed && ! grep -q pam_facelock.so /etc/pam.d/facelock-scratch" \
     0
 
 # The `setup --pam` alias must reach the same writer and the same bytes.
-run_test "setup --pam alias installs the line" \
-    "facelock setup --pam --service facelock-scratch --yes > /dev/null 2>&1; test \$? -eq 0 && grep -qxF '$PAM_LINE_TEXT' /etc/pam.d/facelock-scratch" \
+# Placement, not just presence: the alias and the verb share one writer, and
+# the thing that would prove they had stopped sharing it is the line landing
+# somewhere else. Asserted by index, with the same probe the verb's row uses.
+run_test "setup --pam alias installs the line as the first auth line" \
+    "facelock setup --pam --service facelock-scratch --yes > /dev/null 2>&1; test \$? -eq 0 && grep -qxF '$PAM_LINE_TEXT' /etc/pam.d/facelock-scratch && python3 /tmp/pam-first-auth.py /etc/pam.d/facelock-scratch" \
     0
 
 run_test "setup --pam --remove alias removes the line" \
@@ -201,6 +244,7 @@ run_test "setup --pam --remove --if-present succeeds on an absent service file" 
 rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
       /etc/pam.d/facelock-scratch.facelock-backup \
       /etc/pam.d/facelock-scratch2.facelock-backup \
+      /etc/pam.d/facelock-scratch-link /tmp/facelock-outside \
       /tmp/pam-action.py /tmp/pam-first-auth.py
 
 # --- Spec 29: Smart PAM skip (no enrolled faces) ---
