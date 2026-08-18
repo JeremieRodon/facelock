@@ -167,28 +167,14 @@ pub fn is_access_denied(err: &anyhow::Error) -> bool {
     })
 }
 
-/// True if the D-Bus error chain carries the daemon's own "requires root"
-/// denial (`require_root` in `facelock_daemon::server`'s `authorize_method`), as
-/// opposed to a bus-policy rejection for a caller outside the `facelock`
-/// group. Matched on the rendered message rather than the `zbus::Error`
-/// shape, since the daemon's denial text is the only thing the wire
-/// preserves distinctly from a bus-policy AccessDenied.
-fn is_root_required_denial(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.to_string().contains("requires root"))
-}
-
 /// Append an actionable hint to AccessDenied errors.
 ///
-/// Under DEC-6 (root-by-default CLI), most D-Bus methods are root-only, so
-/// most AccessDenied errors are the daemon's own `require_root` rejection —
-/// those get a root-specific hint (Wave-1 cross-PR note, issue #108: telling
-/// a root-only rejection to "join the facelock group" is actively wrong).
-/// The remaining case is the system bus policy (dbus/org.facelock.Daemon.conf)
-/// denying a caller that is neither root nor in the `facelock` group *before*
-/// the request reaches the daemon — without a hint there, a first `facelock
-/// preview`-style call after setup fails with a bare AccessDenied and no
-/// explanation (issue #89).
+/// Under DEC-6 (root-by-default CLI) every method the CLI calls over D-Bus is
+/// root-only, and under ADR 010 the bus itself admits a non-root caller to
+/// `Authenticate` alone — so whether the denial came from the daemon's own
+/// `require_root` or from the bus policy, the fix is the same: run as root.
+/// (Issue #108: telling a root-only rejection to "join the facelock group"
+/// was actively wrong even before the group stopped granting method calls.)
 fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
     if !is_access_denied(&err) {
         return err;
@@ -196,11 +182,7 @@ fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
     // Context strings render on stderr for a human, so they localize (D10);
     // `explain` also emits the machine line the sinks emit, so the hint stays
     // visible in the debug event stream.
-    if is_root_required_denial(&err) {
-        err.context(explain(&AccessMessage::AccessDeniedRootHint))
-    } else {
-        err.context(explain(&AccessMessage::AccessDeniedGroupHint))
-    }
+    err.context(explain(&AccessMessage::AccessDeniedRootHint))
 }
 
 /// The typed daemon transport (D5): one function per D-Bus method, returning
@@ -438,18 +420,20 @@ mod tests {
     // from the bus or the daemon arrives as `zbus::Error::MethodError`, whose
     // name is checked by `is_access_denied_name` above.
     //
-    // "rejected by policy" deliberately does not contain "requires root", so
-    // this pins the bus-policy (non-root-specific) denial case.
+    // ADR 010: a bus-policy denial can only mean a non-root caller reached
+    // for a root-only method (every local user may send `Authenticate`), so
+    // the hint says root — never "join the group", which grants nothing.
     #[test]
-    fn access_denied_fdo_error_gets_group_hint() {
+    fn access_denied_bus_policy_denial_gets_root_hint() {
         let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
             "rejected by policy".into(),
         ))))
         .context("D-Bus PreviewFrame call failed");
         let hinted = add_access_denied_hint(err);
         let msg = format!("{hinted:#}");
-        assert!(msg.contains("usermod -aG facelock"), "got: {msg}");
-        assert!(msg.contains("log out"), "got: {msg}");
+        assert!(msg.contains("requires root"), "got: {msg}");
+        assert!(!msg.contains("usermod"), "got: {msg}");
+        assert!(!msg.contains("facelock' group"), "got: {msg}");
     }
 
     // The daemon's `authorize_method` -> `require_root` denial (issue #108,

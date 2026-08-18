@@ -22,7 +22,6 @@ pub enum AccessMessage {
     RootRequired { hint: String },
     SudoReexecPrompt,
     AccessDeniedRootHint,
-    AccessDeniedGroupHint,
     EnrollTimedOutClientSide,
 
     // -- backend selection (D1) --
@@ -54,9 +53,6 @@ impl Message for AccessMessage {
             AccessDeniedRootHint => translate(
                 "Access denied: this operation requires root.\n  Re-run with sudo, or as root.",
             ),
-            AccessDeniedGroupHint => translate(
-                "Access denied. If you are not in the 'facelock' group, add yourself:\n  sudo usermod -aG facelock $USER\nthen log out and back in (or re-run: sudo facelock setup). Note: some operations require root regardless of group membership.",
-            ),
             EnrollTimedOutClientSide => translate(
                 "enrollment timed out client-side; the daemon may have completed it — run `facelock list` before retrying",
             ),
@@ -86,7 +82,7 @@ impl Message for AccessMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for AccessMessage {
-    const VARIANT_COUNT: usize = 10;
+    const VARIANT_COUNT: usize = 9;
 
     fn samples() -> Vec<Self> {
         use AccessMessage::*;
@@ -99,7 +95,6 @@ impl super::Samples for AccessMessage {
             RootRequired { hint: s("h") },
             SudoReexecPrompt,
             AccessDeniedRootHint,
-            AccessDeniedGroupHint,
             EnrollTimedOutClientSide,
             DaemonUnreachableFallback,
             PreviewGraphicalNeedsDaemonOneshot,

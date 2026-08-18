@@ -265,7 +265,7 @@ impl Message for SetupMessage {
             ),
             GroupStepFailed { error } => fill(
                 translate(
-                    "  Group setup failed: {error}\n  Add manually: sudo usermod -aG facelock <user>",
+                    "  Could not create the 'facelock' system group: {error}\n  Create it manually: sudo groupadd -r facelock",
                 ),
                 &[("error", error.clone())],
             ),

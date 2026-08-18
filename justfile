@@ -448,13 +448,9 @@ install-files:
         [ -f "$f" ] || { echo "Error: $f not found. Run 'just build-release' first."; exit 1; }
     done
 
-    # Create facelock system group and add the installing user
+    # Create the facelock system group (packaging parity; the bus policy names
+    # it). Nobody is added to it — face unlock needs no membership (ADR 010).
     getent group facelock >/dev/null || groupadd -r facelock
-    REAL_USER="${SUDO_USER:-${DOAS_USER:-}}"
-    if [ -n "$REAL_USER" ] && ! id -nG "$REAL_USER" 2>/dev/null | grep -qw facelock; then
-        usermod -aG facelock "$REAL_USER"
-        echo "Added $REAL_USER to facelock group (log out and back in to take effect)."
-    fi
 
     # Binaries
     install -Dm755 target/release/facelock /usr/bin/facelock

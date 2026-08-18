@@ -50,7 +50,7 @@ follow it.
 
 | Command | Purpose |
 |---------|---------|
-| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, enrollment, PAM); also manages `facelock` group membership (creates the group if missing, adds the invoking user) |
+| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, enrollment, PAM); creates the `facelock` system group if missing (packaging parity — it grants nothing on the auth path, ADR 010) |
 | `facelock setup --systemd` | Install/enable systemd units |
 | `facelock setup --pam` | Alias onto `facelock pam add\|remove` (see "facelock pam" below). Kept, and kept parsing, for every wrapper written against it |
 | `facelock pam add` | Add the facelock line to one or more `/etc/pam.d/<service>` files. Root |
@@ -1118,20 +1118,19 @@ part of this table.
 runs an interactive question runs its root check **first**, before that
 prompt or any other output or side effect. `remove` and `clear` both ask a
 Y/N confirmation before deleting a face model; historically `remove`'s root
-check ran *after* that confirmation, so a facelock-group member (who lacks
-root) would confirm a destructive action and only then discover it was
-refused — this is fixed. The same ordering applies to `status`, `devices`,
+check ran *after* that confirmation, so a non-root user would confirm a
+destructive action and only then discover it was refused — this is fixed. The same ordering applies to `status`, `devices`,
 `preview`, `test`, `audit`, `bench`, and `config edit`: the root check is
 the first statement in each command's entry point, before `Config::load()`
 or any `println!`.
 
-**AccessDenied hint.** A D-Bus `AccessDenied` reply carries an actionable
-hint (`ipc_client::add_access_denied_hint`) that distinguishes two causes: the
-daemon's own `require_root` rejection (most methods now, since almost every
-D-Bus method is root-only — see IPC Protocol below) gets a root-specific
-hint; a bus-policy rejection (caller is neither root nor in the `facelock`
-group) gets the group-membership hint. Telling a root-only rejection to
-"join the facelock group" is wrong — joining the group does not grant root.
+**AccessDenied hint.** A D-Bus `AccessDenied` reply carries one actionable
+hint (`ipc_client::add_access_denied_hint`): root is required. Since almost
+every D-Bus method is root-only (see IPC Protocol below) and, under ADR 010,
+the bus admits a non-root caller to `Authenticate` alone, a denial from the
+daemon's `require_root` and a denial from the bus policy have the same fix.
+The hint never suggests joining the `facelock` group — the group grants no
+method calls.
 
 ### facelock test Semantics (N11)
 

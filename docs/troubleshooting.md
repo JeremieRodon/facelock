@@ -198,16 +198,24 @@ The ONNX runtime requires access to `/dev/null`, `/dev/urandom`, and `/proc/sys`
 
 ### "Permission denied" / "AccessDenied" when running facelock commands
 
-**Symptom**: `facelock preview` or `facelock test` fails with a D-Bus
-`AccessDenied` error as a normal user (root works fine).
+**Symptom**: `facelock preview`, `facelock test`, `facelock list` or another
+command fails with a D-Bus `AccessDenied` error as a normal user (root works
+fine).
 
-The D-Bus system-bus policy only allows root and the `facelock` group to talk
-to the daemon. `sudo facelock setup` offers to add you to the group; if you
-skipped it (or are on another account), add yourself:
+Every management command is root-only; the CLI offers to re-run itself under
+`sudo` on a terminal. Face unlock itself (hyprlock, swaylock, the polkit
+agent, `facelock is-enrolled`) needs no group and no re-login: the bus admits
+any local user's `Authenticate` for their own account (ADR 010). If a lock
+screen still reports `AccessDenied` right after an upgrade, the bus has not
+re-read the policy yet — `sudo facelock setup --systemd` rewrites it and asks
+for a reload, or reboot.
+
+Membership in the `facelock` group is optional (it only lets a member receive
+the daemon's `AuthAttempted` signals) and is safe to drop. Dropping it does not
+turn face unlock off for that user — remove their models
+(`sudo facelock remove` / `clear`) to do that:
 ```bash
-groups  # check current groups
-sudo usermod -aG facelock $USER
-# Log out and back in for group changes to take effect
+sudo gpasswd -d $USER facelock
 ```
 
 ### Database permission errors

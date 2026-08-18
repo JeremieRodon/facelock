@@ -67,7 +67,7 @@ Actions are the steps that change the system: PAM, systemd, enrollment. `--no-pa
 | Flag | Meaning |
 |------|---------|
 | *(none)* | Full interactive wizard. If stdin is not a terminal, this falls back to the non-interactive flow. |
-| `--non-interactive` | No prompts. Choices resolve to config-or-default. Runs the base setup only: directories, model download and verification, encryption, group membership, path permissions. No PAM, no systemd, no enrollment unless asked for explicitly. |
+| `--non-interactive` | No prompts. Choices resolve to config-or-default. Runs the base setup only: directories, model download and verification, encryption, path permissions. No PAM, no systemd, no enrollment unless asked for explicitly. |
 | `-y`, `--yes` (alias `--no-confirm`) | Suppress confirmation prompts, and unlock the sensitive-service gate. |
 
 `--non-interactive` suppresses the per-file "Proceed?" confirmation before a PAM edit on its own, since it promises no prompts. It deliberately does **not** unlock the sensitive-service gate: the shared auth stacks `common-auth`, `password-auth`, `password-auth-ac`, `system-auth`, `system-auth-ac` and `system-login`, plus `login` and `sshd`, still require an explicit `--yes`, so `facelock setup --non-interactive --pam --service sshd` refuses until you add it. Locking yourself out of a machine should take two decisions, not one.
@@ -235,7 +235,7 @@ It answers from a single marker file, and deliberately does **not**:
 - activate the facelock daemon over D-Bus (which is why `facelock list --json` cannot be used for this — `list` tries daemon IPC first and will bus-activate the system daemon)
 - open a camera
 - read the face database
-- error merely because the caller lacks `facelock` group membership — a caller outside the group reports `not-enrolled`, which is the correct answer: the group is required to reach the daemon at all, so face auth is genuinely not operational for that caller
+- error merely because the caller's marker is unreadable — a missing or unreadable marker reports `not-enrolled`, never an error; no group membership is involved (ADR 010)
 
 The only files it touches are `/etc/facelock/config.toml` (to find the state directory) and one marker.
 

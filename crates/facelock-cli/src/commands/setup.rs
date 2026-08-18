@@ -602,9 +602,9 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         false
     };
 
-    // Group membership: without it, the first daemon command a normal user
-    // runs after setup fails with a bare D-Bus AccessDenied (issue #89).
-    if let Err(e) = setup_group_membership(Some(&theme)) {
+    // Packaging parity only (ADR 010): the group grants nothing on the auth
+    // path, so a failure here is reported, not fatal.
+    if let Err(e) = ensure_facelock_group() {
         Terminal.info(&SetupMessage::GroupStepFailed {
             error: e.to_string(),
         });
@@ -2331,9 +2331,8 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
         None => setup_encryption_auto(&config)?,
     }
 
-    // Ensure the facelock group exists (secure_setup_paths chowns to it) and
-    // add the invoking user so daemon commands work without sudo (#89).
-    setup_group_membership(None)?;
+    // Packaging parity only (ADR 010): the bus policy names the group.
+    ensure_facelock_group()?;
 
     secure_setup_paths(&config, Some(&manifest))?;
     write_setup_marker()?;
@@ -2449,38 +2448,17 @@ fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// facelock group membership
+// facelock system group
 // ---------------------------------------------------------------------------
 
-/// Resolve the invoking (non-root) user behind `sudo facelock setup`.
-fn invoking_user() -> Option<String> {
-    let valid = |u: &String| !u.is_empty() && u != "root";
-    std::env::var("SUDO_USER")
-        .ok()
-        .filter(valid)
-        .or_else(|| std::env::var("DOAS_USER").ok().filter(valid))
-}
-
-/// True if `user` is a member of `group` (supplementary or primary).
-fn user_in_group(user: &str, group: &nix::unistd::Group) -> bool {
-    if group.mem.iter().any(|m| m == user) {
-        return true;
-    }
-    // Primary-group membership is recorded in passwd, not in group.mem.
-    matches!(nix::unistd::User::from_name(user), Ok(Some(u)) if u.gid == group.gid)
-}
-
-/// Ensure the `facelock` system group exists and the invoking user is in it.
+/// Ensure the `facelock` system group exists. Nobody is added to it.
 ///
-/// The D-Bus system-bus policy admits only root and the `facelock` group, so
-/// without membership the first `facelock preview`/`test` after setup fails
-/// with AccessDenied (issue #89). Packaging creates the group but cannot know
-/// which human user to add — setup is the right place. Pass `theme` for an
-/// interactive Y/n prompt; `None` adds the invoking sudo/doas user without
-/// prompting, and prints a manual `usermod` command when no invoking user can
-/// be determined.
-fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
-    // Create the system group if packaging didn't (e.g. source installs).
+/// Nothing on the auth path needs membership any more (ADR 010): the bus
+/// admits `Authenticate` from any local user and the state directory is
+/// traversable by everyone. The group survives because the bus policy still
+/// names it (members may receive `AuthAttempted` signals) and packaging
+/// creates it through sysusers, so a source install should match.
+fn ensure_facelock_group() -> anyhow::Result<()> {
     if nix::unistd::Group::from_name("facelock")
         .context("failed to look up facelock group")?
         .is_none()
@@ -2488,37 +2466,6 @@ fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
         Terminal.info(&SystemMessage::CreatingFacelockGroup);
         run_cmd("groupadd", &["-r", "facelock"])?;
     }
-    let group = nix::unistd::Group::from_name("facelock")
-        .context("failed to look up facelock group")?
-        .context("facelock group missing after creation")?;
-
-    let Some(user) = invoking_user() else {
-        Terminal.info(&SystemMessage::GroupMembershipNote);
-        return Ok(());
-    };
-
-    if user_in_group(&user, &group) {
-        Terminal.info(&SystemMessage::AlreadyInGroup { user: user.clone() });
-        return Ok(());
-    }
-
-    if let Some(theme) = theme {
-        // Propagate prompt failures instead of treating them as "declined":
-        // the wizard's caller prints the error plus the manual usermod command,
-        // so a broken stdin surfaces rather than silently skipping the add.
-        let proceed = Confirm::with_theme(theme)
-            .with_prompt(SystemMessage::ConfirmAddToGroup { user: user.clone() }.localized())
-            .default(true)
-            .interact()
-            .context("group membership prompt failed")?;
-        if !proceed {
-            Terminal.info(&SystemMessage::GroupAddSkipped { user: user.clone() });
-            return Ok(());
-        }
-    }
-
-    run_cmd("usermod", &["-aG", "facelock", &user])?;
-    Terminal.info(&SystemMessage::AddedToGroup { user: user.clone() });
     Ok(())
 }
 

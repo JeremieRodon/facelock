@@ -17,13 +17,8 @@ pub enum SystemMessage {
     SystemdSkippedFlag,
     SystemdDeferred,
 
-    // -- group membership --
+    // -- the facelock system group --
     CreatingFacelockGroup,
-    GroupMembershipNote,
-    AlreadyInGroup { user: String },
-    ConfirmAddToGroup { user: String },
-    GroupAddSkipped { user: String },
-    AddedToGroup { user: String },
 
     // -- installing and removing the unit files --
     DisablingSystemdUnits,
@@ -54,29 +49,6 @@ impl Message for SystemMessage {
                 translate("  Answered on the command line; applied once setup finishes.")
             }
             CreatingFacelockGroup => translate("  Creating 'facelock' system group..."),
-            GroupMembershipNote => translate(
-                "  Note: running daemon commands (preview/test) as a normal user requires\n  membership in the 'facelock' group: sudo usermod -aG facelock <user>",
-            ),
-            AlreadyInGroup { user } => fill(
-                translate("  User '{user}' is already in the 'facelock' group."),
-                &[("user", user.clone())],
-            ),
-            ConfirmAddToGroup { user } => fill(
-                translate(
-                    "Add user '{user}' to the 'facelock' group? (required to run facelock preview/test without sudo)",
-                ),
-                &[("user", user.clone())],
-            ),
-            GroupAddSkipped { user } => fill(
-                translate("  Skipped. Add later with: sudo usermod -aG facelock {user}"),
-                &[("user", user.clone())],
-            ),
-            AddedToGroup { user } => fill(
-                translate(
-                    "  Added '{user}' to the 'facelock' group.\n  NOTE: log out and back in for the new group membership to take effect.",
-                ),
-                &[("user", user.clone())],
-            ),
             DisablingSystemdUnits => translate("Disabling facelock-daemon systemd units..."),
             SystemdUnitsDisabled => translate("facelock-daemon service disabled and stopped."),
             InstallingSystemdUnits => {
@@ -107,7 +79,7 @@ impl Message for SystemMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SystemMessage {
-    const VARIANT_COUNT: usize = 19;
+    const VARIANT_COUNT: usize = 14;
 
     fn samples() -> Vec<Self> {
         use SystemMessage::*;
@@ -118,11 +90,6 @@ impl super::Samples for SystemMessage {
             SystemdSkippedFlag,
             SystemdDeferred,
             CreatingFacelockGroup,
-            GroupMembershipNote,
-            AlreadyInGroup { user: s("u") },
-            ConfirmAddToGroup { user: s("u") },
-            GroupAddSkipped { user: s("u") },
-            AddedToGroup { user: s("u") },
             DisablingSystemdUnits,
             SystemdUnitsDisabled,
             InstallingSystemdUnits,
