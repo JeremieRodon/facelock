@@ -2502,8 +2502,9 @@ fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> anyhow::Result<()> {
 /// Nothing on the auth path needs membership any more (ADR 010): the bus
 /// admits `Authenticate` from any local user and the state directory is
 /// traversable by everyone. The group survives because the bus policy still
-/// names it (members may receive `AuthAttempted` signals) and packaging
-/// creates it through sysusers, so a source install should match.
+/// names it (members may receive `AuthAttempted` signals), `/run/facelock` is
+/// `root:facelock`, and packaging creates it through sysusers, so a source
+/// install should match.
 fn ensure_facelock_group() -> anyhow::Result<()> {
     if nix::unistd::Group::from_name("facelock")
         .context("failed to look up facelock group")?

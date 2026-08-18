@@ -1285,7 +1285,7 @@ and never a correct one.
 | Path | Owner | Mode | Purpose |
 |------|-------|------|---------|
 | `/etc/facelock/config.toml` | root:root | 644 | Configuration |
-| `/var/lib/facelock/` | root:root | 711 | State dir. Traversable by every local user, listable by root only: anyone can open a path it knows by name (its own enrollment marker, a model file) but nobody can enumerate what is there |
+| `/var/lib/facelock/` | root:root | 711 | State dir. Traversable by every local user, listable by root only: anyone can open a path it knows by name (its own enrollment marker, a model file) but nobody can enumerate what is there (`models/` is itself `0755` and listable — public data) |
 | `/var/lib/facelock/facelock.db` | root:root | 600 | Face embeddings. Read by the daemon (root) only; user-run PAM stacks request authentication through the daemon, they never read templates |
 | `/var/lib/facelock/models/` | root:root | 755 | ONNX models — public, SHA256-verified downloads |
 | `/var/lib/facelock/enrolled/` | root:root | 711 | Enrollment markers; traversable by all, listable by none |

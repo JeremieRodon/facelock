@@ -11,8 +11,9 @@
 //! The markers live **inside** the state directory. Both directories grant
 //! everyone traversal (`--x`) and nobody but root listing (ADR 010), so any
 //! local user can open its own marker by name but cannot `readdir` the
-//! directory: which *other* accounts have face auth enrolled stays private.
-//! Each marker is `0600` and owned by its user, so "am I enrolled?" is
+//! directory, so the enrolled roster is not enumerable; a guessed name can
+//! still be probed for existence with `stat(2)` — the accepted residual
+//! recorded in `docs/security.md` § 3 A2. Each marker is `0600` and owned by its user, so "am I enrolled?" is
 //! answerable by that user and nobody else — the same privacy property as
 //! `~/.ssh/authorized_keys`. No group membership is involved; `is-enrolled`
 //! answers `enrolled` as soon as the marker exists.

@@ -421,7 +421,8 @@ directories. No group membership is involved (ADR 010): the answer is
 ```
 
 - **`0711` on the directory** permits traversal to a known filename but not
-  `readdir`, so which accounts have face auth enrolled is not listable.
+  `readdir`, so which accounts have face auth enrolled is not listable (a
+  guessed name can be probed for existence — the § A2 residual).
 - **`0600` owned by the user** means "am I enrolled?" is answerable by that
   user and by nobody else — the same privacy property as
   `~/.ssh/authorized_keys`.
