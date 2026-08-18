@@ -84,9 +84,9 @@ pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
     // means modes could not be set and must never block an authentication.
     crate::state_layout::ensure_state_layout_best_effort(&config);
 
-    // Open a writable store (the oneshot path runs as root or the facelock
-    // group). The rate limiter is SQLite-backed through this database, so its
-    // window is shared with the daemon and survives across process invocations.
+    // Open a writable store (the oneshot path runs as root). The rate limiter
+    // is SQLite-backed through this database, so its window is shared with the
+    // daemon and survives across process invocations.
     // `create`: on a genuinely fresh install this is what brings the
     // rate-limiter's storage into being, so switching to `open_existing` would
     // change auth-path behaviour, not harden it.

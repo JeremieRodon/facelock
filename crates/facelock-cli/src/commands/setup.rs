@@ -2522,15 +2522,6 @@ fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn facelock_group_gid() -> anyhow::Result<u32> {
-    nix::unistd::Group::from_name("facelock")
-        .context("failed to look up facelock group")?
-        .map(|group| group.gid.as_raw())
-        .context(
-            "facelock group is missing; install package assets or create the facelock system group",
-        )
-}
-
 fn secure_existing_path(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
@@ -2568,7 +2559,6 @@ fn secure_dir_if_exists(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> 
 }
 
 fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyhow::Result<()> {
-    let facelock_gid = facelock_group_gid()?;
     let config_path = facelock_core::paths::config_path();
     let config_dir = config_path
         .parent()
@@ -2583,14 +2573,11 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700, 0)?;
 
     // The state directory subtree — state dir, models/, enrolled/, and the
-    // database file modes — is owned by `state_layout`. Re-applied here
-    // because setup only creates the `facelock` group partway through, so the
-    // earlier call could not chown.
+    // database file modes — is owned by `state_layout`. Re-applied here so a
+    // path created earlier in setup with a looser mode converges before the
+    // marker reconcile runs.
     if let Some(layout) = crate::state_layout::StateLayout::from_config(config) {
-        let owners = nix::unistd::Uid::current()
-            .is_root()
-            .then_some(crate::state_layout::Owners { facelock_gid });
-        crate::state_layout::apply_layout(&layout, owners)?;
+        crate::state_layout::apply_layout(&layout, nix::unistd::Uid::current().is_root())?;
     }
     if let Some(parent) = audit_path.parent() {
         // Per-user auth history: root-only, like the snapshots.

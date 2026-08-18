@@ -89,7 +89,7 @@ chmod 644 /var/lib/facelock/models/*.onnx
 #### A. Database File Permissions (Required)
 
 ```bash
-# Database owned by root, readable only by root and facelock group
+# Database owned by root, readable by root only
 chown root:root /var/lib/facelock/facelock.db
 chmod 600 /var/lib/facelock/facelock.db
 ```
