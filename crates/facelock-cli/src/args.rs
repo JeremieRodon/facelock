@@ -202,7 +202,10 @@ system-auth, system-auth-ac or system-login additionally requires \
 --allow-sensitive; neither flag implies the \
 other. --json implies --no-confirm, since a prompt would block the pipeline \
 reading the document. Every service is validated before any file is written, \
-so a rejected service leaves the rest untouched.")]
+so a rejected service leaves the rest untouched. A service that exists only in \
+a vendor directory (/usr/lib/pam.d, where polkit-1 ships on Arch) is copied to \
+/etc/pam.d first and reported as 'overridden'; the package's own file is never \
+modified.")]
     Add {
         #[command(flatten)]
         service: PamServiceArg,

@@ -24,7 +24,11 @@ use crate::message::{
 // it is the list of services setup offers to configure, which is a property of
 // the setup flow rather than of the writer, and moving it would have split the
 // multi-select from the entries it renders for no gain.
-use super::pam::{PAM_DIR, PAM_LINE, PAM_MODULE_PATH, PamAction, PamRequest};
+/// The tempdir-as-search-path helper the writer's own tests use, so the
+/// wizard's step 9 is driven exactly the way `pam add` is.
+#[cfg(test)]
+use super::pam::only;
+use super::pam::{PAM_LINE, PAM_MODULE_PATHS, PamAction, PamDirs, PamRequest};
 
 /// Embedded systemd unit file.
 const SERVICE_UNIT: &str = include_str!("../../../../systemd/facelock-daemon.service");
@@ -599,7 +603,7 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     // -- Step 9: PAM configuration --
     Terminal.info(&SetupMessage::SetupStepPam);
     let pam_services = match pam_step_in(
-        Path::new(PAM_DIR),
+        &PamDirs::system(),
         plan,
         &theme,
         super::pam::module_installed(),
@@ -2009,7 +2013,7 @@ fn wizard_systemd_setup(theme: &ColorfulTheme, assume_yes: bool) -> anyhow::Resu
 /// prompt or write, and so tests can drive the write path on a machine that has
 /// no PAM module installed.
 fn pam_step_in(
-    base: &Path,
+    dirs: &PamDirs,
     plan: &SetupPlan,
     theme: &ColorfulTheme,
     module_present: bool,
@@ -2019,7 +2023,7 @@ fn pam_step_in(
     if !step.touches_pam_d() {
         if step == PamStep::Skip {
             Terminal.info(&PamMessage::PamSkippedFlag {
-                dir: base.display().to_string(),
+                dir: dirs.display(),
             });
         }
         return Ok(Vec::new());
@@ -2027,7 +2031,7 @@ fn pam_step_in(
 
     if !module_present {
         Terminal.info(&PamMessage::PamModuleMissing {
-            path: PAM_MODULE_PATH.to_string(),
+            paths: PAM_MODULE_PATHS.join(", "),
         });
         return Ok(Vec::new());
     }
@@ -2042,23 +2046,23 @@ fn pam_step_in(
             // on both knobs here. Splitting them would make `--pam --service X
             // --yes` start prompting where it never did.
             super::pam::install_one_in(
-                base,
+                dirs,
                 &pam_request(PamAction::Add, &service, setup_pam_knobs(plan), false),
             )?;
             Ok(vec![service])
         }
-        PamStep::Ask => wizard_pam_setup_in(base, theme),
+        PamStep::Ask => wizard_pam_setup_in(dirs, theme),
         // Both returned above; repeated here to keep the match exhaustive.
         PamStep::Skip | PamStep::Deferred => Ok(Vec::new()),
     }
 }
 
-fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec<String>> {
-    let candidates = candidates_in(base);
+fn wizard_pam_setup_in(dirs: &PamDirs, theme: &ColorfulTheme) -> anyhow::Result<Vec<String>> {
+    let candidates = candidates_in(dirs);
 
     if candidates.is_empty() {
         Terminal.info(&PamMessage::NoPamCandidates {
-            dir: base.display().to_string(),
+            dir: dirs.display(),
         });
         return Ok(Vec::new());
     }
@@ -2102,7 +2106,7 @@ fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec
             no_confirm: true,
             allow_sensitive: true,
         };
-        match super::pam::install_one_in(base, &pam_request(PamAction::Add, &service, knobs, false))
+        match super::pam::install_one_in(dirs, &pam_request(PamAction::Add, &service, knobs, false))
         {
             Ok(()) => configured.push(service),
             Err(e) => {
@@ -2307,7 +2311,7 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
         tracing::warn!("could not reconcile enrollment markers: {e}");
     }
 
-    if super::pam::is_configured(Path::new(PAM_DIR), "hyprlock") {
+    if super::pam::is_configured(&PamDirs::system(), "hyprlock") {
         print_hyprlock_hint();
     }
 
@@ -2779,8 +2783,10 @@ struct PamCandidate {
 //   - login: TTY login. Cameras often aren't initialized at boot.
 //   - su, passwd, chsh, chfn: privilege/credential-change tools that should
 //     require a real password.
-//   - any unknown service: detection is by /etc/pam.d/<name> existence, but only
-//     services in PAM_CANDIDATES are offered.
+//   - any unknown service: detection is by the service file existing anywhere on
+//     the PAM search path — /etc/pam.d, then the vendor directories, which is
+//     where polkit-1 ships on current Arch — but only services in
+//     PAM_CANDIDATES are offered.
 const PAM_CANDIDATES: &[PamCandidate] = &[
     PamCandidate {
         service: "sudo",
@@ -2840,11 +2846,17 @@ const PAM_CANDIDATES: &[PamCandidate] = &[
     },
 ];
 
-/// Returns candidates from `PAM_CANDIDATES` whose service file exists under `base`.
-fn candidates_in(base: &Path) -> Vec<&'static PamCandidate> {
+/// Returns candidates from `PAM_CANDIDATES` whose service file exists anywhere
+/// on the PAM search path.
+///
+/// Through the writer's own resolver rather than a `join(...).exists()` here:
+/// the menu has to offer exactly what `pam add` can configure, and those two
+/// answers drifting apart is what hid `polkit-1` from the wizard on every Arch
+/// box where the file moved to `/usr/lib/pam.d`.
+fn candidates_in(dirs: &PamDirs) -> Vec<&'static PamCandidate> {
     PAM_CANDIDATES
         .iter()
-        .filter(|c| base.join(c.service).exists())
+        .filter(|c| super::pam::service_exists(dirs, c.service))
         .collect()
 }
 
@@ -3417,7 +3429,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("sudo"), "").unwrap();
         std::fs::write(tmp.path().join("hyprlock"), "").unwrap();
-        let found: Vec<_> = candidates_in(tmp.path())
+        let found: Vec<_> = candidates_in(&only(tmp.path()))
             .iter()
             .map(|c| c.service)
             .collect();
@@ -3444,7 +3456,7 @@ mod tests {
         // service file is actually present.
         let tmp = tempfile::TempDir::new().unwrap();
         let present = |base: &Path| {
-            candidates_in(base)
+            candidates_in(&only(base))
                 .iter()
                 .any(|c| c.service == "omarchy-lock-face")
         };
@@ -3752,7 +3764,8 @@ mod action_tests {
         let before = hash_dir(dir.path());
 
         let plan = pam_plan(PamPref::Skip);
-        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+        let configured =
+            pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), true).unwrap();
 
         assert!(configured.is_empty());
         assert_eq!(
@@ -3775,7 +3788,8 @@ mod action_tests {
                 service: Some("sudo".to_string()),
             })
         };
-        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+        let configured =
+            pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), true).unwrap();
 
         assert_eq!(configured, vec!["sudo".to_string()]);
         let after = hash_dir(dir.path());
@@ -3784,7 +3798,7 @@ mod action_tests {
             after.contains_key("sudo.facelock-backup"),
             "a backup file must have appeared: {after:?}"
         );
-        assert!(super::super::pam::is_configured(dir.path(), "sudo"));
+        assert!(super::super::pam::is_configured(&only(dir.path()), "sudo"));
     }
 
     /// `--pam --remove` is `run_with_plan`'s job; step 9 must not pre-empt it.
@@ -3799,7 +3813,7 @@ mod action_tests {
         });
         assert_eq!(pam_step_for(&plan), PamStep::Deferred);
         assert!(
-            pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true)
+            pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), true)
                 .unwrap()
                 .is_empty()
         );
@@ -3820,7 +3834,8 @@ mod action_tests {
                 service: Some("hyprlock".to_string()),
             })
         };
-        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+        let configured =
+            pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), true).unwrap();
 
         assert_eq!(configured, vec!["hyprlock".to_string()]);
         let after = hash_dir(dir.path());
@@ -3849,7 +3864,8 @@ mod action_tests {
 
         let dir = fake_pam_d();
         let before = hash_dir(dir.path());
-        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), true).unwrap();
+        let configured =
+            pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), true).unwrap();
         assert_eq!(configured, vec![DEFAULT_PAM_SERVICE.to_string()]);
 
         // hyprlock is `default_enabled` but was not named, so it is untouched.
@@ -4009,7 +4025,8 @@ mod action_tests {
         let before = hash_dir(dir.path());
 
         let plan = SetupPlan::default();
-        let configured = pam_step_in(dir.path(), &plan, &ColorfulTheme::default(), false).unwrap();
+        let configured =
+            pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), false).unwrap();
 
         assert!(configured.is_empty());
         assert_eq!(before, hash_dir(dir.path()));

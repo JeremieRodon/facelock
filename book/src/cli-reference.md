@@ -563,6 +563,8 @@ Manage the facelock line in `/etc/pam.d` service files. This command owns every 
 
 `add` and `remove` require root and never offer to re-exec under `sudo` — silently re-running an `/etc/pam.d` edit on a wrapper script's behalf is a surprise, not a convenience. `status` reads only and needs no root.
 
+A service name is looked up in `/etc/pam.d` first and `/usr/lib/pam.d` second — Linux-PAM's own order, first hit wins — because packages ship their configuration there: on current Arch `polkit` installs `/usr/lib/pam.d/polkit-1` and there is no `/etc/pam.d/polkit-1` at all. Only `/etc/pam.d` is ever written to. A service that exists only in a vendor directory is copied there first, with the facelock line already in it and a two-line header saying what it was forked from; the package's own file is left byte for byte. That copy reports `overridden` rather than `installed`, and `pam status` reports a service with no local copy as `vendor-only` rather than as `missing`. Deleting the override restores the vendor file. Set `[pam] config_dirs` if your distribution's vendor directory is somewhere else.
+
 ### facelock pam add
 
 ```bash
@@ -624,8 +626,10 @@ The exit code is the answer, on the same 0/1/2 scale as `is-enrolled` and `grep`
 Across several services the worst outcome wins. `--if-present` means here what it means on `add` and `remove`: an absent service file is reported and no longer forces exit 2, so exit 0 becomes "every requested service **that exists** carries the line" and a set of optional integrations can be installed and then verified with the same flag on both commands. It forgives absence only — a service whose file is a dangling or looping symlink is still exit 2, since an unresolvable link is not an absent file. `--json` emits one document:
 
 ```json
-{"command":"status","dry_run":false,"services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
+{"command":"status","dry_run":false,"module_path":"/lib/security/pam_facelock.so","services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
 ```
+
+`module_path` is where `pam_facelock.so` was found, or `null` when no candidate hit — a property of the machine rather than of a service, and what tells an integrator that a service carries the line while the module it names is at a path nothing looks at. `add` and `remove` refuse before writing when the module is missing, so their documents do not carry the key.
 
 The document's shape and the `action` vocabulary are a stability contract, including the rule that a consumer must tolerate an `action` it does not recognize rather than treat it as an error. See `docs/contracts.md`, "facelock pam Semantics", for that, for the `add`/`remove` exit codes, and for what `--json` does on a validation failure.
 

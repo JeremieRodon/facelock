@@ -565,6 +565,18 @@ services are configured in one process, under one root check. `add` and
 `remove` require root and never offer to re-exec under `sudo`; `status` reads
 only and needs no root.
 
+A service name is looked up in `/etc/pam.d` first and `/usr/lib/pam.d` second —
+Linux-PAM's own order, first hit wins — because packages ship their
+configuration there: on current Arch `polkit` installs `/usr/lib/pam.d/polkit-1`
+and there is no `/etc/pam.d/polkit-1` at all. Only `/etc/pam.d` is ever written
+to. A service that exists only in a vendor directory is copied there first, with
+the facelock line already in it and a two-line header saying what it was forked
+from; the package's own file is left byte for byte. That copy reports
+`overridden` rather than `installed`, and `pam status` reports a service with no
+local copy as `vendor-only` rather than as `missing`. Deleting the override
+restores the vendor file. Set `[pam] config_dirs` if your distribution's vendor
+directory is somewhere else.
+
 ### facelock pam add
 
 ```bash
@@ -656,8 +668,14 @@ facelock pam status --service hyprlock --service swaylock --if-present
 `--json` emits one document:
 
 ```json
-{"command":"status","dry_run":false,"services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
+{"command":"status","dry_run":false,"module_path":"/lib/security/pam_facelock.so","services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
 ```
+
+`module_path` is where `pam_facelock.so` was found, or `null` when no candidate
+hit — a property of the machine rather than of a service, and what tells an
+integrator that a service carries the line while the module it names is at a
+path nothing looks at. `add` and `remove` refuse before writing when the module
+is missing, so their documents do not carry the key.
 
 The document's shape, the `action` vocabulary, and the rule that a consumer
 must tolerate an `action` it does not recognize rather than treat it as an

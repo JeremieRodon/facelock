@@ -431,7 +431,22 @@ Manage the facelock line in
 service files. This command owns every write to that directory;
 \fBsetup \-\-pam\fR is an alias onto it. \fB\-\-service\fR is repeatable on
 all three verbs and defaults to \fBsudo\fR, so several services are configured
-in one process under one root check.
+in one process under one root check. A name is looked up in
+.I /etc/pam.d
+first and
+.I /usr/lib/pam.d
+second \(em Linux\-PAM's own order, first hit wins \(em since packages ship
+their configuration in the vendor directory; on current Arch \fBpolkit\fR
+installs
+.I /usr/lib/pam.d/polkit\-1
+and no
+.I /etc/pam.d
+copy. Only
+.I /etc/pam.d
+is ever written to: a service found only in a vendor directory is copied there
+first, with the facelock line already in it and a header naming what it was
+forked from, and the package's file is left untouched. Configurable with
+\fB[pam] config_dirs\fR.
 .RS
 .TP
 .B add

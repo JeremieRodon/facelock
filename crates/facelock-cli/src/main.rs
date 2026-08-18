@@ -276,11 +276,17 @@ fn main() -> anyhow::Result<()> {
                 Commands::IsEnrolled { user, json } => {
                     std::process::exit(commands::is_enrolled::run(user.user, json.json))
                 }
-                // `pam` consumes no `Config` either: `add`/`remove` edit
-                // `/etc/pam.d` and `status` reads it, and neither wants a
-                // missing or broken config file to be the thing that stops
-                // them. Its exit code is its own — `status` answers on grep's
-                // 0/1/2 scale — so it exits here rather than returning `()`.
+                // `pam` reads the config for itself, best-effort, and that
+                // is why it is still dispatched here rather than below: it
+                // needs `[pam] config_dirs` to know which directories a
+                // service name resolves through, and it must keep working
+                // when that file is missing or broken — `add`/`remove` edit
+                // `/etc/pam.d` and `status` reads it, and an unrelated config
+                // mistake is not a reason to stop an operator repairing an
+                // auth stack. A failed read yields the default search path;
+                // see `commands::pam::PamDirs::system`. Its exit code is its
+                // own — `status` answers on grep's 0/1/2 scale — so it exits
+                // here rather than returning `()`.
                 Commands::Pam { command } => {
                     std::process::exit(commands::pam::run(command.into())?)
                 }
