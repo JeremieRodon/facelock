@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`facelock pam status --all`** (#203): enumerate every service in the
+  resolved pam.d directories that names `pam_facelock.so`, through the same row
+  builder, `action` words and JSON document as `pam status --service`, so the
+  two cannot disagree about one service. Bare `pam status` still means `sudo`
+  and keeps its exit codes; `--all` conflicts with `--service`, has no short
+  letter, and answers 1 when nothing is configured (`--if-present` does not
+  change that). "Not checked" is a distinct fact from "not configured": a
+  directory that could not be listed is named on stderr and in a new additive
+  `directories` key (`scanned` / `absent` / `unreadable`), the empty answer is
+  scoped to what could be read, and an entry that cannot be examined is an
+  `unknown` row rather than a missing one. Rows carry `shadows` (omitted when
+  nothing is shadowed) naming the vendor file an `/etc/pam.d` copy overrides,
+  and the human line says `(local override of …)`. Package-manager leftovers
+  (`.pacnew`, `.rpmsave`, `.dpkg-old`, `~`, `.facelock-backup`), dotfiles,
+  non-regular files and non-UTF-8 names are not services. Capability
+  `pam-status-all`.
+- **`facelock status --json`** (#204): the last diagnostic command a script could
+  not parse. A separate wire type built from the health model; nothing in
+  `health.rs` learns `Serialize`, so Rust names are not the contract. Every
+  section and nested fact is tri-state `ok` / `problem` / `unknown` with a
+  `reason` on anything not `ok`; there is no `null`, and no `false`, `0` or
+  `[]` ever stands in for "not interrogated" (an unreadable store omits
+  `enrollment.models` rather than emitting an empty array; uncounted embeddings
+  are `unknown`, not 0/0). Machine output never touches the translation catalog;
+  reasons are fixed identifiers or the probe's own diagnostic, and `daemon`
+  carries no free-text error because the transport's can be a localized hint.
+  The PAM section reuses `pam status`'s row shape and words. One fixture drives
+  both renderers and a test asserts they agree section by section; another
+  asserts the example document in `docs/contracts.md` is byte for byte what the
+  build emits. `state` is section-specific (under auto-detect `camera.state`
+  says detection is on and `camera.device.state` says whether a camera exists),
+  and the contract tabulates what each answers. Exit codes are unchanged (0
+  whenever a report was produced), so `--quiet --json` prints nothing. The
+  daemon integration tests wait on `status --json` + `jq` instead of grepping
+  the human report. Capability `status-json`.
+- **`--if-present` on `setup --pam` add, not only on `--remove`** (#202): the
+  alias now takes the flag the verb already had, on the standalone form and
+  under a wizard base (`setup --pam --service X --if-present --enroll`), where
+  it used to be dropped silently. Absent service → exit 0 with a note;
+  permission denied, a malformed file and a failed write stay fatal with or
+  without it; the default is still a hard error, which is what catches
+  `--service polkti-1`. A skipped or declined service is no longer listed in the
+  closing summary or handed to the hyprlock integration.
 - **`facelock pam add | remove | status`** (#180): one command owns every write
   to `/etc/pam.d`, and `setup --pam` is now an alias onto it that keeps parsing
   and keeps its behaviour. `--service` is repeatable on all three verbs, so
@@ -170,12 +213,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The setup wizard configures the daemon before enrolling** (#200): the order
+  is now Camera → Model quality → Inference device → Model download →
+  Encryption → **Daemon → Enrollment → Test** → PAM. On a first install
+  enrollment and the recognition test used to run before the daemon existed,
+  fell back to direct camera access with a `DirectByFallback` warning, and so
+  validated a code path no later authentication takes. The daemon step now
+  starts the unit (or restarts it when it is already running, so a re-run
+  enrols through the daemon holding the wizard's configuration; a restart can
+  interrupt an authentication in flight, which falls back to the password once,
+  where a stale daemon would silently hold the wrong key or model) and waits for
+  it to answer; `--systemd` and `--systemd --disable` are applied inside the
+  daemon step under a wizard or non-interactive base instead of after the whole
+  flow, and standalone `setup --systemd` is unchanged. `--no-systemd` and
+  oneshot installs enrol exactly as before. Step banners renumbered; PAM stays
+  step 9.
+- **`facelock status` reports every configured PAM service, not just `sudo`**
+  (#203): the report line is `PAM services: sudo, polkit-1 (2 configured, 1
+  shadowing a vendor file)`, `none configured` (only when every directory was
+  read), or `not checked` with the place that could not be read, built from the
+  same scan as `pam status --all`. The old `sudo PAM: configured` line stat-ed
+  one hardcoded file and could not tell "not configured" from "could not look".
 - **The CLI defaults to `warn`, and the daemon still logs at `info`.** Every
   command used to emit INFO on stderr, so the setup wizard's questions arrived
   interleaved with timestamped log lines and a run that was succeeding looked
   broken. Diagnostics now start at `warn`, and the new global `-v` raises them
-  one step per repeat (`-v` info, `-vv` debug, `-vvv` trace). `facelock daemon
-  run` is unchanged at `info`, because it writes to the journal, where nothing
+  one step per repeat from where the process starts (`-v` info, `-vv` debug,
+  `-vvv` trace for the CLI). `facelock daemon run` is unchanged at `info`, because it writes to the journal, where nothing
   competes with it. `RUST_LOG` still outranks both, and unlike the environment
   variable, `-v` survives `sudo`. Exit codes and stdout payloads are untouched
   at every level, and every degradation worth acting on was already WARN or
@@ -412,6 +476,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PAM service files are resolved through the vendor directories** (#201):
+  `/etc/pam.d`, then `/usr/lib/pam.d`, first hit wins, configurable with
+  `[pam] config_dirs`. On a current Arch install polkit ships its stack at
+  `/usr/lib/pam.d/polkit-1` and `/etc/pam.d/polkit-1` does not exist, so
+  `setup --pam --service polkit-1` failed with "service file not found" and
+  Omarchy's setup aborted before the lock screen's own service got its line.
+  A vendor directory is never written: a vendor-only service is copied to
+  `/etc/pam.d/<service>` with a provenance header and the facelock line in one
+  atomic write, the operator is told the copy now shadows the vendor file, and
+  the new `action` words `overridden` and `vendor-only` say which happened;
+  `pam remove` on a vendor-only service is a no-op exit 0. Every write the
+  module makes (the edit, the copy and the backup) goes through one
+  temp-file-fsync-rename primitive that carries mode, owner and the SELinux
+  label (POSIX ACLs and other xattrs are not carried; written down). The
+  symlink rule is restated per directory (a vendor file symlinked into
+  `/etc/pam.d` is refused), the hard-link check now also covers the target of
+  an in-directory symlink, and a stat error other than "not found" no longer
+  falls through to a later directory. `PamFileNotFound` names every path tried;
+  the wizard's PAM menu offers `polkit-1` exactly when `pam add` can configure
+  it. Direct service-file editing is the Arch-family path; Debian
+  (`pam-auth-update`) and Fedora (`authselect`) are out of scope and say so.
+- **The PAM module is probed at `/lib/security`, `/usr/lib/security` and
+  `/usr/lib64/security`** (#201, #170): one read-only list shared with the
+  health probe, first hit wins, and the refusal names every candidate. The
+  single hardcoded `/lib/security/pam_facelock.so` refused every service on
+  Fedora, where this repo's own spec file installs to `/usr/lib64/security`.
+  `pam status --json` gains a top-level `module_path` (`null` when nothing was
+  found).
 - **`pam add` refused to install when stderr was redirected** (#194): the
   per-file confirmation tested stdin, but `dialoguer` draws *and* reads the
   prompt on stderr, so `sudo facelock pam add --service sudo 2>install.log` had
