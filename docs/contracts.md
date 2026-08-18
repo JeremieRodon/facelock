@@ -50,7 +50,7 @@ follow it.
 
 | Command | Purpose |
 |---------|---------|
-| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, daemon, enrollment, PAM — the daemon before enrollment, so enrollment and the recognition test run on the transport later authentications use); creates the `facelock` system group if missing (packaging parity — it grants nothing on the auth path, ADR 010) |
+| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, daemon, enrollment, PAM — the daemon before enrollment, so enrollment and the recognition test run on the transport later authentications use); removes a leftover `facelock` group from an older install, best-effort (ADR 010) |
 | `facelock setup --systemd` | Install/enable systemd units |
 | `facelock setup --pam` | Alias onto `facelock pam add\|remove` (see "facelock pam" below). Kept, and kept parsing, for every wrapper written against it |
 | `facelock pam add` | Add the facelock line to one or more `/etc/pam.d/<service>` files. Root |
@@ -58,7 +58,7 @@ follow it.
 | `facelock pam status` | Report whether services carry the line. Reads only, **no root** — the probe to branch on instead of grepping `/etc/pam.d` |
 | `facelock setup` choice flags | `--camera <PATH\|auto>`, `--models <standard\|balanced\|high>`, `--execution-provider <cpu\|cuda\|rocm\|openvino\|auto>`, `--encryption <tpm\|keyfile\|none\|auto>`. Precedence: CLI flag > config file > built-in default |
 | `facelock setup` action opt-outs | `--no-pam`, `--no-systemd`, `--no-enroll` decline an action outright (and their `--pam`/`--systemd`/`--enroll` counterparts force it). Later flag wins |
-| `facelock is-enrolled` | Report whether face auth is operational for a user. Exit code is the contract; no daemon activation, no camera, no group membership: it opens the caller's own `0600` marker under `0711` directories (ADR 010) |
+| `facelock is-enrolled` | Report whether face auth is operational for a user. Exit code is the contract; no daemon activation, no camera, no group: it opens the caller's own `0600` marker under `0711` directories (ADR 010) |
 | `facelock capabilities` | Report what this build can do: one capability name per line, or `--json` for `{"version", "capabilities"}`. Unprivileged, reads no config, activates no daemon. The feature probe to branch on instead of grepping `--help` |
 | `facelock enroll` | Capture and store a face |
 | `facelock test` | Test face recognition |
@@ -1129,8 +1129,7 @@ hint (`ipc_client::add_access_denied_hint`): root is required. Since almost
 every D-Bus method is root-only (see IPC Protocol below) and, under ADR 010,
 the bus admits a non-root caller to `Authenticate` alone, a denial from the
 daemon's `require_root` and a denial from the bus policy have the same fix.
-The hint never suggests joining the `facelock` group — the group grants no
-method calls.
+There is no group to join (ADR 010).
 
 ### facelock test Semantics (N11)
 
@@ -1306,9 +1305,8 @@ The state directory and `enrolled/` are `0711 root:root`: any local user may
 entry below is locked down in its own right — `0600 root:root` database and
 sidecars, `0600 <user>:<user>` markers — and `models/` is the one subtree that
 carries "other" read bits of its own, because its contents are public,
-SHA256-verified downloads. There is no group in the file contract: the
-`facelock` group owns nothing under `/var/lib/facelock` and reads nothing
-there that any other user cannot.
+SHA256-verified downloads. There is no group in the file contract: nothing
+under `/var/lib/facelock` is group-owned or group-readable (ADR 010).
 
 D-Bus is required for user-run screen lockers (hyprlock/swaylock) and the
 polkit agent — their PAM stack runs as the user, and nothing makes the `0600
@@ -1361,9 +1359,9 @@ Everything else in the table above is unchanged. For an existing install the
 on-disk change is a `chmod`/`chown` of those two directories — idempotent,
 applied by packaging (tmpfiles, install scriptlets) and re-applied by any root
 invocation of the binary (`ensure_state_layout` on daemon start, best-effort on
-the auth path). Existing `facelock` group memberships are left alone; they
-grant nothing on the auth path any more and may be removed with
-`sudo gpasswd -d <user> facelock`.
+the auth path). `sudo facelock setup`, `just install-files` and the package
+scriptlets remove a leftover `facelock` group best-effort; `sudo groupdel
+facelock` if it lingers.
 
 ### Audit Log Entries
 
@@ -1603,8 +1601,8 @@ hill-climbing oracle by construction rather than by redacting fields):
   The bus policy (`dbus/org.facelock.Daemon.conf`) grants root the whole
   interface and every local user exactly `Authenticate` (ADR 010) — so
   adding a root-only method needs no policy edit, and a future user-scoped
-  method needs one deliberately; the `facelock` group grants signal receipt
-  only. The per-method root/user-scoped decision is the in-daemon check on
+  method needs one deliberately; there is no group policy, and signals are
+  root-only. The per-method root/user-scoped decision is the in-daemon check on
   the caller UID from `GetConnectionUnixUser`, keyed by a table-driven scope
   (`authorize_method` in `facelock_daemon::server`) so a new method is
   root-only by default until deliberately opened up.
@@ -1643,8 +1641,7 @@ to the next auth mechanism (password), never a lockout.
   intentionally carries **no similarity score** (the raw biometric score is
   an information leak / spoof-tuning oracle). The system bus policy
   (`dbus/org.facelock.Daemon.conf`) denies signal reception from the daemon
-  by default; only root and members of the `facelock` group may receive it —
-  signal receipt is the group's only grant (ADR 010).
+  by default; only root may receive it (ADR 010: no group policy).
 
 ### Response types
 `AuthResult`, `Enrolled`, `Models`, `Removed`, `Frame`, `DetectFrame`, `Devices`, `Ok`, `Error`

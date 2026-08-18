@@ -60,9 +60,6 @@ pub enum SetupMessage {
     SystemdStepFailed {
         error: String,
     },
-    GroupStepFailed {
-        error: String,
-    },
     PamStepFailed {
         error: String,
     },
@@ -263,12 +260,6 @@ impl Message for SetupMessage {
                 ),
                 &[("error", error.clone())],
             ),
-            GroupStepFailed { error } => fill(
-                translate(
-                    "  Could not create the 'facelock' system group: {error}\n  Create it manually: sudo groupadd -r facelock",
-                ),
-                &[("error", error.clone())],
-            ),
             PamStepFailed { error } => fill(
                 translate(
                     "  PAM setup failed: {error}\n  You can configure PAM later with: sudo facelock setup --pam",
@@ -409,7 +400,7 @@ impl Message for SetupMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SetupMessage {
-    const VARIANT_COUNT: usize = 71;
+    const VARIANT_COUNT: usize = 70;
 
     fn samples() -> Vec<Self> {
         use SetupMessage::*;
@@ -444,7 +435,6 @@ impl super::Samples for SetupMessage {
             EnrollStepFailed { error: s("e") },
             TestStepFailed { error: s("e") },
             SystemdStepFailed { error: s("e") },
-            GroupStepFailed { error: s("e") },
             PamStepFailed { error: s("e") },
             ConfirmEnrollNow,
             EnrollSkipped,

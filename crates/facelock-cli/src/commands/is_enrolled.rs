@@ -23,7 +23,7 @@
 //! [`crate::commands::enrollment_marker`] — never from the database, which is
 //! `0600 root:root`. The marker sits under two `0711 root:root` directories,
 //! so any local user can open its own `0600` marker by name (ADR 010): one
-//! `open(2)` answers the question with no group membership, no daemon and no
+//! `open(2)` answers the question with no group, no daemon and no
 //! camera. `EACCES` on that open (a hardened or foreign layout) is reported
 //! as not-enrolled rather than as an error — an indicator that fails to show
 //! is the safe way to be wrong.

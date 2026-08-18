@@ -1,10 +1,10 @@
-//! Wiring facelock into the system: the daemon unit and the `facelock` group.
+//! Wiring facelock into the system: the daemon unit and legacy group cleanup.
 
 #[cfg(test)]
 use super::sample_text as s;
 use super::{Message, fill, translate};
 
-/// Daemon unit and `facelock` group setup.
+/// Daemon unit setup and legacy `facelock` group cleanup.
 ///
 /// Variant and field names are the machine vocabulary: [`Message::machine`]
 /// derives its event line from them.
@@ -22,8 +22,8 @@ pub enum SystemMessage {
     DaemonRunning,
     DaemonNotReady { seconds: u64 },
 
-    // -- the facelock system group --
-    CreatingFacelockGroup,
+    // -- the legacy facelock system group (ADR 010) --
+    RetiredFacelockGroup,
 
     // -- installing and removing the unit files --
     DisablingSystemdUnits,
@@ -61,7 +61,9 @@ impl Message for SystemMessage {
                 ),
                 &[("seconds", seconds.to_string())],
             ),
-            CreatingFacelockGroup => translate("  Creating 'facelock' system group..."),
+            RetiredFacelockGroup => {
+                translate("  Removed the legacy 'facelock' group; face unlock no longer uses it.")
+            }
             DisablingSystemdUnits => translate("Disabling facelock-daemon systemd units..."),
             SystemdUnitsDisabled => translate("facelock-daemon service disabled and stopped."),
             InstallingSystemdUnits => {
@@ -105,7 +107,7 @@ impl super::Samples for SystemMessage {
             DaemonRestarted,
             DaemonRunning,
             DaemonNotReady { seconds: 20 },
-            CreatingFacelockGroup,
+            RetiredFacelockGroup,
             DisablingSystemdUnits,
             SystemdUnitsDisabled,
             InstallingSystemdUnits,
