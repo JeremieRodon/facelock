@@ -34,10 +34,13 @@ pub enum DeviceMessage {
     DetectedProvider { detail: String },
 
     // The three warnings below reach `Terminal::info`, so `--quiet` suppresses
-    // them. Deliberate: they have always gone to stdout, and routing them to
-    // `error` to make them unsuppressible would move them to stderr, breaking
-    // both the byte-identity pins and any script reading setup's stdout.
-    // Stream fidelity won; do not "fix" these into `error`.
+    // them. Deliberate, and re-decided when `Terminal::notice` arrived —
+    // `notice` would keep them on stdout *and* make them unsuppressible, which
+    // is what `EncryptionDisabledWarning` needed. These do not: they are
+    // advisory, nothing is gated on them, and no prompt is waiting on their
+    // context. A `notice` that did not have to be seen is just an unquietable
+    // one. `error` is wrong for a third reason — it would move them to stderr,
+    // breaking the byte-identity pins and any script reading setup's stdout.
     ProviderQueryFailed { error: String },
     NvidiaDriverMissing,
     CudaRuntimeMissing,

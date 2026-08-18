@@ -54,6 +54,34 @@
 //! A service name is **one path component** ([`confined`]), rejected before
 //! any I/O on every verb. `base.join(service)` is not a confinement
 //! primitive: an absolute `service` *replaces* `base` outright.
+//!
+//! A well-formed name still has to survive the *filesystem*: on an authselect
+//! system `/etc/pam.d/system-auth` and `/etc/pam.d/password-auth` are symlinks
+//! into `/etc/authselect`, and `read`/`copy`/`write` follow a symlink without
+//! being asked to. Editing through one writes a file authselect regenerates,
+//! and drops the `.facelock-backup` beside the *link* rather than beside the
+//! file that changed. So [`resolve_service_path`] stats the entry with
+//! `symlink_metadata` and, when it is a link, canonicalizes it: a target under
+//! `base` is followed (the real file is read, rewritten and backed up), and a
+//! target anywhere else — or one that cannot be resolved at all — is a
+//! validation failure, so the two-phase rule applies and nothing is written
+//! for the whole run. A *hard* link is refused outright: `nlink > 1` says the
+//! inode has another name and does not say where, which is the one question
+//! confinement exists to answer.
+//!
+//! Because a link inside `base` **is** followed, the sensitive gate runs twice
+//! — on the name as typed and on the file it resolved to ([`gate_sensitive`]).
+//! Otherwise `alias -> system-auth` is an ungated name for a gated file.
+//!
+//! # Limits
+//!
+//! The write is `fs::write`: truncate in place, not a temp file and a rename,
+//! so a kill between the truncate and the last byte leaves a short service
+//! file. `remove` takes no backup of its own and relies on the one `add`
+//! wrote. Both are stated in `docs/contracts.md` ("facelock pam Semantics",
+//! Limits) rather than fixed here, because an atomic replace has to carry the
+//! mode, owner and SELinux context across, which is the same primitive the
+//! vendor-to-`/etc` copy needs; see the `TODO(P1)` markers below.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -77,9 +105,38 @@ pub const PAM_MODULE_PATH: &str = "/lib/security/pam_facelock.so";
 
 /// Services whose stacks can lock the machine, or the network, out. Adding
 /// face auth here needs `--allow-sensitive` (`--yes` on the `setup` alias);
-/// **removing** it needs no gate, because removal can only take away a way to
-/// authenticate.
-pub const SENSITIVE_SERVICES: &[&str] = &["system-auth", "login", "sshd"];
+/// **removing** it needs no gate on sensitivity, because removal can only take
+/// away a way to authenticate — the confinement rules still apply to it, and
+/// to `status`, like any other verb.
+///
+/// Six of the eight are *shared stacks* — files other service files `include`,
+/// so an edit here reaches `su`, `passwd`, `chsh` and the display manager at
+/// once — and which name a distribution uses is the only difference between
+/// them: `system-auth` and `password-auth` on Fedora/RHEL and Arch,
+/// `system-auth-ac` and `password-auth-ac` where RHEL's older `authconfig`
+/// wrote the real file and left the unsuffixed name pointing at it,
+/// `common-auth` on Debian and Ubuntu, `system-login` on Arch. Gating only the
+/// Arch spelling made the gate a coin flip on the operator's distro. `login`
+/// (TTY login) and `sshd` (the network path) are the two that lock you out of
+/// a specific door rather than all of them.
+///
+/// The list is matched against the name as typed **and** against the file that
+/// name resolves to ([`gate_sensitive`]), because a symlink inside the
+/// directory is otherwise an ungated name for a gated file — which is exactly
+/// the shape `authconfig` leaves behind.
+///
+/// Every name here is also in each packager's `FACELOCK_PAM_SERVICES`, pinned
+/// by a test, so an uninstall strips a line this gate let through.
+pub const SENSITIVE_SERVICES: &[&str] = &[
+    "common-auth",
+    "login",
+    "password-auth",
+    "password-auth-ac",
+    "sshd",
+    "system-auth",
+    "system-auth-ac",
+    "system-login",
+];
 
 /// The service a bare `pam add` / `setup --pam` means.
 pub const DEFAULT_PAM_SERVICE: &str = "sudo";
@@ -98,6 +155,17 @@ const BACKUP_SUFFIX: &str = ".facelock-backup";
 /// change with the operator's locale. The human still gets the localized
 /// message, on stderr.
 const INVALID_SERVICE_NAME: &str = "invalid service name";
+
+/// The `--json` `error` value for a service file that is a symlink leading out
+/// of [`PAM_DIR`]. Fixed C-locale text for the same reason as
+/// [`INVALID_SERVICE_NAME`]; the human gets the localized message, which names
+/// the target, on stderr. It spells the real directory rather than the `base`
+/// under test because it is a documented constant, not a rendering.
+const SYMLINKED_OUT_OF_DIR: &str = "symlinked outside /etc/pam.d";
+
+/// The `--json` `error` value for a service file with more than one name.
+/// Fixed C-locale text, as above.
+const HARD_LINKED: &str = "hard-linked service file";
 
 // ---------------------------------------------------------------------------
 // Exit codes
@@ -156,6 +224,10 @@ pub struct PamRequest {
     /// [`DEFAULT_PAM_SERVICE`].
     pub services: Vec<String>,
     /// Suppress prompts. **Never** unlocks [`SENSITIVE_SERVICES`].
+    ///
+    /// `--json` implies it (the conversion in the binary's `args.rs` sets it):
+    /// a prompt on stderr in front of a document a `jq` pipeline is waiting
+    /// for is a hang, and the machine caller is by definition unattended.
     pub no_confirm: bool,
     /// Accept the risk of editing a [`SENSITIVE_SERVICES`] entry.
     pub allow_sensitive: bool,
@@ -233,7 +305,10 @@ impl Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceReport {
     service: String,
-    path: String,
+    /// The file this row is about, or `None` when the *name* was rejected and
+    /// no path was ever resolved. Reporting `/etc/pam.d/../escape` there named
+    /// a path nothing went near, which reads as a path that was acted on.
+    path: Option<String>,
     outcome: Outcome,
     /// The `.facelock-backup` path, when one exists on disk after the
     /// operation. `null` otherwise — including for every `--dry-run` service,
@@ -285,8 +360,16 @@ impl Target {
 
     /// The backup path if it exists on disk, for the report's `backup` field.
     fn existing_backup(&self) -> Option<String> {
-        self.backup.exists().then(|| self.backup_string())
+        existing_backup_for(&self.path)
     }
+}
+
+/// The `.facelock-backup` beside `path`, if one is on disk. Both report paths
+/// derive the field the same way, so they cannot disagree about what `backup`
+/// means.
+fn existing_backup_for(path: &Path) -> Option<String> {
+    let backup = backup_path(path);
+    backup.exists().then(|| backup.display().to_string())
 }
 
 /// A PAM service name is **one path component** under [`PAM_DIR`].
@@ -311,6 +394,152 @@ fn confined(service: &str) -> anyhow::Result<()> {
     Err(fail(PamMessage::PamInvalidServiceName {
         service: service.to_string(),
     }))
+}
+
+/// A link this refuses to write through.
+///
+/// Both phases reject the same two shapes and report them differently —
+/// [`plan_writes`] as an `Err` that stops the whole run, [`status_reports`] as
+/// an `unknown` row beside the services it could answer about — so the reason
+/// is a value here rather than a rendered message at each site. Everything
+/// that differs between the two (the fixed machine reason, the localized text,
+/// the row's `path` and `backup`) hangs off it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkFault {
+    /// A symlink whose target is outside `base`, or one that cannot be
+    /// resolved to prove otherwise.
+    OutOfBase { link: PathBuf, target: PathBuf },
+    /// A regular file reachable by more than one name. Which other names is
+    /// exactly what a link count does not say, so the edit cannot be shown to
+    /// stay inside the directory.
+    HardLinked { link: PathBuf, links: u64 },
+}
+
+impl LinkFault {
+    /// The `--json` `error` value: fixed C-locale text, never the localized
+    /// message. See [`INVALID_SERVICE_NAME`].
+    fn reason(&self) -> &'static str {
+        match self {
+            LinkFault::OutOfBase { .. } => SYMLINKED_OUT_OF_DIR,
+            LinkFault::HardLinked { .. } => HARD_LINKED,
+        }
+    }
+
+    /// The localized refusal, for a human on stderr.
+    fn message(&self, base: &Path) -> PamMessage {
+        match self {
+            LinkFault::OutOfBase { link, target } => PamMessage::PamServiceSymlinkedOutside {
+                path: link.display().to_string(),
+                target: target.display().to_string(),
+                dir: base.display().to_string(),
+            },
+            LinkFault::HardLinked { link, links } => PamMessage::PamServiceHardLinked {
+                path: link.display().to_string(),
+                links: links.to_string(),
+            },
+        }
+    }
+
+    /// The entry this is about: a real, confined path that was `lstat`ed, so
+    /// unlike a rejected *name* it is worth reporting.
+    fn link(&self) -> &Path {
+        match self {
+            LinkFault::OutOfBase { link, .. } | LinkFault::HardLinked { link, .. } => link,
+        }
+    }
+}
+
+/// The file a validated `service` names under `base`, or the reason it cannot
+/// be written through.
+///
+/// `confined` checks the *name*; this checks what the filesystem does with it,
+/// and there are two ways for a well-formed name to reach a file this cannot
+/// account for.
+///
+/// **Symlinks.** `read_to_string`, `fs::copy` and `fs::write` all follow one,
+/// so on an authselect system `/etc/pam.d/system-auth -> /etc/authselect/…`
+/// would be edited in place — a file authselect regenerates, with the backup
+/// left beside the link rather than beside the file that changed. A link that
+/// stays under `base` is followed on purpose: `base.join(service)` and its
+/// target are the same file, and the operator asked about that file; the
+/// resolved path is what gets read, written and backed up, so the backup lands
+/// beside the real file. A link that cannot be resolved at all — dangling,
+/// looping, or any other resolve error — is a fault too: the rule is "prove it
+/// stays inside", and an unresolvable link proves nothing. That is why
+/// `--if-present` does not forgive one; absence is a fact, and this is the
+/// absence of an answer.
+///
+/// **Hard links.** A symlink can be followed to somewhere and checked. A
+/// second *hard* link cannot: `nlink > 1` says another name for this inode
+/// exists and says nothing about where, so an edit here silently changes a
+/// file this cannot name — the confinement rule's whole subject. Refusing is
+/// the conservative reading, and it is temporary: the atomic temp-and-rename
+/// replace under "Limits" writes a new inode and leaves the other name alone,
+/// which makes the question moot. A `/etc` that has been through a
+/// deduplicating backup or `jdupes -L` can trip this without any adversary
+/// involved, so the message says how to break the link.
+fn resolve_service_path(base: &Path, service: &str) -> Result<PathBuf, LinkFault> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path = base.join(service);
+    // No entry, or an entry this cannot stat: there is nothing to follow. The
+    // read that follows reports the error, or `--if-present` forgives it.
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Ok(path);
+    };
+
+    if !metadata.file_type().is_symlink() {
+        // `is_file` matters: a directory's link count is its subdirectory
+        // count, and a directory where a service file should be is a read
+        // error reported as one, not a link fault.
+        if metadata.is_file() && metadata.nlink() > 1 {
+            return Err(LinkFault::HardLinked {
+                link: path,
+                links: metadata.nlink(),
+            });
+        }
+        return Ok(path);
+    }
+
+    match (fs::canonicalize(&path), fs::canonicalize(base)) {
+        (Ok(target), Ok(root)) if target.starts_with(&root) => Ok(target),
+        (Ok(target), _) => Err(LinkFault::OutOfBase { link: path, target }),
+        (Err(_), _) => Err(LinkFault::OutOfBase {
+            target: fs::read_link(&path).unwrap_or_else(|_| path.clone()),
+            link: path,
+        }),
+    }
+}
+
+/// Refuse a [`SENSITIVE_SERVICES`] entry unless the caller accepted the risk.
+///
+/// Called twice per service, on the name as typed and again on the file that
+/// name resolved to: the gate protects the *file*, and a symlink
+/// `alias -> system-auth` inside `/etc/pam.d` is a way to reach a gated file
+/// under a name the first check waves through. Only `add` is gated —
+/// see [`SENSITIVE_SERVICES`].
+fn gate_sensitive(
+    service: &str,
+    action: PamAction,
+    allow_sensitive: bool,
+    remedy: &str,
+) -> anyhow::Result<()> {
+    if action != PamAction::Add || allow_sensitive || !SENSITIVE_SERVICES.contains(&service) {
+        return Ok(());
+    }
+    Err(fail(PamMessage::PamSensitiveRefused {
+        service: service.to_string(),
+        remedy: remedy.to_string(),
+    }))
+}
+
+/// The last component of a resolved path, for the gate to test. A path with no
+/// final component cannot be a service file, and the empty string is in no
+/// list, so it falls through to the read that reports it.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Requested services, defaulted and de-duplicated, in the order given.
@@ -348,18 +577,21 @@ fn plan_writes(
 
     for service in services {
         confined(service)?;
+        // On the name as typed, before any I/O.
+        gate_sensitive(service, action, request.allow_sensitive, sensitive_remedy)?;
 
-        if action == PamAction::Add
-            && SENSITIVE_SERVICES.contains(&service.as_str())
-            && !request.allow_sensitive
-        {
-            return Err(fail(PamMessage::PamSensitiveRefused {
-                service: service.clone(),
-                remedy: sensitive_remedy.to_string(),
-            }));
-        }
+        let path =
+            resolve_service_path(base, service).map_err(|fault| fail(fault.message(base)))?;
+        // ...and again on the file the name reached. A link `alias ->
+        // system-auth` inside the directory is a gated file behind an ungated
+        // name, and the gate is on the file.
+        gate_sensitive(
+            &file_name_of(&path),
+            action,
+            request.allow_sensitive,
+            sensitive_remedy,
+        )?;
 
-        let path = base.join(service);
         let backup = backup_path(&path);
         let display = path.display().to_string();
 
@@ -475,6 +707,26 @@ fn with_line_removed(content: &str) -> String {
 // Output routing
 // ---------------------------------------------------------------------------
 
+/// Which seam sink one line of this command's human text goes to.
+///
+/// Named rather than decided inline because two of this module's lines must
+/// survive `--quiet`, and "which stream, suppressible or not" is then a rule
+/// worth pinning with a test instead of re-reading `apply_add` for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// `Terminal::info` — stdout, silenced by `--quiet`. Ordinary progress.
+    Info,
+    /// `Terminal::notice` — stdout, which `--quiet` does not reach. For the
+    /// lines an operator needs *and* that have to stay on stdout to keep the
+    /// bytes a normal run prints byte-identical.
+    Notice,
+    /// `Terminal::error` — stderr, never silenced.
+    Error,
+    /// Nothing is printed: `--json` replaces the human rendering, and the
+    /// document carries the same fact in a field.
+    Dropped,
+}
+
 /// Where this invocation's human text goes.
 ///
 /// `--json` replaces the human rendering of the payload, so [`Sink::info`] is
@@ -482,7 +734,8 @@ fn with_line_removed(content: &str) -> String {
 /// stderr is everything else (contracts.md, "CLI Output Streams"), so a
 /// diagnostic belongs on stderr whether or not a JSON document is being
 /// written to stdout. `--quiet` is handled one layer down, by the message
-/// seam, which silences `Terminal::info` and never `Terminal::error`.
+/// seam, which silences `Terminal::info`, and never `Terminal::error` or
+/// `Terminal::notice`.
 #[derive(Clone, Copy)]
 struct Sink {
     json: bool,
@@ -490,14 +743,97 @@ struct Sink {
 
 impl Sink {
     fn info(&self, msg: &dyn Message) {
-        if !self.json {
-            Terminal.info(msg);
+        self.emit(self.info_route(), msg);
+    }
+
+    /// Ordinary progress: stdout, and `--quiet` may have it. `--json` replaces
+    /// the human rendering wholesale, so under it there is nothing to print.
+    fn info_route(&self) -> Route {
+        if self.json {
+            Route::Dropped
+        } else {
+            Route::Info
         }
     }
 
     fn error(&self, msg: &dyn Message) {
-        Terminal.error(msg);
+        self.emit(Route::Error, msg);
     }
+
+    /// The context a per-file confirmation needs to be answerable.
+    ///
+    /// It is `info` when nothing is being asked — nobody is waiting on it, so
+    /// `--quiet` may have it. When the question *will* be asked it has to be
+    /// seen, so it goes to the sink that `--quiet` cannot reach, on the stream
+    /// the prompt is on: see [`preview_route`].
+    fn preview(&self, msg: &dyn Message, prompting: bool) {
+        self.emit(preview_route(self.json, prompting), msg);
+    }
+
+    /// A line that must be seen and must stay on stdout — the rollback
+    /// instructions. Dropped under `--json`, where the document's `backup`
+    /// field is the same fact in machine form.
+    fn notice(&self, msg: &dyn Message) {
+        self.emit(self.notice_route(), msg);
+    }
+
+    /// Split out from [`Sink::notice`] so the rule is assertable without
+    /// capturing stdout, the way [`preview_route`] is.
+    fn notice_route(&self) -> Route {
+        if self.json {
+            Route::Dropped
+        } else {
+            Route::Notice
+        }
+    }
+
+    fn emit(&self, route: Route, msg: &dyn Message) {
+        match route {
+            Route::Info => Terminal.info(msg),
+            Route::Notice => Terminal.notice(msg),
+            Route::Error => Terminal.error(msg),
+            Route::Dropped => {}
+        }
+    }
+}
+
+/// Where the pre-confirmation preview goes, as a pure function of the two
+/// facts that decide it.
+///
+/// The preview says which file is about to change, what line goes in and where
+/// the backup lands; a "Proceed?" with that suppressed is a question with no
+/// subject. So when the prompt will be asked it is never `Info`:
+///
+/// - human mode → `Notice`, which prints the same bytes on the same stream a
+///   normal run always printed, and keeps printing them under `--quiet`;
+/// - `--json` → `Error`, because stdout is holding a document a parser is
+///   reading and the prompt itself is on stderr, so that is where its context
+///   belongs. Unreachable from the CLI, where `--json` implies `--no-confirm`;
+///   the engine takes plain data, so a library caller can still get here.
+fn preview_route(json: bool, prompting: bool) -> Route {
+    match (json, prompting) {
+        (false, false) => Route::Info,
+        (false, true) => Route::Notice,
+        (true, false) => Route::Dropped,
+        (true, true) => Route::Error,
+    }
+}
+
+/// Whether the per-file confirmation can be asked at all.
+///
+/// **Both streams, not just stdin.** dialoguer's `Confirm` reads *and* draws
+/// through `Term::stderr()`, so `sudo facelock pam add --service sudo
+/// 2>install.log` — stdin a TTY, stderr a file — made `interact()` fail with
+/// "not a terminal", which the writer reported as `failed` having written
+/// nothing. Redirecting a log is not a reason to refuse to install.
+///
+/// Proceeding is the answer a closed stdin has always got, and it is what
+/// makes `setup --pam` work from a provisioning script: the prompt defaults to
+/// yes, so skipping it changes whether you are asked, not the outcome. The
+/// sensitive-service gate is decided in the validation phase, before any
+/// prompt exists, so nothing here can unlock it.
+fn should_prompt(no_confirm: bool, stdin_is_tty: bool, stderr_is_tty: bool) -> bool {
+    !no_confirm && stdin_is_tty && stderr_is_tty
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +866,14 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
     };
     let backup = target.backup_string();
 
+    // Decided before the preview is printed, because it decides where the
+    // preview goes: a question that will be asked needs its context seen.
+    let prompting = should_prompt(
+        no_confirm,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    );
+
     // The insertion point is decided before prompting, so the preview is
     // accurate rather than a guess the write could contradict.
     let hint = if at_top {
@@ -537,17 +881,17 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
     } else {
         PamMessage::PamInsertBeforeAuthHint
     };
-    sink.info(&PamMessage::PamModifyPreview {
-        path: path.clone(),
-        line: PAM_LINE.to_string(),
-        hint: hint.localized(),
-        backup: backup.clone(),
-    });
+    sink.preview(
+        &PamMessage::PamModifyPreview {
+            path: path.clone(),
+            line: PAM_LINE.to_string(),
+            hint: hint.localized(),
+            backup: backup.clone(),
+        },
+        prompting,
+    );
 
-    // A closed or piped stdin proceeds rather than hanging on a question
-    // nobody can answer. This predates the verb and is preserved deliberately:
-    // it is what makes `setup --pam` work from a provisioning script.
-    let proceed = if no_confirm || !std::io::stdin().is_terminal() {
+    let proceed = if !prompting {
         true
     } else {
         match Confirm::new()
@@ -573,11 +917,20 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
         backup: backup.clone(),
     });
 
+    // TODO(P1): truncate-in-place. A kill between the truncate and the last
+    // byte leaves a short service file; the fix is a temp file and a rename
+    // that carries mode, owner and SELinux context across, which is the same
+    // primitive the vendor-to-/etc copy needs. Documented under "Limits" in
+    // docs/contracts.md until then; the backup above is the recovery.
     if let Err(error) = fs::write(&target.path, with_line_inserted(content)) {
         return Outcome::Failed(format!("failed to write {path}: {error}"));
     }
 
-    sink.info(&PamMessage::PamInstalled {
+    // `notice`, not `info`: this is the one message that tells an operator who
+    // has just changed an auth stack how to undo it, so `--quiet` must not
+    // take it. Still stdout, so a normal run prints the same bytes it always
+    // did. Under `--json` the row's `backup` field carries the same fact.
+    sink.notice(&PamMessage::PamInstalled {
         path,
         backup,
         service: target.service.clone(),
@@ -605,6 +958,10 @@ fn apply_remove(target: &Target, sink: &Sink) -> Outcome {
             sink.info(&PamMessage::PamNoLineFound { path: path.clone() });
             Outcome::Unchanged
         }
+        // TODO(P1): truncate-in-place, and `remove` takes no backup of its
+        // own — it relies on the one `add` wrote. Both are stated under
+        // "Limits" in docs/contracts.md; the atomic replace is the same work
+        // as in `apply_add`.
         Plan::Remove { content } => match fs::write(&target.path, with_line_removed(content)) {
             Ok(()) => {
                 sink.info(&PamMessage::PamRemoved { path: path.clone() });
@@ -793,7 +1150,7 @@ fn write_in(base: &Path, request: &PamRequest) -> anyhow::Result<i32> {
 
         reports.push(ServiceReport {
             service: target.service.clone(),
-            path: target.path_string(),
+            path: Some(target.path_string()),
             outcome,
             backup: (!request.dry_run)
                 .then(|| target.existing_backup())
@@ -847,7 +1204,7 @@ fn status_in(base: &Path, request: &PamRequest) -> i32 {
 
     reports
         .iter()
-        .map(|report| status_code(&report.outcome))
+        .map(|report| status_code(&report.outcome, request.if_present))
         .max()
         .unwrap_or(STATUS_PRESENT)
 }
@@ -858,9 +1215,6 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
     services
         .iter()
         .map(|service| {
-            let path = base.join(service);
-            let display = path.display().to_string();
-
             // A rejected name is answered without touching the filesystem —
             // including the backup probe below, which would otherwise `stat`
             // `/etc/pam.d/../escape.facelock-backup` for a name the whole
@@ -876,11 +1230,31 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
                 });
                 return ServiceReport {
                     service: service.clone(),
-                    path: display,
+                    path: None,
                     outcome: Outcome::Unknown(INVALID_SERVICE_NAME.to_string()),
                     backup: None,
                 };
             }
+
+            let path = match resolve_service_path(base, service) {
+                Ok(path) => path,
+                // Read as `unknown`, the same word an unreadable file gets:
+                // the question "does this service carry the line?" has no
+                // answer this may go and look for. `path` is the entry — a
+                // real, confined path this did `lstat` — and its backup is
+                // probed, because a facelock version that wrote through the
+                // link left it there and it is what a recovery needs.
+                Err(fault) => {
+                    sink.error(&fault.message(base));
+                    return ServiceReport {
+                        service: service.clone(),
+                        path: Some(fault.link().display().to_string()),
+                        outcome: Outcome::Unknown(fault.reason().to_string()),
+                        backup: existing_backup_for(fault.link()),
+                    };
+                }
+            };
+            let display = path.display().to_string();
 
             let outcome = match fs::read_to_string(&path) {
                 Ok(content) if content.lines().any(is_facelock_pam_line) => {
@@ -910,12 +1284,11 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
                 }
             };
 
-            let backup = backup_path(&path);
             ServiceReport {
                 service: service.clone(),
-                path: display,
+                path: Some(display),
                 outcome,
-                backup: backup.exists().then(|| backup.display().to_string()),
+                backup: existing_backup_for(&path),
             }
         })
         .collect()
@@ -924,10 +1297,16 @@ fn status_reports(base: &Path, services: &[String], sink: &Sink) -> Vec<ServiceR
 /// `grep`'s scale, and `is-enrolled`'s. The worst outcome across the requested
 /// services wins, which is why this is a function of one outcome and the
 /// caller takes the max.
-fn status_code(outcome: &Outcome) -> i32 {
+fn status_code(outcome: &Outcome, if_present: bool) -> i32 {
     match outcome {
         Outcome::Present => STATUS_PRESENT,
         Outcome::Missing => STATUS_MISSING,
+        // `--if-present` means the same thing here as on `add` and `remove`:
+        // a service file that is not installed is not an error, so the row is
+        // still reported and the exit code is decided by the services that do
+        // exist. It converts *absence* and nothing else — an unreadable file
+        // or a rejected name is still exit 2.
+        Outcome::Absent if if_present => STATUS_PRESENT,
         _ => STATUS_ERROR,
     }
 }
@@ -1528,7 +1907,7 @@ mod tests {
     fn json_document_shape_is_the_contract() {
         let reports = [ServiceReport {
             service: "sudo".into(),
-            path: "/etc/pam.d/sudo".into(),
+            path: Some("/etc/pam.d/sudo".into()),
             outcome: Outcome::Installed,
             backup: Some("/etc/pam.d/sudo.facelock-backup".into()),
         }];
@@ -1552,13 +1931,13 @@ mod tests {
         let reports = [
             ServiceReport {
                 service: "sudo".into(),
-                path: "/etc/pam.d/sudo".into(),
+                path: Some("/etc/pam.d/sudo".into()),
                 outcome: Outcome::Failed("disk full".into()),
                 backup: None,
             },
             ServiceReport {
                 service: "polkit-1".into(),
-                path: "/etc/pam.d/polkit-1".into(),
+                path: Some("/etc/pam.d/polkit-1".into()),
                 outcome: Outcome::Unchanged,
                 backup: None,
             },
@@ -1607,7 +1986,7 @@ mod tests {
     fn json_escapes_a_service_name_containing_a_quote() {
         let reports = [ServiceReport {
             service: "a\"b".into(),
-            path: "/etc/pam.d/a\"b".into(),
+            path: Some("/etc/pam.d/a\"b".into()),
             outcome: Outcome::Missing,
             backup: None,
         }];
@@ -1671,12 +2050,404 @@ mod tests {
         assert!(!is_facelock_pam_line("auth include system-login"));
     }
 
+    /// The shared auth stacks of every distribution this runs on, plus the two
+    /// single doors. Gating only Arch's spelling of the shared stack made the
+    /// gate a function of the operator's distribution, which is not a security
+    /// boundary.
     #[test]
-    fn sensitive_services_are_the_three_that_can_lock_you_out() {
-        assert!(SENSITIVE_SERVICES.contains(&"system-auth"));
+    fn sensitive_services_cover_every_distributions_shared_stack() {
+        for shared in [
+            "system-auth",
+            "system-auth-ac",
+            "password-auth",
+            "password-auth-ac",
+            "common-auth",
+            "system-login",
+        ] {
+            assert!(
+                SENSITIVE_SERVICES.contains(&shared),
+                "{shared} is a shared auth stack and must be gated"
+            );
+        }
         assert!(SENSITIVE_SERVICES.contains(&"login"));
         assert!(SENSITIVE_SERVICES.contains(&"sshd"));
         assert!(!SENSITIVE_SERVICES.contains(&"sudo"));
+        assert!(!SENSITIVE_SERVICES.contains(&"polkit-1"));
+    }
+
+    // -- the confirmation guard ---------------------------------------------
+
+    /// dialoguer draws and reads the prompt through `Term::stderr()`, so a
+    /// redirected stderr makes it unanswerable even with stdin on a TTY —
+    /// which is what `sudo facelock pam add --service sudo 2>install.log` is,
+    /// and it used to report `failed` having written nothing.
+    #[test]
+    fn a_prompt_is_asked_only_when_both_streams_are_a_terminal() {
+        for (no_confirm, stdin_tty, stderr_tty, expected) in [
+            (false, true, true, true),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, false),
+            // `--no-confirm` answers before either stream is consulted.
+            (true, true, true, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, false),
+        ] {
+            assert_eq!(
+                should_prompt(no_confirm, stdin_tty, stderr_tty),
+                expected,
+                "no_confirm={no_confirm} stdin_tty={stdin_tty} stderr_tty={stderr_tty}"
+            );
+        }
+    }
+
+    /// Not being asked is not a licence to write into a gated service: the
+    /// gate is decided in phase one, before a prompt exists to skip.
+    #[test]
+    fn skipping_the_prompt_never_unlocks_the_gate() {
+        let dir = seeded(&[("system-auth", SUDO_BEFORE)]);
+        let before = snapshot(dir.path());
+
+        assert!(write_in(dir.path(), &add(&["system-auth"])).is_err());
+        assert_eq!(before, snapshot(dir.path()));
+    }
+
+    // -- what --quiet and --json may not silence -----------------------------
+
+    /// The preview names the file, the line and the backup path; a "Proceed?"
+    /// with that suppressed is a question with no subject. So whenever the
+    /// question will be asked it leaves the sink `--quiet` can reach.
+    #[test]
+    fn a_prompt_that_will_be_asked_keeps_its_context() {
+        // Nobody is being asked: ordinary progress, suppressible.
+        assert_eq!(preview_route(false, false), Route::Info);
+        assert_eq!(preview_route(true, false), Route::Dropped);
+
+        // Being asked: stdout in human mode (same bytes a normal run always
+        // printed, and `--quiet` does not reach `notice`), stderr under
+        // `--json`, where the prompt itself is and where stdout is holding a
+        // document.
+        assert_eq!(preview_route(false, true), Route::Notice);
+        assert_eq!(preview_route(true, true), Route::Error);
+    }
+
+    /// The rollback instructions are the one message that tells a locked-out
+    /// operator how to get back in. `--quiet` must not take them; `--json`
+    /// does, because the row's `backup` field is the same fact.
+    #[test]
+    fn the_rollback_advice_survives_quiet() {
+        // `notice` is the unsuppressible stdout sink — see
+        // `message::tests::quiet_silences_stdout_except_notice`, which pins
+        // that `--quiet` does not reach it.
+        assert_eq!(
+            Sink { json: false }.notice_route(),
+            Route::Notice,
+            "the rollback advice must not be silenceable by --quiet"
+        );
+        assert_eq!(Sink { json: true }.notice_route(), Route::Dropped);
+
+        let dir = seeded(&[("sudo", SUDO_BEFORE)]);
+        write_in(dir.path(), &add(&["sudo"])).unwrap();
+        // ...and the fact it carries is the one the JSON row carries.
+        assert_eq!(
+            read(&dir, "sudo.facelock-backup"),
+            SUDO_BEFORE,
+            "the backup the advice names has to be the original file"
+        );
+    }
+
+    // -- symlinked service files --------------------------------------------
+
+    /// The authselect shape: `/etc/pam.d/system-auth` is a symlink into
+    /// `/etc/authselect`. `read`/`copy`/`write` follow it, so without this the
+    /// writer edits a generated file — which authselect regenerates away —
+    /// and drops the backup beside the link rather than beside what changed.
+    #[test]
+    fn a_symlink_out_of_base_is_a_validation_failure() {
+        for action in [PamAction::Add, PamAction::Remove] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let base = dir.path().join("pam.d");
+            fs::create_dir(&base).unwrap();
+            let outside = dir.path().join("authselect-system-auth");
+            fs::write(&outside, OMARCHY_PRESENT).unwrap();
+            std::os::unix::fs::symlink(&outside, base.join("system-auth")).unwrap();
+
+            let request = PamRequest {
+                action,
+                services: vec!["system-auth".to_string()],
+                no_confirm: true,
+                allow_sensitive: true,
+                ..PamRequest::default()
+            };
+            let error = write_in(&base, &request).unwrap_err().to_string();
+
+            assert!(error.contains("it is a symlink to"), "got: {error}");
+            assert!(
+                error.contains(outside.to_str().unwrap()),
+                "the refusal must name the target: {error}"
+            );
+            assert_eq!(
+                fs::read_to_string(&outside).unwrap(),
+                OMARCHY_PRESENT,
+                "nothing outside the directory may be written"
+            );
+            assert!(
+                !backup_path(&outside).exists(),
+                "and nothing outside it may gain a backup"
+            );
+        }
+    }
+
+    /// `..` inside the *link* is the same escape as `..` inside the name, and
+    /// `confined` cannot see it: the name is one component either way.
+    #[test]
+    fn a_symlink_traversing_out_of_base_is_rejected_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("pam.d");
+        fs::create_dir(&base).unwrap();
+        fs::write(dir.path().join("shadow"), "root:!:1::::::\n").unwrap();
+        std::os::unix::fs::symlink("../shadow", base.join("sudo")).unwrap();
+
+        assert!(write_in(&base, &add(&["sudo"])).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("shadow")).unwrap(),
+            "root:!:1::::::\n"
+        );
+    }
+
+    /// A link that stays inside the directory is the operator's own alias for
+    /// a file they asked about, so it is followed — and the write and the
+    /// backup both land on the real file, not beside the link.
+    #[test]
+    fn a_symlink_inside_base_is_followed_to_the_real_file() {
+        let dir = seeded(&[("sudo", SUDO_BEFORE)]);
+        std::os::unix::fs::symlink("sudo", dir.path().join("sudo-alias")).unwrap();
+
+        assert_eq!(
+            write_in(dir.path(), &add(&["sudo-alias"])).unwrap(),
+            WRITE_OK
+        );
+
+        assert_eq!(read(&dir, "sudo"), SUDO_AFTER, "the real file is rewritten");
+        assert_eq!(read(&dir, "sudo.facelock-backup"), SUDO_BEFORE);
+        assert!(
+            !dir.path().join("sudo-alias.facelock-backup").exists(),
+            "the backup belongs beside the file that changed"
+        );
+        assert!(
+            dir.path().join("sudo-alias").is_symlink(),
+            "the link itself must not be replaced by a regular file"
+        );
+    }
+
+    /// A validation failure, so the two-phase rule covers it: a run naming a
+    /// good service and an escaping one writes nothing at all.
+    #[test]
+    fn a_symlink_rejection_writes_nothing_for_the_whole_run() {
+        let dir = seeded(&[("sudo", SUDO_BEFORE)]);
+        let outside = dir.path().parent().unwrap().join("facelock-escape-target");
+        fs::write(&outside, SUDO_BEFORE).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("polkit-1")).unwrap();
+        let before = snapshot(dir.path());
+
+        assert!(write_in(dir.path(), &add(&["sudo", "polkit-1"])).is_err());
+
+        assert_eq!(before, snapshot(dir.path()));
+        fs::remove_file(&outside).unwrap();
+    }
+
+    /// `status` has no all-or-nothing phase, so the same rejection is a row
+    /// rather than an `Err` — with a fixed C-locale reason, like a rejected
+    /// name, and exit 2.
+    #[test]
+    fn status_reports_an_escaping_symlink_as_unknown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("pam.d");
+        fs::create_dir(&base).unwrap();
+        let outside = dir.path().join("authselect-system-auth");
+        fs::write(&outside, OMARCHY_PRESENT).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("system-auth")).unwrap();
+
+        let sink = Sink { json: true };
+        let reports = status_reports(&base, &["system-auth".to_string()], &sink);
+
+        assert_eq!(
+            reports[0].outcome,
+            Outcome::Unknown(SYMLINKED_OUT_OF_DIR.to_string())
+        );
+        assert_eq!(SYMLINKED_OUT_OF_DIR, "symlinked outside /etc/pam.d");
+        // The link is a real, confined path this did `lstat`, unlike a
+        // rejected name — so it is reported rather than nulled.
+        assert_eq!(
+            reports[0].path,
+            Some(base.join("system-auth").display().to_string())
+        );
+        assert_eq!(
+            status_in(
+                &base,
+                &PamRequest {
+                    action: PamAction::Status,
+                    services: vec!["system-auth".to_string()],
+                    ..PamRequest::default()
+                }
+            ),
+            STATUS_ERROR
+        );
+    }
+
+    /// A second *hard* link cannot be followed and checked the way a symlink
+    /// can: the link count says another name exists and not where it is, so an
+    /// edit here changes a file this cannot name.
+    #[test]
+    fn a_hard_linked_service_file_is_a_validation_failure() {
+        for action in [PamAction::Add, PamAction::Remove] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let base = dir.path().join("pam.d");
+            fs::create_dir(&base).unwrap();
+            let outside = dir.path().join("second-name");
+            fs::write(&outside, OMARCHY_PRESENT).unwrap();
+            fs::hard_link(&outside, base.join("sudo")).unwrap();
+
+            let request = PamRequest {
+                action,
+                services: vec!["sudo".to_string()],
+                no_confirm: true,
+                ..PamRequest::default()
+            };
+            let error = write_in(&base, &request).unwrap_err().to_string();
+
+            assert!(error.contains("names for the same file"), "got: {error}");
+            assert_eq!(
+                fs::read_to_string(&outside).unwrap(),
+                OMARCHY_PRESENT,
+                "the file behind the other name must be untouched"
+            );
+            assert!(!backup_path(&base.join("sudo")).exists());
+        }
+    }
+
+    /// One name is the normal case and must stay quiet — the check is
+    /// `nlink > 1`, not "is a link".
+    #[test]
+    fn a_single_linked_service_file_is_untouched_by_the_rule() {
+        let dir = seeded(&[("sudo", SUDO_BEFORE)]);
+        assert_eq!(write_in(dir.path(), &add(&["sudo"])).unwrap(), WRITE_OK);
+        assert_eq!(read(&dir, "sudo"), SUDO_AFTER);
+    }
+
+    /// `status` answers with a row rather than an `Err`, with the fixed
+    /// C-locale reason and exit 2.
+    #[test]
+    fn status_reports_a_hard_linked_service_as_unknown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("pam.d");
+        fs::create_dir(&base).unwrap();
+        fs::write(dir.path().join("second-name"), OMARCHY_PRESENT).unwrap();
+        fs::hard_link(dir.path().join("second-name"), base.join("sudo")).unwrap();
+
+        let sink = Sink { json: true };
+        let reports = status_reports(&base, &["sudo".to_string()], &sink);
+
+        assert_eq!(
+            reports[0].outcome,
+            Outcome::Unknown(HARD_LINKED.to_string())
+        );
+        assert_eq!(HARD_LINKED, "hard-linked service file");
+        assert_eq!(
+            status_in(
+                &base,
+                &PamRequest {
+                    action: PamAction::Status,
+                    services: vec!["sudo".to_string()],
+                    ..PamRequest::default()
+                }
+            ),
+            STATUS_ERROR
+        );
+    }
+
+    // -- the gate follows the file, not the name -----------------------------
+
+    /// A symlink *inside* the directory is followed, so the name typed on the
+    /// command line is not the only way to reach a gated file. Without the
+    /// second check, `--service alias` installs into `system-auth` with no
+    /// `--allow-sensitive` anywhere in the invocation.
+    #[test]
+    fn the_sensitive_gate_follows_a_link_to_the_real_file() {
+        let make = || {
+            let dir = seeded(&[("system-auth", SUDO_BEFORE)]);
+            std::os::unix::fs::symlink("system-auth", dir.path().join("alias")).unwrap();
+            dir
+        };
+
+        let refused = make();
+        let before = snapshot(refused.path());
+        let error = write_in(refused.path(), &add(&["alias"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("Refusing to modify 'system-auth'"),
+            "the refusal names the file the link reaches: {error}"
+        );
+        assert!(error.contains("--allow-sensitive"), "got: {error}");
+        assert_eq!(before, snapshot(refused.path()), "and writes nothing");
+
+        // ...and the flag still unlocks it, through the link.
+        let allowed = make();
+        let request = PamRequest {
+            allow_sensitive: true,
+            ..add(&["alias"])
+        };
+        assert_eq!(write_in(allowed.path(), &request).unwrap(), WRITE_OK);
+        assert_eq!(read(&allowed, "system-auth"), SUDO_AFTER);
+    }
+
+    /// The gate is `add`-only and stays that way on the resolved file too:
+    /// unwiring a gated service must not need an argument about it.
+    #[test]
+    fn the_resolved_gate_does_not_reach_remove() {
+        let dir = seeded(&[("system-auth", OMARCHY_PRESENT)]);
+        std::os::unix::fs::symlink("system-auth", dir.path().join("alias")).unwrap();
+
+        assert_eq!(write_in(dir.path(), &remove(&["alias"])).unwrap(), WRITE_OK);
+        assert_eq!(read(&dir, "system-auth"), OMARCHY_REMOVED);
+    }
+
+    // -- status --if-present -------------------------------------------------
+
+    /// The pair that could not be written before: install the optional
+    /// integrations with `--if-present`, then verify with the same flag. Only
+    /// absence is converted — an unreadable file or a bad name is still 2.
+    #[test]
+    fn status_if_present_stops_an_absent_service_forcing_exit_2() {
+        let dir = seeded(&[
+            ("omarchy-lock-face", OMARCHY_PRESENT),
+            ("sudo", SUDO_BEFORE),
+        ]);
+        let status = |services: &[&str], if_present| {
+            status_in(
+                dir.path(),
+                &PamRequest {
+                    action: PamAction::Status,
+                    services: services.iter().map(|s| s.to_string()).collect(),
+                    if_present,
+                    ..PamRequest::default()
+                },
+            )
+        };
+
+        assert_eq!(status(&["not-a-service"], false), STATUS_ERROR);
+        assert_eq!(status(&["not-a-service"], true), STATUS_PRESENT);
+        // The services that do exist still decide the answer.
+        assert_eq!(
+            status(&["omarchy-lock-face", "not-a-service"], true),
+            STATUS_PRESENT
+        );
+        assert_eq!(status(&["sudo", "not-a-service"], true), STATUS_MISSING);
+        // ...and it converts absence only.
+        assert_eq!(status(&["../escape"], true), STATUS_ERROR);
     }
 
     /// `install_for_setup` edits `/etc/pam.d` and `run_with_plan` reaches it

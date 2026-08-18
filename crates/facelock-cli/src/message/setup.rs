@@ -141,13 +141,13 @@ pub enum SetupMessage {
     },
     EncryptionEnabledKeyfile,
 
-    /// The plaintext-storage warning. It reaches [`super::Terminal::info`],
-    /// so `--quiet` suppresses it — chosen knowingly: this text has always
-    /// gone to stdout, and moving it to `error` to make it unsuppressible
-    /// would relocate it to stderr and break the byte-identity pin. Nothing
-    /// is gated on it either way; `--encryption=none` is an explicit request,
-    /// and `enroll` still refuses to write plaintext embeddings unless
-    /// `security.allow_plaintext` is set. Do not "fix" this into `error`.
+    /// The plaintext-storage warning. It reaches [`super::Terminal::notice`]:
+    /// stdout, so the bytes are the ones this text has always printed, and
+    /// unsuppressible, so `--quiet` cannot turn "your biometric templates are
+    /// stored in the clear" into silence. `error` would make it unsuppressible
+    /// too, but by moving it to stderr, which is the change the byte-identity
+    /// pin refuses — `notice` exists precisely for that pair of requirements.
+    /// Do not "fix" this into `error`.
     EncryptionDisabledWarning,
     EncryptionAlreadyConfigured {
         method: String,
@@ -160,6 +160,11 @@ pub enum SetupMessage {
         path: String,
     },
     EncryptionEnabledKeyfileAuto,
+    /// Context for the "Delete orphaned models and continue?" confirmation,
+    /// and for the refusal that replaces it when setup is not interactive. On
+    /// [`super::Terminal::notice`] for that reason: a prompt whose subject
+    /// `--quiet` swallowed is unanswerable, and the answer here deletes face
+    /// models.
     OrphanModelsWarning {
         db_path: String,
     },

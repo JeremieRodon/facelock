@@ -247,8 +247,11 @@ pub trait Message: std::fmt::Debug {
 
 /// How much the stdout sinks say.
 ///
-/// **`--quiet` suppresses stdout; errors, prompts and exit codes are
-/// unchanged.** [`Terminal::error`] is never suppressed, so a quiet run that
+/// **`--quiet` suppresses informational stdout; errors, prompts and exit codes
+/// are unchanged.** "Informational" is the word that makes this true of
+/// [`Terminal::notice`], which is stdout and is *not* suppressed —
+/// see the sink table in this module's header for what each one does.
+/// [`Terminal::error`] is never suppressed either, so a quiet run that
 /// fails still says why on stderr and still exits non-zero. That is
 /// `is-enrolled --quiet`'s existing semantics (see
 /// [`crate::commands::is_enrolled`]) and it is the house rule for every

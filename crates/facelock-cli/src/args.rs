@@ -77,7 +77,7 @@ pub struct SetupCli {
     // prompt suppression would understate what the user is authorizing.
     // Spelling still cannot drift: `cli_flag_conformance` pins `-y` and the
     // `no-confirm` alias on every arg named `yes`, wherever it is declared.
-    /// Skip confirmation prompts, and unlock the system-auth/login/sshd gate (also: --no-confirm)
+    /// Skip confirmation prompts, and unlock the sensitive-service gate (also: --no-confirm)
     #[arg(short = 'y', long, alias = "no-confirm")]
     pub yes: bool,
 
@@ -195,16 +195,19 @@ pub struct PamServiceArg {
 pub enum PamCli {
     /// Add the facelock line to one or more /etc/pam.d service files
     #[command(after_help = "\
---yes/--no-confirm only skips the per-file confirmation. Editing the sensitive \
-services system-auth, login or sshd additionally requires --allow-sensitive; \
-neither flag implies the other. Every service is validated before any file is \
-written, so a rejected service leaves the rest untouched.")]
+--yes/--no-confirm only skips the per-file confirmation. Editing one of the \
+sensitive services common-auth, login, password-auth, password-auth-ac, sshd, \
+system-auth, system-auth-ac or system-login additionally requires \
+--allow-sensitive; neither flag implies the \
+other. --json implies --no-confirm, since a prompt would block the pipeline \
+reading the document. Every service is validated before any file is written, \
+so a rejected service leaves the rest untouched.")]
     Add {
         #[command(flatten)]
         service: PamServiceArg,
         #[command(flatten)]
         confirm: ConfirmArg,
-        /// Also permit the sensitive services: system-auth, login, sshd
+        /// Also permit the sensitive services: common-auth, login, password-auth, password-auth-ac, sshd, system-auth, system-auth-ac, system-login
         #[arg(long)]
         allow_sensitive: bool,
         /// Treat a missing service file as success instead of an error
@@ -236,10 +239,15 @@ only take away a way to authenticate, and the .facelock-backup file written by \
     /// Report whether services carry the facelock line (exit 0 = all do, 1 = one does not, 2 = error)
     #[command(after_help = "\
 Reads only; needs no root. This is the probe to branch on instead of grepping \
-/etc/pam.d yourself.")]
+/etc/pam.d yourself. --if-present has the same meaning it has on add and \
+remove, so `pam add --if-present` for optional integrations can be verified \
+with `pam status --if-present` rather than with exit 2.")]
     Status {
         #[command(flatten)]
         service: PamServiceArg,
+        /// Treat a missing service file as success instead of an error
+        #[arg(long = "if-present")]
+        if_present: bool,
         #[command(flatten)]
         json: JsonArg,
     },
@@ -258,7 +266,11 @@ impl From<PamCli> for PamRequest {
             } => PamRequest {
                 action: PamAction::Add,
                 services: service.service,
-                no_confirm: confirm.yes,
+                // `--json` implies `--no-confirm` and never `--allow-sensitive`:
+                // the prompt is on stderr while a parser waits on stdout, so
+                // asking is a hang, but the gate is an authorization and a
+                // machine caller has not given one.
+                no_confirm: confirm.yes || json.json,
                 allow_sensitive,
                 if_present,
                 dry_run: dry_run.dry_run,
@@ -273,15 +285,21 @@ impl From<PamCli> for PamRequest {
             } => PamRequest {
                 action: PamAction::Remove,
                 services: service.service,
-                no_confirm: confirm.yes,
+                // Symmetry with `add`; `remove` has nothing to suppress today.
+                no_confirm: confirm.yes || json.json,
                 allow_sensitive: false,
                 if_present,
                 dry_run: dry_run.dry_run,
                 json: json.json,
             },
-            PamCli::Status { service, json } => PamRequest {
+            PamCli::Status {
+                service,
+                if_present,
+                json,
+            } => PamRequest {
                 action: PamAction::Status,
                 services: service.service,
+                if_present,
                 json: json.json,
                 ..PamRequest::default()
             },

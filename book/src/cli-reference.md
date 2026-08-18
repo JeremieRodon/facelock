@@ -11,7 +11,7 @@ either side of the subcommand name — `facelock -c X daemon` and
 | Flag | Description |
 |------|-------------|
 | `-c`, `--config <PATH>` | Override the config file path. Takes precedence over `FACELOCK_CONFIG`. |
-| `-q`, `--quiet` | Suppress non-essential stdout; the exit code still reports the result. |
+| `-q`, `--quiet` | Suppress informational stdout; errors, prompts and exit codes are unchanged. |
 
 No subcommand re-declares either one. Flag spelling in general is pinned by the
 `cli_flag_conformance` test — see [Contracts](contracts.md), "CLI Flag
@@ -61,7 +61,7 @@ Actions are the steps that change the system: PAM, systemd, enrollment. `--no-pa
 | `--non-interactive` | No prompts. Choices resolve to config-or-default. Runs the base setup only: directories, model download and verification, encryption, group membership, path permissions. No PAM, no systemd, no enrollment unless asked for explicitly. |
 | `-y`, `--yes` (alias `--no-confirm`) | Suppress confirmation prompts, and unlock the sensitive-service gate. |
 
-`--non-interactive` suppresses the per-file "Proceed?" confirmation before a PAM edit on its own, since it promises no prompts. It deliberately does **not** unlock the sensitive-service gate: `system-auth`, `login` and `sshd` still require an explicit `--yes`, so `facelock setup --non-interactive --pam --service sshd` refuses until you add it. Locking yourself out of a machine should take two decisions, not one.
+`--non-interactive` suppresses the per-file "Proceed?" confirmation before a PAM edit on its own, since it promises no prompts. It deliberately does **not** unlock the sensitive-service gate: the shared auth stacks `common-auth`, `password-auth`, `password-auth-ac`, `system-auth`, `system-auth-ac` and `system-login`, plus `login` and `sshd`, still require an explicit `--yes`, so `facelock setup --non-interactive --pam --service sshd` refuses until you add it. Locking yourself out of a machine should take two decisions, not one.
 
 ### Choice flags
 
@@ -562,14 +562,16 @@ sudo facelock pam add --service sudo --json                  # machine-readable 
 |------|---------|
 | `--service <NAME>` | Service to act on; repeat for several (default: `sudo`). |
 | `-y`, `--yes` (alias `--no-confirm`) | Skip the per-file confirmation, and nothing else. |
-| `--allow-sensitive` | Also permit the gated services `system-auth`, `login`, `sshd`. |
+| `--allow-sensitive` | Also permit the gated services `common-auth`, `login`, `password-auth`, `password-auth-ac`, `sshd`, `system-auth`, `system-auth-ac`, `system-login`. |
 | `--if-present` | Treat a missing service file as success instead of an error. |
 | `--dry-run` | Print the resolved plan, write nothing, exit 0. |
-| `--json` | Emit one JSON document instead of human text. |
+| `--json` | Emit one JSON document instead of human text. Implies `--no-confirm`. |
 
 **`--yes` never implies `--allow-sensitive`.** They are separate authorizations: "do not ask me" and "yes, edit `system-auth`". Locking yourself out of a machine should take two decisions, not one.
 
-Every service is validated — name, existence, the sensitive gate, and what the edit would be — before **any** file is written, so a typo'd or gated service name leaves every other service untouched. With no TTY on stdin the per-file confirmation is skipped as if `--yes` were given, which is what has always made this work from a provisioning script; the gate is decided in the validation phase, before any prompt exists, so an unattended `pam add --service system-auth` still refuses.
+Every service is validated — name, existence, the sensitive gate, and what the edit would be — before **any** file is written, so a typo'd or gated service name leaves every other service untouched. The per-file confirmation is skipped as if `--yes` were given whenever it could not be answered — no TTY on stdin, no TTY on stderr (the prompt is drawn there, so `2>install.log` counts), or `--json` — which is what has always made this work from a provisioning script; the gate is decided in the validation phase, before any prompt exists, so an unattended `pam add --service system-auth` still refuses.
+
+A service file that is a symlink out of `/etc/pam.d` is refused rather than written through: on an authselect system `system-auth` and `password-auth` link into `/etc/authselect`, where the edit would be regenerated away. A link that stays inside the directory is followed — and the gate is applied to the file it reaches, so `--service alias` where `alias -> system-auth` still needs `--allow-sensitive` — with the backup written beside the real file. A file with more than one hard link is refused as well: a link count says another name for it exists and not where, so the edit cannot be shown to stay in the directory.
 
 `--dry-run` is honoured after the root check, so it still needs root. `pam status` is the unprivileged read to reach for instead.
 
@@ -590,9 +592,10 @@ Takes the same flags as `add` except `--allow-sensitive`, which it does not offe
 facelock pam status                                          # /etc/pam.d/sudo
 facelock pam status --service sudo --service polkit-1
 facelock pam status --service sudo --json
+facelock pam status --service hyprlock --if-present           # absent is not an error
 ```
 
-Unprivileged, and the probe to branch on instead of grepping `/etc/pam.d` yourself: it answers from the same file, without root, and reports "absent" and "unreadable" as themselves rather than as "not configured". It offers `--service` and `--json` and neither `--dry-run` nor `--allow-sensitive` — there is no write to preview or gate.
+Unprivileged, and the probe to branch on instead of grepping `/etc/pam.d` yourself: it answers from the same file, without root, and reports "absent" and "unreadable" as themselves rather than as "not configured". It offers `--service`, `--if-present` and `--json`, and neither `--dry-run` nor `--allow-sensitive` — there is no write to preview or gate.
 
 The exit code is the answer, on the same 0/1/2 scale as `is-enrolled` and `grep`:
 
@@ -600,9 +603,9 @@ The exit code is the answer, on the same 0/1/2 scale as `is-enrolled` and `grep`
 |------|---------|
 | `0` | Every requested service carries the line |
 | `1` | At least one exists without it |
-| `2` | At least one is absent, unreadable, or misnamed |
+| `2` | At least one is absent, unreadable, misnamed, symlinked out of the directory, or hard-linked |
 
-Across several services the worst outcome wins. `--json` emits one document:
+Across several services the worst outcome wins. `--if-present` means here what it means on `add` and `remove`: an absent service file is reported and no longer forces exit 2, so exit 0 becomes "every requested service **that exists** carries the line" and a set of optional integrations can be installed and then verified with the same flag on both commands. It forgives absence only — a service whose file is a dangling or looping symlink is still exit 2, since an unresolvable link is not an absent file. `--json` emits one document:
 
 ```json
 {"command":"status","dry_run":false,"services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}

@@ -605,7 +605,7 @@ uninstall-files:
     # does not have is inert. A drift test in setup.rs
     # (`packaging_uninstall_covers_every_pam_candidate`) fails if a new candidate
     # is added without being listed here.
-    FACELOCK_PAM_SERVICES="sudo polkit-1 hyprlock swaylock kscreenlocker_greet gdm-password sddm lightdm omarchy-lock-face system-auth login sshd"
+    FACELOCK_PAM_SERVICES="sudo polkit-1 hyprlock swaylock kscreenlocker_greet gdm-password sddm lightdm omarchy-lock-face system-auth login sshd common-auth password-auth system-login system-auth-ac password-auth-ac"
 
     # Remove PAM lines (match on module name, not exact spacing)
     for service in $FACELOCK_PAM_SERVICES; do
