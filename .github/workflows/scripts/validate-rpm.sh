@@ -15,7 +15,6 @@ CHECKS=(
   "etc/facelock/config.toml:config"
   "dbus-1/system.d/org.facelock.Daemon.conf:D-Bus policy"
   "dbus-1/system-services/org.facelock.Daemon.service:D-Bus activation"
-  "sysusers.d/facelock.conf:sysusers"
   "tmpfiles.d/facelock.conf:tmpfiles"
   "authselect/vendor/facelock:authselect"
 )

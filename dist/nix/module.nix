@@ -65,9 +65,6 @@ in
       SystemdService=facelock-daemon.service
     '';
 
-    # The facelock system group: the bus policy names it (members may receive AuthAttempted signals); it grants nothing on the auth path (ADR 010).
-    users.groups.facelock = { };
-
     # systemd units
     systemd.services.facelock-daemon = {
       description = "Facelock Face Authentication Daemon";
@@ -101,7 +98,8 @@ in
     # tmpfiles rules
     # Must match dist/facelock.tmpfiles.
     systemd.tmpfiles.rules = [
-      "d /run/facelock 0755 root facelock -"
+      # Nothing is group-owned any more (ADR 010).
+      "d /run/facelock 0755 root root -"
       # 0711 root:root = traversable by everyone, listable by root only
       # (ADR 010). Parent must come before its children.
       "d /var/lib/facelock 0711 root root -"

@@ -18,7 +18,8 @@ depend() {
 }
 
 start_pre() {
-    checkpath --directory --owner root:facelock --mode 0755 /run/facelock
+    # Nothing is group-owned any more (ADR 010).
+    checkpath --directory --owner root:root --mode 0755 /run/facelock
 
     # checkpath does not create parents, so the state dir comes first.
     # 0711 root:root: traversable by everyone, listable by root only (ADR 010).

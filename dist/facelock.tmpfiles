@@ -1,5 +1,6 @@
-# Runtime directory for facelock daemon
-d /run/facelock 0755 root facelock -
+# Runtime directory for facelock daemon. Nothing is group-owned any more
+# (ADR 010).
+d /run/facelock 0755 root root -
 
 # State directory (biometric data - restricted).
 # 0711 root:root = traversable by every local user, listable by nobody but

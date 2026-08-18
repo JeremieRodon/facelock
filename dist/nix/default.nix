@@ -66,8 +66,7 @@ rustPlatform.buildRustPackage {
     install -Dm644 dbus/org.facelock.Daemon.conf $out/share/dbus-1/system.d/org.facelock.Daemon.conf
     install -Dm644 dbus/org.facelock.Daemon.service $out/share/dbus-1/system-services/org.facelock.Daemon.service
 
-    # sysusers.d and tmpfiles.d
-    install -Dm644 dist/facelock.sysusers $out/lib/sysusers.d/facelock.conf
+    # tmpfiles.d
     install -Dm644 dist/facelock.tmpfiles $out/lib/tmpfiles.d/facelock.conf
 
     # Bundled ONNX Runtime for non-NixOS use

@@ -448,10 +448,6 @@ install-files:
         [ -f "$f" ] || { echo "Error: $f not found. Run 'just build-release' first."; exit 1; }
     done
 
-    # Create the facelock system group (packaging parity; the bus policy names
-    # it). Nobody is added to it — face unlock needs no membership (ADR 010).
-    getent group facelock >/dev/null || groupadd -r facelock
-
     # Binaries
     install -Dm755 target/release/facelock /usr/bin/facelock
     install -Dm755 target/release/libpam_facelock.so /lib/security/pam_facelock.so
@@ -534,6 +530,13 @@ install-files:
     [ -f /var/lib/facelock/facelock.db ] && chown root:root /var/lib/facelock/facelock.db && chmod 600 /var/lib/facelock/facelock.db || true
     [ -f /var/lib/facelock/facelock.db-wal ] && chown root:root /var/lib/facelock/facelock.db-wal && chmod 600 /var/lib/facelock/facelock.db-wal || true
     [ -f /var/lib/facelock/facelock.db-shm ] && chown root:root /var/lib/facelock/facelock.db-shm && chmod 600 /var/lib/facelock/facelock.db-shm || true
+
+    # ADR 010 retired the facelock group: nothing is group-owned any more, so
+    # remove a group an older install created. Best-effort.
+    [ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
+    if getent group facelock >/dev/null 2>&1; then
+        groupdel facelock 2>/dev/null || true
+    fi
 
     echo ""
     echo ""
@@ -655,6 +658,12 @@ uninstall-files:
 
     systemctl daemon-reload 2>/dev/null || true
 
+    # ADR 010 retired the facelock group: nothing is group-owned any more, so
+    # remove a group an older install created. Best-effort.
+    if getent group facelock >/dev/null 2>&1; then
+        groupdel facelock 2>/dev/null || true
+    fi
+
     echo ""
     echo "==> facelock uninstalled. User data preserved at:"
     echo "==>   /etc/facelock/      (config.toml, encryption.key.sealed, setup markers)"
@@ -663,10 +672,6 @@ uninstall-files:
     echo "==>"
     echo "==> To remove all face data, config, models, and logs:"
     echo "==>   sudo rm -rf /etc/facelock /var/lib/facelock /var/log/facelock"
-    echo "==>"
-    echo "==> To remove the facelock group (after removing all members):"
-    echo "==>   sudo gpasswd -d <username> facelock"
-    echo "==>   sudo groupdel facelock"
 
 # ---------------------------------------------------------------------------
 # Localization (optional tooling)

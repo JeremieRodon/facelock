@@ -18,7 +18,6 @@ RUN install -Dm755 /build/target/release/facelock /usr/bin/facelock && \
     install -dm755 /usr/share/facelock/quirks.d && \
     install -Dm644 /build/config/quirks.d/*.toml /usr/share/facelock/quirks.d/ && \
     install -Dm644 /build/systemd/facelock-daemon.service /usr/lib/systemd/system/facelock-daemon.service && \
-    install -Dm644 /build/dist/facelock.sysusers /usr/lib/sysusers.d/facelock.conf && \
     install -Dm644 /build/dist/facelock.tmpfiles /usr/lib/tmpfiles.d/facelock.conf && \
     install -Dm644 /build/dbus/org.facelock.Daemon.conf /usr/share/dbus-1/system.d/org.facelock.Daemon.conf && \
     install -Dm644 /build/dbus/org.facelock.Daemon.service /usr/share/dbus-1/system-services/org.facelock.Daemon.service && \
