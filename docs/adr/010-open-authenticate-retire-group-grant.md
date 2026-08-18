@@ -60,14 +60,15 @@ database exists to avoid.
   unenrolled UID gets a no-model reply from `pre_check` without the camera
   opening. An enrolled UID could already do this (it was in the group). No
   UID can target another user or learn another user's enrollment. Every
-  attempt is audited when auditing is enabled; an enrolled UID's failed
-  attempts are rate-limited per user, while an unenrolled UID's calls are
-  answered by `pre_check` before the limiter and are not charged. Such a
-  call still occupies the daemon's single capture slot for its
-  (sub-millisecond) duration, so any local UID can now contend with a lock
-  screen for that slot where before only root and group members could — a
-  local availability margin, not a bypass; recorded and accepted in
-  `docs/security.md` § 4 A.
+  attempt is audited when auditing is enabled (an unenrolled UID's calls
+  are audited but not rate-limited, so a loop can rotate the audit log —
+  see `docs/security.md` § 4 A); an enrolled UID's failed attempts are
+  rate-limited per user, while an unenrolled UID's calls are answered by
+  `pre_check` before the limiter and are not charged. Such a call still
+  occupies the daemon's single capture slot for its brief duration, so any
+  local UID can now contend with a lock screen for that slot where before
+  only root and group members could — a local availability margin, not a
+  bypass; recorded and accepted in `docs/security.md` § 4 A.
 - **Residual widened**: any local user can `stat` a name it guesses under the
   state directory (`facelock.db` size/mtime, `enrolled/<name>` existence).
   Previously group members only. Accepted; recorded in `docs/security.md`

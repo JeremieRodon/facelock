@@ -3694,6 +3694,11 @@ mod tests {
     #[test]
     fn dbus_policy_opens_authenticate_to_the_default_context_only() {
         let policy = DBUS_POLICY;
+        assert_eq!(
+            policy.matches(r#"<policy context="default">"#).count(),
+            1,
+            "exactly one default-context policy block; a second one could reopen the interface below this test's slice"
+        );
         let default_start = policy
             .find(r#"<policy context="default">"#)
             .expect("default context policy");

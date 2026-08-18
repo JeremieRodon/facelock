@@ -551,14 +551,22 @@ What it costs, stated plainly: the bus policy also bounded *who could make the
 daemon do cheap work*. Any local UID can now (a) bus-activate the daemon (it
 already could — `StartServiceByName` is open to every context in
 `system.conf`), (b) reset its idle timer (`daemon.idle_timeout_secs` defaults
-to 0, so no default install idles out anyway), and (c) hold the single capture
-slot for the sub-millisecond an unenrolled `Authenticate` takes, so a tight
-loop from any local account can make a concurrent lock-screen `Authenticate`
-return `daemon busy` and fall back to the password prompt. That is a local
+to 0, so no default install idles out anyway), (c) hold the single capture
+slot for the brief time an unenrolled `Authenticate` takes, so a tight loop
+from any local account can make a concurrent lock-screen `Authenticate`
+return `daemon busy` and fall back to the password prompt, and (d) write one
+audit row per call without a rate-limit charge, so a local loop can roll
+`audit.jsonl` past `audit.rotate_size_mb` twice and evict genuine history —
+audit is off by default; operators who enable it should size
+`rotate_size_mb` accordingly or ship the log off-host. That is a local
 availability margin on a convenience feature — face unlock fails closed to
 the password — and it is accepted (ADR 010). Note also that `abort_if_ssh` is
 enforced by the PAM client from its own environment; a direct bus caller is
-not subject to it, which was already true for group members.
+not subject to it, which was already true for group members. A config-file
+mtime change also makes the *first* message after it pay a handler rebuild
+(`maybe_reload_handler` runs before `authorize_method` in `server.rs`), and
+that message may now come from any local UID; the trigger is a
+`644 root:root` file, so it is not attacker-controlled.
 
 The scope table's catch-all arm is root-only, so a method added later is closed until it is deliberately opened up. Two entries are spelled out explicitly rather than left to that catch-all, because their root-only scope is load-bearing rather than incidental:
 - `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter. For any weaker caller it would be a continuous similarity feed at camera framerate; together with score redaction, denying non-root callers closes the hill-climbing oracle by construction (see A5 below).
@@ -613,12 +621,12 @@ is not redacted.
 **Attack**: Any local user adds a match rule (or runs `dbus-monitor`) and passively observes `AuthAttempted` broadcast signals to learn who authenticates when — and, if the payload carried the raw similarity score, uses it as a spoof-tuning oracle (iterate on a photo/mask until the score climbs).
 
 **Mitigations**:
-- The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to the authorized caller.
+- The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to a **root** caller; it is redacted to `0.0` for every non-root caller (ADR 010 opened `Authenticate` to every local user).
 - The bus policy denies delivery of the daemon's signals in the default context; only root and `facelock`-group members may receive them.
 
 #### A5. Raw Frame Access Parity (Implemented — root-only)
 
-**Attack**: `PreviewFrame` is root-only, but a `facelock`-group member pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead — silently, with no user consent.
+**Attack**: `PreviewFrame` is root-only, but any local user pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead — silently, with no user consent.
 
 **Mitigation**: both methods are root-only. `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter, so for any weaker caller it would be a continuous similarity feed at camera framerate; `authorize_method` therefore denies every non-root caller with `AccessDenied` before the method reaches the camera or the capture slot.
 
