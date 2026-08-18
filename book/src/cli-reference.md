@@ -277,9 +277,17 @@ Capture and store a face model.
 facelock enroll                         # current user, auto-label
 facelock enroll --user alice            # specific user
 facelock enroll --label "office"        # specific label
+facelock enroll --skip-setup-check      # enroll on a tree setup never marked complete
 ```
 
 Captures 3-10 frames over ~15 seconds. Requires exactly one face per frame. Re-enrolling with the same label replaces the previous model.
+
+Without `--skip-setup-check`, an install whose setup-complete marker is missing
+is offered `facelock setup` first and enrolls through it, since setup enrolls a
+face itself. `--skip-setup-check` goes straight to the capture loop. It is for a
+tree assembled by hand or by a configuration manager, where the marker was never
+written but the models, database and encryption key are all in place; enrollment
+still fails on its own terms if any of them is not.
 
 ## facelock test
 

@@ -2,6 +2,41 @@
 
 Stable contracts. Do not change without updating this document.
 
+The CLI surface is the first half; the daemon, storage and protocol contracts
+follow it.
+
+- [Binaries](#binaries)
+- [CLI Subcommands](#cli-subcommands)
+  - [CLI Flag Spelling](#cli-flag-spelling)
+  - [CLI Output Streams](#cli-output-streams)
+  - [CLI Machine Output](#cli-machine-output)
+  - [facelock setup Flag Composition](#facelock-setup-flag-composition)
+  - [facelock pam Semantics](#facelock-pam-semantics)
+  - [facelock capabilities](#facelock-capabilities)
+  - [CLI Privilege Model (DEC-6)](#cli-privilege-model-dec-6)
+  - [facelock test Semantics (N11)](#facelock-test-semantics-n11)
+- [Operating Modes](#operating-modes)
+  - [facelock is-enrolled Exit Codes](#facelock-is-enrolled-exit-codes)
+  - [facelock auth Exit Codes](#facelock-auth-exit-codes)
+- [Filesystem Paths](#filesystem-paths)
+  - [Audit Log Entries](#audit-log-entries)
+- [Config Schema](#config-schema)
+  - [Sections](#sections)
+  - [Camera Auto-Detection](#camera-auto-detection)
+- [Database Schema](#database-schema)
+- [IPC Protocol](#ipc-protocol)
+  - [Methods](#methods)
+  - [Signals](#signals)
+  - [Response types](#response-types)
+  - [Authenticate error encoding](#authenticate-error-encoding)
+  - [Rejection classes](#rejection-classes-authoutcomeerror)
+  - [Daemon peer verification (PAM client)](#daemon-peer-verification-pam-client)
+- [PAM Semantics](#pam-semantics)
+  - [Syslog Format](#syslog-format)
+- [Polkit Agent Semantics](#polkit-agent-semantics)
+- [Anti-Spoofing](#anti-spoofing)
+- [Models](#models)
+
 ## Binaries
 
 | Binary | Crate | Purpose |
@@ -62,7 +97,7 @@ fit an existing domain before it may claim a top-level name. Commands named by
 ADR 009.
 
 The top-level set is pinned by the `TOP_LEVEL_COMMANDS` registry in
-`crates/facelock-cli/src/main.rs`, checked in both directions against
+`crates/facelock-cli/src/conformance/flags.rs`, checked in both directions against
 `Cli::command()`: a name in the registry the binary does not offer fails, and a
 top-level command with no row fails too. Nested verbs are deliberately absent
 from it — where a verb sits inside its group is that group's business.
@@ -75,12 +110,10 @@ scripts hard-code the rest. Two things hold it still.
 
 Shared clap arg structs in `crates/facelock-cli/src/args.rs` (`UserArg`,
 `ConfirmArg`, `JsonArg`, `DryRunArg`) are flattened at every site, so a command
-either offers a flag with the one spelling or does not offer it. The conformance
-test `cli_flag_conformance` in `crates/facelock-cli/src/main.rs` walks the whole
-command tree — nested subcommands included — and fails on any drift. The
-**short-letter registry** lives in that test: a `&[(char, &[&str])]` table naming
-every short letter and the long names allowed to bind it. Spending a new letter
-means editing the registry on purpose.
+either offers a flag with the one spelling or does not offer it.
+`cli_flag_conformance` in `crates/facelock-cli/src/conformance/flags.rs` walks
+the whole command tree, nested subcommands included, and fails on any drift;
+spending a new short letter means editing its registry on purpose.
 
 The invariants it pins:
 
@@ -153,9 +186,8 @@ build instead of shipping.
 
 **A command gains `--json` when it has a named consumer, not to complete a
 matrix.** The coverage list is the `JSON_COMMANDS` registry inside that test,
-and it is checked in both directions: a command on the list that binds no
-`--json` fails, and a `--json` on a command absent from the list fails too.
-Adding a row is the moment someone states who parses the output.
+checked in both directions against the clap tree, so adding a row is the moment
+someone states who parses the output.
 
 | Command | Payload |
 |---------|---------|
@@ -169,12 +201,6 @@ Adding a row is the moment someone states who parses the output.
 `preview` is on the list because it always emitted JSON. It shipped calling the
 flag `--text-only`, which survives as a hidden alias and keeps parsing; the
 per-frame payload is byte for byte what it was.
-
-Two commands were considered and declined. `facelock test` is an interactive
-diagnostic, and `facelock audit` already has a structured log format; neither
-has a consumer asking, which under the rule above settles it. `facelock status`
-is a schema question rather than a flag question, since nothing in `health.rs`
-derives `Serialize` yet, and it is tracked separately.
 
 Machine output does not pass through the translation seam: every `--json`
 payload is built with `serde_json` and is C-locale by construction. It reaches
@@ -332,11 +358,10 @@ validation phase, before any prompt exists to skip, so an unattended
 | `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `absent` under `--if-present`, and `declined` |
 | `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure |
 
-`pam status` is on `grep`'s scale and `is-enrolled`'s, deliberately: it is a
-boolean query whose exit code is the answer, and an absent file is exit 2 for
-the same reason `grep` gives 2 for one. Across several services the worst
-outcome wins. A **declined** confirmation is exit 0 — the command did what the
-operator asked — and `--json` is how a script tells it from an install.
+`pam status` is on `grep`'s scale and `is-enrolled`'s: a boolean query whose
+exit code is the answer. Across several services the worst outcome wins. A
+**declined** confirmation is exit 0, since the command did what the operator
+asked, and `--json` is how a script tells it from an install.
 
 **`--dry-run`** prints the resolved plan, writes nothing, and exits 0. It is
 honoured *after* the root check (see DEC-6 above).
@@ -476,11 +501,10 @@ twice over: a git or distro build can carry a version that says nothing about
 what is in it (`facelock-git` is exactly that case, and is why a downstream
 package pin cannot express "needs the `pam` verb"), and a backport can add a
 feature without moving the number. The name list cannot drift from the binary
-it came out of — a unit test maps every name to the clap argument, subcommand
-or constant that declares the surface it names, and a name with no such proof
-fails the build. What each surface *means* is pinned by the section of this
-document that owns it, and by that command's own tests. `version` is for
-humans and bug reports.
+it came out of: `capability_names_are_all_implemented` maps every name to the
+clap argument, subcommand or constant that declares it, and what each surface
+*means* is pinned by the section of this document that owns it. `version` is
+for humans and bug reports.
 
 **A build that predates the command** answers by failing: clap's
 "unrecognized subcommand" error, usage text on stderr, exit 2, nothing on
@@ -575,12 +599,9 @@ should be scripted.
 
 `facelock pam add|remove` are in the hard-error class because the surface they
 replace was: standalone `setup --pam` bailed from its own root check rather
-than prompting, and silently re-running an `/etc/pam.d` edit under `sudo` on
-behalf of a wrapper script is a surprise, not a convenience. The check runs
-**before `--dry-run` is honoured** — a dry run that succeeded unprivileged
-would be a misleading preview of a command that cannot run — and `pam status`
-is the unprivileged read that covers the case `--dry-run` might otherwise be
-reached for.
+than prompting. The check runs **before `--dry-run` is honoured**, so a dry run
+still needs root, and `pam status` is the unprivileged read to reach for
+instead.
 
 `facelock auth` is not user-facing — PAM spawns it directly, and it is not
 part of this table.

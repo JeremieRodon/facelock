@@ -12,14 +12,14 @@ The following flags are accepted by every subcommand (declared `global = true`):
 | `-q`, `--quiet` | Suppress stdout: informational text, and on commands whose stdout is the payload, the payload too. Errors (stderr), prompts and exit codes are unaffected. |
 
 `--quiet` is complete for every command whose output goes through the message
-seam: `setup`, `status`, `enroll`, `test`, `remove`, `clear`, `is-enrolled`,
-`capabilities`, `pam`, and the `--json` payloads of `list` and `devices`. Nine
-commands still print human text directly and stay noisy under it until
-[#140](https://github.com/tyvsmith/facelock/issues/140) is finished — `bench`,
-`tpm`, `reseal`, `encrypt`, `decrypt`, `config`, `restart`, `hyprlock` and
-`audit` — as do the human tables of `list` and `devices`. `preview --json` is
-not on either list: its frame stream is stdout by design and `--quiet` is
-documented not to reach it.
+seam: `setup`, `enroll`, `test`, `remove`, `clear`, `is-enrolled`,
+`capabilities`, `pam`, and the `--json` payloads of `list` and `devices`. Seven
+still write human text straight to stdout and stay noisy under it until
+[#140](https://github.com/tyvsmith/facelock/issues/140) is finished: `status`,
+`bench`, `tpm` (every verb, `encrypt`/`decrypt`/`reseal` included), `config`,
+`daemon restart`, `hyprlock` and `audit`, as do the human tables of `list` and
+`devices`. `preview --json` is on neither list: its frame stream is stdout by
+design and `--quiet` is documented not to reach it.
 
 ## Machine-readable output
 
@@ -43,11 +43,14 @@ print their payload and now print nothing; the exit code is unchanged.
 
 ## facelock setup
 
-Interactive setup wizard. Walks through camera selection, model quality, inference device (CPU / CUDA / ROCm / OpenVINO), model downloads, encryption, enrollment, and PAM configuration. Can also be run with flags for individual setup tasks.
+Interactive setup wizard. Walks through camera selection, model quality,
+inference device (CPU / CUDA / ROCm / OpenVINO), model downloads, encryption,
+enrollment, systemd and PAM configuration. Every step can also be answered, or
+declined, from the command line.
 
 ```bash
 facelock setup                          # interactive wizard
-facelock setup --non-interactive        # run wizard without prompts
+facelock setup --non-interactive        # base setup, no prompts, no PAM/systemd/enroll
 facelock setup --systemd                # install systemd units
 facelock setup --systemd --disable      # disable systemd units
 facelock setup --pam                    # install to /etc/pam.d/sudo
@@ -55,7 +58,93 @@ facelock setup --pam --service polkit-1 # install to a specific service
 facelock setup --pam --remove           # remove the PAM line
 facelock setup --pam --remove --if-present  # a missing service file is success
 facelock setup --pam --service sshd -y  # a sensitive service: -y is what unlocks it
+facelock setup --no-pam                 # wizard, but never touch /etc/pam.d
+facelock setup --camera /dev/video2     # answer step 1 from the command line
 ```
+
+Three rules generate the whole flag list. Supplying a value answers that
+question and therefore replaces its prompt, which is why there is no
+`--skip-<x>-prompt` family. A `--no-<action>` flag declines an action outright;
+declining is not defaulting. And `auto` means re-derive from the hardware,
+since omitting a flag already gives the default.
+
+### Modes
+
+| Flag | Meaning |
+|------|---------|
+| *(none)* | Full interactive wizard. Falls back to the non-interactive flow when stdin is not a terminal. |
+| `--non-interactive` | No prompts. Choices resolve to config-or-default. Runs the base setup only: directories, model download and verification, encryption, group membership, path permissions. No PAM, no systemd, no enrollment unless asked for explicitly. |
+| `-y`, `--yes` (alias `--no-confirm`) | Suppress confirmation prompts, and unlock the sensitive-service gate. |
+
+`--non-interactive` suppresses the per-file "Proceed?" confirmation on its own,
+since it promises no prompts. It does **not** unlock the sensitive-service
+gate, so `facelock setup --non-interactive --pam --service sshd` refuses until
+`-y` is added. Locking yourself out of a machine takes two decisions.
+
+### Choice flags
+
+Precedence for all four: **CLI flag > config file > built-in default.**
+Supplying the flag suppresses the corresponding wizard step and writes the
+value back to `/etc/facelock/config.toml`. A value that cannot be honoured is
+fatal, never a silent fallback: `--camera /dev/video9` on a machine without
+that node aborts, and `--encryption tpm` with no usable TPM aborts rather than
+quietly writing a software keyfile.
+
+| Flag | Values | What `auto` does | Wizard step |
+|------|--------|------------------|-------------|
+| `--camera <PATH\|auto>` | a `/dev/video*` path, or `auto` | Re-classifies the attached devices and picks the single IR-capable one. Zero IR devices and more than one are both errors that list what was found. | 1 |
+| `--models <standard\|balanced\|high>` | three presets | *no `auto`*: quality is a preference, not something the machine can report | 2 |
+| `--execution-provider <cpu\|cuda\|rocm\|openvino\|auto>` | provider name | Asks the installed ONNX Runtime which providers it was built with and takes the best, in the order cuda > rocm > openvino > cpu. Availability is a property of the runtime build, not of the hardware, and the choice is always printed. | 3 |
+| `--encryption <tpm\|keyfile\|none\|auto>` | method | Uses the TPM when a working TPM 2.0 is present, otherwise a software keyfile. | 5 |
+
+Model presets:
+
+| Preset | Detector | Embedder |
+|--------|----------|----------|
+| `standard` | `scrfd_2.5g_bnkps.onnx` | `w600k_r50.onnx` |
+| `balanced` | `scrfd_2.5g_bnkps.onnx` | `glintr100.onnx` |
+| `high` | `det_10g.onnx` | `glintr100.onnx` |
+
+### Action flags
+
+| Pair | Without either flag (wizard) | Without either flag (`--non-interactive`) |
+|------|------------------------------|-------------------------------------------|
+| `--pam` / `--no-pam` | prompt (step 9) | off |
+| `--systemd` / `--no-systemd` | prompt (step 8) | off |
+| `--enroll` / `--no-enroll` | prompt (step 6) | off; enrollment needs a human in front of the camera |
+
+Each pair is a clap override pair, so **a later flag wins over an earlier
+one**: `--pam --no-pam` declines PAM, `--no-pam --pam` installs it. That
+matters when a wrapper appends an override to a command line it did not
+construct. `--no-pam` means nothing under `/etc/pam.d` is read, backed up or
+written; it is not "use the PAM default".
+
+`--pam` inside the wizard configures **exactly one service**, `--service`
+defaulting to `sudo`, and does not apply the multi-select's pre-checked
+candidates. `--enroll` answers the "enroll a face now?" confirmation as well as
+forcing the step, so it runs unattended.
+
+### Action modifiers
+
+| Flag | Requires | Meaning |
+|------|----------|---------|
+| `--service <NAME>` | `--pam` | Target PAM service. Default `sudo`. |
+| `--remove` | `--pam` | Remove the facelock PAM line instead of adding it. |
+| `--if-present` | `--remove` | Treat an absent service file as success rather than an error. Read, parse and write failures stay fatal. |
+| `--disable` | `--systemd` | Disable and stop the units instead of installing them. |
+
+The parser enforces these, so `facelock setup --remove` is an error naming the
+missing `--pam` rather than a silently ignored flag.
+
+### How setup flags compose
+
+`--pam` and/or `--systemd` **on their own** perform just that action and touch
+nothing else. Any flag that only makes sense while the base setup runs —
+`--non-interactive`, a choice flag, or any of `--no-pam` / `--no-systemd` /
+`--enroll` / `--no-enroll` — forces the base setup, and the requested actions
+run **in addition**. `-y` on its own does not force it, so `facelock setup -y
+--pam` is still PAM-only. When both run the order is base setup, then systemd,
+then PAM.
 
 `--pam` is an alias onto [`facelock pam add | remove`](#facelock-pam), which is
 the primary spelling and the one that takes several services in one process.
@@ -65,9 +154,11 @@ Eight services are gated: the shared auth stacks `common-auth`,
 `password-auth`, `password-auth-ac`, `system-auth`, `system-auth-ac` and
 `system-login`, plus `login` and `sshd`.
 `facelock setup --pam --service login` refuses until `-y` is added, and on
-`facelock pam add` the same gate is `--allow-sensitive`. `--if-present`
-requires `--remove` and turns a missing service file into a successful no-op —
-read, parse and write failures stay fatal.
+`facelock pam add` the same gate is `--allow-sensitive`.
+
+Every `setup` run reconciles the per-user enrollment markers behind
+[`facelock is-enrolled`](#facelock-is-enrolled) against the database, which is
+what backfills users who enrolled before markers existed.
 
 ## facelock is-enrolled
 
@@ -149,9 +240,17 @@ Capture and store a face model.
 facelock enroll                         # current user, auto-label
 facelock enroll --user alice            # specific user
 facelock enroll --label "office"        # specific label
+facelock enroll --skip-setup-check      # enroll on a tree setup never marked complete
 ```
 
 Captures 3-10 frames over ~15 seconds. Requires exactly one face per frame. Re-enrolling with the same label replaces the previous model.
+
+Without `--skip-setup-check`, an install whose setup-complete marker is missing
+is offered `facelock setup` first and enrolls through it, since setup enrolls a
+face itself. `--skip-setup-check` goes straight to the capture loop. It is for a
+tree assembled by hand or by a configuration manager, where the marker was never
+written but the models, database and encryption key are all in place; enrollment
+still fails on its own terms if any of them is not.
 
 ## facelock test
 
