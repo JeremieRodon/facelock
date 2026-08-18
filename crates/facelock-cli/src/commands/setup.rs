@@ -594,13 +594,8 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         }
     };
 
-    // Packaging parity only (ADR 010): the group grants nothing on the auth
-    // path, so a failure here is reported, not fatal.
-    if let Err(e) = ensure_facelock_group() {
-        Terminal.info(&SetupMessage::GroupStepFailed {
-            error: e.to_string(),
-        });
-    }
+    // ADR 010: nothing needs the group; remove a leftover one, best-effort.
+    retire_facelock_group();
 
     if systemd_enabled {
         start_daemon_for_setup(&config);
@@ -2363,10 +2358,9 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
         None => setup_encryption_auto(&config)?,
     }
 
-    // Packaging parity only (ADR 010): the bus policy names the group.
-    ensure_facelock_group()?;
-
     secure_setup_paths(&config, Some(&manifest))?;
+    // ADR 010: nothing needs the group; remove a leftover one, best-effort.
+    retire_facelock_group();
     write_setup_marker()?;
 
     // Daemon configuration, before enrollment and for the same reason the
@@ -2494,26 +2488,26 @@ fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// facelock system group
+// legacy facelock system group
 // ---------------------------------------------------------------------------
 
-/// Ensure the `facelock` system group exists. Nobody is added to it.
+/// Remove a `facelock` group left behind by an older install, best-effort.
 ///
-/// Nothing on the auth path needs membership any more (ADR 010): the bus
-/// admits `Authenticate` from any local user and the state directory is
-/// traversable by everyone. The group survives because the bus policy still
-/// names it (members may receive `AuthAttempted` signals), `/run/facelock` is
-/// `root:facelock`, and packaging creates it through sysusers, so a source
-/// install should match.
-fn ensure_facelock_group() -> anyhow::Result<()> {
-    if nix::unistd::Group::from_name("facelock")
-        .context("failed to look up facelock group")?
-        .is_none()
-    {
-        Terminal.info(&SystemMessage::CreatingFacelockGroup);
-        run_cmd("groupadd", &["-r", "facelock"])?;
+/// ADR 010 retired the group: the bus policy no longer names it, packaging
+/// no longer creates it, and nothing under `/var/lib/facelock` or
+/// `/run/facelock` is owned by it any more (`ensure_state_layout` and the
+/// scriptlets converge those to `root:root` first). `groupdel` fails only when
+/// the group is some account's primary group, which facelock never did; a
+/// failure is reported, never fatal.
+fn retire_facelock_group() {
+    match nix::unistd::Group::from_name("facelock") {
+        Ok(Some(_)) => match run_cmd("groupdel", &["facelock"]) {
+            Ok(()) => Terminal.info(&SystemMessage::RetiredFacelockGroup),
+            Err(e) => tracing::debug!("could not remove the legacy facelock group: {e}"),
+        },
+        Ok(None) => {}
+        Err(e) => tracing::debug!("could not look up the facelock group: {e}"),
     }
-    Ok(())
 }
 
 fn secure_existing_path(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> {
@@ -3976,12 +3970,12 @@ mod tests {
         assert!(result.contains("threshold = 0.75"));
     }
 
-    /// ADR 010: the default context may call exactly `Authenticate`; the
-    /// group grants signals only. Pinned on the embedded policy so a "cleanup"
-    /// of the XML cannot silently close the lock screen out again or reopen
-    /// the whole interface. Order matters — dbus-daemon and dbus-broker apply
-    /// the last matching rule in a context — so the allow must follow the
-    /// deny.
+    /// ADR 010: the default context may call exactly `Authenticate`; there
+    /// is no group policy and only root may receive signals. Pinned on the
+    /// embedded policy so a "cleanup" of the XML cannot silently close the
+    /// lock screen out again, reopen the whole interface, or bring the group
+    /// back. Order matters — dbus-daemon and dbus-broker apply the last
+    /// matching rule in a context — so the allow must follow the deny.
     #[test]
     fn dbus_policy_opens_authenticate_to_the_default_context_only() {
         let policy = DBUS_POLICY;
@@ -4030,21 +4024,25 @@ mod tests {
             "signals stay denied to the default context"
         );
 
-        let group_start = policy
-            .find(r#"<policy group="facelock">"#)
-            .expect("group policy");
-        let group_end = policy[group_start..]
-            .find("</policy>")
-            .map(|i| group_start + i)
-            .expect("group policy closes");
-        let group = &policy[group_start..group_end];
         assert!(
-            !group.contains("send_destination"),
-            "the facelock group grants no method calls (ADR 010)"
+            !policy.contains("<policy group"),
+            "no group policy (ADR 010: the group is retired)"
+        );
+        let root_start = policy.find(r#"<policy user="root">"#).expect("root policy");
+        let root_end = policy[root_start..]
+            .find("</policy>")
+            .map(|i| root_start + i)
+            .expect("root policy closes");
+        let root = &policy[root_start..root_end];
+        let signal_allow = r#"<allow receive_sender="org.facelock.Daemon" receive_type="signal"/>"#;
+        assert_eq!(
+            policy.matches(signal_allow).count(),
+            1,
+            "exactly one signal allow in the whole policy"
         );
         assert!(
-            group.contains(r#"receive_type="signal""#),
-            "the facelock group may receive signals"
+            root.contains(signal_allow),
+            "the only signal allow is inside the root block (signals are root-only)"
         );
     }
 }

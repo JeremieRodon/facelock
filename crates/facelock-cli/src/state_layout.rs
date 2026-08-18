@@ -20,8 +20,8 @@
 //! 2. **Every secret is locked in its own right.** The database and its
 //!    sidecars are `0600 root:root`; nothing under the state directory except
 //!    `models/` (public, SHA-256-verified downloads) carries "other" read or
-//!    write bits. There is no group grant: the `facelock` group owns nothing
-//!    here and reads nothing here that anyone else cannot.
+//!    write bits. There is no group: nothing here is group-owned or
+//!    group-readable.
 //! 3. **Applying the layout is idempotent and never touches data.** It is a
 //!    handful of `mkdir`/`chmod`/`chown` calls; the database and models never
 //!    move, and nothing here creates, copies, or deletes a database. There is
@@ -181,12 +181,12 @@ fn chown_root(path: &Path) -> anyhow::Result<()> {
 /// Already-correct directories are left entirely alone rather than re-`chmod`ed
 /// and re-`chown`ed: this can run on the PAM path on every authentication, so
 /// the steady state must cost one `stat` per path and no writes.
-fn apply_dir(path: &Path, mode: u32, chown_to_root: bool) -> anyhow::Result<()> {
+fn apply_dir(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()> {
     let current = fs::metadata(path).ok().filter(|m| m.is_dir());
     let mode_ok = current
         .as_ref()
         .is_some_and(|m| m.permissions().mode() & 0o7777 == mode);
-    let owner_ok = !chown_to_root
+    let owner_ok = !enforce_owner
         || current
             .as_ref()
             .is_some_and(|m| m.uid() == 0 && m.gid() == 0);
@@ -202,7 +202,7 @@ fn apply_dir(path: &Path, mode: u32, chown_to_root: bool) -> anyhow::Result<()> 
 }
 
 /// Tighten one file if it exists. Never creates it.
-fn apply_file(path: &Path, mode: u32, chown_to_root: bool) -> anyhow::Result<()> {
+fn apply_file(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()> {
     let Ok(meta) = fs::metadata(path) else {
         return Ok(());
     };
@@ -213,7 +213,7 @@ fn apply_file(path: &Path, mode: u32, chown_to_root: bool) -> anyhow::Result<()>
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .with_context(|| format!("failed to chmod {}", path.display()))?;
     }
-    if chown_to_root && (meta.uid() != 0 || meta.gid() != 0) {
+    if enforce_owner && (meta.uid() != 0 || meta.gid() != 0) {
         chown_root(path)?;
     }
     Ok(())
@@ -227,25 +227,26 @@ fn apply_file(path: &Path, mode: u32, chown_to_root: bool) -> anyhow::Result<()>
 ///
 /// Idempotent, and touches no data: directories are created or re-`chmod`ed,
 /// the database is re-`chmod`ed **only if it already exists**, and nothing is
-/// ever moved, copied, or deleted. `chown_to_root` also enforces `root:root`
-/// ownership — pass `false` from unprivileged code (tests), since `chown(2)`
-/// to root needs root.
-pub fn apply_layout(layout: &StateLayout, chown_to_root: bool) -> anyhow::Result<()> {
+/// ever moved, copied, or deleted. Run as root it also enforces `root:root`
+/// ownership; run unprivileged it applies modes alone.
+pub fn apply_layout(layout: &StateLayout) -> anyhow::Result<()> {
+    // chown(2) to root needs root; an unprivileged caller — tests, a user-run
+    // best-effort pass — applies modes alone.
+    let enforce_owner = nix::unistd::Uid::current().is_root();
     for spec in layout.dir_specs() {
-        apply_dir(spec.path, spec.mode, chown_to_root)?;
+        apply_dir(spec.path, spec.mode, enforce_owner)?;
     }
     for file in layout.db_files() {
-        apply_file(&file, DB_FILE_MODE, chown_to_root)?;
+        apply_file(&file, DB_FILE_MODE, enforce_owner)?;
     }
     Ok(())
 }
 
-/// [`apply_layout`] derived from a config, enforcing ownership when root. A
-/// config whose `db_path` has no usable parent has no layout to apply and is
-/// a no-op.
+/// [`apply_layout`] derived from a config. A config whose `db_path` has no
+/// usable parent has no layout to apply and is a no-op.
 pub fn ensure_state_layout(config: &Config) -> anyhow::Result<()> {
     match StateLayout::from_config(config) {
-        Some(layout) => apply_layout(&layout, nix::unistd::Uid::current().is_root()),
+        Some(layout) => apply_layout(&layout),
         None => Ok(()),
     }
 }
@@ -367,7 +368,7 @@ mod tests {
         fs::create_dir_all(&layout.state_dir).unwrap();
         fs::write(&layout.db_path, b"stub").unwrap();
 
-        apply_layout(&layout, false).unwrap();
+        apply_layout(&layout).unwrap();
 
         assert_eq!(mode(&layout.state_dir), STATE_DIR_MODE);
         assert_eq!(mode(&layout.models_dir), MODELS_DIR_MODE);
@@ -380,8 +381,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = layout_at(tmp.path());
 
-        apply_layout(&layout, false).unwrap();
-        apply_layout(&layout, false).unwrap();
+        apply_layout(&layout).unwrap();
+        apply_layout(&layout).unwrap();
 
         assert_eq!(mode(&layout.state_dir), STATE_DIR_MODE);
         assert_eq!(mode(&layout.enrolled_dir), ENROLLED_DIR_MODE);
@@ -395,7 +396,7 @@ mod tests {
         fs::write(&layout.db_path, b"stub").unwrap();
         fs::set_permissions(&layout.db_path, fs::Permissions::from_mode(0o640)).unwrap();
 
-        apply_layout(&layout, false).unwrap();
+        apply_layout(&layout).unwrap();
 
         assert_eq!(mode(&layout.db_path), 0o600);
     }
@@ -405,7 +406,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = layout_at(tmp.path());
 
-        apply_layout(&layout, false).unwrap();
+        apply_layout(&layout).unwrap();
 
         assert!(!layout.db_path.exists(), "the layout must not create files");
         // And the sidecars stayed absent too.
@@ -450,10 +451,10 @@ mod tests {
         fs::create_dir_all(&layout.state_dir).unwrap();
         fs::write(&layout.db_path, b"stub").unwrap();
 
-        apply_layout(&layout, false).unwrap();
+        apply_layout(&layout).unwrap();
         // Simulate later runtime artifacts.
         fs::write(layout.state_dir.join("facelock.db-wal"), b"stub").unwrap();
-        apply_layout(&layout, false).unwrap();
+        apply_layout(&layout).unwrap();
 
         assert_eq!(
             mode(&layout.state_dir) & 0o007,

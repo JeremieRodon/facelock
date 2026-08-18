@@ -174,7 +174,7 @@ pub fn is_access_denied(err: &anyhow::Error) -> bool {
 /// `Authenticate` alone — so whether the denial came from the daemon's own
 /// `require_root` or from the bus policy, the fix is the same: run as root.
 /// (Issue #108: telling a root-only rejection to "join the facelock group"
-/// was actively wrong even before the group stopped granting method calls.)
+/// was actively wrong even before the group was retired.)
 fn add_access_denied_hint(err: anyhow::Error) -> anyhow::Error {
     if !is_access_denied(&err) {
         return err;
@@ -422,7 +422,7 @@ mod tests {
     //
     // ADR 010: a bus-policy denial can only mean a non-root caller reached
     // for a root-only method (every local user may send `Authenticate`), so
-    // the hint says root — never "join the group", which grants nothing.
+    // the hint says root — never "join the group"; there is no group.
     #[test]
     fn access_denied_bus_policy_denial_gets_root_hint() {
         let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(

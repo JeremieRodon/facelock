@@ -382,7 +382,7 @@ already knows by name — its own `enrolled/<user>` marker, a model file — and
 nobody can `readdir` the directory, read the `0600 root:root` database, or
 reach the audit log or snapshots. Every secret is protected by its own mode;
 the directory protects only *what is there* from enumeration. There is no
-group grant (ADR 010): the `facelock` group owns nothing here.
+group (ADR 010): nothing here is group-owned.
 
 Two consequences worth stating explicitly:
 
@@ -412,7 +412,7 @@ message that explains the rule.
 repeatedly on the lock screen. It answers from a marker file rather than from
 the database, and *"enrolled"* means **"face auth is operational for me"**:
 the caller opens its own `0600` marker by name through two `0711 root:root`
-directories. No group membership is involved (ADR 010): the answer is
+directories. No group is involved (ADR 010): the answer is
 `enrolled` the moment enrollment writes the marker.
 
 ```
@@ -520,15 +520,17 @@ Access to the daemon is governed by the D-Bus system bus policy in
 `dbus/org.facelock.Daemon.conf`, installed to `/usr/share/dbus-1/system.d/`
 and enforced by the bus itself (dbus-daemon or dbus-broker). Setup and package
 install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present,
-but `/usr/share/...` is the canonical install path. Three grants (ADR 010):
+but `/usr/share/...` is the canonical install path. Two grants (ADR 010):
 
-- **root**: may own the name and send anything on the interface.
+- **root**: may own the name, send anything on the interface, and receive the
+  daemon's signals. Signals are root-only.
 - **every local user** (`default` context): may send exactly one method,
   `org.facelock.Daemon.Authenticate`. Screen lockers and the polkit agent run
   their PAM stack as the user, so this is what lets face unlock work with no
-  group membership and no re-login. Everything else stays denied at the bus.
-- **the `facelock` group**: may receive the daemon's signals. It grants no
-  method calls; membership is optional and facelock never adds anyone to it.
+  group and no re-login. Everything else stays denied at the bus.
+
+There is no group policy: the `facelock` group is retired (ADR 010) —
+packaging no longer creates it and `facelock setup` removes a leftover one.
 
 Because the bus lets any local user reach `Authenticate`, the daemon's own
 check — it verifies the caller UID via `GetConnectionUnixUser` on every method
@@ -540,8 +542,9 @@ rather than a second layer:
 What opening `Authenticate` exposes, and why it is acceptable: any local UID
 may ask the daemon to authenticate **itself**. An unenrolled UID is answered by
 `pre_check` from SQLite (`has_models`) before the camera is opened. An enrolled
-UID could already do this — it was in the group. No UID can name another user
-(`require_user_authorized`), learn another user's enrollment, or see a
+UID could already do this before ADR 010 — it was in the group. No UID can
+name another user (`require_user_authorized`), learn another user's
+enrollment, or see a
 similarity score (redacted for non-root). Every attempt is audited when
 auditing is enabled; an enrolled UID's failed attempts are rate-limited per
 user, while an unenrolled UID's calls are answered before the limiter and are
@@ -575,7 +578,7 @@ The scope table's catch-all arm is root-only, so a method added later is closed 
 
 The policy also self-contains two explicit defaults rather than relying on system-wide bus defaults:
 - `<deny own="org.facelock.Daemon"/>` in the default context (name-squatting protection; only root may own the name).
-- `<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>` in the default context, with explicit allows for root and the `facelock` group (see below).
+- `<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>` in the default context; the only allow is in the root block (see below).
 
 #### A2. PAM Peer-UID Verification (Required)
 
@@ -623,7 +626,7 @@ is not redacted.
 
 **Mitigations**:
 - The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to a **root** caller; it is redacted to `0.0` for every non-root caller (ADR 010 opened `Authenticate` to every local user).
-- The bus policy denies delivery of the daemon's signals in the default context; only root and `facelock`-group members may receive them.
+- The bus policy denies delivery of the daemon's signals in the default context; only root may receive them.
 
 #### A5. Raw Frame Access Parity (Implemented — root-only)
 
@@ -637,7 +640,7 @@ is not redacted.
 
 #### A6. Capture Contention Guard (Implemented)
 
-**Attack**: Local DoS — a caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request. Under ADR 010 any local UID may call `Authenticate` for itself, so for that method the caller set the guard bounds is every local account, not root and the `facelock` group; `PreviewDetectFrame` remains root-only.
+**Attack**: Local DoS — a caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request. Under ADR 010 any local UID may call `Authenticate` for itself, so for that method the caller set the guard bounds is every local account, not root and the (pre-ADR 010) `facelock` group; `PreviewDetectFrame` remains root-only.
 
 **Mitigation**: A cheap in-flight capture guard is checked *before* the expensive handler lock. If a capture is already in flight, a concurrent `Authenticate`/`Enroll`/`PreviewFrame`/`PreviewDetectFrame` call is rejected **immediately** with a `daemon busy` error instead of queueing. PAM treats this like any daemon error (`PAM_IGNORE`) and falls through to password — degraded, never locked out. Per-user rate limiting is unchanged and orthogonal.
 
