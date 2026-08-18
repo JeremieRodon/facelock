@@ -24,11 +24,11 @@ pub enum SetupMessage {
     SetupStepInferenceDevice,
     SetupStepModelDownload,
     SetupStepEncryption,
+    SetupStepDaemon,
     SetupStepEnrollment,
     SetupStepEnrollmentSkipped,
     SetupStepTest,
     SetupStepTestSkipped,
-    SetupStepDaemon,
     SetupStepPam,
     SetupCompleteHeader,
 
@@ -94,7 +94,7 @@ pub enum SetupMessage {
         status: String,
     },
     DaemonStatusNotConfiguredNoSystemd,
-    DaemonStatusDeferred,
+    DaemonStatusFromCommandLine,
     DaemonStatusEnabled,
     DaemonStatusNotConfigured,
     SummaryPam {
@@ -193,7 +193,7 @@ impl Message for SetupMessage {
         match self {
             SetupIntro { version } => fill(
                 translate(
-                    "\n  Facelock v{version}\n  Linux face authentication\n\n  This wizard will walk you through initial setup:\n    - Camera detection\n    - Model quality and inference device\n    - Model downloads\n    - Embedding encryption (TPM or software)\n    - Face enrollment\n    - Daemon and PAM configuration\n",
+                    "\n  Facelock v{version}\n  Linux face authentication\n\n  This wizard will walk you through initial setup:\n    - Camera detection\n    - Model quality and inference device\n    - Model downloads\n    - Embedding encryption (TPM or software)\n    - Daemon configuration\n    - Face enrollment\n    - PAM configuration\n",
                 ),
                 &[("version", version.clone())],
             ),
@@ -202,15 +202,15 @@ impl Message for SetupMessage {
             SetupStepInferenceDevice => translate("\n--- Step 3: Inference Device ---\n"),
             SetupStepModelDownload => translate("\n--- Step 4: Model Download ---\n"),
             SetupStepEncryption => translate("\n--- Step 5: Embedding Encryption ---\n"),
-            SetupStepEnrollment => translate("\n--- Step 6: Face Enrollment ---\n"),
+            SetupStepDaemon => translate("\n--- Step 6: Daemon Configuration ---\n"),
+            SetupStepEnrollment => translate("\n--- Step 7: Face Enrollment ---\n"),
             SetupStepEnrollmentSkipped => {
-                translate("\n--- Step 6: Face Enrollment (skipped, --no-enroll) ---\n")
+                translate("\n--- Step 7: Face Enrollment (skipped, --no-enroll) ---\n")
             }
-            SetupStepTest => translate("\n--- Step 7: Test Recognition ---\n"),
+            SetupStepTest => translate("\n--- Step 8: Test Recognition ---\n"),
             SetupStepTestSkipped => {
-                translate("\n--- Step 7: Test Recognition (skipped, no face enrolled) ---\n")
+                translate("\n--- Step 8: Test Recognition (skipped, no face enrolled) ---\n")
             }
-            SetupStepDaemon => translate("\n--- Step 8: Daemon Configuration ---\n"),
             SetupStepPam => translate("\n--- Step 9: PAM Configuration ---\n"),
             SetupCompleteHeader => translate("\n--- Setup Complete ---\n"),
             CameraStepFailed { error, current } => fill(
@@ -304,7 +304,7 @@ impl Message for SetupMessage {
                 &[("status", status.clone())],
             ),
             DaemonStatusNotConfiguredNoSystemd => translate("not configured (--no-systemd)"),
-            DaemonStatusDeferred => translate("configured from the command line"),
+            DaemonStatusFromCommandLine => translate("configured from the command line"),
             DaemonStatusEnabled => translate("enabled (D-Bus activation)"),
             DaemonStatusNotConfigured => translate("not configured"),
             SummaryPam { services } => fill(
@@ -420,11 +420,11 @@ impl super::Samples for SetupMessage {
             SetupStepInferenceDevice,
             SetupStepModelDownload,
             SetupStepEncryption,
+            SetupStepDaemon,
             SetupStepEnrollment,
             SetupStepEnrollmentSkipped,
             SetupStepTest,
             SetupStepTestSkipped,
-            SetupStepDaemon,
             SetupStepPam,
             SetupCompleteHeader,
             CameraStepFailed {
@@ -460,7 +460,7 @@ impl super::Samples for SetupMessage {
             SummaryEncryption { value: s("v") },
             SummaryDaemon { status: s("st") },
             DaemonStatusNotConfiguredNoSystemd,
-            DaemonStatusDeferred,
+            DaemonStatusFromCommandLine,
             DaemonStatusEnabled,
             DaemonStatusNotConfigured,
             SummaryPam {
@@ -506,6 +506,65 @@ impl super::Samples for SetupMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wizard's step banners, in the order `run_wizard` prints them.
+    ///
+    /// The numbering is the whole point of the list: the daemon is configured
+    /// at step 6, ahead of enrollment and the recognition test, so that both
+    /// run against the transport every later authentication uses instead of
+    /// against the direct-camera fallback. A banner whose number no longer
+    /// matches its position is the symptom of a step that moved without the
+    /// steps around it being renumbered.
+    #[test]
+    fn step_banners_are_numbered_in_the_order_the_wizard_runs_them() {
+        use SetupMessage::*;
+
+        let expected = [
+            (SetupStepCamera, "\n--- Step 1: Camera Selection ---\n"),
+            (SetupStepModelQuality, "\n--- Step 2: Model Quality ---\n"),
+            (
+                SetupStepInferenceDevice,
+                "\n--- Step 3: Inference Device ---\n",
+            ),
+            (SetupStepModelDownload, "\n--- Step 4: Model Download ---\n"),
+            (
+                SetupStepEncryption,
+                "\n--- Step 5: Embedding Encryption ---\n",
+            ),
+            (SetupStepDaemon, "\n--- Step 6: Daemon Configuration ---\n"),
+            (SetupStepEnrollment, "\n--- Step 7: Face Enrollment ---\n"),
+            (SetupStepTest, "\n--- Step 8: Test Recognition ---\n"),
+            (SetupStepPam, "\n--- Step 9: PAM Configuration ---\n"),
+        ];
+        for (step, banner) in &expected {
+            assert_eq!(&step.localized(), banner);
+        }
+
+        // The skipped twins carry their unskipped twin's number, so they
+        // renumber with it rather than drifting into a second numbering.
+        assert_eq!(
+            SetupStepEnrollmentSkipped.localized(),
+            "\n--- Step 7: Face Enrollment (skipped, --no-enroll) ---\n"
+        );
+        assert_eq!(
+            SetupStepTestSkipped.localized(),
+            "\n--- Step 8: Test Recognition (skipped, no face enrolled) ---\n"
+        );
+    }
+
+    /// The intro promises the same order the steps run in.
+    #[test]
+    fn the_intro_lists_the_daemon_before_enrollment() {
+        let intro = SetupMessage::SetupIntro {
+            version: "0.0.0".into(),
+        }
+        .localized();
+        let daemon = intro.find("Daemon configuration").expect("daemon bullet");
+        let enrollment = intro.find("Face enrollment").expect("enrollment bullet");
+        let pam = intro.find("PAM configuration").expect("pam bullet");
+        assert!(daemon < enrollment, "daemon is configured before enrolling");
+        assert!(enrollment < pam);
+    }
 
     /// Every string this domain took over from a `println!` in
     /// `commands/setup.rs`, pinned to the bytes that call site printed.

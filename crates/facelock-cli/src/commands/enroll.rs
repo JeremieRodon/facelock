@@ -25,7 +25,7 @@ pub fn run(
                 if !marker.exists() {
                     return Err(fail(FaceMessage::SetupDidNotComplete));
                 }
-                // Setup includes face enrollment (Step 4), so we're done
+                // Setup includes face enrollment (Step 7), so we're done
                 return Ok(());
             } else {
                 Terminal.info(&FaceMessage::RunSetupWhenReady);

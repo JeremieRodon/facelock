@@ -51,7 +51,7 @@ just install              # build + install binaries, systemd, D-Bus, PAM
 
 ```bash
 sudo facelock setup       # interactive wizard: camera, models, encryption,
-                          # enrollment, daemon, and PAM for sudo + screen lock
+                          # daemon, enrollment, and PAM for sudo + screen lock
 ```
 
 That's it. Open a new terminal and run `sudo echo "ok"` to confirm face auth fires. Keep a root shell open until you've verified it works.

@@ -61,8 +61,20 @@ print their payload and now print nothing; the exit code is unchanged.
 
 Interactive setup wizard. Walks through camera selection, model quality,
 inference device (CPU / CUDA / ROCm / OpenVINO), model downloads, encryption,
-enrollment, systemd and PAM configuration. Every step can also be answered, or
-declined, from the command line.
+the daemon, enrollment and PAM configuration. Every step can also be answered,
+or declined, from the command line.
+
+The daemon is configured before enrollment on purpose. `enroll` and `test`
+select their transport once, when they start, so on a first install a daemon
+configured after them would never be the one they used: enrollment would fall
+back to direct camera access and the recognition test would validate a
+transport no later authentication takes. The step starts the daemon, or
+restarts it if one is already running, because the daemon reads the encryption
+method, the model preset and the inference device once at startup: on a re-run
+of `setup` an untouched daemon would hold the answers from before the wizard.
+A restart interrupts any authentication that daemon is mid-way through, so a
+`sudo` prompt waiting on a face in another terminal falls back to a password
+that once.
 
 ```bash
 facelock setup                          # interactive wizard
@@ -127,8 +139,8 @@ Model presets:
 | Pair | Without either flag (wizard) | Without either flag (`--non-interactive`) |
 |------|------------------------------|-------------------------------------------|
 | `--pam` / `--no-pam` | prompt (step 9) | off |
-| `--systemd` / `--no-systemd` | prompt (step 8) | off |
-| `--enroll` / `--no-enroll` | prompt (step 6) | off; enrollment needs a human in front of the camera |
+| `--systemd` / `--no-systemd` | prompt (step 6) | off |
+| `--enroll` / `--no-enroll` | prompt (step 7) | off; enrollment needs a human in front of the camera |
 
 Each pair is a clap override pair, so **a later flag wins over an earlier
 one**: `--pam --no-pam` declines PAM, `--no-pam --pam` installs it. That

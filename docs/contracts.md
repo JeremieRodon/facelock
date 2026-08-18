@@ -50,7 +50,7 @@ follow it.
 
 | Command | Purpose |
 |---------|---------|
-| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, enrollment, PAM); creates the `facelock` system group if missing (packaging parity — it grants nothing on the auth path, ADR 010) |
+| `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, daemon, enrollment, PAM — the daemon before enrollment, so enrollment and the recognition test run on the transport later authentications use); creates the `facelock` system group if missing (packaging parity — it grants nothing on the auth path, ADR 010) |
 | `facelock setup --systemd` | Install/enable systemd units |
 | `facelock setup --pam` | Alias onto `facelock pam add\|remove` (see "facelock pam" below). Kept, and kept parsing, for every wrapper written against it |
 | `facelock pam add` | Add the facelock line to one or more `/etc/pam.d/<service>` files. Root |

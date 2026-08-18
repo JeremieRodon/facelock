@@ -15,7 +15,12 @@ pub enum SystemMessage {
     SystemdNotDetected,
     SystemdDeclined,
     SystemdSkippedFlag,
-    SystemdDeferred,
+    SystemdFromCommandLine,
+
+    // -- bringing the daemon up --
+    DaemonRestarted,
+    DaemonRunning,
+    DaemonNotReady { seconds: u64 },
 
     // -- the facelock system group --
     CreatingFacelockGroup,
@@ -45,9 +50,17 @@ impl Message for SystemMessage {
             SystemdSkippedFlag => translate(
                 "  Skipping daemon configuration (--no-systemd).\n  No unit files are written and systemctl is not invoked.",
             ),
-            SystemdDeferred => {
-                translate("  Answered on the command line; applied once setup finishes.")
-            }
+            SystemdFromCommandLine => translate("  Answered on the command line."),
+            DaemonRestarted => translate(
+                "  facelock-daemon was already running; restarted so enrollment uses\n  the new configuration.",
+            ),
+            DaemonRunning => translate("  facelock-daemon is running."),
+            DaemonNotReady { seconds } => fill(
+                translate(
+                    "  facelock-daemon did not answer within {seconds}s.\n  Continuing with direct camera access; check: systemctl status facelock-daemon",
+                ),
+                &[("seconds", seconds.to_string())],
+            ),
             CreatingFacelockGroup => translate("  Creating 'facelock' system group..."),
             DisablingSystemdUnits => translate("Disabling facelock-daemon systemd units..."),
             SystemdUnitsDisabled => translate("facelock-daemon service disabled and stopped."),
@@ -79,7 +92,7 @@ impl Message for SystemMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SystemMessage {
-    const VARIANT_COUNT: usize = 14;
+    const VARIANT_COUNT: usize = 17;
 
     fn samples() -> Vec<Self> {
         use SystemMessage::*;
@@ -88,7 +101,10 @@ impl super::Samples for SystemMessage {
             SystemdNotDetected,
             SystemdDeclined,
             SystemdSkippedFlag,
-            SystemdDeferred,
+            SystemdFromCommandLine,
+            DaemonRestarted,
+            DaemonRunning,
+            DaemonNotReady { seconds: 20 },
             CreatingFacelockGroup,
             DisablingSystemdUnits,
             SystemdUnitsDisabled,

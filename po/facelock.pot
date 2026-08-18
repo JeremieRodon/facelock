@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: facelock\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-18 13:19-0700\n"
+"POT-Creation-Date: 2026-08-18 14:27-0700\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -669,8 +669,9 @@ msgid ""
 "    - Model quality and inference device\n"
 "    - Model downloads\n"
 "    - Embedding encryption (TPM or software)\n"
+"    - Daemon configuration\n"
 "    - Face enrollment\n"
-"    - Daemon and PAM configuration\n"
+"    - PAM configuration\n"
 msgstr ""
 
 #: crates/facelock-cli/src/message/setup.rs:200
@@ -706,31 +707,31 @@ msgstr ""
 #: crates/facelock-cli/src/message/setup.rs:205
 msgid ""
 "\n"
-"--- Step 6: Face Enrollment ---\n"
+"--- Step 6: Daemon Configuration ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:207
+#: crates/facelock-cli/src/message/setup.rs:206
 msgid ""
 "\n"
-"--- Step 6: Face Enrollment (skipped, --no-enroll) ---\n"
+"--- Step 7: Face Enrollment ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:209
+#: crates/facelock-cli/src/message/setup.rs:208
 msgid ""
 "\n"
-"--- Step 7: Test Recognition ---\n"
+"--- Step 7: Face Enrollment (skipped, --no-enroll) ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:211
+#: crates/facelock-cli/src/message/setup.rs:210
 msgid ""
 "\n"
-"--- Step 7: Test Recognition (skipped, no face enrolled) ---\n"
+"--- Step 8: Test Recognition ---\n"
 msgstr ""
 
-#: crates/facelock-cli/src/message/setup.rs:213
+#: crates/facelock-cli/src/message/setup.rs:212
 msgid ""
 "\n"
-"--- Step 8: Daemon Configuration ---\n"
+"--- Step 8: Test Recognition (skipped, no face enrolled) ---\n"
 msgstr ""
 
 #: crates/facelock-cli/src/message/setup.rs:214
@@ -1280,66 +1281,82 @@ msgstr ""
 msgid "{path} ({error})"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:38
+#: crates/facelock-cli/src/message/system.rs:43
 msgid "Enable daemon mode with D-Bus activation?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:40
+#: crates/facelock-cli/src/message/system.rs:45
 msgid ""
 "  systemd not detected. Skipping daemon configuration.\n"
 "  Facelock will use oneshot mode for authentication."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:43
+#: crates/facelock-cli/src/message/system.rs:48
 msgid "  Skipping systemd setup. Facelock will use oneshot mode."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:46
+#: crates/facelock-cli/src/message/system.rs:51
 msgid ""
 "  Skipping daemon configuration (--no-systemd).\n"
 "  No unit files are written and systemctl is not invoked."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:49
-msgid "  Answered on the command line; applied once setup finishes."
-msgstr ""
-
-#: crates/facelock-cli/src/message/system.rs:51
-msgid "  Creating 'facelock' system group..."
-msgstr ""
-
-#: crates/facelock-cli/src/message/system.rs:52
-msgid "Disabling facelock-daemon systemd units..."
-msgstr ""
-
 #: crates/facelock-cli/src/message/system.rs:53
-msgid "facelock-daemon service disabled and stopped."
+msgid "  Answered on the command line."
 msgstr ""
 
 #: crates/facelock-cli/src/message/system.rs:55
-msgid "Installing facelock-daemon systemd and D-Bus units..."
+msgid ""
+"  facelock-daemon was already running; restarted so enrollment uses\n"
+"  the new configuration."
 msgstr ""
 
 #: crates/facelock-cli/src/message/system.rs:57
+msgid "  facelock-daemon is running."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:60
+msgid ""
+"  facelock-daemon did not answer within {seconds}s.\n"
+"  Continuing with direct camera access; check: systemctl status facelock-daemon"
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:64
+msgid "  Creating 'facelock' system group..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:65
+msgid "Disabling facelock-daemon systemd units..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:66
+msgid "facelock-daemon service disabled and stopped."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:68
+msgid "Installing facelock-daemon systemd and D-Bus units..."
+msgstr ""
+
+#: crates/facelock-cli/src/message/system.rs:70
 #, python-brace-format
 msgid "  Wrote {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:59
+#: crates/facelock-cli/src/message/system.rs:72
 #, python-brace-format
 msgid "  Refreshed legacy {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:62
+#: crates/facelock-cli/src/message/system.rs:75
 msgid "  systemctl daemon-reload done."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:64
+#: crates/facelock-cli/src/message/system.rs:77
 #, python-brace-format
 msgid "  systemctl enable {unit} done."
 msgstr ""
 
-#: crates/facelock-cli/src/message/system.rs:68
+#: crates/facelock-cli/src/message/system.rs:81
 msgid ""
 "\n"
 "facelock-daemon D-Bus activation is now enabled."
