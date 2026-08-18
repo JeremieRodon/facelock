@@ -27,16 +27,29 @@ _facelock_secure_paths() {
     return 0
 }
 
+# The bus policy may have changed (ADR 010). Refresh any legacy copy, then ask
+# the bus to re-read. Best-effort throughout.
+_facelock_refresh_bus_policy() {
+    # A legacy copy in /etc/dbus-1/system.d is read after /usr/share and would
+    # re-deny Authenticate (last matching rule wins); refresh it if present.
+    if [ -f /etc/dbus-1/system.d/org.facelock.Daemon.conf ] && \
+       grep -q 'org.facelock.Daemon' /etc/dbus-1/system.d/org.facelock.Daemon.conf; then
+        install -Dm644 /usr/share/dbus-1/system.d/org.facelock.Daemon.conf \
+            /etc/dbus-1/system.d/org.facelock.Daemon.conf 2>/dev/null || true
+    fi
+    # Both dbus-daemon and dbus-broker watch the policy directory, but a
+    # running lock screen may call Authenticate before they notice — ask
+    # explicitly.
+    dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+        /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+    return 0
+}
+
 post_install() {
     systemd-sysusers
     systemd-tmpfiles --create
     _facelock_secure_paths
-
-    # The bus policy may have changed (ADR 010). Both dbus-daemon and
-    # dbus-broker watch the policy directory, but a running lock screen may
-    # call Authenticate before they notice — ask explicitly, best-effort.
-    dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
-        /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+    _facelock_refresh_bus_policy
 
     # Reload systemd for D-Bus activation
     systemctl daemon-reload 2>/dev/null || true
@@ -50,12 +63,7 @@ post_upgrade() {
     systemd-sysusers
     systemd-tmpfiles --create
     _facelock_secure_paths
-
-    # The bus policy may have changed (ADR 010). Both dbus-daemon and
-    # dbus-broker watch the policy directory, but a running lock screen may
-    # call Authenticate before they notice — ask explicitly, best-effort.
-    dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
-        /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+    _facelock_refresh_bus_policy
 
     # Pick up unit changes before the restart below, not after. Without this,
     # `systemctl restart` re-runs the *cached* unit and every change the new

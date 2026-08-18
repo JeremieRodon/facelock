@@ -44,6 +44,13 @@ case "$1" in
             systemctl daemon-reload 2>/dev/null || true
         fi
 
+        # A legacy copy in /etc/dbus-1/system.d is read after /usr/share and would
+        # re-deny Authenticate (last matching rule wins); refresh it if present.
+        if [ -f /etc/dbus-1/system.d/org.facelock.Daemon.conf ] && \
+           grep -q 'org.facelock.Daemon' /etc/dbus-1/system.d/org.facelock.Daemon.conf; then
+            install -Dm644 /usr/share/dbus-1/system.d/org.facelock.Daemon.conf \
+                /etc/dbus-1/system.d/org.facelock.Daemon.conf 2>/dev/null || true
+        fi
         # Bus policy may have changed (ADR 010); ask the bus to re-read it.
         dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
             /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true

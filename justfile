@@ -489,6 +489,9 @@ install-files:
        grep -q 'org.facelock.Daemon' /etc/dbus-1/system-services/org.facelock.Daemon.service; then
         install -Dm644 dbus/org.facelock.Daemon.service /etc/dbus-1/system-services/org.facelock.Daemon.service
     fi
+    # The bus may not have noticed the policy change yet; ask (best-effort).
+    dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+        /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
 
     # Polkit agent binary (optional, do NOT install autostart — agent is not production-ready
     # and will steal polkit auth from the DE's agent, causing all privilege prompts to hang)
