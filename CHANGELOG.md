@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`facelock pam add | remove | status`** (#180): one command owns every write
+  to `/etc/pam.d`, and `setup --pam` is now an alias onto it that keeps parsing
+  and keeps its behaviour. `--service` is repeatable on all three verbs, so
+  several services are configured in one process under one root check.
+  Validation is two-phase: a typo'd or gated service name writes nothing at all.
+  `add` takes `--allow-sensitive` to unlock the shared auth stacks and
+  `--dry-run` to print the resolved plan; `--if-present` turns an absent service
+  file into a successful no-op on all three verbs; `--json` emits one document
+  whose shape and `action` vocabulary are a stability contract. `status` reads
+  only and needs no root — the probe to branch on instead of grepping
+  `/etc/pam.d`, on `grep`'s 0/1/2 scale.
+- **`facelock capabilities`** (#182): what this build can do, one name per line
+  or `--json` for `{"version", "capabilities"}`. Unprivileged, reads no config,
+  activates no daemon; it replaces grepping `--help`, which is not an API.
+  **Probe by name, never by version** — a git or distro build carries a version
+  that says nothing about what is in it, and a backport can add a feature
+  without moving the number. The name list is a stability contract: names are
+  added, never removed or repurposed, and a consumer tolerates one it does not
+  know. A build that predates the command answers by failing, which a caller
+  reads as "no capabilities at all".
+- **Global `-c`/`--config` and `-q`/`--quiet`, accepted on either side of the
+  subcommand** (#178/#179): each is declared once, so `facelock daemon -c X` and
+  `facelock -c X daemon` are the same invocation and no command re-declares
+  them. `--user` is `-u` everywhere it exists, `facelock auth` included, and
+  `remove`/`clear` accept `--no-confirm` as an alias for `-y` (it was
+  `setup`-only). A conformance test walks the whole command tree, nested
+  subcommands included, and fails on any drift.
+- **`facelock preview --json`** (#181): the flag shipped as `--text-only`, which
+  survives as a hidden alias and keeps parsing; the per-frame payload is byte
+  for byte what it was. It comes with a rule — every command whose output a
+  script would parse takes `--json`, spelled exactly that, with no short letter
+  and no `--output json`, and gains it when it has a named consumer rather than
+  to complete a matrix. The coverage list is a registry checked in both
+  directions against the command tree.
+- **Every command is documented, and pinned there by tests** (#184): the CLI
+  reference, the man page and the book. A subcommand that ships without a
+  heading fails the build, as does a documented example that no longer parses or
+  that installs into a gated PAM service without the flag that unlocks it.
+- **The container PAM tier exercises `facelock pam` end to end**: `add`,
+  `remove` and `status` against a real `/etc/pam.d`, covering the sensitive
+  gate, the two-phase all-or-nothing rule, a rejected service name and a symlink
+  out of the directory.
 - **Optional idempotent PAM-line removal** (#148): `facelock setup --pam
   --remove --if-present` now succeeds when the requested PAM service file is
   absent, so teardown scripts can iterate optional integrations without their
@@ -128,6 +170,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`--quiet` has one implementation and one meaning** (#179/#193): it
+  suppresses informational stdout and, on a command whose stdout is the payload,
+  the payload too, so `facelock --quiet devices --json` writes nothing and the
+  exit code is the whole answer. `is-enrolled`, `capabilities`, `pam`,
+  `list --json` and `devices --json` all follow it; `list --json --quiet` and
+  `devices --json --quiet` used to print their payload and no longer do. Errors,
+  prompts, exit codes and `pam add`'s rollback advice are unchanged — a silenced
+  question is a hang, not a quieter program. The flag is read by the two
+  suppressible stdout sinks of the message seam, so no command implements it and
+  none can forget it.
+  [#140](https://github.com/tyvsmith/facelock/issues/140) tracks the commands
+  that still print human text directly and stay noisy under it.
+- **PAM writer hardening** (#194). Eight services are gated where three were:
+  `common-auth`, `login`, `password-auth`, `password-auth-ac`, `sshd`,
+  `system-auth`, `system-auth-ac` and `system-login`. Whether the gate fired
+  used to depend on the operator's distribution, and RHEL's older `authconfig`
+  leaves the `-ac` names pointing at the real file. `pam add` now refuses a
+  service file that is a symlink out of `/etc/pam.d` — on an authselect system
+  `system-auth` links into `/etc/authselect`, where the edit is regenerated away
+  — or that has more than one hard link, since a link count says another name
+  for the inode exists and not where, which is the one question confinement
+  answers. A symlink that stays inside the directory is followed, and the
+  sensitive gate then runs on the file it reaches rather than only on the typed
+  name. `--json` implies `--no-confirm` on `pam add|remove`, because the
+  per-file question is drawn on stderr while a parser waits on stdout; it does
+  **not** imply `--allow-sensitive`, which is an authorization a machine caller
+  has not given. `pam status` gained `--if-present`, so "install the optional
+  integrations, then verify" is a pair of commands with the same flag on both.
+- **Upgrade note — authselect and authconfig systems.** Where an earlier
+  facelock wrote through `/etc/pam.d/system-auth` into `/etc/authselect/…`,
+  `facelock pam remove --service system-auth` now refuses rather than following
+  the link; confinement applies to every verb. The message names the target file
+  so it can be edited by hand, or through `authselect` itself. Nothing is
+  removed silently and nothing is left half-written.
+- **The hyprlock hint follows only a file facelock would write** (#195): a
+  `/etc/pam.d/hyprlock` that is a symlink out of the directory no longer draws
+  "your lock screen is wired up", because that is a service the writer refuses
+  to touch. The rest of the alias refactor behind it is not observable.
+- **`is-enrolled --json` documents `updated` as `null` when the user is not
+  enrolled.** There is no marker to read a timestamp from, which is what the
+  command has always emitted; only the documentation was wrong.
 - **BREAKING: `facelock restart` is now `facelock daemon restart`** (ADR 009).
 - **BREAKING: `facelock encrypt` is now `facelock tpm encrypt`** (ADR 009).
   `--generate-key` is unchanged.
@@ -319,6 +402,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`pam add` refused to install when stderr was redirected** (#194): the
+  per-file confirmation tested stdin, but `dialoguer` draws *and* reads the
+  prompt on stderr, so `sudo facelock pam add --service sudo 2>install.log` had
+  a terminal on stdin, none where the prompt goes, and failed the service having
+  written nothing. Redirecting a log is not a reason to refuse to install, so
+  the guard now takes both streams and skips the question when either is not a
+  terminal. The sensitive gate is decided before any prompt exists and is
+  unaffected.
 - **`--json` output corrupted by log lines on stdout** (#149): the CLI's tracing
   subscriber inherited `tracing_subscriber`'s default writer, which is *stdout*
   — the same stream `devices --json`, `list --json` and `is-enrolled --json`

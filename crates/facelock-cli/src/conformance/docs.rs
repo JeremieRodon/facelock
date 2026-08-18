@@ -107,6 +107,59 @@ fn docs_cli_documents_every_subcommand() {
     }
 }
 
+/// Every `setup` flag is named in the section a capability points at.
+///
+/// `setup-no-pam`, `setup-systemd` and `setup-if-present` are capability
+/// names: a wrapper reads one, then opens `docs/cli.md` to find out what the
+/// flag it has just proved exists actually does. That section documented none
+/// of the choice or action flags for the whole cycle they shipped in — the man
+/// page and the book carried them and `docs/cli.md` did not. It is the rot
+/// [`docs_cli_documents_every_subcommand`] catches, one level down.
+///
+/// Scoped to `setup` on purpose. Holding every command's flags to this would
+/// demand a flag table on commands that read better as prose, which is a
+/// decision about what the reference contains rather than a check that it is
+/// accurate. `setup` is the one section a capability name sends a reader to
+/// for a flag.
+///
+/// A global flag is skipped. `--config` and `--quiet` are documented once
+/// under `## Global flags`, which is what `global = true` is for;
+/// `Cli::command()` does not propagate them into the subcommand today, so this
+/// is a forward guard rather than a filter that fires.
+///
+/// A flag counts as documented when its long name is a backticked token of its
+/// own — ``` `--no-pam` ``` — or opens one carrying a metavariable —
+/// ``` `--camera <PATH|auto>` ```. Both spellings are in the file. What
+/// neither accepts is the name appearing only in running prose, where a reader
+/// scanning the tables never reaches it.
+#[test]
+fn docs_cli_setup_documents_every_flag() {
+    let root = Cli::command();
+    let setup = root
+        .get_subcommands()
+        .find(|command| command.get_name() == "setup")
+        .expect("`facelock setup` ships");
+
+    let section = section_of(CLI_DOC, "\n## facelock setup\n");
+
+    for arg in setup.get_arguments() {
+        if arg.is_global_set() {
+            continue;
+        }
+        let Some(long) = arg.get_long() else {
+            continue;
+        };
+        if long == "help" || long == "version" {
+            continue;
+        }
+        assert!(
+            section.contains(&format!("`--{long}`")) || section.contains(&format!("`--{long} <")),
+            "`facelock setup --{long}` ships but the `## facelock setup` \
+             section of docs/cli.md never names it"
+        );
+    }
+}
+
 /// The `## Machine-readable output` section names every command that
 /// offers `--json`.
 ///
