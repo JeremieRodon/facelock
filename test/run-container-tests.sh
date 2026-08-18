@@ -147,6 +147,24 @@ run_test "pam status exits 0 once the line is present" \
     "facelock pam status --service facelock-scratch" \
     0
 
+# --- P1b (#170): the module probe ---
+#
+# This is the only tier where pam_facelock.so is genuinely installed, so it is
+# where a regressed probe shows: `just install-files` puts it at
+# /lib/security, the first candidate. The key is top-level and additive, and
+# `null` here would mean `pam add` is about to refuse on a machine that has
+# the module.
+cat > /tmp/pam-module-path.py <<'EOF'
+import json, sys
+print(json.load(open(sys.argv[1])).get("module_path"))
+EOF
+
+run_test "pam status --json reports where the module was found" \
+    "facelock pam status --service facelock-scratch --json > /tmp/pam-module.json 2>/dev/null; python3 /tmp/pam-module-path.py /tmp/pam-module.json | grep -qx /lib/security/pam_facelock.so" \
+    0
+
+rm -f /tmp/pam-module.json /tmp/pam-module-path.py
+
 # The sensitive-service gate. Arch's `pam` package ships /etc/pam.d/system-auth,
 # so that is what this normally runs against; the loop keeps the row honest if
 # the base image ever changes which of the three exists. The refusal is decided

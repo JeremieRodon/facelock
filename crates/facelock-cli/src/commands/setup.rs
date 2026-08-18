@@ -28,7 +28,7 @@ use crate::message::{
 /// wizard's step 9 is driven exactly the way `pam add` is.
 #[cfg(test)]
 use super::pam::only;
-use super::pam::{PAM_LINE, PAM_MODULE_PATH, PamAction, PamDirs, PamRequest};
+use super::pam::{PAM_LINE, PAM_MODULE_PATHS, PamAction, PamDirs, PamRequest};
 
 /// Embedded systemd unit file.
 const SERVICE_UNIT: &str = include_str!("../../../../systemd/facelock-daemon.service");
@@ -2031,7 +2031,7 @@ fn pam_step_in(
 
     if !module_present {
         Terminal.info(&PamMessage::PamModuleMissing {
-            path: PAM_MODULE_PATH.to_string(),
+            paths: PAM_MODULE_PATHS.join(", "),
         });
         return Ok(Vec::new());
     }

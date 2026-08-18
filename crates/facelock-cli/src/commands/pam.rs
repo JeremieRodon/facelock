@@ -133,8 +133,29 @@ pub const PAM_DIR: &str = "/etc/pam.d";
 /// than by these bytes — see [`is_facelock_pam_line`].
 pub const PAM_LINE: &str = "auth      sufficient pam_facelock.so";
 
-/// Where the PAM module has to be for the line to mean anything.
-pub const PAM_MODULE_PATH: &str = "/lib/security/pam_facelock.so";
+/// Where the PAM module may be installed, in probe order — first hit wins.
+///
+/// A list rather than one path because this repository **ships the packaging
+/// that puts it elsewhere**: `dist/facelock.spec` installs to
+/// `%{_libdir}/security/`, which is `/usr/lib64/security` on x86-64 Fedora and
+/// RHEL, so on the distribution whose spec file is in this tree a single
+/// hardcoded `/lib/security` made `pam add` refuse with "module not installed"
+/// while the module was installed (#170).
+///
+/// `/lib/security` stays first so the answer on usrmerged Arch — where it is
+/// the same file as `/usr/lib/security/pam_facelock.so` — does not change.
+/// There is deliberately **no** Debian multiarch triple
+/// (`/usr/lib/<triple>/security`): Debian's idiomatic path is
+/// `pam-auth-update` rather than a hand-inserted line, which this command does
+/// not do, so a probe path for it would suggest support that is not there.
+///
+/// This is the one list. `crate::health` reads it rather than keeping a second
+/// copy, because two lists that drift is the bug class this closes.
+pub const PAM_MODULE_PATHS: &[&str] = &[
+    "/lib/security/pam_facelock.so",
+    "/usr/lib/security/pam_facelock.so",
+    "/usr/lib64/security/pam_facelock.so",
+];
 
 /// Services whose stacks can lock the machine, or the network, out. Adding
 /// face auth here needs `--allow-sensitive` (`--yes` on the `setup` alias);
@@ -1884,12 +1905,25 @@ fn report_json(action: PamAction, dry_run: bool, reports: &[ServiceReport]) -> S
         })
         .collect();
 
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "command": action.word(),
         "dry_run": dry_run,
         "services": services,
-    })
-    .to_string()
+    });
+
+    // `status` alone carries `module_path`: it is the verb that answers "is
+    // this machine wired up", and "the line is present but the module it names
+    // is at a path nothing looks at" is the state an integrator could not
+    // otherwise see. `add` and `remove` refuse before writing when the module
+    // is absent, so the question is already answered for them. A property of
+    // the machine, not of a service, so it is top-level rather than repeated
+    // in every service object — `null` when no candidate hit.
+    if let (PamAction::Status, Some(object)) = (action, document.as_object_mut()) {
+        let found = installed_module_path().map(|path| path.display().to_string());
+        object.insert("module_path".to_string(), serde_json::json!(found));
+    }
+
+    document.to_string()
 }
 
 /// Emit the machine document on stdout, if this invocation asked for one.
@@ -1954,19 +1988,42 @@ pub fn run(request: PamRequest) -> anyhow::Result<i32> {
 ///
 /// A property of the machine, not of a service, so it is asked once per
 /// invocation rather than per service — and asked here rather than by each
-/// caller spelling [`PAM_MODULE_PATH`] itself, which is how `setup` came to
+/// caller spelling [`PAM_MODULE_PATHS`] itself, which is how `setup` came to
 /// have its own copy of the test.
 pub(crate) fn module_installed() -> bool {
-    Path::new(PAM_MODULE_PATH).exists()
+    installed_module_path().is_some()
+}
+
+/// The candidate the module was found at, or `None`. The probe is **read
+/// only**: it finds the module and never installs, copies or links it —
+/// placing it is the packager's job, and writing into the directory `ld.so`
+/// loads auth modules from is not something a CLI should do.
+pub(crate) fn installed_module_path() -> Option<PathBuf> {
+    first_existing(PAM_MODULE_PATHS)
+}
+
+/// The first candidate that exists. Split out so the order is testable without
+/// a machine that has the module installed in three places.
+fn first_existing(candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(Path::new)
+        .find(|path| path.exists())
+        .map(Path::to_path_buf)
 }
 
 /// The precondition the line is useless without, as the refusal to write.
+///
+/// The refusal names **every** candidate: an operator whose distribution puts
+/// the module somewhere unlisted can then see what facelock looked for rather
+/// than guess which single path it wanted.
 fn require_module_installed() -> anyhow::Result<()> {
     if module_installed() {
         return Ok(());
     }
     Err(fail(PamMessage::PamModuleNotInstalled {
-        path: PAM_MODULE_PATH.to_string(),
+        paths: PAM_MODULE_PATHS.join(", "),
+        path: PAM_MODULE_PATHS.first().unwrap_or(&"").to_string(),
     }))
 }
 
@@ -4085,5 +4142,127 @@ mod tests {
             [Path::new("/etc/pam.d"), Path::new("/usr/lib/pam.d")],
             "Linux-PAM's own precedence: /etc first, the vendor directory second"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The module probe (P1b, #170)
+    // -----------------------------------------------------------------------
+
+    /// First hit wins, and the *order* is the contract: `/lib/security` stays
+    /// first so the answer on usrmerged Arch does not change.
+    #[test]
+    fn the_module_probe_takes_the_first_candidate_that_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let candidates: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| dir.path().join(name).display().to_string())
+            .collect();
+        let list: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        assert_eq!(first_existing(&list), None, "a miss is None, not a guess");
+
+        fs::write(dir.path().join("b"), "").unwrap();
+        fs::write(dir.path().join("c"), "").unwrap();
+        assert_eq!(
+            first_existing(&list),
+            Some(dir.path().join("b")),
+            "the earlier of two hits wins"
+        );
+
+        fs::write(dir.path().join("a"), "").unwrap();
+        assert_eq!(first_existing(&list), Some(dir.path().join("a")));
+    }
+
+    /// The regression that matters: the module installed **only** at the last
+    /// candidate. `dist/facelock.spec` puts it at `%{_libdir}/security`, which
+    /// is `/usr/lib64/security` on x86-64 Fedora and RHEL, and the old single
+    /// path made `pam add` refuse on the distribution this repository ships a
+    /// spec file for.
+    #[test]
+    fn a_module_at_the_last_candidate_is_still_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let candidates: Vec<String> = ["lib", "usr-lib", "usr-lib64"]
+            .iter()
+            .map(|name| dir.path().join(name).display().to_string())
+            .collect();
+        let list: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        fs::write(dir.path().join("usr-lib64"), "").unwrap();
+
+        assert_eq!(first_existing(&list), Some(dir.path().join("usr-lib64")));
+    }
+
+    /// The refusal names every candidate, so an operator on an unlisted layout
+    /// can see what to add rather than guess which single path was wanted.
+    #[test]
+    fn the_module_refusal_names_every_candidate() {
+        let message = PamMessage::PamModuleNotInstalled {
+            paths: PAM_MODULE_PATHS.join(", "),
+            path: PAM_MODULE_PATHS[0].to_string(),
+        }
+        .localized();
+
+        for candidate in PAM_MODULE_PATHS {
+            assert!(
+                message.contains(candidate),
+                "{candidate} unnamed: {message}"
+            );
+        }
+    }
+
+    /// The probe order, pinned. `/lib/security` first keeps Arch's answer the
+    /// answer it was; `/usr/lib64/security` is Fedora's; there is deliberately
+    /// no Debian multiarch triple, because Debian's path is `pam-auth-update`
+    /// and this command does not do that.
+    #[test]
+    fn the_module_probe_order_is_the_contract() {
+        assert_eq!(
+            PAM_MODULE_PATHS,
+            [
+                "/lib/security/pam_facelock.so",
+                "/usr/lib/security/pam_facelock.so",
+                "/usr/lib64/security/pam_facelock.so",
+            ]
+        );
+        // One list, and there is deliberately nothing to assert about it:
+        // `health::PAM_MODULE_PATHS` is a `pub use` of this const, not a
+        // second declaration, so an equality check here could not fail. The
+        // re-export *is* the guarantee that `status` cannot say "installed"
+        // where `pam add` says "not installed" — re-declaring the list would
+        // have to delete it, which is a diff a reader sees.
+    }
+
+    /// `pam status --json` carries the resolved module path as a new
+    /// **top-level** key: it is a property of the machine, not of a service,
+    /// and "the line is present but the module it names is at a path nothing
+    /// looks at" is the state an integrator could not otherwise see. `add` and
+    /// `remove` refuse before writing when it is missing, so their documents
+    /// do not carry it.
+    #[test]
+    fn status_json_carries_the_module_path_and_the_write_verbs_do_not() {
+        let rows = [ServiceReport {
+            service: "sudo".to_string(),
+            path: Some("/etc/pam.d/sudo".to_string()),
+            outcome: Outcome::Present,
+            backup: None,
+        }];
+
+        let status: serde_json::Value =
+            serde_json::from_str(&report_json(PamAction::Status, false, &rows)).unwrap();
+        assert!(
+            status.get("module_path").is_some(),
+            "the key is always present on status, null when nothing hit"
+        );
+        assert_eq!(
+            status["module_path"],
+            installed_module_path()
+                .map(|path| serde_json::json!(path.display().to_string()))
+                .unwrap_or(serde_json::Value::Null)
+        );
+
+        for action in [PamAction::Add, PamAction::Remove] {
+            let document: serde_json::Value =
+                serde_json::from_str(&report_json(action, false, &rows)).unwrap();
+            assert!(document.get("module_path").is_none(), "{action:?}");
+        }
     }
 }

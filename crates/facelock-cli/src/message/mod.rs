@@ -615,12 +615,17 @@ mod tests {
              Falling back to text-only mode.\n"
         );
         // The module-missing refusal was an inline `bail!` on the same path.
+        // It now names every candidate the probe tried (#170) — the operator
+        // on an unlisted layout is the one who needs this string — and still
+        // names one concrete place to put the module.
         assert_eq!(
             PamMessage::PamModuleNotInstalled {
+                paths: "/lib/security/pam_facelock.so, /usr/lib64/security/pam_facelock.so".into(),
                 path: "/lib/security/pam_facelock.so".into()
             }
             .localized(),
-            "PAM module not found at /lib/security/pam_facelock.so.\n\
+            "PAM module not found. Tried: /lib/security/pam_facelock.so, \
+             /usr/lib64/security/pam_facelock.so\n\
              Install it first: cargo build --release -p pam-facelock && \
              sudo cp target/release/libpam_facelock.so /lib/security/pam_facelock.so"
         );

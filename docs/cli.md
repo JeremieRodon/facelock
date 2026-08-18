@@ -656,8 +656,14 @@ facelock pam status --service hyprlock --service swaylock --if-present
 `--json` emits one document:
 
 ```json
-{"command":"status","dry_run":false,"services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
+{"command":"status","dry_run":false,"module_path":"/lib/security/pam_facelock.so","services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
 ```
+
+`module_path` is where `pam_facelock.so` was found, or `null` when no candidate
+hit — a property of the machine rather than of a service, and what tells an
+integrator that a service carries the line while the module it names is at a
+path nothing looks at. `add` and `remove` refuse before writing when the module
+is missing, so their documents do not carry the key.
 
 The document's shape, the `action` vocabulary, and the rule that a consumer
 must tolerate an `action` it does not recognize rather than treat it as an

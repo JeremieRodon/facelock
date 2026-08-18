@@ -17,8 +17,11 @@ pub enum PamMessage {
     PamSkippedFlag {
         dir: String,
     },
+    /// The wizard's softer version of [`PamMessage::PamModuleNotInstalled`]:
+    /// step 9 skips PAM rather than failing. Names every candidate for the
+    /// same reason.
     PamModuleMissing {
-        path: String,
+        paths: String,
     },
     ConfiguringPamFor {
         service: String,
@@ -164,7 +167,12 @@ pub enum PamMessage {
         service: String,
         remedy: String,
     },
+    /// `paths` is every candidate the probe tried, comma-separated, and
+    /// `path` the primary one the install hint names. Both: an operator on an
+    /// unlisted layout needs to see what was looked for, and still needs one
+    /// concrete place to put it.
     PamModuleNotInstalled {
+        paths: String,
         path: String,
     },
     PamServiceAbsentSkipped {
@@ -212,11 +220,11 @@ impl Message for PamMessage {
                 ),
                 &[("dir", dir.clone())],
             ),
-            PamModuleMissing { path } => fill(
+            PamModuleMissing { paths } => fill(
                 translate(
-                    "  PAM module not found at {path}.\n  Install it first, then run: sudo facelock setup --pam",
+                    "  PAM module not found. Tried: {paths}\n  Install it first, then run: sudo facelock setup --pam",
                 ),
-                &[("path", path.clone())],
+                &[("paths", paths.clone())],
             ),
             ConfiguringPamFor { service } => fill(
                 translate("  Configuring PAM for {service}..."),
@@ -398,11 +406,11 @@ impl Message for PamMessage {
                 ),
                 &[("service", service.clone()), ("remedy", remedy.clone())],
             ),
-            PamModuleNotInstalled { path } => fill(
+            PamModuleNotInstalled { paths, path } => fill(
                 translate(
-                    "PAM module not found at {path}.\nInstall it first: cargo build --release -p pam-facelock && sudo cp target/release/libpam_facelock.so {path}",
+                    "PAM module not found. Tried: {paths}\nInstall it first: cargo build --release -p pam-facelock && sudo cp target/release/libpam_facelock.so {path}",
                 ),
-                &[("path", path.clone())],
+                &[("paths", paths.clone()), ("path", path.clone())],
             ),
             PamServiceAbsentSkipped { path } => fill(
                 translate("PAM service file absent: {path}. Nothing to add."),
@@ -458,7 +466,7 @@ impl super::Samples for PamMessage {
         use PamMessage::*;
         vec![
             PamSkippedFlag { dir: s("/d") },
-            PamModuleMissing { path: s("/p") },
+            PamModuleMissing { paths: s("/p") },
             ConfiguringPamFor { service: s("sudo") },
             NoPamCandidates { dir: s("/d") },
             PamLinePreview {
@@ -542,7 +550,10 @@ impl super::Samples for PamMessage {
                 service: s("sshd"),
                 remedy: s("--allow-sensitive"),
             },
-            PamModuleNotInstalled { path: s("/p") },
+            PamModuleNotInstalled {
+                paths: s("/lib/security/pam_facelock.so, /usr/lib64/security/pam_facelock.so"),
+                path: s("/lib/security/pam_facelock.so"),
+            },
             PamServiceAbsentSkipped { path: s("/p") },
             PamPlanAdd {
                 path: s("/p"),

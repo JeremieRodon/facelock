@@ -36,10 +36,12 @@ pub const AUTH_BIN: &str = "/usr/bin/facelock";
 
 /// Where the PAM module may be installed; the first entry is the primary
 /// path named in the report's item line.
-pub const PAM_MODULE_PATHS: [&str; 2] = [
-    "/lib/security/pam_facelock.so",
-    "/usr/lib/security/pam_facelock.so",
-];
+///
+/// Re-exported rather than declared: `commands::pam` owns the probe order,
+/// because it is what refuses to write when the module is missing, and two
+/// lists that drift apart is exactly the bug `status` would then fail to
+/// report (#170).
+pub use crate::commands::pam::PAM_MODULE_PATHS;
 
 /// The `why` shared by every fact that cannot be probed without a parsed
 /// config.

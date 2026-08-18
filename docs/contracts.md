@@ -287,6 +287,21 @@ the vendor file; `pam remove` takes the line out and leaves the override in
 place. The vendor file is never read-modified-written, never backed up, and
 never renamed over.
 
+**The module is probed too, and that is a different list.** The service-file
+order above says where a *service file* is looked up; the module
+`pam_facelock.so` is looked up in `/lib/security`, then `/usr/lib/security`,
+then `/usr/lib64/security`, first hit wins. Two lists for two things: one is
+configuration, the other is a shared object, and they are never merged.
+`/lib/security` is first so the answer on usrmerged Arch is unchanged;
+`/usr/lib64/security` is where `dist/facelock.spec` installs on x86-64 Fedora
+and RHEL, which is why the single hardcoded path was a refusal-to-write on the
+distribution this repository ships a spec file for. There is deliberately no
+Debian multiarch triple: Debian's idiomatic path is `pam-auth-update`, which is
+out of scope for this command. The probe is **read only** — it finds the
+module, and never installs, copies or links it. When it finds nothing, `add`
+refuses and the refusal names **every** candidate, so an operator on an
+unlisted layout can see what to add. The list is not configurable.
+
 **A vendor file that already carries the line needs no override.** `add`
 reports `unchanged` and writes nothing, and `status` reports `present`: a
 distribution that ships face auth in its own PAM stack is configured, and
@@ -493,6 +508,14 @@ the refusal is *also* written to stderr for a human. Exit 2 either way.
   ]
 }
 ```
+
+`pam status --json` carries one extra top-level key, `module_path`: the
+candidate `pam_facelock.so` was found at, or `null` when none was. It is a
+property of the machine rather than of a service — which is why it is top-level
+and not repeated in every service object — and it is what tells an integrator
+that the line is present but names a module at a path nothing looks at. `add`
+and `remove` refuse before writing when the module is missing, so their
+documents do not carry the key.
 
 **This shape is a stability contract.** An object rather than a bare array so a
 new top-level field is additive. Field names do not change and are not removed;

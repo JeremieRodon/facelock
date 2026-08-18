@@ -618,8 +618,10 @@ The exit code is the answer, on the same 0/1/2 scale as `is-enrolled` and `grep`
 Across several services the worst outcome wins. `--if-present` means here what it means on `add` and `remove`: an absent service file is reported and no longer forces exit 2, so exit 0 becomes "every requested service **that exists** carries the line" and a set of optional integrations can be installed and then verified with the same flag on both commands. It forgives absence only — a service whose file is a dangling or looping symlink is still exit 2, since an unresolvable link is not an absent file. `--json` emits one document:
 
 ```json
-{"command":"status","dry_run":false,"services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
+{"command":"status","dry_run":false,"module_path":"/lib/security/pam_facelock.so","services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
 ```
+
+`module_path` is where `pam_facelock.so` was found, or `null` when no candidate hit — a property of the machine rather than of a service, and what tells an integrator that a service carries the line while the module it names is at a path nothing looks at. `add` and `remove` refuse before writing when the module is missing, so their documents do not carry the key.
 
 The document's shape and the `action` vocabulary are a stability contract, including the rule that a consumer must tolerate an `action` it does not recognize rather than treat it as an error. See `docs/contracts.md`, "facelock pam Semantics", for that, for the `add`/`remove` exit codes, and for what `--json` does on a validation failure.
 
