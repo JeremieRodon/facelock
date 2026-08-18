@@ -248,12 +248,20 @@ Consequently `setup --systemd --pam` now runs both (it previously dropped
 `--remove` and `--service` require `--pam`, and `--disable` requires `--systemd`,
 so a dropped flag is now a parse error rather than silence.
 
-`--if-present` requires `--remove` (and therefore `--pam`). It changes only a
-missing target service file from an error into a successful no-op; read, parse
-and write failures remain fatal, and `--remove` without the flag retains its
-historical missing-file error. (On `facelock pam` the same flag is offered on
-**both** `add` and `remove`, since "configure hyprlock if this machine has
-hyprlock" is the same question in either direction.)
+`--if-present` requires `--pam` and applies to the add side as well as
+`--remove`. "Configure hyprlock if this machine has hyprlock" is the same
+question in either direction, and it is what a provisioning script over a set
+of optional integrations is asking. The flag turns a missing target service
+file from an error into a successful no-op and does nothing else; read, parse
+and write failures remain fatal, and without it both directions keep their
+historical missing-file error. The exit code is `facelock pam`'s and identical
+on both: an absent service is reported `absent` and the alias exits 0.
+
+The flag is not a way around a service that *should* resolve. Since the search
+path took in the vendor directories, `--service polkit-1` finds
+`/usr/lib/pam.d/polkit-1` on a stock Arch box without it. Reserve
+`--if-present` for services a machine may genuinely not have. The default stays
+a hard error, which is what catches `--service polkti-1`.
 
 **`--pam` is an alias onto `facelock pam add` / `facelock pam remove`.** The
 plan resolution above stays on `setup` — `--pam`, `--no-pam`, `--service`,
@@ -673,7 +681,7 @@ that is not on this list is not being denied, only not yet promised.
 | `pam-multi-service` | `pam add`/`pam remove`/`pam status` take a repeatable `--service` — several services in one process, one root check |
 | `pam-status` | `pam status` exists — the unprivileged `/etc/pam.d` read (DEC-6 below) |
 | `quiet` | the global `--quiet` |
-| `setup-if-present` | `setup --pam --remove --if-present` |
+| `setup-if-present` | `setup --pam --if-present`, on add and on `--remove` alike |
 | `setup-no-pam` | `setup --no-pam` |
 | `setup-systemd` | `setup --systemd` |
 | `tpm-decrypt` | `tpm decrypt` exists — the verb ADR 009 moved under `tpm` from the top-level `decrypt` |

@@ -113,8 +113,8 @@ pub struct SetupCli {
     /// Used with --pam: remove the PAM line instead of adding it
     #[arg(long, requires = "pam")]
     pub remove: bool,
-    /// Used with --pam --remove: treat an absent service file as success
-    #[arg(long = "if-present", requires = "remove")]
+    /// Used with --pam: treat an absent service file as success
+    #[arg(long = "if-present", requires = "pam")]
     pub if_present: bool,
 
     // -- Choice flags. Supplying a value answers the question, and so skips

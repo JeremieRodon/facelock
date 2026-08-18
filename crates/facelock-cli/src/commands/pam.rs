@@ -2356,7 +2356,18 @@ pub(crate) fn remove_for_setup(request: &PamRequest) -> anyhow::Result<()> {
 /// already *is* the per-service consent, and the module check already ran, so
 /// neither is repeated here — nor is the closing hint, which the wizard emits
 /// itself once, after step 9, whatever that step decided.
-pub(crate) fn install_one_in(dirs: &PamDirs, request: &PamRequest) -> anyhow::Result<()> {
+///
+/// `Ok(true)` means the service carries a facelock line now. The wizard needs
+/// that answer and cannot get it from `Ok(())`: it names the configured
+/// services in its closing summary and offers the hyprlock handoff off the
+/// same list, and both are claims about the file rather than about the call
+/// having not failed. `absent` and `declined` are successes that configured
+/// nothing.
+///
+/// The wizard's request names exactly one service, so the fold below reads it
+/// off a single row; `any` rather than `all` so a future empty request answers
+/// "nothing was configured" instead of "everything was".
+pub(crate) fn install_one_in(dirs: &PamDirs, request: &PamRequest) -> anyhow::Result<bool> {
     debug_assert_eq!(request.action, PamAction::Add);
     let write = WriteRequest {
         action: WriteAction::Add,
@@ -2365,7 +2376,31 @@ pub(crate) fn install_one_in(dirs: &PamDirs, request: &PamRequest) -> anyhow::Re
     };
     let sink = Sink::human();
     let reports = apply_all(&plan_writes(dirs, &write)?, &write, &sink);
-    first_failure(&reports)
+    first_failure(&reports)?;
+    Ok(reports
+        .iter()
+        .any(|report| add_left_the_line(&report.outcome)))
+}
+
+/// Whether `add` left the service carrying a facelock line.
+///
+/// `overridden` is `true`: the `/etc/pam.d` copy that now exists carries it.
+/// `absent` and `declined` are `false` — neither is a failure, and neither
+/// configured anything. Every other word belongs to `remove` or `status`, or
+/// is `failed`, which [`first_failure`] has already turned into an `Err`
+/// before this is consulted.
+fn add_left_the_line(outcome: &Outcome) -> bool {
+    match outcome {
+        Outcome::Installed | Outcome::Overridden | Outcome::Unchanged => true,
+        Outcome::Absent
+        | Outcome::Declined
+        | Outcome::Removed
+        | Outcome::VendorOnly
+        | Outcome::Failed(_)
+        | Outcome::Present
+        | Outcome::Missing
+        | Outcome::Unknown(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -3497,6 +3532,90 @@ mod tests {
         assert_eq!(status(&["sudo", "not-a-service"], true), STATUS_MISSING);
         // ...and it converts absence only.
         assert_eq!(status(&["../escape"], true), STATUS_ERROR);
+    }
+
+    /// The alias honours `--if-present` on `add`, and forgives absence only.
+    ///
+    /// The verb's own coverage is `if_present_turns_a_missing_service_into_a_no_op_on_both_verbs`
+    /// above; this is the alias entry point, which is where the bool used to
+    /// stop. `install_one_in` rather than `install_for_setup` because the
+    /// latter refuses non-root before it reaches phase one — the two differ by
+    /// that check and the module check, and hand `plan_writes` the same
+    /// request.
+    #[test]
+    fn the_alias_honours_if_present_on_add() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let request = PamRequest {
+            no_confirm: true,
+            if_present: true,
+            ..add(&["omarchy-lock-face"])
+        };
+        assert!(
+            !install_one_in(&only(dir.path()), &request).unwrap(),
+            "an absent service configured nothing, so it is not a configured service"
+        );
+        assert!(
+            fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "an absent service must leave the directory empty"
+        );
+
+        // The positive control: the same call on a service that is there
+        // answers `true`, so the bool tracks the file and not the flag.
+        let real = seeded(&[("omarchy-lock-face", OMARCHY_REMOVED)]);
+        assert!(install_one_in(&only(real.path()), &request).unwrap());
+        assert_eq!(read(&real, "omarchy-lock-face"), OMARCHY_PRESENT);
+
+        // Without the flag the same call is a failure, so the default still
+        // catches a typo'd `--service`.
+        let error = install_one_in(&only(dir.path()), &add(&["omarchy-lock-face"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("PAM service file not found:"),
+            "got: {error}"
+        );
+
+        // ...and the flag converts absence and nothing else: an unreadable
+        // target is still fatal through the alias, exactly as through the verb.
+        fs::create_dir(dir.path().join("sudo")).unwrap();
+        let error = install_one_in(
+            &only(dir.path()),
+            &PamRequest {
+                no_confirm: true,
+                if_present: true,
+                allow_sensitive: true,
+                ..add(&["sudo"])
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed to read"), "got: {error}");
+    }
+
+    /// The decision table behind `install_one_in`'s bool, every word given a
+    /// verdict on purpose.
+    ///
+    /// `Declined` is reachable no other way from a test: it needs a terminal
+    /// answering "no" at the per-file confirmation. It is the second word that
+    /// is a success having configured nothing, so the wizard's summary and its
+    /// hyprlock handoff must treat it the way they treat `absent`.
+    #[test]
+    fn only_the_add_words_that_leave_a_line_count_as_configured() {
+        for outcome in [Outcome::Installed, Outcome::Overridden, Outcome::Unchanged] {
+            assert!(add_left_the_line(&outcome), "{}", outcome.word());
+        }
+        for outcome in [
+            Outcome::Absent,
+            Outcome::Declined,
+            Outcome::Removed,
+            Outcome::VendorOnly,
+            Outcome::Failed("e".to_string()),
+            Outcome::Present,
+            Outcome::Missing,
+            Outcome::Unknown("e".to_string()),
+        ] {
+            assert!(!add_left_the_line(&outcome), "{}", outcome.word());
+        }
     }
 
     /// `install_for_setup` edits `/etc/pam.d` and `run_with_plan` reaches it
