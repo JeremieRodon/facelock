@@ -749,7 +749,7 @@ run_test "bus policy: a non-member user may call Authenticate" \
 # send_destination must match the owner, not just the well-known name.
 FAKE_OWNER=$(dbus-send --system --print-reply --dest=org.freedesktop.DBus \
     /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
-    string:org.facelock.Daemon 2>/dev/null | awk '/string/ {gsub(/"/, "", $2); print $2}')
+    string:org.facelock.Daemon 2>/dev/null | awk '/string/ {gsub(/"/, "", $2); print $2}' || true)
 run_test "bus policy: a non-member user may call Authenticate on the daemon's unique name" \
     "[ -n '$FAKE_OWNER' ] && runuser -u outsider -- dbus-send --system --print-reply --dest=$FAKE_OWNER /org/facelock/Daemon org.facelock.Daemon.Authenticate string:outsider | grep -q 'boolean true'" \
     0
@@ -772,6 +772,14 @@ run_test "bus policy: a group member cannot call Ping either (group grants signa
 
 run_test "bus policy: a group member may still call Authenticate" \
     "runuser -u testuser -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:testuser | grep -q 'boolean true'" \
+    0
+
+# The whole user-run PAM path under the real policy: pam_facelock as a plain
+# non-member user → verify_daemon_peer (owner is root) → Authenticate on the
+# daemon's unique name → the (fake, root-owned) daemon answers matched=true →
+# PAM_SUCCESS. Before ADR 010 the bus denied this send.
+run_test "bus policy: non-member pamtester succeeds through pam_facelock against the root fake daemon" \
+    "timeout 15 runuser -u outsider -- pamtester facelock-test outsider authenticate < /dev/null" \
     0
 
 kill "$FAKE_ROOT_PID" 2>/dev/null || true
