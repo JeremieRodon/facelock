@@ -78,34 +78,32 @@ impl Message for AccessMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for AccessMessage {
-    fn first_sample() -> Self {
-        use AccessMessage::*;
-        NoConfigFile { path: s("/p") }
-    }
+    const VARIANT_COUNT: usize = 10;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use AccessMessage::*;
-        Some(match self {
-            NoConfigFile { .. } => InvalidConfig {
+        vec![
+            NoConfigFile { path: s("/p") },
+            InvalidConfig {
                 path: s("/p"),
                 error: s("e"),
             },
-            InvalidConfig { .. } => RootRequired { hint: s("h") },
-            RootRequired { .. } => SudoReexecPrompt,
-            SudoReexecPrompt => AccessDeniedRootHint,
-            AccessDeniedRootHint => AccessDeniedGroupHint,
-            AccessDeniedGroupHint => EnrollTimedOutClientSide,
-            EnrollTimedOutClientSide => DaemonUnreachableFallback,
-            DaemonUnreachableFallback => PreviewGraphicalNeedsDaemonOneshot,
-            PreviewGraphicalNeedsDaemonOneshot => PreviewGraphicalDaemonUnreachable,
-            PreviewGraphicalDaemonUnreachable => return None,
-        })
+            RootRequired { hint: s("h") },
+            SudoReexecPrompt,
+            AccessDeniedRootHint,
+            AccessDeniedGroupHint,
+            EnrollTimedOutClientSide,
+            DaemonUnreachableFallback,
+            PreviewGraphicalNeedsDaemonOneshot,
+            PreviewGraphicalDaemonUnreachable,
+        ]
     }
 }

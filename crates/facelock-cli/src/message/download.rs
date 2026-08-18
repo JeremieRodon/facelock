@@ -107,45 +107,43 @@ impl Message for DownloadMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for DownloadMessage {
-    fn first_sample() -> Self {
-        use DownloadMessage::*;
-        ModelPresentOk {
-            name: s("n"),
-            purpose: s("p"),
-        }
-    }
+    const VARIANT_COUNT: usize = 12;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use DownloadMessage::*;
-        Some(match self {
-            ModelPresentOk { .. } => AllModelsPresent,
-            AllModelsPresent => ModelsToDownloadHeader,
-            ModelsToDownloadHeader => ModelToDownloadEntry {
+        vec![
+            ModelPresentOk {
+                name: s("n"),
+                purpose: s("p"),
+            },
+            AllModelsPresent,
+            ModelsToDownloadHeader,
+            ModelToDownloadEntry {
                 name: s("n"),
                 size_mb: 1,
                 purpose: s("p"),
             },
-            ModelToDownloadEntry { .. } => TotalDownloadSize { mb: 1 },
-            TotalDownloadSize { .. } => ConfirmDownloadRequiredModels,
-            ConfirmDownloadRequiredModels => SkippingModelDownload,
-            SkippingModelDownload => DownloadingModel { name: s("n") },
-            DownloadingModel { .. } => ModelDownloaded { name: s("n") },
-            ModelDownloaded { .. } => ModelDownloadPending {
+            TotalDownloadSize { mb: 1 },
+            ConfirmDownloadRequiredModels,
+            SkippingModelDownload,
+            DownloadingModel { name: s("n") },
+            ModelDownloaded { name: s("n") },
+            ModelDownloadPending {
                 name: s("n"),
                 size_mb: 1,
                 purpose: s("p"),
             },
-            ModelDownloadPending { .. } => ModelRedownloading { name: s("n") },
-            ModelRedownloading { .. } => ModelRedownloaded { name: s("n") },
-            ModelRedownloaded { .. } => return None,
-        })
+            ModelRedownloading { name: s("n") },
+            ModelRedownloaded { name: s("n") },
+        ]
     }
 }
 
@@ -158,7 +156,7 @@ mod tests {
     /// change: the non-interactive flow now renders them too, so they are
     /// load-bearing on both paths.
     #[test]
-    fn english_fallback_is_byte_identical() {
+    fn download_fallback_is_byte_identical() {
         use DownloadMessage::*;
 
         assert_eq!(

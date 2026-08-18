@@ -248,89 +248,87 @@ impl Message for FaceMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for FaceMessage {
-    fn first_sample() -> Self {
-        use FaceMessage::*;
-        SetupNotCompleted
-    }
+    const VARIANT_COUNT: usize = 32;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use FaceMessage::*;
-        Some(match self {
-            SetupNotCompleted => ConfirmRunSetupNow,
-            ConfirmRunSetupNow => SetupDidNotComplete,
-            SetupDidNotComplete => RunSetupWhenReady,
-            RunSetupWhenReady => PlaintextEnrollWarning,
-            PlaintextEnrollWarning => ModelsMissing { dir: s("/m") },
-            ModelsMissing { .. } => StaleEmbedderNote { embedder: s("e") },
-            StaleEmbedderNote { .. } => Enrolling {
+        vec![
+            SetupNotCompleted,
+            ConfirmRunSetupNow,
+            SetupDidNotComplete,
+            RunSetupWhenReady,
+            PlaintextEnrollWarning,
+            ModelsMissing { dir: s("/m") },
+            StaleEmbedderNote { embedder: s("e") },
+            Enrolling {
                 user: s("u"),
                 label: s("l"),
             },
-            Enrolling { .. } => EnrollLookAtCamera,
-            EnrollLookAtCamera => EnrollComplete {
+            EnrollLookAtCamera,
+            EnrollComplete {
                 model_id: 1,
                 count: 2,
                 label: s("l"),
             },
-            EnrollComplete { .. } => TooManyModels {
+            TooManyModels {
                 user: s("u"),
                 count: 6,
             },
-            TooManyModels { .. } => ModelsNotFoundOfferSetup,
-            ModelsNotFoundOfferSetup => ConfirmDownloadModels,
-            ConfirmDownloadModels => ModelsStillMissingAfterSetup,
-            ModelsStillMissingAfterSetup => ModelsRequired,
-            ModelsRequired => NoModelsEnrolled { user: s("u") },
-            NoModelsEnrolled { .. } => RunEnrollFirst,
-            RunEnrollFirst => NoMatchingEmbedder { embedder: s("e") },
-            NoMatchingEmbedder { .. } => ReenrollHint,
-            ReenrollHint => TestingUser { user: s("u") },
-            TestingUser { .. } => TestLookAtCamera,
-            TestLookAtCamera => TestMatched {
+            ModelsNotFoundOfferSetup,
+            ConfirmDownloadModels,
+            ModelsStillMissingAfterSetup,
+            ModelsRequired,
+            NoModelsEnrolled { user: s("u") },
+            RunEnrollFirst,
+            NoMatchingEmbedder { embedder: s("e") },
+            ReenrollHint,
+            TestingUser { user: s("u") },
+            TestLookAtCamera,
+            TestMatched {
                 similarity: 0.5,
                 seconds: 1.0,
             },
-            TestMatched { .. } => TestMatchedModel {
+            TestMatchedModel {
                 model_id: 1,
                 label: s("l"),
                 similarity: 0.5,
                 seconds: 1.0,
             },
-            TestMatchedModel { .. } => TestVarianceBlocked {
+            TestVarianceBlocked {
                 similarity: 0.5,
                 seconds: 1.0,
             },
-            TestVarianceBlocked { .. } => TestNoMatch {
+            TestNoMatch {
                 similarity: 0.5,
                 seconds: 1.0,
             },
-            TestNoMatch { .. } => ConfirmRemoveModel {
+            ConfirmRemoveModel {
                 model_id: 1,
                 user: s("u"),
             },
-            ConfirmRemoveModel { .. } => Cancelled,
-            Cancelled => RemovedModel {
+            Cancelled,
+            RemovedModel {
                 model_id: 1,
                 user: s("u"),
             },
-            RemovedModel { .. } => ModelNotFound {
+            ModelNotFound {
                 model_id: 1,
                 user: s("u"),
             },
-            ModelNotFound { .. } => ConfirmClearAll { user: s("u") },
-            ConfirmClearAll { .. } => ClearedModels {
+            ConfirmClearAll { user: s("u") },
+            ClearedModels {
                 count: 1,
                 user: s("u"),
             },
-            ClearedModels { .. } => AllModelsRemoved { user: s("u") },
-            AllModelsRemoved { .. } => return None,
-        })
+            AllModelsRemoved { user: s("u") },
+        ]
     }
 }

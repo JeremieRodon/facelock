@@ -99,43 +99,41 @@ impl Message for SystemMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SystemMessage {
-    fn first_sample() -> Self {
-        use SystemMessage::*;
-        ConfirmDaemonMode
-    }
+    const VARIANT_COUNT: usize = 19;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use SystemMessage::*;
-        Some(match self {
-            ConfirmDaemonMode => SystemdNotDetected,
-            SystemdNotDetected => SystemdDeclined,
-            SystemdDeclined => SystemdSkippedFlag,
-            SystemdSkippedFlag => SystemdDeferred,
-            SystemdDeferred => CreatingFacelockGroup,
-            CreatingFacelockGroup => GroupMembershipNote,
-            GroupMembershipNote => AlreadyInGroup { user: s("u") },
-            AlreadyInGroup { .. } => ConfirmAddToGroup { user: s("u") },
-            ConfirmAddToGroup { .. } => GroupAddSkipped { user: s("u") },
-            GroupAddSkipped { .. } => AddedToGroup { user: s("u") },
-            AddedToGroup { .. } => DisablingSystemdUnits,
-            DisablingSystemdUnits => SystemdUnitsDisabled,
-            SystemdUnitsDisabled => InstallingSystemdUnits,
-            InstallingSystemdUnits => WroteFile { path: s("/p") },
-            WroteFile { .. } => RefreshedLegacyFile { path: s("/p") },
-            RefreshedLegacyFile { .. } => SystemctlDaemonReloadDone,
-            SystemctlDaemonReloadDone => SystemctlEnableDone {
+        vec![
+            ConfirmDaemonMode,
+            SystemdNotDetected,
+            SystemdDeclined,
+            SystemdSkippedFlag,
+            SystemdDeferred,
+            CreatingFacelockGroup,
+            GroupMembershipNote,
+            AlreadyInGroup { user: s("u") },
+            ConfirmAddToGroup { user: s("u") },
+            GroupAddSkipped { user: s("u") },
+            AddedToGroup { user: s("u") },
+            DisablingSystemdUnits,
+            SystemdUnitsDisabled,
+            InstallingSystemdUnits,
+            WroteFile { path: s("/p") },
+            RefreshedLegacyFile { path: s("/p") },
+            SystemctlDaemonReloadDone,
+            SystemctlEnableDone {
                 unit: s("u.service"),
             },
-            SystemctlEnableDone { .. } => DbusActivationEnabled,
-            DbusActivationEnabled => return None,
-        })
+            DbusActivationEnabled,
+        ]
     }
 }
 
@@ -147,7 +145,7 @@ mod tests {
     /// printed. `facelock setup --systemd` is a scripted entry point
     /// (packaging, Omarchy), so these lines are read by more than humans.
     #[test]
-    fn english_fallback_is_byte_identical() {
+    fn system_fallback_is_byte_identical() {
         use SystemMessage::*;
 
         assert_eq!(

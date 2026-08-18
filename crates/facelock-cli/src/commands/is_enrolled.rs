@@ -6,8 +6,8 @@
 //!
 //! Named after systemd's `is-*` family (`systemctl is-active`, `is-enabled`),
 //! which is the established idiom for this exact shape: a boolean query whose
-//! exit code is the contract, printing the state word on stdout and taking a
-//! `--quiet` to suppress it.
+//! exit code is the contract, printing the state word on stdout and taking the
+//! global `--quiet` to suppress it.
 //!
 //! **The exit code is the contract**, so this drops into a shell one-liner:
 //!
@@ -54,6 +54,7 @@
 use std::path::Path;
 
 use crate::commands::enrollment_marker::{self, MarkerState};
+use crate::message;
 
 /// Exit code: the user has a usable enrollment.
 const EXIT_ENROLLED: i32 = 0;
@@ -63,11 +64,11 @@ const EXIT_NOT_ENROLLED: i32 = 1;
 const EXIT_ERROR: i32 = 2;
 
 /// Run `facelock is-enrolled`, returning the process exit code.
-pub fn run(user: Option<String>, json: bool, quiet: bool) -> i32 {
+pub fn run(user: Option<String>, json: bool) -> i32 {
     // Pure `$SUDO_USER`/`$USER`/`getpwuid` resolution — no D-Bus, no database.
     let user = crate::ipc_client::resolve_user(user.as_deref());
     let base = enrollment_marker::marker_dir_or_default();
-    report(state_in(&base, &user), json, quiet)
+    report(state_in(&base, &user), json)
 }
 
 /// Read one user's marker from `base`. The whole of this command's logic, with
@@ -78,23 +79,25 @@ fn state_in(base: &Path, user: &str) -> MarkerState {
 
 /// Print the result and map it to an exit code.
 ///
-/// `quiet` suppresses stdout only — a genuine error still explains itself on
-/// stderr, since a silent exit 2 is indistinguishable from a broken invocation.
-fn report(state: MarkerState, json: bool, quiet: bool) -> i32 {
+/// Everything printed here is machine-facing — a JSON document or a state
+/// word — so it goes out through [`message::payload`], which is also where
+/// `--quiet` acts: under it this command prints nothing on stdout and the exit
+/// code is the whole answer. A genuine error still explains itself on stderr,
+/// since a silent exit 2 is indistinguishable from a broken invocation.
+fn report(state: MarkerState, json: bool) -> i32 {
     match &state {
         MarkerState::Unreadable(reason) => {
             eprintln!("facelock is-enrolled: {reason}");
         }
-        _ if quiet => {}
         MarkerState::Enrolled(marker) if json => {
-            println!("{}", enrolled_json(Some(marker)));
+            message::payload(&enrolled_json(Some(marker)));
         }
         MarkerState::Absent if json => {
-            println!("{}", enrolled_json(None));
+            message::payload(&enrolled_json(None));
         }
         // The state word, as `systemctl is-active` prints `active`.
-        MarkerState::Enrolled(_) => println!("enrolled"),
-        MarkerState::Absent => println!("not-enrolled"),
+        MarkerState::Enrolled(_) => message::payload("enrolled"),
+        MarkerState::Absent => message::payload("not-enrolled"),
     }
 
     exit_code(&state)
@@ -221,15 +224,20 @@ mod tests {
         assert_eq!(exit_code(&state_in(&base, "alice")), 0);
     }
 
+    /// The exit code is the contract, and `--json` does not touch it.
+    ///
+    /// `--quiet` is not a parameter any more — it acts at the payload sink —
+    /// so what is left to pin here is that the two rendering modes agree on
+    /// the answer.
     #[test]
-    fn quiet_and_json_still_produce_the_contract_exit_codes() {
+    fn json_still_produces_the_contract_exit_codes() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("enrolled");
         write_marker_in(&base, "alice", 1, None).unwrap();
 
-        for (json, quiet) in [(false, false), (true, false), (false, true), (true, true)] {
-            assert_eq!(report(state_in(&base, "alice"), json, quiet), 0);
-            assert_eq!(report(state_in(&base, "nobody"), json, quiet), 1);
+        for json in [false, true] {
+            assert_eq!(report(state_in(&base, "alice"), json), 0);
+            assert_eq!(report(state_in(&base, "nobody"), json), 1);
         }
     }
 

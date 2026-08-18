@@ -1,10 +1,41 @@
+//! `preview --json`: one JSON document per frame, on stdout, until Ctrl+C.
+//!
+//! **stdout here is the frame stream and nothing else.** `--json` is parsed one
+//! level up, so neither loop below knows whether a human or `jq` is reading,
+//! and both must keep stdout clean either way. The regression this rule exists
+//! for shipped: the no-enrollment notice went through `Terminal::info`, which
+//! writes to stdout, so a fresh oneshot install prefixed the stream with a
+//! localized sentence and a consumer failed on the first line.
+//!
+//! Two checks enforce it, one per way in. `#![deny(clippy::print_stdout)]`
+//! below refuses a bare `println!` — CI runs clippy with `-D warnings` — while
+//! leaving the frame loops' `writeln!` alone. The seam's stdout sinks are
+//! invisible to that lint, so `no_stdout_sink_of_the_seam_is_used_here`
+//! scans this file for them; [`warn`] is the convenience that makes the right
+//! thing the short thing, not a barrier, since a fully-qualified call to
+//! `crate::message::Terminal`'s informational sink needs no import to compile
+//! here.
+//!
+//! The frame stream is the one payload in the CLI that does not go through
+//! `message::payload`: it runs until interrupted, so a `--quiet` that silenced
+//! it would leave a command that produces nothing forever.
+#![deny(clippy::print_stdout)]
+
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::ipc_client;
-use crate::message::{FaceMessage, Terminal};
+use crate::message::FaceMessage;
+
+/// This module's route for human text: stderr, never stdout.
+///
+/// A convenience, not an enforcement — see the module docs for what actually
+/// checks that the stdout sinks stay out of this file.
+fn warn(msg: &dyn crate::message::Message) {
+    crate::message::Terminal.error(msg);
+}
 
 /// Run the text-only preview mode.
 ///
@@ -100,11 +131,9 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
     let stored = match crate::direct::open_store_existing(config) {
         Ok(store) => crate::direct::load_user_embeddings(&store, config, user)?,
         Err(facelock_store::StoreError::Absent { .. }) => {
-            // stderr, not the informational sink: stdout here is the frame
-            // stream, and this loop cannot see whether `--json` was passed.
-            // As stdout chatter this localized sentence prefixed the stream
-            // on any fresh oneshot install, so `jq` failed on line 1.
-            Terminal.error(&FaceMessage::NoModelsEnrolled {
+            // stderr, not stdout: this is the notice that used to corrupt
+            // the frame stream (see the module docs).
+            warn(&FaceMessage::NoModelsEnrolled {
                 user: user.to_string(),
             });
             Vec::new()
@@ -313,41 +342,28 @@ mod tests {
         );
     }
 
-    /// stdout in this module is the frame stream and nothing else.
+    /// The seam's stdout sinks, which no lint can see.
     ///
-    /// `--json` is parsed one level up, so neither loop here knows whether a
-    /// human or `jq` is reading, and both must keep stdout clean either way.
-    /// The regression this catches shipped: the no-enrollment notice in
-    /// `run_direct` went through `Terminal::info`, which writes to stdout, so
-    /// a fresh oneshot install prefixed the stream with a localized sentence
-    /// and a consumer failed on the first line. Human text goes to stderr.
-    ///
-    /// A source scan is the only seam available: both loops need a daemon or
-    /// a camera to run. Needles are assembled at runtime so this test does
-    /// not match itself, following `backend.rs`'s single-siting pins.
+    /// `#![deny(clippy::print_stdout)]` catches a bare `println!`. It cannot
+    /// catch either sink that writes to stdout through the seam: the
+    /// informational one, which is what shipped as the bug, and the notice
+    /// one, which `--quiet` does not even suppress. Neither needs an import
+    /// to reach from here. So this scans the source, which is the only seam
+    /// available — both frame loops need a daemon or a camera to run. The
+    /// needles are assembled at runtime so the test does not match itself,
+    /// following `backend.rs`'s single-siting pins.
     #[test]
-    fn nothing_beside_the_frame_stream_writes_to_stdout() {
+    fn no_stdout_sink_of_the_seam_is_used_here() {
         let source = include_str!("text_only.rs");
-        let info_sink = format!("Terminal{}info(", ".");
-        let bare_stdout = format!("{}!(", String::from("print") + "ln");
-
-        for (index, line) in source.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
+        for sink in ["info", "notice"] {
+            for sep in [".", "::"] {
+                let needle = format!("Terminal{sep}{sink}(");
+                assert!(
+                    !source.contains(&needle),
+                    "`{needle}` writes to stdout, which here is the frame \
+                     stream; human text goes to stderr through `warn`"
+                );
             }
-            let number = index + 1;
-            assert!(
-                !code.contains(&info_sink),
-                "line {number}: the informational sink writes to stdout, which \
-                 here is the frame stream; use Terminal::error"
-            );
-            // `eprint` is masked first so only the stdout macro can match.
-            assert!(
-                !code.replace("eprint", "eprint_").contains(&bare_stdout),
-                "line {number}: bare stdout printing beside the frame stream; \
-                 human text belongs on stderr"
-            );
         }
     }
 

@@ -22,10 +22,29 @@
 //! sink, not the string — `bail!` text a human reads on stderr localizes,
 //! the same event written to audit/syslog/tracing does not.
 //!
-//! `--quiet` acts here rather than at the call sites: [`set_verbosity`]
-//! silences [`Terminal::info`] and nothing else, so converting a `println!`
-//! into a message is also what makes it quietable — no caller ever asks
-//! whether it should be printing.
+//! # Three sinks write to stdout, and `--quiet` knows all three
+//!
+//! `--quiet` acts here rather than at the call sites: [`set_verbosity`] is
+//! read by the sinks themselves, so no caller ever asks whether it should be
+//! printing.
+//!
+//! | Sink | Renders | Under `--quiet` |
+//! |---|---|---|
+//! | [`Terminal::info`] | localized | silenced |
+//! | [`payload`] | never localized | silenced |
+//! | [`Terminal::notice`] | localized | still prints |
+//!
+//! [`payload`] is the machine half of stdout: `--json` documents, `is-enrolled`'s
+//! state word, `capabilities`' name list. It takes an already-rendered `&str`,
+//! so no catalog is consulted on the way out — a payload cannot pick up a
+//! translation by being routed through the seam. [`Terminal::notice`] is for
+//! the rare human line that must be seen and must stay on stdout for byte
+//! compatibility.
+//!
+//! One rule follows: **`--quiet` suppresses stdout, and on a command whose
+//! stdout *is* the payload that means the payload too — the exit code is the
+//! answer.** Errors, prompts, exit codes and the `RUST_LOG` event stream are
+//! unchanged.
 //!
 //! # The vocabulary is split by domain
 //!
@@ -58,9 +77,10 @@
 //!    translators can reorder them. Pre-format numbers that need precision
 //!    (`format!("{similarity:.2}")`) before filling — Rust formatting is
 //!    locale-independent, so numbers stay stable across locales.
-//! 3. Link a sample into that domain's [`Samples`] walk. The compiler asks
-//!    for this: the walk is a wildcard-free `match`, so a new variant does
-//!    not build until the placeholder sweep can reach it.
+//! 3. Add a sample to that domain's [`Samples`] list and bump its
+//!    [`Samples::VARIANT_COUNT`]. The compiler forces step 2 (the `localized`
+//!    match is wildcard-free); the count is what forces this step, and the
+//!    sweep says so when the two disagree.
 //! 4. Replace the `println!`/`eprintln!`/`bail!` site with
 //!    `Terminal.info(&msg)` / `Terminal.error(&msg)` / `return Err(fail(msg))`.
 //!
@@ -75,6 +95,10 @@
 //! strings (PAM substring-matches those on the wire — see
 //! `pam_code_for_daemon_error` in `pam-facelock`). Route none of them
 //! through [`Message::localized`].
+//!
+//! The first two still belong on stdout, and still have to obey `--quiet`, so
+//! they go through [`payload`] instead: same global, no gettext. The rest are
+//! not stdout at all and do not come through this module.
 //!
 //! # Why this lives in `facelock-cli`
 //!
@@ -221,17 +245,20 @@ pub trait Message: std::fmt::Debug {
 // Verbosity
 // ---------------------------------------------------------------------------
 
-/// How much the human sink says.
+/// How much the stdout sinks say.
 ///
-/// **`--quiet` suppresses informational stdout only; errors and exit codes are
+/// **`--quiet` suppresses stdout; errors, prompts and exit codes are
 /// unchanged.** [`Terminal::error`] is never suppressed, so a quiet run that
 /// fails still says why on stderr and still exits non-zero. That is
 /// `is-enrolled --quiet`'s existing semantics (see
 /// [`crate::commands::is_enrolled`]) and it is the house rule for every
-/// command. Prompts ([`Terminal::confirm`]) are unaffected too — a silenced
-/// question is a hang, not a quieter program. The debug side channel
-/// (`trace`) also keeps firing: the machine event stream is not user-facing
-/// output, so `RUST_LOG=facelock=debug` works the same either way.
+/// command: on a command whose stdout is a machine payload, `--quiet` takes
+/// the payload with it and the exit code is the whole answer. Prompts
+/// ([`Terminal::confirm`]) are unaffected — a silenced question is a hang, not
+/// a quieter program — and so is [`Terminal::notice`], the sink that exists
+/// for the lines that must be seen. The debug side channel (`trace`) also
+/// keeps firing: the machine event stream is not user-facing output, so
+/// `RUST_LOG=facelock=debug` works the same either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Verbosity {
     #[default]
@@ -239,57 +266,59 @@ pub enum Verbosity {
     Quiet,
 }
 
-/// Process-global verbosity. Written once, from the parsed global `--quiet`
-/// flag, before any other thread exists; `Relaxed` is therefore enough — no
-/// other state is published through it.
-static VERBOSITY: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(Verbosity::Normal as u8);
+/// Process-global verbosity, written once from the parsed global `--quiet`
+/// flag before any other thread exists.
+static VERBOSITY: std::sync::OnceLock<Verbosity> = std::sync::OnceLock::new();
 
 /// Set the process verbosity. Call once, early in `main`, next to [`init`].
+///
+/// A second call is a programming error — the flag is parsed once and the
+/// sinks are allowed to assume the answer does not change under them. The
+/// second write is dropped rather than refused, since returning a `Result` to
+/// a caller three lines into `main` buys nothing; the `debug_assert` is what
+/// makes the drop visible to a test binary that calls this twice instead of
+/// leaving it to be discovered as a `--quiet` that stopped working.
+///
+/// The write is a `let` binding, not the assert's argument: `debug_assert!`
+/// compiles its condition out of a release build, which would take the write
+/// with it.
 pub fn set_verbosity(verbosity: Verbosity) {
-    VERBOSITY.store(verbosity as u8, std::sync::atomic::Ordering::Relaxed);
+    let first_write = VERBOSITY.set(verbosity).is_ok();
+    debug_assert!(
+        first_write,
+        "set_verbosity called twice; the global is written once, from main"
+    );
 }
 
 /// The process verbosity ([`Verbosity::Normal`] until [`set_verbosity`] runs).
-///
-/// The decode names every level rather than testing for `Quiet` and defaulting,
-/// so the next one to be added is visible here instead of quietly demoting to
-/// `Normal`. Rust cannot check a `u8` match against the enum, so the guarantee
-/// is a test: `every_level_round_trips_through_the_stored_byte` walks a
-/// wildcard-free `match` over [`Verbosity`] — a new level does not compile
-/// until it joins that walk, and then fails the round trip until it is listed
-/// below. The trailing arm is unreachable ([`set_verbosity`] is the only
-/// writer) and resolves to `Normal`, the setting that hides nothing.
-pub fn verbosity() -> Verbosity {
-    let stored = VERBOSITY.load(std::sync::atomic::Ordering::Relaxed);
-    match stored {
-        v if v == Verbosity::Normal as u8 => Verbosity::Normal,
-        v if v == Verbosity::Quiet as u8 => Verbosity::Quiet,
-        _ => Verbosity::Normal,
-    }
+pub(crate) fn verbosity() -> Verbosity {
+    VERBOSITY.get().copied().unwrap_or_default()
 }
 
-/// The walk that holds [`verbosity`]'s decode to this enum.
+/// What [`Terminal::info`] writes at this verbosity, or `None` when silenced.
 ///
-/// Wildcard-free on purpose, the same discipline as the [`Samples`] walks: a
-/// level added without a line here does not compile.
-#[cfg(test)]
-impl Verbosity {
-    fn next_level(self) -> Option<Self> {
-        match self {
-            Verbosity::Normal => Some(Verbosity::Quiet),
-            Verbosity::Quiet => None,
-        }
-    }
+/// The decision is a pure function of the level rather than of the global, so
+/// the rule is testable without mutating process state or capturing stdout —
+/// what matters is *what the sink decides*, not what a pipe received.
+fn info_at(msg: &dyn Message, verbosity: Verbosity) -> Option<String> {
+    (verbosity == Verbosity::Normal).then(|| msg.localized())
 }
 
-/// Whether [`Terminal::info`] writes anything to stdout.
+/// What [`Terminal::notice`] writes at this verbosity: always the message.
 ///
-/// The decision is a pure function of the global so it can be tested without
-/// capturing stdout — the test that matters is *what the sink decides*, not
-/// what a captured pipe received.
-fn info_enabled() -> bool {
-    verbosity() == Verbosity::Normal
+/// The unused level is the contract, stated in the signature so a test can
+/// hold it: this sink is offered the verbosity and ignores it.
+fn notice_at(msg: &dyn Message, _verbosity: Verbosity) -> Option<String> {
+    Some(msg.localized())
+}
+
+/// What [`payload`] writes at this verbosity, or `None` when silenced.
+///
+/// Borrowed through unchanged: no gettext, no formatting, no allocation. A
+/// payload is bytes a script parses, and this sink's whole job is to keep them
+/// that way while still answering to `--quiet`.
+fn payload_at(text: &str, verbosity: Verbosity) -> Option<&str> {
+    (verbosity == Verbosity::Normal).then_some(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +341,25 @@ impl Terminal {
     /// silences. The machine rendering is emitted either way.
     pub fn info(&self, msg: &dyn Message) {
         trace(msg);
-        if info_enabled() {
-            println!("{}", msg.localized());
+        if let Some(line) = info_at(msg, verbosity()) {
+            println!("{line}");
+        }
+    }
+
+    /// Human message to stdout that `--quiet` does **not** silence.
+    ///
+    /// For the few lines that must be seen and must stay on stdout, where
+    /// [`Terminal::error`]'s stderr would change the stream a caller reads:
+    /// [`PamMessage::PamInstalled`]'s rollback instructions (the one message
+    /// that tells a locked-out operator how to get back in),
+    /// [`SetupMessage::EncryptionDisabledWarning`], and the context a prompt
+    /// needs to be answerable. Everything else informational is
+    /// [`Terminal::info`] — a `notice` that did not have to be seen is just an
+    /// unquietable one.
+    pub fn notice(&self, msg: &dyn Message) {
+        trace(msg);
+        if let Some(line) = notice_at(msg, verbosity()) {
+            println!("{line}");
         }
     }
 
@@ -338,6 +384,38 @@ impl Terminal {
         trace(msg);
         eprint!("{}", prompt_line(msg, "[Y/n]"));
         Ok(!matches!(read_answer()?.as_str(), "n" | "no"))
+    }
+}
+
+/// The machine sink: one line of payload on stdout, C-locale, `--quiet`-aware.
+///
+/// This is what a script parses — a `--json` document, `is-enrolled`'s state
+/// word, `capabilities`' name list — so it takes an already-rendered `&str`
+/// and prints it. Nothing here consults gettext: there is no [`Message`] to
+/// call [`Message::localized`] on, so routing a payload through the seam
+/// cannot translate it. That is the "boundary is the sink" trick that keeps
+/// logs English (D2), pointed the other way — weaker in one direction, since
+/// a caller is free to hand this sink text it localized itself.
+///
+/// It reads the same [`Verbosity`] as [`Terminal::info`], which is the whole
+/// point: before this existed `--quiet` had three implementations and a silent
+/// no-op — this global, three `quiet: bool` parameters each gating a bare
+/// `println!`, and two commands that took the flag and ignored it. One sink,
+/// one rule: `--quiet` suppresses stdout and the exit code is the answer.
+///
+/// Nothing is traced. A payload is not an event: it is already on stdout in a
+/// stable form, and copying a JSON document into the debug stream would say
+/// nothing the reader cannot see.
+///
+/// **The one payload that does not come through here** is `preview --json`'s
+/// frame stream (`commands/preview/text_only.rs`): it emits a document per
+/// frame until the operator interrupts it, so a `--quiet` that silenced it
+/// would leave a command that produces nothing forever. That module denies
+/// `clippy::print_stdout` and scans itself for the seam's stdout sinks, so the
+/// exception cannot spread past the frame loops it was made for.
+pub fn payload(text: &str) {
+    if let Some(line) = payload_at(text, verbosity()) {
+        println!("{line}");
     }
 }
 
@@ -386,31 +464,37 @@ pub fn fail(msg: impl Message) -> anyhow::Error {
 }
 
 // ---------------------------------------------------------------------------
-// Test support: the sample walk that feeds the placeholder sweep
+// Test support: the sample list that feeds the sweeps
 // ---------------------------------------------------------------------------
 
-/// A walk over every variant of a domain, one constructed sample each.
+/// One constructed sample per variant of a domain, for the sweeps below.
 ///
-/// Implementations write [`Samples::next_sample`] as a wildcard-free `match`,
-/// which is what keeps the walk honest: a variant added without a sample does
-/// not compile.
+/// # What holds this to the vocabulary
+///
+/// Three things, and it is worth being exact about which is which, because an
+/// earlier version of this trait claimed the first one covered all three:
+///
+/// - **The compiler** proves every variant has a `localized` arm: that `match`
+///   is wildcard-free, so a new variant does not build until it renders.
+/// - **[`VARIANT_COUNT`](Samples::VARIANT_COUNT)** proves [`samples`](Samples::samples)
+///   has not fallen behind: `every_variant_has_a_sample` fails when the list and
+///   the count disagree, and fails again if two entries are the same variant.
+///   Adding a variant therefore touches the enum, the rendering, the sample
+///   list and the count, and the count is the one that says so out loud.
+/// - **Nothing** can prove the count itself: stable Rust cannot count enum
+///   variants, so a variant added while touching neither the list nor the
+///   count is invisible here. What is *not* possible any more is the failure
+///   this replaced: a linked-list walk whose arms were compiler-checked while
+///   its results were not, so `Foo => Bar` beside `Prev => Bar` compiled,
+///   dropped `Foo` from the sweep, and could route the walk into a cycle (the
+///   old `assert!(out.len() < 10_000)` was the tell).
 #[cfg(test)]
 pub(crate) trait Samples: Sized {
-    /// The first sample, in enum order.
-    fn first_sample() -> Self;
-
-    /// The sample after `self`, or `None` at the end of the vocabulary.
-    fn next_sample(&self) -> Option<Self>;
+    /// How many variants this domain has. Bumped with the sample below it.
+    const VARIANT_COUNT: usize;
 
     /// Every variant of this domain, exactly once, in enum order.
-    fn samples() -> Vec<Self> {
-        let mut out = vec![Self::first_sample()];
-        while let Some(next) = out[out.len() - 1].next_sample() {
-            out.push(next);
-            assert!(out.len() < 10_000, "sample walk does not terminate");
-        }
-        out
-    }
+    fn samples() -> Vec<Self>;
 }
 
 /// Placeholder-sized string for sample values.
@@ -427,8 +511,11 @@ mod tests {
     /// so `localized()` is the English fallback — these pins are exactly the
     /// bytes the historical inline strings produced (container tests grep
     /// some of them).
+    ///
+    /// The strings pinned here are `face`, `access` and `pam` ones; each
+    /// domain module pins its own alongside its `Samples` list.
     #[test]
-    fn english_fallback_is_byte_identical() {
+    fn face_access_and_pam_fallback_is_byte_identical() {
         assert_eq!(
             FaceMessage::EnrollComplete {
                 model_id: 3,
@@ -536,54 +623,48 @@ mod tests {
         );
     }
 
-    /// `--quiet` gates informational stdout and nothing else.
+    /// `--quiet` silences the two suppressible stdout sinks, and only those.
     ///
-    /// Asserted on `info_enabled` rather than on captured stdout: the sink's
+    /// Asserted on the sinks' decisions rather than on captured stdout: the
     /// decision is the contract, and a capture test would prove the same thing
-    /// while making every future sink change a plumbing exercise. What the
-    /// other three sinks do is structural — `error`, `confirm` and
-    /// `confirm_default_yes` never call `info_enabled`, so there is no state
-    /// in which they could go quiet.
-    #[test]
-    fn quiet_suppresses_info_only() {
-        let _guard = VERBOSITY_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(verbosity(), Verbosity::Normal, "default must be Normal");
-        assert!(info_enabled());
-
-        set_verbosity(Verbosity::Quiet);
-        assert_eq!(verbosity(), Verbosity::Quiet);
-        assert!(!info_enabled(), "Quiet must silence Terminal::info");
-
-        set_verbosity(Verbosity::Normal);
-        assert!(info_enabled(), "Normal must restore informational output");
-    }
-
-    /// Every level survives the `u8` the global stores it in.
+    /// while making every future sink change a plumbing exercise. The
+    /// decisions are pure functions of the level, so nothing here touches the
+    /// process global — which is why this test can exist beside a `OnceLock`
+    /// that `main` writes exactly once.
     ///
-    /// This is what makes `verbosity`'s `u8` match honest. The walk is
-    /// wildcard-free, so a new level cannot compile without joining it; once
-    /// it has, this fails until `verbosity` decodes it too. Without the pair,
-    /// an unlisted level would read back as `Normal` and silently un-quiet
-    /// the program.
+    /// `error`, `confirm` and `confirm_default_yes` are absent because they
+    /// are not offered a level at all: they are on stderr, where `--quiet`
+    /// has never reached.
     #[test]
-    fn every_level_round_trips_through_the_stored_byte() {
-        let _guard = VERBOSITY_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
-        let mut level = Some(Verbosity::Normal);
-        while let Some(current) = level {
-            set_verbosity(current);
-            assert_eq!(
-                verbosity(),
-                current,
-                "{current:?} must survive the u8 round trip"
-            );
-            level = current.next_level();
-        }
-        set_verbosity(Verbosity::Normal);
+    fn quiet_silences_stdout_except_notice() {
+        let msg = FaceMessage::ModelsRequired;
+        let text = "Models required. Run `facelock setup` to download them.";
+
+        assert_eq!(info_at(&msg, Verbosity::Normal), Some(text.to_string()));
+        assert_eq!(info_at(&msg, Verbosity::Quiet), None);
+
+        assert_eq!(payload_at("{}", Verbosity::Normal), Some("{}"));
+        assert_eq!(payload_at("{}", Verbosity::Quiet), None);
+
+        // The unsuppressible one: same text at either level.
+        assert_eq!(notice_at(&msg, Verbosity::Normal), Some(text.to_string()));
+        assert_eq!(
+            notice_at(&msg, Verbosity::Quiet),
+            Some(text.to_string()),
+            "notice exists to be seen; --quiet must not reach it"
+        );
     }
 
-    /// Held by every test that writes the process-global verbosity, so two of
-    /// them cannot interleave their mutate/restore sequences.
-    static VERBOSITY_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// An unwritten global reads as `Normal`, so a `main` that forgot
+    /// [`set_verbosity`] hides nothing rather than everything.
+    ///
+    /// Nothing in this crate's tests writes the `OnceLock`; if that changes,
+    /// this is the test that says the default stopped being observable.
+    #[test]
+    fn unset_verbosity_reads_as_normal() {
+        assert_eq!(Verbosity::default(), Verbosity::Normal);
+        assert_eq!(verbosity(), Verbosity::Normal);
+    }
 
     /// The answer hint is appended by the sink and the question alone is the
     /// msgid, so a translator cannot advertise an answer `read_answer` will
@@ -605,11 +686,25 @@ mod tests {
         );
     }
 
+    /// The domain list the sweeps below run over. Single-sited because it is
+    /// the one list here that no compiler checks: a new domain module joins
+    /// the seam by being added to this macro.
+    macro_rules! every_domain {
+        ($sweep:ident) => {{
+            $sweep::<AccessMessage>();
+            $sweep::<FaceMessage>();
+            $sweep::<StatusMessage>();
+            $sweep::<NotifyMessage>();
+            $sweep::<SetupMessage>();
+            $sweep::<DeviceMessage>();
+            $sweep::<DownloadMessage>();
+            $sweep::<SystemMessage>();
+            $sweep::<PamMessage>();
+        }};
+    }
+
     /// Every message in every domain renders with all placeholders
     /// substituted — a leftover `{name}` means a template/argument mismatch.
-    ///
-    /// The per-domain walks are compiler-checked for completeness; this list
-    /// of domains is the one thing that is not, so a new module goes here.
     #[test]
     fn no_unfilled_placeholders() {
         fn sweep<M: Message + Samples>() {
@@ -621,15 +716,40 @@ mod tests {
                 );
             }
         }
-        sweep::<AccessMessage>();
-        sweep::<FaceMessage>();
-        sweep::<StatusMessage>();
-        sweep::<NotifyMessage>();
-        sweep::<SetupMessage>();
-        sweep::<DeviceMessage>();
-        sweep::<DownloadMessage>();
-        sweep::<SystemMessage>();
-        sweep::<PamMessage>();
+        every_domain!(sweep);
+    }
+
+    /// Each domain's sample list holds one sample per variant.
+    ///
+    /// Two failures, which together are the whole of what [`Samples`]
+    /// guarantees (its doc comment says what is left over): a list that has
+    /// drifted from `VARIANT_COUNT`, and a list that names the same variant
+    /// twice — the copy-paste mistake that used to hide a variant from the
+    /// sweep above while still compiling.
+    #[test]
+    fn every_variant_has_a_sample() {
+        fn sweep<M: Message + Samples>() {
+            let samples = M::samples();
+            assert_eq!(
+                samples.len(),
+                M::VARIANT_COUNT,
+                "{} samples for {} variants — add the missing sample, or fix \
+                 VARIANT_COUNT if a variant was removed: {samples:?}",
+                samples.len(),
+                M::VARIANT_COUNT,
+            );
+            for (index, sample) in samples.iter().enumerate() {
+                for other in &samples[index + 1..] {
+                    assert_ne!(
+                        std::mem::discriminant(sample),
+                        std::mem::discriminant(other),
+                        "{sample:?} is sampled twice, so some variant is not \
+                         sampled at all"
+                    );
+                }
+            }
+        }
+        every_domain!(sweep);
     }
 
     /// The machine rendering names the variant and its data, and never goes

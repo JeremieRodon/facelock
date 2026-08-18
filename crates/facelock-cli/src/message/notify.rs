@@ -65,26 +65,24 @@ impl From<&NotifyEvent> for NotifyMessage {
     }
 }
 
-/// One sample per variant, in enum order, for the placeholder sweep.
+/// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 ///
-/// [`Self::next_sample`] is an exhaustive `match` with no wildcard arm, so a
-/// new variant stops this compiling until it is given a sample and linked
-/// into the walk — the sweep cannot silently fall behind the vocabulary.
+/// The list is flat, so it cannot cycle and cannot name a variant twice
+/// without saying so; `VARIANT_COUNT` is what fails the sweep when a new
+/// variant is not sampled at all. The compiler's share of this is `localized`
+/// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for NotifyMessage {
-    fn first_sample() -> Self {
-        use NotifyMessage::*;
-        NotifyScanning
-    }
+    const VARIANT_COUNT: usize = 4;
 
-    fn next_sample(&self) -> Option<Self> {
+    fn samples() -> Vec<Self> {
         use NotifyMessage::*;
-        Some(match self {
-            NotifyScanning => NotifyWelcome { label: s("l") },
-            NotifyWelcome { .. } => NotifyRecognized { similarity: 0.5 },
-            NotifyRecognized { .. } => NotifyAuthFailed { reason: s("r") },
-            NotifyAuthFailed { .. } => return None,
-        })
+        vec![
+            NotifyScanning,
+            NotifyWelcome { label: s("l") },
+            NotifyRecognized { similarity: 0.5 },
+            NotifyAuthFailed { reason: s("r") },
+        ]
     }
 }
 #[cfg(test)]

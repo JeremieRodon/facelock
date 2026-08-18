@@ -9,13 +9,17 @@ The following flags are accepted by every subcommand (declared `global = true`):
 | Flag | Description |
 |------|-------------|
 | `-c`, `--config <PATH>` | Override the config file path. Takes precedence over `FACELOCK_CONFIG`. |
-| `-q`, `--quiet` | Suppress informational output on stdout. Errors (stderr), prompts and exit codes are unaffected. |
+| `-q`, `--quiet` | Suppress stdout: informational text, and on commands whose stdout is the payload, the payload too. Errors (stderr), prompts and exit codes are unaffected. |
 
-`--quiet` is complete for `facelock setup` except the PAM extension hint, which
-[#174](https://github.com/tyvsmith/facelock/issues/174) converts along with the
-rest of that region. Other commands still print some output directly rather than
-through the message seam the flag gates, so they stay partly noisy until
-[#140](https://github.com/tyvsmith/facelock/issues/140) is finished.
+`--quiet` is complete for every command whose output goes through the message
+seam: `setup`, `status`, `enroll`, `test`, `remove`, `clear`, `is-enrolled`,
+`capabilities`, `pam`, and the `--json` payloads of `list` and `devices`. Nine
+commands still print human text directly and stay noisy under it until
+[#140](https://github.com/tyvsmith/facelock/issues/140) is finished — `bench`,
+`tpm`, `reseal`, `encrypt`, `decrypt`, `config`, `restart`, `hyprlock` and
+`audit` — as do the human tables of `list` and `devices`. `preview --json` is
+not on either list: its frame stream is stdout by design and `--quiet` is
+documented not to reach it.
 
 ## Machine-readable output
 
@@ -31,11 +35,11 @@ Output".
 
 The payload goes to stdout and nothing else does — diagnostics are on stderr
 whatever `RUST_LOG` says — so `facelock devices --json` is safe to pipe at any
-log level. On `is-enrolled`, `capabilities` and `pam`, `--quiet` suppresses the
-payload too, leaving the exit code as the whole answer; `list`, `devices` and
-`preview` still print theirs directly rather than through the seam the flag
-gates, so they stay noisy until
-[#140](https://github.com/tyvsmith/facelock/issues/140) is finished.
+log level. `--quiet` suppresses the payload, leaving the exit code as the whole
+answer, on every one of these except `preview`, whose frame stream runs until
+interrupted and would otherwise become a command that prints nothing forever.
+**This changed:** `list --json --quiet` and `devices --json --quiet` used to
+print their payload and now print nothing; the exit code is unchanged.
 
 ## facelock setup
 
