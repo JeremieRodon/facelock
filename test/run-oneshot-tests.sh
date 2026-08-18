@@ -363,9 +363,9 @@ print(len(devices))
 
 # Prints the path of the first device in $NOQUIRK_DEVICES_JSON matching $1
 # ("non_ir" or "ir"), or nothing (exit 0) if every device classified fine but
-# none matched — the legitimate skip case. jq is not in this test image (see
-# test/Containerfile); python3 is (the fake-daemon harness already requires
-# it), so it parses the JSON.
+# none matched — the legitimate skip case. python3 parses the JSON: the
+# fake-daemon harness already requires it, and the selection below reads better
+# as a loop than as a filter.
 #
 # A device missing an expected key, or of the wrong type, is a genuine
 # selector/schema break — not "no camera" — so it is left to raise

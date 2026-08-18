@@ -98,19 +98,31 @@ run_test_or_skip() {
     esac
 }
 
+# The daemon is up when `status --json` reports the bus round trip completed.
+#
+# Parsed, not grepped. `    [ok] responding` is one line of a report written for
+# a person, and this loop pinned it by accident for as long as it existed; the
+# document is the surface that promises to keep its shape
+# (docs/contracts.md, "facelock status Semantics"). stdout and stderr are
+# captured apart because merging them is what makes a JSON document
+# unparseable the moment RUST_LOG has something to say.
 wait_for_daemon() {
     local deadline=$((SECONDS + 30))
-    local output=""
+    local document=""
+    local errors="/tmp/facelock-status-stderr"
 
+    : > "$errors"
     while [ "$SECONDS" -lt "$deadline" ]; do
-        output="$(facelock status 2>&1 || true)"
-        if printf '%s\n' "$output" | grep -q '\[ok\] responding'; then
+        document="$(facelock status --json 2>"$errors" || true)"
+        if printf '%s' "$document" \
+            | jq -e '.daemon.reachability == "responding"' > /dev/null 2>&1; then
             return 0
         fi
         sleep 1
     done
 
-    printf '%s\n' "$output"
+    printf '%s\n' "$document"
+    cat "$errors" >&2 || true
     return 1
 }
 
@@ -156,6 +168,35 @@ sleep 2
 # Verify daemon is running
 run_test "Daemon responds to ping" \
     "wait_for_daemon" || exit 1
+
+# The report a person reads still says it, in the words it has always used.
+# `wait_for_daemon` parses the document now, so without this row nothing here
+# would exercise the human renderer at all.
+run_test_contains "Status report still names a responding daemon" \
+    "facelock status" \
+    "\[ok\] responding"
+
+# Every section answers with one of the three verdict words. The filters live in
+# files rather than inline so the quoting survives `run_test`'s `eval`.
+cat > /tmp/status-sections.jq <<'EOF'
+[.config, .daemon, .oneshot_fallback, .camera, .models, .execution_provider,
+ .encryption, .enrollment, .security, .notifications, .pam]
+| length == 11
+  and (map(.state) | all(. == "ok" or . == "problem" or . == "unknown"))
+EOF
+run_test "Status --json carries a verdict for every section" \
+    "facelock status --json | jq -e -f /tmp/status-sections.jq > /dev/null"
+
+# The payoff a setup script wants: the PAM scan as data, with "could not look"
+# distinguishable from "nothing configured" without reading prose.
+cat > /tmp/status-pam.jq <<'EOF'
+.pam.services
+| (.state == "ok" or .state == "unknown")
+  and (.configured | type) == "array"
+  and (.not_checked | type) == "array"
+EOF
+run_test "Status --json enumerates the PAM scan as data" \
+    "facelock status --json | jq -e -f /tmp/status-pam.jq > /dev/null"
 
 # Test device listing
 run_test_contains "Device listing works" \

@@ -83,8 +83,9 @@ run_test "facelock daemon requires root" \
 # It writes only to service files it creates itself (facelock-scratch*) and
 # removes them at the end, so it is safe to run twice; sudo and the sensitive
 # services are read and never written — the one row that aims at a sensitive
-# service asserts a refusal, and saves and restores the file either way. jq is
-# not in the image, so the --json documents are asserted with python.
+# service asserts a refusal, and saves and restores the file either way. The
+# --json documents are asserted with python, which the fake-daemon harness
+# already requires.
 
 PAM_LINE_TEXT='auth      sufficient pam_facelock.so'
 
