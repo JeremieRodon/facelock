@@ -113,3 +113,16 @@ Supported providers: `cpu` (default), `cuda` (NVIDIA), `rocm` (AMD), `openvino` 
 - Tag `vX.Y.Z` triggers CI to build binaries, .deb, and .rpm.
 - Update `CHANGELOG.md` before committing the release.
 - See `docs/releasing.md` for full process and versioning contract.
+
+## Commits, PRs, and Issues
+
+Applies to anything an agent authors in this repository, including runs
+triggered from GitHub (`@claude` in a comment or issue).
+
+- Titles: `<type>(<scope>): <subject>`. Types: `feat` `fix` `refactor` `polish` `docs` `test` `ci` `chore` `perf` `build` `style` `revert`.
+- No AI attribution anywhere: no "Generated with Claude Code" footer, no `Co-Authored-By` trailer, no mention of Claude, AI, agents, or assistants in a title, body, commit message, or changelog entry.
+- Open PRs as drafts. The maintainer marks them ready.
+- PR and issue bodies are bullets: verb-first fragments, lowercase, no terminal period. Prose only for the `Why`, capped at four sentences. A small PR is two or three bullets with no headings.
+- Never paste command output, CI logs, or pass/fail tables into a PR. Naming a check under `Validation` is fine; reporting its result is not.
+- Every PR says why the change exists. If it cannot be derived, ask; never invent one.
+- Docs are part of the deliverable. A change to paths, config keys, CLI flags, D-Bus interface, or behavior updates `docs/` (and `docs/contracts.md` where it applies) in the same PR.
