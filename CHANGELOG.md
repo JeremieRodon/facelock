@@ -170,6 +170,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Face unlock needs no group membership and no re-login** (ADR 010): the
+  system-bus policy now admits any local user's `Authenticate` for their own
+  account — the daemon already checks that the caller's UID owns the username
+  it names, and every other method stays root-only at both the bus and the
+  daemon. hyprlock/swaylock/polkit face unlock and the `is-enrolled` face
+  icon work the moment enrollment finishes. `/var/lib/facelock` and
+  `/var/lib/facelock/enrolled` are `0711 root:root` (traversable by all,
+  listable by none; database and markers keep their `0600` modes); the
+  `facelock` group grants signal receipt only, `sudo facelock setup` and `just
+  install-files` no longer add anyone to it, and the CLI's `AccessDenied` hint
+  says "root required" instead of "join the group". Existing memberships are
+  harmless. Upgrades converge through tmpfiles, the package scriptlets, and
+  the binary's own layout enforcement; the scriptlets and `setup --systemd`
+  also ask the bus to reload its policy. Widened residual, accepted: any local
+  user can `stat` a name it guesses under the state directory (previously
+  group members only).
 - **The CLI defaults to `warn`, and the daemon still logs at `info`.** Every
   command used to emit INFO on stderr, so the setup wizard's questions arrived
   interleaved with timestamped log lines and a run that was succeeding looked

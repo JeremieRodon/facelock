@@ -39,7 +39,7 @@ RestrictSUIDSGID=yes
 # /dev/video* and /dev/tpmrm0, both protected by standard Unix permissions.
 # Note: ProtectSystem=strict does NOT cover /dev/ — it only remounts /usr,
 # /etc, and /boot read-only. Device access here is restricted solely by
-# standard Unix file permissions (root:facelock ownership/mode) on
+# standard Unix file permissions (root:video / root:tss ownership and mode) on
 # /dev/video* and /dev/tpmrm0.
 
 # Phase 3: Capabilities, seccomp, and network lockdown

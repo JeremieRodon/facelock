@@ -225,10 +225,10 @@ The SQLite database requires specific permissions:
 sudo chown root:root /var/lib/facelock/facelock.db
 sudo chmod 600 /var/lib/facelock/facelock.db
 # The daemon (root) writes the -wal/-shm sidecars next to the database; the
-# state directory itself ships at 710 root:facelock (traverse-only for the
-# group, nothing for anyone else):
-sudo chown root:facelock /var/lib/facelock
-sudo chmod 710 /var/lib/facelock
+# state directory and enrolled/ ship at 711 root:root (traversable by every
+# local user, listable by none):
+sudo chown root:root /var/lib/facelock /var/lib/facelock/enrolled
+sudo chmod 711 /var/lib/facelock /var/lib/facelock/enrolled
 ```
 
 ### PAM module cannot reach daemon

@@ -184,12 +184,10 @@ enough to call repeatedly from a lock screen: it reads one marker file under
 `/var/lib/facelock/enrolled/` and never activates the daemon, opens a camera,
 or reads the face database.
 
-It never errors merely because the caller is outside the `facelock` group, but
-it cannot report `enrolled` for one either: the marker sits under two
-`0710 root:facelock` directories, so a non-member reads `EACCES` and is
-reported `not-enrolled`. That is the correct answer — the group is required to
-reach the daemon at all, so face auth genuinely is not operational for that
-caller yet.
+No group membership is involved (ADR 010): the marker sits under two
+`0711 root:root` directories, so any local user can open its own marker by
+name. A missing or unreadable marker (`ENOENT` or `EACCES`) is reported
+`not-enrolled` rather than as an error.
 
 ```bash
 facelock is-enrolled                    # prints enrolled / not-enrolled

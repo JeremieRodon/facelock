@@ -242,16 +242,16 @@ The only files it touches are `/etc/facelock/config.toml` (to find the state dir
 ### The marker is a hint, not authority
 
 ```
-/var/lib/facelock/            0710 root:facelock   traverse-only, NOT listable
+/var/lib/facelock/            0711 root:root       traverse-only, NOT listable
   facelock.db                 0600 root:root
   models/                     0755 root:root       public, SHA256-verified
-  enrolled/                   0710 root:facelock   markers only
+  enrolled/                   0711 root:root       markers only
     <user>                    0600 <user>:<user>
 ```
 
-The markers live **inside** the state directory. Both directories on the path grant the `facelock` group traversal (`g+x`) and everyone else nothing, so *"enrolled"* means **"face auth is operational for me"**: one `open(2)` answers group-membership and enrollment together. Traverse-only means a group member can open its own marker by name but cannot `readdir` the directory, so which other accounts have face auth enrolled is not listable. Each marker is `0600` and owned by its user, so "am I enrolled?" is answerable by that user and nobody else — the same privacy property as `~/.ssh/authorized_keys`. Both `ENOENT` and `EACCES` are reported as not-enrolled (exit 1), never as an error.
+The markers live **inside** the state directory. Both directories on the path are `0711 root:root` — traversable by every local user, listable by none — so *"enrolled"* means **"face auth is operational for me"**: one `open(2)` of the caller's own marker answers it, with no group membership involved (ADR 010). Traverse-only means any user can open its own marker by name but cannot `readdir` the directory, so which other accounts have face auth enrolled is not listable. Each marker is `0600` and owned by its user, so "am I enrolled?" is answerable by that user and nobody else — the same privacy property as `~/.ssh/authorized_keys`. Both `ENOENT` and `EACCES` are reported as not-enrolled (exit 1), never as an error.
 
-The database is `600 root:root` — encrypted biometric templates are read by the daemon, never by group members — so the marker can in principle drift from it, for instance after an out-of-band database restore. That is acceptable because `is-enrolled` only decides whether to show a **UI affordance**. A stale marker degrades gracefully: the indicator appears, the PAM attempt fails, and the password context was running in parallel the whole time.
+The database is `600 root:root` — encrypted biometric templates are read by the daemon, never by any other user — so the marker can in principle drift from it, for instance after an out-of-band database restore. That is acceptable because `is-enrolled` only decides whether to show a **UI affordance**. A stale marker degrades gracefully: the indicator appears, the PAM attempt fails, and the password context was running in parallel the whole time.
 
 **PAM at auth time remains authoritative.** Nothing in the authentication path consults the marker.
 

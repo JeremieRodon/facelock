@@ -60,7 +60,7 @@ Supported providers: `cpu` (default), `cuda` (NVIDIA), `rocm` (AMD), `openvino` 
 - D-Bus daemon verifies caller UID via `GetConnectionUnixUser` before executing methods.
 - D-Bus message size limits enforced by the bus daemon.
 - PAM module logs all auth attempts to syslog.
-- Database and model files have restrictive permissions (640/644, root:facelock).
+- Database is 0600 root:root, model files 0644 under a 0755 root:root directory; the state directory is 0711 root:root (ADR 010).
 - Rate limiting enforced in daemon (5 attempts/user/60s default).
 - Constant-time embedding comparison via `subtle` crate (prevents timing side-channels).
 - systemd service hardened with ProtectSystem=strict, NoNewPrivileges, InaccessiblePaths, etc.

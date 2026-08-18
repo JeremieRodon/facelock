@@ -164,18 +164,13 @@ See
 below. It reads only the per-user marker file under
 .IR /var/lib/facelock/enrolled/ ;
 it does not activate the daemon over D-Bus, does not open a camera, and does
-not read the face database. It never errors merely because the caller is
-outside the
-.B facelock
-group, but it cannot report
-.B enrolled
-for one either: the marker sits under two 0710 root:facelock directories, so a
-non-member reads EACCES and is reported
-.BR not\-enrolled .
-That is the correct answer \(em the group is required to reach the daemon at
-all, so face auth genuinely is not operational for that caller yet. The marker
-is a hint for deciding whether to offer a face-auth affordance \(em PAM at
-authentication time remains authoritative.
+not read the face database. No group membership is involved (ADR 010): the
+marker sits under two 0711 root:root directories, so any local user can open
+its own marker by name. A missing or unreadable marker (ENOENT or EACCES) is
+reported
+.B not\-enrolled
+rather than as an error. The marker is a hint for deciding whether to offer a
+face-auth affordance \(em PAM at authentication time remains authoritative.
 .RS
 .TP
 .B \-u\fR, \fB\-\-user \fIusername\fR
@@ -588,26 +583,23 @@ Main configuration file. Controls camera device, recognition thresholds,
 daemon settings, security policy, and TPM options.
 .TP
 .I /var/lib/facelock/
-State directory. Permissions should be 710, owned by root:facelock:
-traverse-only for the
+State directory. Permissions should be 711, owned by root:root:
+traversable by every local user, listable by root only. Any user can open a
+path it knows by name \(em its own enrollment marker, a model file \(em but
+nobody can list the directory. There is no group grant here (ADR 010): the
 .B facelock
-group, nothing for anyone else. A group member can open a path it knows by
-name \(em its own enrollment marker, a model file \(em but cannot list the
-directory, and users outside the group cannot reach anything below it. The
-group is a D-Bus access grant, not a file-read grant.
+group owns nothing under this directory.
 .TP
 .I /var/lib/facelock/facelock.db
 SQLite database storing face embeddings. Permissions should be 600, owned
-by root:root: the daemon reads it as root, and
-.B facelock
-group members request authentication through the daemon rather than reading
-templates.
+by root:root: the daemon reads it as root, and user-run PAM stacks request
+authentication through the daemon rather than reading templates.
 .TP
 .I /var/lib/facelock/models/
 Directory containing ONNX model files (SCRFD and ArcFace). SHA256-verified
 at load time. Public downloads, so permissions are 755 root:root with the
-model files themselves 644; the 710 state directory above is what keeps
-non-group users away. Overridable via
+model files themselves 644; the 711 state directory above grants traversal to
+a known name but no listing. Overridable via
 .I daemon.model_dir
 in the configuration file; an explicitly configured directory is honored
 verbatim and is never rewritten.
@@ -615,11 +607,9 @@ verbatim and is never rewritten.
 .I /var/lib/facelock/enrolled/
 Enrollment markers read by
 .BR "facelock is\-enrolled" .
-Permissions should be 710, owned by root:facelock: group-traversable to a
-known filename but not listable. The ownership is part of the contract \(em
-the group-execute bit only works because the
-.B facelock
-group owns the directory.
+Permissions should be 711, owned by root:root: traversable to a known
+filename by any local user, listable by none. No group membership is involved
+(ADR 010).
 .TP
 .I /var/lib/facelock/enrolled/<user>
 One user's marker, 600 and owned by that user. Contains the model count and
