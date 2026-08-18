@@ -232,9 +232,13 @@ impl Message for SetupMessage {
                 ),
                 &[("error", error.clone())],
             ),
+            // The msgid changed on purpose: ADR 009 renamed `facelock
+            // encrypt` to `facelock tpm encrypt`, so the old string pointed
+            // at a spelling this binary no longer accepts. Regenerated into
+            // `po/facelock.pot` by `just pot`.
             EncryptionStepFailed { error } => fill(
                 translate(
-                    "  Encryption setup failed: {error}\n  You can configure encryption later with: sudo facelock encrypt --generate-key",
+                    "  Encryption setup failed: {error}\n  You can configure encryption later with: sudo facelock tpm encrypt --generate-key",
                 ),
                 &[("error", error.clone())],
             ),

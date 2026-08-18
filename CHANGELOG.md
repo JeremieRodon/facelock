@@ -128,6 +128,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `facelock restart` is now `facelock daemon restart`** (ADR 009).
+- **BREAKING: `facelock encrypt` is now `facelock tpm encrypt`** (ADR 009).
+  `--generate-key` is unchanged.
+- **BREAKING: `facelock decrypt` is now `facelock tpm decrypt`** (ADR 009).
+- **BREAKING: `facelock reseal` is now `facelock tpm reseal`** (ADR 009).
+- **BREAKING: `facelock config --edit` is now `facelock config edit`** (ADR
+  009).
+- The old spellings are removed rather than aliased, so they exit 2 with clap's
+  unrecognized-subcommand error. Clap has no cross-level alias, and the project
+  is pre-1.0 with no external caller of the four names: the byte-coupled
+  surfaces in ADR 009 §4 and the Omarchy scripts name none of them. Bare
+  `facelock daemon` still runs the daemon and bare `facelock config` still
+  shows, so every shipped service unit and the `ExecStart` marker in
+  `facelock setup --systemd` keep working unchanged. The privilege split is
+  unchanged too: `config show` is unprivileged, `config edit` is root. The rule
+  that decides whether a new command is top-level or lives inside a noun group
+  is now written into `docs/contracts.md` §CLI Subcommands and pinned by a
+  `TOP_LEVEL_COMMANDS` registry test.
 - **`facelock tpm status` and `facelock tpm pcr-baseline` now require root**,
   like every other `tpm` verb. Neither checked, which left `status` failing
   with a raw sqlite "unable to open database file" error when it reached the

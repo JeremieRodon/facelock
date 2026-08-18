@@ -88,7 +88,55 @@ fn bench_refuses_before_root_non_root() {
 
 #[test]
 fn config_edit_refuses_before_root_non_root() {
-    assert_refuses_before_output(&["config", "--edit"], &["Config file:", "Config saved"]);
+    assert_refuses_before_output(&["config", "edit"], &["Config file:", "Config saved"]);
+}
+
+// The four commands ADR 009 moved under `daemon` and `tpm`. None of them had a
+// C6 row under its old top-level spelling — a pre-existing gap, closed here
+// because the rename is the moment their argv changes anyway. Each asserts the
+// same thing as the rows above: the root check runs ahead of the command's
+// first byte of output, not after it.
+
+#[test]
+fn daemon_restart_refuses_before_root_non_root() {
+    assert_refuses_before_output(
+        &["daemon", "restart"],
+        &["Daemon restarted.", "Daemon shutdown requested"],
+    );
+}
+
+#[test]
+fn tpm_encrypt_refuses_before_root_non_root() {
+    assert_refuses_before_output(
+        &["tpm", "encrypt"],
+        &[
+            "Proceeding to encrypt embeddings",
+            "All embeddings are already encrypted",
+            "Encrypting ",
+        ],
+    );
+}
+
+#[test]
+fn tpm_decrypt_refuses_before_root_non_root() {
+    assert_refuses_before_output(
+        &["tpm", "decrypt"],
+        &["No encrypted embeddings found", "Decrypting "],
+    );
+}
+
+#[test]
+fn tpm_reseal_refuses_before_root_non_root() {
+    // The method check is the first thing `run_reseal` does after the root
+    // check, so its refusal text is the tightest ordering witness available.
+    assert_refuses_before_output(
+        &["tpm", "reseal"],
+        &[
+            "only applies when encryption.method",
+            "no sealed key found at",
+            "Unsealed the current key",
+        ],
+    );
 }
 
 #[test]

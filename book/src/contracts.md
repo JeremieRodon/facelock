@@ -25,15 +25,36 @@ Stable contracts. Do not change without updating this document.
 | `facelock preview` | Live camera preview |
 | `facelock devices` | List V4L2 cameras |
 | `facelock status` | Check system status |
-| `facelock config` | Show/edit configuration |
-| `facelock daemon` | Run persistent daemon |
+| `facelock config show` | Show configuration (bare `facelock config` shows) |
+| `facelock config edit` | Open the config file in `$EDITOR` |
+| `facelock daemon run` | Run persistent daemon (bare `facelock daemon` runs it) |
+| `facelock daemon restart` | Restart the daemon |
 | `facelock auth --user X` | One-shot auth (PAM helper). `--user` is required here and only here; `--config` is the global flag, not a per-command one |
 | `facelock tpm status` | TPM status, sealed-key presence and encrypted/plaintext embedding counts. Root, like every `tpm` verb |
-| `facelock encrypt` | Encrypt face database |
-| `facelock decrypt` | Decrypt face database |
+| `facelock tpm encrypt` | Encrypt face database |
+| `facelock tpm decrypt` | Decrypt face database |
 | `facelock audit` | View audit log |
 | `facelock bench` | Benchmarks |
-| `facelock restart` | Restart daemon |
+
+**Where a command goes.** A top-level command names a user task and keeps its
+spelling for the life of the binary. A noun group exists when the noun names a
+distinct operational domain and owns two or more subcommands. The domains:
+`pam` (`/etc/pam.d`), `tpm` (the TPM device and the encryption key), `hyprlock`
+(`hyprlock.conf`), `daemon` (the running service), `config` (the config file),
+`bench` (measurement runs). Facelock's primary objects, meaning face models,
+cameras, the audit log and the install itself, are reached by top-level
+commands and never earn a group. Inside a group the second word is spelled the
+way its domain spells it, verb or noun: `tpm seal-key` and `tpm pcr-baseline`
+follow tpm2-tools, `bench cold-auth` names a measurement. A new command must
+fit an existing domain before it may claim a top-level name. Commands named by
+`pam_facelock.so`, the service units, or the Omarchy scripts never move. See
+ADR 009.
+
+The top-level set is pinned by the `TOP_LEVEL_COMMANDS` registry in
+`crates/facelock-cli/src/main.rs`, checked in both directions against
+`Cli::command()`: a name in the registry the binary does not offer fails, and a
+top-level command with no row fails too. Nested verbs are deliberately absent
+from it — where a verb sits inside its group is that group's business.
 
 ### CLI Flag Spelling
 

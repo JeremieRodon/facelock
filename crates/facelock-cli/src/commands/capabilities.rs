@@ -51,6 +51,8 @@
 /// in `main.rs` refuses to build a name that nothing in the clap tree backs.
 pub const CAPABILITIES: &[&str] = &[
     "capabilities",
+    "config-edit",
+    "daemon-restart",
     "devices-json",
     "is-enrolled",
     "is-enrolled-json",
@@ -63,6 +65,9 @@ pub const CAPABILITIES: &[&str] = &[
     "setup-if-present",
     "setup-no-pam",
     "setup-systemd",
+    "tpm-decrypt",
+    "tpm-encrypt",
+    "tpm-reseal",
 ];
 
 /// This binary's version — the string `facelock --version` prints.
@@ -123,6 +128,8 @@ mod tests {
     /// something to fail against.
     const CAPABILITIES_EVER_EMITTED: &[&str] = &[
         "capabilities",
+        "config-edit",
+        "daemon-restart",
         "devices-json",
         "is-enrolled",
         "is-enrolled-json",
@@ -135,6 +142,9 @@ mod tests {
         "setup-if-present",
         "setup-no-pam",
         "setup-systemd",
+        "tpm-decrypt",
+        "tpm-encrypt",
+        "tpm-reseal",
     ];
 
     /// The half of the contract no clap predicate can see: a consumer that

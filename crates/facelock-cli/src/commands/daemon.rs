@@ -1,4 +1,5 @@
-//! The `facelock daemon` command: process setup for the D-Bus server.
+//! The `facelock daemon` command group: process setup for the D-Bus server,
+//! and the restart that acts on it.
 //!
 //! The server itself — the `org.facelock.Daemon` service, per-method
 //! authorization, capture slot, idle timeout — lives in
@@ -7,8 +8,14 @@
 //! check, tracing init, and building the production handler from config
 //! (camera resolution, model/EP probes, state layout — all of which lean on
 //! CLI-shared modules like `crate::resolved` and `crate::state_layout`).
+//!
+//! `restart` lives here rather than in `commands/config.rs`, where it shipped:
+//! it acts on the daemon, not the config file (ADR 009).
 
 use std::path::Path;
+use std::process::Command;
+
+use clap::Subcommand;
 
 use facelock_camera::quirks::QuirksDb;
 use facelock_camera::{
@@ -229,12 +236,63 @@ fn reconcile_enrollment_markers(config: &Config) {
     }
 }
 
+/// Verbs on the running service.
+///
+/// `None` at the call site means [`DaemonCommand::Run`]: bare `facelock
+/// daemon` is what five init-system units and `commands::setup::run_systemd`'s
+/// `ExecStart` marker invoke, and it keeps running the daemon (ADR 009 §4).
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    /// Run the daemon in the foreground (what bare `facelock daemon` does)
+    Run,
+    /// Restart the running daemon
+    Restart,
+}
+
+/// Restart the facelock daemon via systemd, or via D-Bus shutdown if systemd
+/// is unavailable.
+///
+/// `pub(crate)` because `config edit` calls it too: a config change that the
+/// daemon caches at startup is applied by restarting it.
+pub(crate) fn restart_daemon() {
+    // Try systemd first (most common)
+    let result = Command::new("systemctl")
+        .args(["restart", "facelock-daemon.service"])
+        .status();
+
+    match result {
+        Ok(s) if s.success() => println!("Daemon restarted."),
+        _ => {
+            // Fallback: send shutdown via D-Bus, let systemd auto-restart or D-Bus activation
+            // handle the next request
+            let _ = Command::new("busctl")
+                .args([
+                    "--system",
+                    "call",
+                    "org.facelock.Daemon",
+                    "/org/facelock/Daemon",
+                    "org.facelock.Daemon",
+                    "Shutdown",
+                ])
+                .status();
+            println!("Daemon shutdown requested (will restart on next use).");
+        }
+    }
+}
+
+/// Restart the facelock daemon. Called by `facelock daemon restart`.
+pub fn restart() -> anyhow::Result<()> {
+    crate::ipc_client::require_root("sudo facelock daemon restart")?;
+    restart_daemon();
+    Ok(())
+}
+
 /// `--config` is honored through the process-level override `main` installs
 /// before dispatch, which is what `Config::load()` and
 /// `paths::config_path()` both read — so startup, the live reload and the
 /// mtime watch cannot disagree about which file is the config.
 pub fn run(notifier_factory: NotifierFactory) -> anyhow::Result<()> {
-    crate::ipc_client::require_root("sudo facelock daemon")?;
+    crate::ipc_client::require_root("sudo facelock daemon run")?;
 
     // Init tracing (the daemon is the one caller that wants targets rendered).
     // See crate::logging's module doc for why this must not build its own

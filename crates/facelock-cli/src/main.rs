@@ -11,6 +11,8 @@ use clap::{Parser, Subcommand};
 
 use facelock_cli::commands::TpmCommand;
 use facelock_cli::commands::bench::BenchCommand;
+use facelock_cli::commands::config::ConfigCommand;
+use facelock_cli::commands::daemon::DaemonCommand;
 use facelock_cli::commands::hyprlock::HyprlockCommand;
 use facelock_cli::commands::setup::{SetupArgs, resolve_setup_plan};
 use facelock_cli::{commands, logging, message, notifications, resolved};
@@ -103,9 +105,8 @@ enum Commands {
     },
     /// Show or edit configuration
     Config {
-        /// Open config file in editor
-        #[arg(long)]
-        edit: bool,
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
     },
     /// Check system status
     Status,
@@ -114,8 +115,11 @@ enum Commands {
         #[command(flatten)]
         json: JsonArg,
     },
-    /// Run the persistent authentication daemon
-    Daemon,
+    /// Run or restart the persistent authentication daemon
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
     /// One-shot authentication (used by PAM module)
     Auth {
         // Required, unlike every other `--user`, and so not a `UserArg`:
@@ -131,7 +135,7 @@ enum Commands {
         #[command(subcommand)]
         command: BenchCommand,
     },
-    /// TPM integration status and management
+    /// Manage the encryption key and the TPM that can seal it (key material, TPM or not)
     Tpm {
         #[command(subcommand)]
         command: TpmCommand,
@@ -146,18 +150,6 @@ enum Commands {
         #[command(subcommand)]
         command: HyprlockCommand,
     },
-    /// Encrypt all unencrypted embeddings with AES-256-GCM
-    Encrypt {
-        /// Generate a new encryption key (does not encrypt)
-        #[arg(long)]
-        generate_key: bool,
-    },
-    /// Decrypt all software-encrypted embeddings
-    Decrypt,
-    /// Re-seal the TPM AES key under current PCRs (recovery after a firmware/kernel change)
-    Reseal,
-    /// Restart the facelock daemon
-    Restart,
     /// View structured audit log
     Audit {
         /// Follow mode: watch for new entries
@@ -198,8 +190,32 @@ fn main() -> anyhow::Result<()> {
     }
 
     match command {
-        // Daemon and auth init their own tracing, so handle them separately
-        Commands::Daemon => commands::daemon::run(notifications::daemon_notifier_factory()),
+        // Daemon and auth init their own tracing, so handle them separately.
+        //
+        // The whole `daemon` group is dispatched here, in one arm, even though
+        // only `run` needs to precede the tracing init. Splitting it across
+        // two levels of this match — `run` here, `restart` in the D7 block —
+        // is what let a future `DaemonCommand::Reload` compile and then panic
+        // on the `unreachable!()` arm below. Matched exhaustively on
+        // `DaemonCommand` in one place, a new verb is a compile error at this
+        // `match` instead. The duplicated `init_stderr` line is that guarantee's
+        // whole cost.
+        //
+        // Bare `facelock daemon` is `daemon run`: the five init-system units
+        // and setup.rs's `ExecStart` marker all invoke the bare form (ADR 009 §4).
+        Commands::Daemon { command } => match command {
+            None | Some(DaemonCommand::Run) => {
+                commands::daemon::run(notifications::daemon_notifier_factory())
+            }
+            // `restart` only talks to systemd: no parsed Config, and nothing
+            // from the D7 block it used to sit in except this tracing init
+            // (`message::init` already ran at the top of `main`, for every
+            // command alike).
+            Some(DaemonCommand::Restart) => {
+                logging::init_stderr(false);
+                commands::daemon::restart()
+            }
+        },
         Commands::Auth { user } => {
             // `auth` is its own one-shot process and loads the config itself,
             // so it takes the explicit path rather than re-deriving it.
@@ -220,9 +236,8 @@ fn main() -> anyhow::Result<()> {
                 // in front of all config/resolution machinery: it tolerates a
                 // missing or broken config and probes nothing (see
                 // commands/is_enrolled.rs). `hyprlock` edits the user's own
-                // dotfiles, `config` operates on the config file itself, and
-                // `restart` only talks to systemd — none consume a parsed
-                // Config.
+                // dotfiles and `config` operates on the config file itself —
+                // neither consumes a parsed Config.
                 //
                 // `capabilities` reports on the binary itself — its own clap
                 // tree and constants. It reads no file at all, so it sits
@@ -243,8 +258,10 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(commands::pam::run(command.into(), quiet)?)
                 }
                 Commands::Hyprlock { command } => commands::hyprlock::run(command),
-                Commands::Config { edit } => commands::config::run(edit),
-                Commands::Restart => commands::config::restart(),
+                // `config show` (and bare `config`) is the unprivileged read
+                // DEC-6 lists; `config edit` takes root inside the command,
+                // ahead of the editor (C6).
+                Commands::Config { command } => commands::config::run(command),
 
                 // Setup bootstraps the config file — creates the default when
                 // missing and edits it in place — so it owns its own load; see
@@ -288,24 +305,25 @@ fn main() -> anyhow::Result<()> {
                         }
                         Commands::Devices { json } => commands::devices::run(&config, json.json),
                         Commands::Bench { command } => commands::bench::run(&config, command),
+                        // `tpm encrypt|decrypt|reseal` land here, which is
+                        // where the top-level spellings landed before the
+                        // rename: they take the one parsed Config (D7).
                         Commands::Tpm { command } => commands::tpm::run(&config, command),
-                        Commands::Encrypt { generate_key } => {
-                            commands::encrypt::run_encrypt(&config, generate_key)
-                        }
-                        Commands::Decrypt => commands::encrypt::run_decrypt(&config),
-                        Commands::Reseal => commands::tpm::run_reseal(&config),
                         Commands::Audit { follow, lines } => {
                             commands::audit::run(&config, follow, lines)
                         }
-                        // Already handled above
-                        Commands::Daemon
+                        // Already handled above. `Daemon` is dispatched
+                        // exhaustively in the top-level match, so this arm
+                        // cannot be reached by any `DaemonCommand`; it stays
+                        // only because `other` is typed `Commands` and this
+                        // match must still cover every variant of it.
+                        Commands::Daemon { .. }
                         | Commands::Auth { .. }
                         | Commands::IsEnrolled { .. }
                         | Commands::Capabilities { .. }
                         | Commands::Pam { .. }
                         | Commands::Hyprlock { .. }
                         | Commands::Config { .. }
-                        | Commands::Restart
                         | Commands::Setup(..)
                         | Commands::Status => unreachable!(),
                     }
@@ -693,6 +711,67 @@ mod tests {
     // Flag spelling (#167)
     // -----------------------------------------------------------------------
 
+    /// The top-level command set, in `--help` order.
+    ///
+    /// A top-level name is the spelling every wrapper script, unit file and
+    /// lock screen hard-codes, so gaining or losing one is a decision, not a
+    /// side effect of adding a variant. The rule that decides whether a new
+    /// command belongs here or inside a noun group is written down in
+    /// `docs/contracts.md` §CLI Subcommands; ADR 009 adopted it.
+    ///
+    /// Checked in both directions against `Cli::command()`, like
+    /// `JSON_COMMANDS`: a name here that the binary does not offer fails, and
+    /// a command the binary offers that is not here fails too. Nested verbs
+    /// (`daemon restart`, `tpm encrypt`, `pam status`) are deliberately absent
+    /// — they are their group's business, and moving one is not a change to
+    /// this surface.
+    const TOP_LEVEL_COMMANDS: &[&str] = &[
+        "setup",
+        "is-enrolled",
+        "capabilities",
+        "enroll",
+        "remove",
+        "clear",
+        "list",
+        "test",
+        "preview",
+        "config",
+        "status",
+        "devices",
+        "daemon",
+        "auth",
+        "bench",
+        "tpm",
+        "pam",
+        "hyprlock",
+        "audit",
+    ];
+
+    #[test]
+    fn top_level_commands_match_the_registry() {
+        let root = Cli::command();
+        let actual: Vec<&str> = root
+            .get_subcommands()
+            .map(|c| c.get_name())
+            .filter(|name| *name != "help")
+            .collect();
+
+        for name in TOP_LEVEL_COMMANDS {
+            assert!(
+                actual.contains(name),
+                "`facelock {name}` is in TOP_LEVEL_COMMANDS but the binary does not offer it"
+            );
+        }
+        for name in &actual {
+            assert!(
+                TOP_LEVEL_COMMANDS.contains(name),
+                "`facelock {name}` is a top-level command with no row in \
+                 TOP_LEVEL_COMMANDS; add one only if it names a user task that \
+                 fits no existing noun group (docs/contracts.md §CLI Subcommands)"
+            );
+        }
+    }
+
     /// The short-letter registry.
     ///
     /// Short letters are a single namespace shared by every subcommand: once
@@ -1053,6 +1132,22 @@ mod tests {
             &["facelock", "pam", "status"],
             &["facelock", "pam", "status", "--service", "sudo", "--json"],
             &["facelock", "--quiet", "pam", "status", "--json"],
+            // ADR 009. The bare forms are what five init-system units and
+            // `commands::setup::run_systemd`'s `ExecStart` marker invoke, and
+            // what a reader types; the explicit forms are the new spellings.
+            // The four deleted top-level spellings get no rows here: this
+            // table pins what must keep parsing, and ADR 009 decided they
+            // must not. They are pinned as parse errors further down.
+            &["facelock", "daemon"],
+            &["facelock", "daemon", "run"],
+            &["facelock", "daemon", "restart"],
+            &["facelock", "config"],
+            &["facelock", "config", "show"],
+            &["facelock", "config", "edit"],
+            &["facelock", "tpm", "encrypt"],
+            &["facelock", "tpm", "encrypt", "--generate-key"],
+            &["facelock", "tpm", "decrypt"],
+            &["facelock", "tpm", "reseal"],
         ] {
             Cli::try_parse_from(argv)
                 .unwrap_or_else(|e| panic!("`{}` must still parse: {e}", argv.join(" ")));
@@ -1078,7 +1173,10 @@ mod tests {
         assert_eq!(user, "alice");
 
         // `daemon -c X` kept its spelling when the per-command flag was deleted:
-        // the global one gained `-c`. Both sides of the subcommand work.
+        // the global one gained `-c`. Both sides of the subcommand work, and
+        // the bare form still reaches the daemon under `Option<DaemonCommand>`
+        // (ADR 009): were `None` ever to mean `Restart`, every service unit
+        // would restart the daemon at boot instead of starting it.
         for argv in [
             &["facelock", "daemon", "-c", "/tmp/x.toml"][..],
             &["facelock", "-c", "/tmp/x.toml", "daemon"],
@@ -1086,7 +1184,39 @@ mod tests {
             let cli = Cli::try_parse_from(argv)
                 .unwrap_or_else(|e| panic!("`{}` must parse: {e}", argv.join(" ")));
             assert_eq!(cli.config.as_deref(), Some("/tmp/x.toml"));
-            assert!(matches!(cli.command, Commands::Daemon));
+            assert!(matches!(cli.command, Commands::Daemon { command: None }));
+        }
+
+        // The `None` arms are the compatibility surface: bare `daemon` runs
+        // the daemon and bare `config` shows the file. A future `Option` that
+        // defaulted to anything else would be a silent behaviour change.
+        assert!(matches!(
+            Cli::try_parse_from(["facelock", "daemon"])
+                .expect("bare `facelock daemon` must parse")
+                .command,
+            Commands::Daemon { command: None }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["facelock", "config"])
+                .expect("bare `facelock config` must parse")
+                .command,
+            Commands::Config { command: None }
+        ));
+
+        // Deleted, not hidden (ADR 009): the old spellings must not parse.
+        for argv in [
+            &["facelock", "restart"][..],
+            &["facelock", "encrypt"],
+            &["facelock", "encrypt", "--generate-key"],
+            &["facelock", "decrypt"],
+            &["facelock", "reseal"],
+            &["facelock", "config", "--edit"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "`{}` was renamed and must no longer parse",
+                argv.join(" ")
+            );
         }
 
         // `--quiet` moved off `is-enrolled` onto the root, so both positions
@@ -1207,11 +1337,33 @@ mod tests {
         let root = Cli::command();
         let pam = sub(&root, "pam");
         let setup = sub(&root, "setup");
+        let tpm = sub(&root, "tpm");
 
         for name in CAPABILITIES {
             match *name {
                 "capabilities" => {
                     sub(&root, "capabilities");
+                }
+                // ADR 009 renamed five invocations. A consumer cannot tell a
+                // build that offers `daemon restart` from one that still wants
+                // `restart` by any means except asking, so each new spelling
+                // is its own name. One name, one promise: that the subcommand
+                // at this path exists — not what it does, which the
+                // docs/contracts.md row it is checked against owns.
+                "config-edit" => {
+                    sub(sub(&root, "config"), "edit");
+                }
+                "daemon-restart" => {
+                    sub(sub(&root, "daemon"), "restart");
+                }
+                "tpm-decrypt" => {
+                    sub(tpm, "decrypt");
+                }
+                "tpm-encrypt" => {
+                    sub(tpm, "encrypt");
+                }
+                "tpm-reseal" => {
+                    sub(tpm, "reseal");
                 }
                 "devices-json" => assert_long(sub(&root, "devices"), "json", "json"),
                 "is-enrolled" => {
@@ -1411,6 +1563,12 @@ mod tests {
     /// mean parsing prose for command names, and the reverse direction is
     /// already covered — a command named here that binds no `--json` fails
     /// `cli_flag_conformance` against `JSON_COMMANDS` first.
+    ///
+    /// `docs/cli.md` only, unlike the coverage and example checks either side
+    /// of it. The book's copy has no `## Machine-readable output` section at
+    /// all, so holding it to this would not find rot — it would demand a
+    /// section that has never existed, which is a decision about what the book
+    /// contains rather than a check that it is accurate.
     #[test]
     fn docs_cli_machine_output_section_names_every_json_command() {
         let root = Cli::command();
@@ -1455,13 +1613,19 @@ mod tests {
     ///   placeholder would make `--user <user>` pass while `remove <id>`
     ///   failed, which is an arbitrary line. Angle brackets are used for
     ///   metavariables in the flag *tables*, which are not bash blocks.
-    fn documented_invocations() -> Vec<Vec<String>> {
+    ///
+    /// Takes the document rather than reading `CLI_DOC` directly, because the
+    /// book ships a second, hand-maintained copy of this reference. Checking
+    /// only `docs/cli.md` left the copy that rots more freely — the one a
+    /// reader is likelier to arrive at from a search engine — free to document
+    /// a command line that does not parse.
+    fn documented_invocations(doc: &str) -> Vec<Vec<String>> {
         const OPERATORS: &[&str] = &["|", "||", "&&", ";", "&"];
 
         let mut invocations = Vec::new();
         let mut in_bash = false;
 
-        for line in CLI_DOC.lines() {
+        for line in doc.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("```") {
                 in_bash = !in_bash && trimmed == "```bash";
@@ -1490,8 +1654,8 @@ mod tests {
             for token in &argv {
                 assert!(
                     !token.contains('<') && !token.contains('>'),
-                    "`{command}` in docs/cli.md carries a placeholder or redirect \
-                     (`{token}`); a reference example must be runnable as written"
+                    "`{command}` carries a placeholder or redirect (`{token}`); \
+                     a reference example must be runnable as written"
                 );
             }
             invocations.push(argv);
@@ -1499,8 +1663,8 @@ mod tests {
 
         assert!(
             invocations.len() > 20,
-            "extracted only {} invocations from docs/cli.md — the extractor is \
-             probably broken, not the doc",
+            "extracted only {} invocations — the extractor is probably broken, \
+             not the doc",
             invocations.len()
         );
         invocations
@@ -1508,9 +1672,12 @@ mod tests {
 
     #[test]
     fn docs_cli_examples_all_parse() {
-        for argv in documented_invocations() {
-            Cli::try_parse_from(&argv)
-                .unwrap_or_else(|e| panic!("`{}` in docs/cli.md must parse: {e}", argv.join(" ")));
+        for (doc_path, doc) in MARKDOWN_REFERENCES {
+            for argv in documented_invocations(doc) {
+                Cli::try_parse_from(&argv).unwrap_or_else(|e| {
+                    panic!("`{}` in {doc_path} must parse: {e}", argv.join(" "))
+                });
+            }
         }
     }
 
@@ -1557,44 +1724,47 @@ mod tests {
                 .cloned()
         };
 
-        for argv in documented_invocations() {
-            let rendered = argv.join(" ");
-            let cli = Cli::try_parse_from(&argv).expect("checked by docs_cli_examples_all_parse");
+        for (doc_path, doc) in MARKDOWN_REFERENCES {
+            for argv in documented_invocations(doc) {
+                let rendered = argv.join(" ");
+                let cli =
+                    Cli::try_parse_from(&argv).expect("checked by docs_cli_examples_all_parse");
 
-            match cli.command {
-                Commands::Pam { command } => {
-                    let request: facelock_cli::commands::pam::PamRequest = command.into();
-                    if request.action != PamAction::Add || request.allow_sensitive {
-                        continue;
+                match cli.command {
+                    Commands::Pam { command } => {
+                        let request: facelock_cli::commands::pam::PamRequest = command.into();
+                        if request.action != PamAction::Add || request.allow_sensitive {
+                            continue;
+                        }
+                        if let Some(service) = gated(&request.services) {
+                            panic!(
+                                "`{rendered}` in {doc_path} installs into the gated service \
+                                 `{service}` without --allow-sensitive, so it fails as written"
+                            );
+                        }
                     }
-                    if let Some(service) = gated(&request.services) {
-                        panic!(
-                            "`{rendered}` in docs/cli.md installs into the gated service \
-                             `{service}` without --allow-sensitive, so it fails as written"
-                        );
+                    Commands::Setup(setup) => {
+                        let plan = resolve_setup_plan(SetupArgs::from(setup));
+                        // `setup --yes` is the documented exception: it maps onto
+                        // --allow-sensitive as well as --no-confirm.
+                        if plan.yes {
+                            continue;
+                        }
+                        let PamPref::Install {
+                            service: Some(service),
+                        } = &plan.pam
+                        else {
+                            continue;
+                        };
+                        if let Some(service) = gated(std::slice::from_ref(service)) {
+                            panic!(
+                                "`{rendered}` in {doc_path} installs into the gated service \
+                                 `{service}` without -y, so it fails as written"
+                            );
+                        }
                     }
+                    _ => {}
                 }
-                Commands::Setup(setup) => {
-                    let plan = resolve_setup_plan(SetupArgs::from(setup));
-                    // `setup --yes` is the documented exception: it maps onto
-                    // --allow-sensitive as well as --no-confirm.
-                    if plan.yes {
-                        continue;
-                    }
-                    let PamPref::Install {
-                        service: Some(service),
-                    } = &plan.pam
-                    else {
-                        continue;
-                    };
-                    if let Some(service) = gated(std::slice::from_ref(service)) {
-                        panic!(
-                            "`{rendered}` in docs/cli.md installs into the gated service \
-                             `{service}` without -y, so it fails as written"
-                        );
-                    }
-                }
-                _ => {}
             }
         }
     }

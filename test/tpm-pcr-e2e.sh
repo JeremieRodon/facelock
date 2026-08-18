@@ -6,7 +6,7 @@
 #   seal key under PCR binding -> unseal OK
 #   -> extend a bound PCR -> unseal FAILS (this is the regression: it used to
 #      succeed because the sealed object's userWithAuth let empty auth pass)
-#   -> `facelock reseal` re-seals under the new PCRs -> unseal OK again.
+#   -> `facelock tpm reseal` re-seals under the new PCRs -> unseal OK again.
 set -uo pipefail
 
 PASS=0
@@ -74,7 +74,7 @@ rm -f /etc/facelock/encryption.key /etc/facelock/encryption.key.sealed
 
 # 3. Generate a plaintext key (kept as the reseal backup), then seal it under the
 #    current PCR 16 state. seal-key flips encryption.method to "tpm".
-run_expect "generate plaintext key (backup)" "facelock encrypt --generate-key" 0
+run_expect "generate plaintext key (backup)" "facelock tpm encrypt --generate-key" 0
 run_expect "seal AES key under PCR 16" "facelock tpm seal-key" 0
 
 # 4. Unseal succeeds while PCR 16 is unchanged (policy satisfiable).
@@ -90,7 +90,7 @@ run_expect "unseal-check FAILS after bound PCR changed (finding #5)" \
 
 # 7. Recovery: reseal re-seals the key (recovered from the plaintext backup)
 #    under the new PCR state, and unseal works again.
-run_expect "facelock reseal restores under new PCRs" "facelock reseal" 0
+run_expect "facelock tpm reseal restores under new PCRs" "facelock tpm reseal" 0
 run_expect "unseal-check OK again after reseal" "facelock tpm unseal-check" 0
 
 echo ""

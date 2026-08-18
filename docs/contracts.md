@@ -32,19 +32,40 @@ Stable contracts. Do not change without updating this document.
 | `facelock preview` | Live camera preview |
 | `facelock devices` | List V4L2 cameras |
 | `facelock status` | Check system status |
-| `facelock config` | Show/edit configuration |
-| `facelock daemon` | Run persistent daemon |
+| `facelock config show` | Show configuration. Bare `facelock config` is `config show` |
+| `facelock config edit` | Open the config file in `$EDITOR`, validate on save, restart the daemon when a cached setting changed. Root |
+| `facelock daemon run` | Run the persistent daemon. Bare `facelock daemon` is `daemon run` — the form every shipped service unit invokes |
+| `facelock daemon restart` | Restart the daemon (`systemctl restart`, or a D-Bus `Shutdown` when systemd is unavailable). Root |
 | `facelock auth --user X` | One-shot auth (PAM helper). `--user` is required here and only here; `--config` is the global flag, not a per-command one |
-| `facelock tpm status` | TPM status, sealed-key presence and encrypted/plaintext embedding counts. Root, like every `tpm` verb |
 | `facelock hyprlock enable\|disable\|status` | Manage hyprlock lock-screen integration (user, no root); `enable` accepts `--no-icon` to skip the cosmetic face glyph |
-| `facelock encrypt` | Encrypt face database |
-| `facelock decrypt` | Decrypt face database |
-| `facelock reseal` | Re-seal the TPM AES key under current PCRs (recovery after a firmware/kernel change) |
+| `facelock tpm status` | TPM status, sealed-key presence and encrypted/plaintext embedding counts. Root, like every `tpm` verb |
+| `facelock tpm encrypt` | Encrypt face database |
+| `facelock tpm decrypt` | Decrypt face database |
+| `facelock tpm reseal` | Re-seal the TPM AES key under current PCRs (recovery after a firmware/kernel change) |
 | `facelock tpm seal-key` / `unseal-key` | Migrate keyfile↔tpm key protection |
 | `facelock tpm unseal-check` | Read-only: verify the sealed key still unseals (PCR policy satisfied) |
 | `facelock audit` | View audit log |
 | `facelock bench` | Benchmarks |
-| `facelock restart` | Restart daemon |
+
+**Where a command goes.** A top-level command names a user task and keeps its
+spelling for the life of the binary. A noun group exists when the noun names a
+distinct operational domain and owns two or more subcommands. The domains:
+`pam` (`/etc/pam.d`), `tpm` (the TPM device and the encryption key), `hyprlock`
+(`hyprlock.conf`), `daemon` (the running service), `config` (the config file),
+`bench` (measurement runs). Facelock's primary objects, meaning face models,
+cameras, the audit log and the install itself, are reached by top-level
+commands and never earn a group. Inside a group the second word is spelled the
+way its domain spells it, verb or noun: `tpm seal-key` and `tpm pcr-baseline`
+follow tpm2-tools, `bench cold-auth` names a measurement. A new command must
+fit an existing domain before it may claim a top-level name. Commands named by
+`pam_facelock.so`, the service units, or the Omarchy scripts never move. See
+ADR 009.
+
+The top-level set is pinned by the `TOP_LEVEL_COMMANDS` registry in
+`crates/facelock-cli/src/main.rs`, checked in both directions against
+`Cli::command()`: a name in the registry the binary does not offer fails, and a
+top-level command with no row fails too. Nested verbs are deliberately absent
+from it — where a verb sits inside its group is that group's business.
 
 ### CLI Flag Spelling
 
@@ -391,6 +412,8 @@ that is not on this list is not being denied, only not yet promised.
 | Name | Meaning |
 |------|---------|
 | `capabilities` | this command exists, so a consumer's membership test is uniform across every name |
+| `config-edit` | `config edit` exists — the verb ADR 009 split out of the old `--edit` flag |
+| `daemon-restart` | `daemon restart` exists — the verb ADR 009 moved under `daemon` from the top-level `restart` |
 | `devices-json` | `devices --json` |
 | `is-enrolled` | `is-enrolled` exists — the unprivileged enrollment probe whose exit code is the contract |
 | `is-enrolled-json` | `is-enrolled --json` |
@@ -403,6 +426,14 @@ that is not on this list is not being denied, only not yet promised.
 | `setup-if-present` | `setup --pam --remove --if-present` |
 | `setup-no-pam` | `setup --no-pam` |
 | `setup-systemd` | `setup --systemd` |
+| `tpm-decrypt` | `tpm decrypt` exists — the verb ADR 009 moved under `tpm` from the top-level `decrypt` |
+| `tpm-encrypt` | `tpm encrypt` exists — the verb ADR 009 moved under `tpm` from the top-level `encrypt` |
+| `tpm-reseal` | `tpm reseal` exists — the verb ADR 009 moved under `tpm` from the top-level `reseal` |
+
+The five names ADR 009 added are the only way a wrapper can tell a build that
+takes `daemon restart` from one that still wants `restart`: the old spellings
+were deleted rather than aliased, so probing by invocation costs a failed
+command. Each promises only that the subcommand at that path parses.
 
 ### CLI Privilege Model (DEC-6)
 
@@ -414,7 +445,7 @@ listed below, which are unprivileged by design, not by omission.
 | `facelock is-enrolled` | Answers from the caller's own `0600` marker file; the unprivileged integration point (see Exit Codes above). Never probes D-Bus |
 | `facelock hyprlock …` | Edits the user's own dotfile — root would write root-owned files into `$HOME`, which is wrong, not just unnecessary |
 | `facelock pam status` | Reads `0644` files under `/etc/pam.d` and writes nothing. Same role as `is-enrolled`: the probe an integration runs without `sudo`, replacing a hand-rolled `grep -q pam_facelock.so /etc/pam.d/<service>`. A file it cannot read reports `unknown` and exits 2 rather than reporting it as missing |
-| `facelock config` (display, no `--edit`) | Reads a `0644` file |
+| `facelock config [show]` | Reads a `0644` file. The rename split the flag into a verb (ADR 009) and the privilege split survives it exactly: `config show`, and the bare `config` that means it, stay unprivileged; `config edit` is root |
 | `facelock capabilities` | Reports what the *binary* can do, derived from its own clap tree and compiled-in constants — no file, no D-Bus, no camera, no per-user state, so there is nothing to protect. Unprivileged because the consumer is a user-level setup script deciding whether to invoke `sudo facelock …` at all: a probe that needed root to answer "do I need root?" would be useless |
 | `--help`, `--version` | — |
 
@@ -422,19 +453,28 @@ Every other command requires root. Two escalation behaviors apply, and each
 command uses exactly one:
 
 - **Interactive prompt.** `setup`, `enroll`, `test`, `preview`, `bench`,
-  `encrypt`, `decrypt`, `tpm`, `reseal`, `restart`, `config --edit`, `remove`,
-  `clear`, `list`, `status`, `devices`. Run as non-root with a TTY attached,
+  `tpm` (including `tpm encrypt`, `tpm decrypt` and `tpm reseal`),
+  `daemon run`, `daemon restart`, `config edit`, `remove`, `clear`, `list`,
+  `status`, `devices`. Run as non-root with a TTY attached,
   these ask `Root required. Re-run with sudo? [Y/n]` and re-exec via `sudo`
   on yes. Run as non-root with no TTY (scripted, piped, or closed stdin),
   they hard-error instead — `Root required.\n  Run: sudo facelock <cmd>` —
   rather than hang waiting for input that will never arrive
   (`ipc_client::require_root`).
-- **Hard error only.** `facelock pam add`, `facelock pam remove`, `facelock
-  audit` (and `facelock daemon`, whose own root check predates this table)
-  never offer the interactive prompt at all,
-  even with a TTY attached — both are typically invoked non-interactively or
-  as a long-running service, where a stray confirmation prompt is a hang, not
-  a convenience (`ipc_client::require_root_scripted`).
+- **Hard error only.** `facelock pam add`, `facelock pam remove` and
+  `facelock audit` never offer the interactive prompt at all, even with a TTY
+  attached — each is typically invoked non-interactively or by a wrapper,
+  where a stray confirmation prompt is a hang, not a convenience
+  (`ipc_client::require_root_scripted`).
+
+`facelock daemon run` is listed above under **interactive prompt** because
+that is what `commands::daemon::run` calls (`ipc_client::require_root`), not
+because a service manager should ever meet a prompt. Earlier revisions of this
+table claimed it was hard-error-only; the code has always said otherwise, and
+this row now matches the code. Under systemd there is no TTY, so the branch
+taken is the hard error either way.
+[#188](https://github.com/tyvsmith/facelock/issues/188) tracks whether it
+should be scripted.
 
 `facelock pam add|remove` are in the hard-error class because the surface they
 replace was: standalone `setup --pam` bailed from its own root check rather
@@ -455,7 +495,7 @@ Y/N confirmation before deleting a face model; historically `remove`'s root
 check ran *after* that confirmation, so a facelock-group member (who lacks
 root) would confirm a destructive action and only then discover it was
 refused — this is fixed. The same ordering applies to `status`, `devices`,
-`preview`, `test`, `audit`, `bench`, and `config --edit`: the root check is
+`preview`, `test`, `audit`, `bench`, and `config edit`: the root check is
 the first statement in each command's entry point, before `Config::load()`
 or any `println!`.
 
@@ -766,7 +806,7 @@ device coupling of Plan 02.
 `0x01` = no PCR policy; `0x03` = PCR-bound, and self-describes its PCR index list. A
 PCR-bound object is created with `userWithAuth = false`, and unseal starts a real policy
 session and replays `PolicyPCR` — so a changed bound PCR makes unseal **fail** (finding #5).
-`facelock reseal` re-seals the key under the current PCRs (recovery path).
+`facelock tpm reseal` re-seals the key under the current PCRs (recovery path).
 
 ### Camera Auto-Detection
 

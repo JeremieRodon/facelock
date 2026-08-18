@@ -37,7 +37,7 @@ fn obtain_sealer(config: &Config) -> Result<facelock_tpm::SoftwareSealer> {
 }
 
 pub fn run_encrypt(config: &Config, generate_key: bool) -> Result<()> {
-    crate::ipc_client::require_root("sudo facelock encrypt")?;
+    crate::ipc_client::require_root("sudo facelock tpm encrypt")?;
 
     if generate_key {
         match config.encryption.method {
@@ -73,7 +73,7 @@ pub fn run_encrypt(config: &Config, generate_key: bool) -> Result<()> {
                     .context("failed to generate encryption key")?;
                 println!("Key generated (permissions: 0600 root-only).");
                 println!(
-                    "\nTo encrypt embeddings, run: sudo facelock encrypt\n\
+                    "\nTo encrypt embeddings, run: sudo facelock tpm encrypt\n\
                      To enable auto-encryption, add to config:\n\
                      [encryption]\n\
                      method = \"keyfile\"\n\
@@ -144,7 +144,7 @@ pub fn run_encrypt(config: &Config, generate_key: bool) -> Result<()> {
 }
 
 pub fn run_decrypt(config: &Config) -> Result<()> {
-    crate::ipc_client::require_root("sudo facelock decrypt")?;
+    crate::ipc_client::require_root("sudo facelock tpm decrypt")?;
 
     // `open_existing`, never `create`: nothing to encrypt or decrypt means a
     // missing database is an error to report, not a file to bring into being
