@@ -449,6 +449,7 @@ fn docs_cli_examples_never_install_into_a_gated_service() {
                     }
                     let PamPref::Install {
                         service: Some(service),
+                        ..
                     } = &plan.pam
                     else {
                         continue;

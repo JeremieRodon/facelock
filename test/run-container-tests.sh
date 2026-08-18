@@ -259,6 +259,22 @@ run_test "setup --pam --remove --if-present succeeds on an absent service file" 
     "facelock setup --pam --service facelock-scratch --remove --yes --if-present" \
     0
 
+# The add side of the same flag. A provisioning script configures a set of
+# optional integrations in one pass; before this, the alias could only say
+# "add", so a machine without hyprlock failed the whole run. Absence must be a
+# successful no-op that creates nothing. Both halves are asserted: a `setup
+# --pam` that reached exit 0 by writing a service file out of thin air would
+# satisfy an exit-code-only row.
+run_test "setup --pam --if-present succeeds on an absent service file" \
+    "facelock setup --pam --service facelock-scratch --yes --if-present > /dev/null 2>&1; test \$? -eq 0 && ! test -e /etc/pam.d/facelock-scratch" \
+    0
+
+# ...and the default is still a hard error, which is what catches a typo'd
+# --service rather than silently configuring nothing.
+run_test "setup --pam without --if-present still fails on an absent service file" \
+    "facelock setup --pam --service facelock-scratch --yes > /dev/null 2>&1; test \$? -ne 0 && ! test -e /etc/pam.d/facelock-scratch" \
+    0
+
 # --- P1: vendor pam.d resolution ---
 #
 # Linux-PAM reads /etc/pam.d first and /usr/lib/pam.d second, and packages have

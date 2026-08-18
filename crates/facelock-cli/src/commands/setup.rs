@@ -114,8 +114,14 @@ pub enum SystemdPref {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PamPref {
     Ask,
-    Install { service: Option<String> },
-    Remove { service: String, if_present: bool },
+    Install {
+        service: Option<String>,
+        if_present: bool,
+    },
+    Remove {
+        service: String,
+        if_present: bool,
+    },
     Skip,
 }
 
@@ -228,6 +234,7 @@ pub fn resolve_setup_plan(args: SetupArgs) -> SetupPlan {
     } else if args.pam {
         PamPref::Install {
             service: args.service.clone(),
+            if_present: args.if_present,
         }
     } else if args.no_pam {
         PamPref::Skip
@@ -412,7 +419,10 @@ pub fn run_with_plan(plan: SetupPlan) -> anyhow::Result<()> {
             PamKnobs::default(),
             *if_present,
         ))?,
-        PamPref::Install { service } => {
+        PamPref::Install {
+            service,
+            if_present,
+        } => {
             // The wizard's step 9 already applied `--pam`; installing again here
             // would be a second, unasked-for edit of the same file.
             if !wizard_ran {
@@ -421,7 +431,7 @@ pub fn run_with_plan(plan: SetupPlan) -> anyhow::Result<()> {
                     PamAction::Add,
                     service,
                     setup_pam_knobs(&plan),
-                    false,
+                    *if_present,
                 ))?;
             }
         }
@@ -1899,10 +1909,16 @@ fn systemd_step_for(plan: &SetupPlan) -> SystemdStep {
 enum PamStep {
     /// No flag: today's multi-select over the detected candidates.
     Ask,
-    /// `--pam [--service X]`: exactly this one service. Deliberately *not* the
-    /// candidates' five `default_enabled` entries — `--pam` already means "sudo"
-    /// in standalone mode, so a scripter gets one consistent meaning everywhere.
-    Install(String),
+    /// `--pam [--service X] [--if-present]`: exactly this one service.
+    /// Deliberately *not* the candidates' five `default_enabled` entries —
+    /// `--pam` already means "sudo" in standalone mode, so a scripter gets one
+    /// consistent meaning everywhere.
+    ///
+    /// `if_present` rides along because this arm is `--pam` under a *wizard*
+    /// base — `setup --pam --service X --if-present --enroll` reaches step 9
+    /// rather than [`run_with_plan`]'s alias call, and a flag the operator
+    /// typed must not be decided differently by which other flags they typed.
+    Install { service: String, if_present: bool },
     /// `--no-pam`: declined. Nothing under the PAM directory is written or
     /// backed up.
     Skip,
@@ -1913,7 +1929,7 @@ enum PamStep {
 impl PamStep {
     /// Whether step 9 modifies anything under the PAM directory.
     fn touches_pam_d(&self) -> bool {
-        matches!(self, PamStep::Ask | PamStep::Install(_))
+        matches!(self, PamStep::Ask | PamStep::Install { .. })
     }
 }
 
@@ -1921,11 +1937,15 @@ fn pam_step_for(plan: &SetupPlan) -> PamStep {
     match &plan.pam {
         PamPref::Ask => PamStep::Ask,
         PamPref::Skip => PamStep::Skip,
-        PamPref::Install { service } => PamStep::Install(
-            service
+        PamPref::Install {
+            service,
+            if_present,
+        } => PamStep::Install {
+            service: service
                 .clone()
                 .unwrap_or_else(|| DEFAULT_PAM_SERVICE.to_string()),
-        ),
+            if_present: *if_present,
+        },
         PamPref::Remove { .. } => PamStep::Deferred,
     }
 }
@@ -2037,7 +2057,10 @@ fn pam_step_in(
     }
 
     match step {
-        PamStep::Install(service) => {
+        PamStep::Install {
+            service,
+            if_present,
+        } => {
             Terminal.info(&PamMessage::ConfiguringPamFor {
                 service: service.clone(),
             });
@@ -2045,11 +2068,22 @@ fn pam_step_in(
             // `--non-interactive`, so `setup_pam_knobs` reduces to `plan.yes`
             // on both knobs here. Splitting them would make `--pam --service X
             // --yes` start prompting where it never did.
-            super::pam::install_one_in(
+            //
+            // The returned bool, not the absence of an `Err`, decides whether
+            // this service is named in the closing summary and whether the
+            // hyprlock handoff fires. Under `--if-present` an absent service
+            // is a success that configured nothing, and reporting it as
+            // configured would have offered to wire `hyprlock.conf` up to a
+            // PAM service that has no facelock line.
+            let configured = super::pam::install_one_in(
                 dirs,
-                &pam_request(PamAction::Add, &service, setup_pam_knobs(plan), false),
+                &pam_request(PamAction::Add, &service, setup_pam_knobs(plan), if_present),
             )?;
-            Ok(vec![service])
+            Ok(if configured {
+                vec![service]
+            } else {
+                Vec::new()
+            })
         }
         PamStep::Ask => wizard_pam_setup_in(dirs, theme),
         // Both returned above; repeated here to keep the match exhaustive.
@@ -2106,9 +2140,17 @@ fn wizard_pam_setup_in(dirs: &PamDirs, theme: &ColorfulTheme) -> anyhow::Result<
             no_confirm: true,
             allow_sensitive: true,
         };
+        // `false`, not the plan's `--if-present`: the multi-select only ever
+        // offers services whose file it just found, so there is no absence to
+        // forgive, and these are not the service the operator named.
         match super::pam::install_one_in(dirs, &pam_request(PamAction::Add, &service, knobs, false))
         {
-            Ok(()) => configured.push(service),
+            Ok(true) => configured.push(service),
+            // Unreachable as written — the multi-select offers only services
+            // whose file it just found, and `no_confirm` suppresses the
+            // decline — but the list must carry what was configured, not what
+            // was attempted.
+            Ok(false) => {}
             Err(e) => {
                 Terminal.info(&PamMessage::PamConfigureFailed {
                     service: service.clone(),
@@ -3786,6 +3828,7 @@ mod action_tests {
             yes: true,
             ..pam_plan(PamPref::Install {
                 service: Some("sudo".to_string()),
+                if_present: false,
             })
         };
         let configured =
@@ -3832,6 +3875,7 @@ mod action_tests {
             yes: true,
             ..pam_plan(PamPref::Install {
                 service: Some("hyprlock".to_string()),
+                if_present: false,
             })
         };
         let configured =
@@ -3842,6 +3886,75 @@ mod action_tests {
         assert_ne!(before["hyprlock"], after["hyprlock"]);
         assert_eq!(before["sudo"], after["sudo"]);
         assert_eq!(before["polkit-1"], after["polkit-1"]);
+    }
+
+    /// `--if-present` reaches the writer through step 9, not only through the
+    /// alias call in [`run_with_plan`].
+    ///
+    /// `setup --pam --service X --if-present --enroll` resolves to a *wizard*
+    /// base, so `run_with_plan` skips its own `install_for_setup` and step 9
+    /// performs the install instead. Step 9 used to hand the writer a
+    /// hard-coded `false`, which made the flag mean one thing on
+    /// `--pam --if-present` and nothing at all as soon as any base-forcing flag
+    /// was typed beside it.
+    #[test]
+    fn pam_if_present_survives_into_step_nine() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = SetupPlan {
+            yes: true,
+            ..pam_plan(PamPref::Install {
+                service: Some("facelock-absent".to_string()),
+                if_present: true,
+            })
+        };
+        assert_eq!(
+            pam_step_for(&plan),
+            PamStep::Install {
+                service: "facelock-absent".to_string(),
+                if_present: true,
+            }
+        );
+
+        let configured =
+            pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), true).unwrap();
+        assert!(
+            configured.is_empty(),
+            "an absent service configured nothing, so the closing summary must not \
+             name it and the hyprlock handoff must not fire for it: {configured:?}"
+        );
+        assert_eq!(
+            before,
+            hash_dir(dir.path()),
+            "an absent service under --if-present must write nothing"
+        );
+    }
+
+    /// The default stays a hard error: without the flag, a service that is not
+    /// there fails the step rather than being skipped. This is what catches
+    /// `--service polkti-1`.
+    #[test]
+    fn an_absent_service_without_if_present_still_fails_step_nine() {
+        let dir = fake_pam_d();
+        let before = hash_dir(dir.path());
+
+        let plan = SetupPlan {
+            yes: true,
+            ..pam_plan(PamPref::Install {
+                service: Some("facelock-absent".to_string()),
+                if_present: false,
+            })
+        };
+
+        let error = pam_step_in(&only(dir.path()), &plan, &ColorfulTheme::default(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("PAM service file not found:"),
+            "got: {error}"
+        );
+        assert_eq!(before, hash_dir(dir.path()));
     }
 
     /// Bare `--pam` means `sudo`, not the candidates' `default_enabled` set.
@@ -3855,11 +3968,17 @@ mod action_tests {
     fn pam_without_service_means_sudo_not_the_default_enabled_set() {
         let plan = SetupPlan {
             yes: true,
-            ..pam_plan(PamPref::Install { service: None })
+            ..pam_plan(PamPref::Install {
+                service: None,
+                if_present: false,
+            })
         };
         assert_eq!(
             pam_step_for(&plan),
-            PamStep::Install(DEFAULT_PAM_SERVICE.to_string())
+            PamStep::Install {
+                service: DEFAULT_PAM_SERVICE.to_string(),
+                if_present: false,
+            }
         );
 
         let dir = fake_pam_d();

@@ -38,6 +38,7 @@ fn parse_error(args: &[&str]) -> clap::Error {
 fn install(service: Option<&str>) -> PamPref {
     PamPref::Install {
         service: service.map(str::to_string),
+        if_present: false,
     }
 }
 
@@ -203,6 +204,34 @@ fn pam_remove_if_present_reaches_the_resolved_plan() {
     );
 }
 
+/// The add side of the same flag.
+///
+/// `setup --pam --if-present` used to be a parse error, and the alias handed
+/// the writer a hard-coded `false` even so — two independent places for the
+/// bool to stop, which is why the row is here as well as in
+/// `commands::setup`'s step-9 tests. What a caller wants out of it is one
+/// thing: configure this set of optional integrations, skipping the services
+/// this machine does not have.
+#[test]
+fn pam_add_if_present_reaches_the_resolved_plan() {
+    assert_eq!(
+        plan(&["--pam", "--service", "omarchy-lock-face", "--if-present"]).pam,
+        PamPref::Install {
+            service: Some("omarchy-lock-face".to_string()),
+            if_present: true,
+        }
+    );
+    // Bare `--pam --if-present` too: the service default is applied later, and
+    // the flag must survive that.
+    assert_eq!(
+        plan(&["--pam", "--if-present"]).pam,
+        PamPref::Install {
+            service: None,
+            if_present: true,
+        }
+    );
+}
+
 #[test]
 fn systemd_disable_is_standalone() {
     let p = plan(&["--systemd", "--disable"]);
@@ -305,19 +334,31 @@ fn remove_without_pam_is_a_parse_error() {
     );
 }
 
+/// `--if-present` requires `--pam`, and nothing else.
+///
+/// Was `if_present_requires_remove_and_pam`, back when the flag was gated to
+/// removal. The two cases that must keep failing are the same two it held
+/// then, kept here rather than dropped: `--if-present` on its own is still a
+/// parse error naming the action it modifies, and `--remove --if-present`
+/// still fails on `--remove`'s own `requires = "pam"`. Only the middle case
+/// moved, from a parse error to a resolved plan.
 #[test]
-fn if_present_requires_remove_and_pam() {
-    for args in [
-        &["--if-present"][..],
-        &["--pam", "--if-present"],
-        &["--remove", "--if-present"],
-    ] {
+fn if_present_requires_pam() {
+    for args in [&["--if-present"][..], &["--remove", "--if-present"]] {
         assert_eq!(
             parse_error(args).kind(),
             clap::error::ErrorKind::MissingRequiredArgument,
             "unexpected error kind for {args:?}"
         );
     }
+    // ...and the case that used to be here as a third failure.
+    assert_eq!(
+        plan(&["--pam", "--if-present"]).pam,
+        PamPref::Install {
+            service: None,
+            if_present: true,
+        }
+    );
 }
 
 #[test]

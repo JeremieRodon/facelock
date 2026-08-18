@@ -29,7 +29,8 @@ facelock setup --systemd --disable      # disable systemd units
 facelock setup --pam                    # install to /etc/pam.d/sudo
 facelock setup --pam --service polkit-1 # install to a specific service
 facelock setup --pam --remove           # remove the PAM line
-facelock setup --pam --remove --if-present  # a missing service file is success
+facelock setup --pam --service hyprlock --if-present  # a missing service file is success
+facelock setup --pam --remove --if-present  # ...on removal too
 facelock setup --pam --service sshd -y  # a sensitive service: -y is what unlocks it
 facelock setup --no-pam                 # wizard, but never touch /etc/pam.d
 facelock setup --camera /dev/video2     # answer step 1 from the command line
@@ -111,7 +112,7 @@ Two details worth knowing:
 |------|----------|---------|
 | `--service <name>` | `--pam` | Target PAM service. Default `sudo`. |
 | `--remove` | `--pam` | Remove the facelock PAM line instead of adding it. |
-| `--if-present` | `--remove` | Treat an absent service file as success rather than an error. Read, parse and write failures stay fatal. |
+| `--if-present` | `--pam` | Treat an absent service file as success rather than an error, on the add side as well as `--remove`. Read, parse and write failures stay fatal. Without it, a service that is not there is a hard error. |
 | `--disable` | `--systemd` | Disable and stop the units instead of installing them. |
 
 These `requires` relationships are enforced by the parser. `facelock setup --remove` is a clear error naming the missing `--pam`, not a silently ignored flag.
