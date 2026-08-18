@@ -279,6 +279,49 @@ fn help_output_contains_expected_subcommands() {
     }
 }
 
+/// `capabilities` reads no file at all, so a `--config` pointing at nothing
+/// must not change its answer.
+///
+/// The D7 dispatch order is what makes that true — `capabilities` is handled
+/// ahead of `ConfigLoad::read()` — and only a spawned process can witness it.
+/// `capability_names_are_all_implemented` proves each name is backed by a
+/// surface, but it calls `Cli::command()` in-process and would keep passing if
+/// the command started loading a config and exiting 1 on a missing one, which
+/// is the failure a probing wrapper actually hits.
+///
+/// Asserted against `CAPABILITIES` rather than a hand-picked name or two: an
+/// empty stdout also exits 0, and would tell that wrapper this build can do
+/// nothing.
+#[test]
+fn capabilities_ignores_a_missing_config_file() {
+    let output = facelock_bin()
+        .args([
+            "--config",
+            "/nonexistent/facelock-smoke.toml",
+            "capabilities",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute facelock capabilities");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "`facelock --config /nonexistent/... capabilities` must exit 0, got {}:\n\
+         stdout: {stdout}\nstderr: {stderr}",
+        output.status
+    );
+
+    for name in facelock_cli::commands::capabilities::CAPABILITIES {
+        assert!(
+            stdout.lines().any(|line| line == *name),
+            "capabilities must print `{name}` on a line of its own, got:\n{stdout}"
+        );
+    }
+}
+
 #[test]
 fn no_args_shows_error_or_help() {
     let output = facelock_bin()

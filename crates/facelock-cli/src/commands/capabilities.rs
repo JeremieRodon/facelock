@@ -41,9 +41,10 @@
 //! A hand-maintained feature list rots the moment a flag is renamed, and a
 //! stale list is worse than no list: a consumer that trusts it invokes
 //! something that is not there. So [`CAPABILITIES`] is not documentation —
-//! `capability_names_are_all_implemented` in `main.rs` maps every name to the
-//! clap subcommand or argument that declares the surface it names, and a name
-//! nothing backs fails the build rather than shipping.
+//! `capability_names_are_all_implemented` in `conformance/capabilities.rs`
+//! maps every name to the clap subcommand or argument that declares the
+//! surface it names, and a name nothing backs fails the build rather than
+//! shipping.
 
 use crate::message;
 
@@ -52,7 +53,8 @@ use crate::message;
 /// cheapest way to keep it so.
 ///
 /// Adding a name here is a promise. `capability_names_are_all_implemented`
-/// in `main.rs` refuses to build a name that nothing in the clap tree backs.
+/// in `conformance/capabilities.rs` refuses to build a name that nothing in
+/// the clap tree backs.
 pub const CAPABILITIES: &[&str] = &[
     "capabilities",
     "config-edit",
@@ -200,8 +202,9 @@ mod tests {
 
     /// Every emitted name has a row in the contract saying what it means.
     ///
-    /// `capability_names_are_all_implemented` in `main.rs` proves a name is
-    /// backed by a real surface; this proves the same name is *documented*,
+    /// `capability_names_are_all_implemented` in `conformance/capabilities.rs`
+    /// proves a name is backed by a real surface; this proves the same name
+    /// is *documented*,
     /// which is the other half of a promise — a consumer cannot branch on a
     /// name whose meaning is written down nowhere. `include_str!` reaches out
     /// of the crate the way `setup.rs` embeds the systemd unit and D-Bus
