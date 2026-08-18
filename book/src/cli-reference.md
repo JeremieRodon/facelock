@@ -31,6 +31,8 @@ Interactive setup wizard. Walks through camera selection, model quality, inferen
 
 The daemon is configured before enrollment on purpose. `enroll` and `test` select their transport once, when they start, so on a first install a daemon configured after them would never be the one they used: enrollment would fall back to direct camera access and the recognition test would validate a transport no later authentication takes. It stays after the model download and encryption steps, because the daemon loads the models and opens the embedding key at startup.
 
+The step starts the daemon, or restarts it if one is already running. The encryption method, the model preset and the inference device are read once at daemon startup, so on a re-run of `setup` a daemon left running would answer enrollment and the recognition test with the configuration from before the wizard. A restart interrupts any authentication that daemon is mid-way through, which on a `sudo` prompt in another terminal means one password fallback.
+
 ```bash
 facelock setup                          # interactive wizard
 facelock setup --non-interactive        # base setup, no prompts, no PAM/systemd/enroll

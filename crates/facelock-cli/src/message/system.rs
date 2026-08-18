@@ -18,6 +18,7 @@ pub enum SystemMessage {
     SystemdFromCommandLine,
 
     // -- bringing the daemon up --
+    DaemonRestarted,
     DaemonRunning,
     DaemonNotReady { seconds: u64 },
 
@@ -55,6 +56,9 @@ impl Message for SystemMessage {
                 "  Skipping daemon configuration (--no-systemd).\n  No unit files are written and systemctl is not invoked.",
             ),
             SystemdFromCommandLine => translate("  Answered on the command line."),
+            DaemonRestarted => translate(
+                "  facelock-daemon was already running; restarted so enrollment uses\n  the new configuration.",
+            ),
             DaemonRunning => translate("  facelock-daemon is running."),
             DaemonNotReady { seconds } => fill(
                 translate(
@@ -116,7 +120,7 @@ impl Message for SystemMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SystemMessage {
-    const VARIANT_COUNT: usize = 21;
+    const VARIANT_COUNT: usize = 22;
 
     fn samples() -> Vec<Self> {
         use SystemMessage::*;
@@ -126,6 +130,7 @@ impl super::Samples for SystemMessage {
             SystemdDeclined,
             SystemdSkippedFlag,
             SystemdFromCommandLine,
+            DaemonRestarted,
             DaemonRunning,
             DaemonNotReady { seconds: 20 },
             CreatingFacelockGroup,

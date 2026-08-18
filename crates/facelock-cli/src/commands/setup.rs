@@ -3132,6 +3132,23 @@ const DAEMON_READY_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// Bring the daemon up so the enrollment and test steps that follow select it
 /// instead of falling back to direct camera access.
 ///
+/// A stopped unit is started; one that is already running is restarted. The
+/// daemon reads the encryption method (step 5), the model preset (step 2) and
+/// the inference device (step 3) once, at startup, so on a second `setup` run
+/// leaving the running instance alone would enroll and test through a daemon
+/// holding the configuration the wizard has just replaced.
+///
+/// A restart needs more than a `Ping` to be believed. `--no-block` returns
+/// when systemd has queued the job, not when it has run it, so the first
+/// probe would be answered by the process being replaced — and step 7, with
+/// no prompt in front of it under `--enroll`, would then select its backend
+/// during the window where the old instance has exited and the new one is
+/// still loading its models, falling back to direct camera access under a
+/// line claiming the opposite. So the unit's main PID is read before the
+/// restart and the wait requires a *different* non-zero PID as well as a
+/// responding daemon ([`daemon_ready`]). The `start` branch needs none of
+/// that: there is no outgoing instance for an answer to have come from.
+///
 /// Every failure here is survivable and none of them are fatal: [`run_systemd`]
 /// has already installed and enabled the unit, which is what the user asked
 /// for, and a daemon that does not come up leaves exactly the direct-access
@@ -3147,19 +3164,162 @@ fn start_daemon_for_setup(config: &Config) {
         return;
     }
 
-    // `--no-block` because `Type=dbus` makes a blocking start wait on bus-name
-    // acquisition under systemd's start timeout. The wait below is ours, and
-    // bounded by us.
-    if let Err(e) = run_cmd("systemctl", &["start", "--no-block", SERVICE_FILENAME]) {
-        tracing::warn!("could not start {SERVICE_FILENAME}: {e}");
+    let bring_up = daemon_bring_up_for(daemon_unit_is_active());
+    // Read before the job is queued, so it names the instance being replaced.
+    let outgoing_pid = bring_up.main_pid();
+
+    // `--no-block` because `Type=dbus` makes a blocking start or restart wait
+    // on bus-name acquisition under systemd's start timeout. The wait below is
+    // ours, and bounded by us.
+    let issued = run_cmd(
+        "systemctl",
+        &[bring_up.verb(), "--no-block", SERVICE_FILENAME],
+    );
+    if let Err(e) = &issued {
+        tracing::warn!("could not {} {SERVICE_FILENAME}: {e}", bring_up.verb());
+    }
+    if restart_announced(bring_up, issued.is_ok()) {
+        Terminal.info(&SystemMessage::DaemonRestarted);
     }
 
-    if wait_for_daemon(DAEMON_READY_TIMEOUT) {
+    if wait_for_daemon(DAEMON_READY_TIMEOUT, bring_up, outgoing_pid) {
         Terminal.info(&SystemMessage::DaemonRunning);
     } else {
         Terminal.info(&SystemMessage::DaemonNotReady {
             seconds: DAEMON_READY_TIMEOUT.as_secs(),
         });
+    }
+}
+
+/// How the wizard brings the unit up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonBringUp {
+    /// Nothing is running: `systemctl start`.
+    Start,
+    /// Something is running, on the configuration from before the wizard:
+    /// `systemctl try-restart`.
+    Restart,
+}
+
+impl DaemonBringUp {
+    /// The two verbs differ in which starting state they do nothing for, and
+    /// that is the whole reason both exist here: `start` is a no-op on an
+    /// already-running unit — the stale daemon this pairing exists to replace
+    /// — and `try-restart` is a no-op on a stopped one.
+    ///
+    /// Both directions of the race between the check and the call therefore
+    /// end somewhere survivable. A unit that stops in that window is left
+    /// down, rather than started by a verb whose branch never checked for
+    /// that. A unit that starts in it — a concurrent D-Bus activation — takes
+    /// `Start`, which is then the no-op: the freshly activated daemon
+    /// survives with the pre-wizard configuration, and no restart is
+    /// announced, because none happened. Milliseconds wide, and the readiness
+    /// wait reports whatever is actually there either way.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Restart => "try-restart",
+        }
+    }
+
+    /// The unit's main PID, on the branch whose acceptance rule reads one.
+    ///
+    /// `Start` has no outgoing instance to tell a successor from, so it never
+    /// consults a PID and does not pay a `systemctl show` per poll for one.
+    fn main_pid(self) -> Option<u32> {
+        match self {
+            Self::Restart => daemon_main_pid(),
+            Self::Start => None,
+        }
+    }
+}
+
+/// Which verb the unit's current state calls for. Pure, so the choice is
+/// testable without systemd; [`daemon_unit_is_active`] is the part that is not.
+fn daemon_bring_up_for(unit_active: bool) -> DaemonBringUp {
+    if unit_active {
+        DaemonBringUp::Restart
+    } else {
+        DaemonBringUp::Start
+    }
+}
+
+/// Whether systemd reports the unit as already running.
+///
+/// `systemctl is-active` exits non-zero for every state that is not active, so
+/// a stopped unit, a failed one, and a systemd that is not there at all all
+/// read as inactive: the [`DaemonBringUp::Start`] branch, whose own failure is
+/// already best effort.
+///
+/// The `Err` is the *answer*, not a fault — do not propagate it with `?`, or a
+/// stopped unit becomes a fatal setup.
+fn daemon_unit_is_active() -> bool {
+    run_cmd("systemctl", &["is-active", "--quiet", SERVICE_FILENAME]).is_ok()
+}
+
+/// The PID of the running instance, or `None` when there is not one.
+///
+/// `systemctl show -p MainPID --value` prints `0` for a unit that is not
+/// running; a systemd that is absent or that fails the query prints nothing
+/// usable. All three mean the same thing here — no instance to tell apart from
+/// its successor — so all three answer `None`, which [`daemon_ready`] treats
+/// as "cannot prove a restart happened" on the restart branch and ignores
+/// entirely on the start branch.
+fn daemon_main_pid() -> Option<u32> {
+    let out = Command::new("systemctl")
+        .args(["show", "-p", "MainPID", "--value", SERVICE_FILENAME])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (pid != 0).then_some(pid)
+}
+
+/// Whether the step announces the restart it asked for.
+///
+/// Only a restart systemd accepted: a rejected one replaced nothing, so the
+/// daemon the wait goes on to find is the same one that was already there, and
+/// saying otherwise would be the lie the notice exists to prevent.
+fn restart_announced(bring_up: DaemonBringUp, systemctl_ok: bool) -> bool {
+    systemctl_ok && matches!(bring_up, DaemonBringUp::Restart)
+}
+
+/// Whether a poll of the unit means the daemon the wizard asked for is up.
+///
+/// The two branches accept different evidence, because they have different
+/// things to prove:
+///
+/// - `Start` had nothing running, so any daemon answering is the one it
+///   started. A `Ping` is the whole test.
+/// - `Restart` had something running, and that something answers `Ping` until
+///   systemd gets round to stopping it. So the answer only counts once the
+///   unit reports a *different*, non-zero main PID: systemd runs a restart as
+///   stop-then-start, so a changed PID means the process that could have
+///   answered falsely is gone.
+///
+/// `current_pid` of `None` — a stopped unit, or a systemd that would not say —
+/// is never proof of a restart. It fails the wait rather than passing it,
+/// which costs at worst a bounded 20s and the direct-access fallback the whole
+/// step is best-effort about. An `old_pid` of `None` is the one soft spot: the
+/// wizard could not name the outgoing instance, so any running one is accepted
+/// and the branch degrades to the `Start` rule.
+fn daemon_ready(
+    bring_up: DaemonBringUp,
+    old_pid: Option<u32>,
+    current_pid: Option<u32>,
+    ping_ok: bool,
+) -> bool {
+    if !ping_ok {
+        return false;
+    }
+    match bring_up {
+        DaemonBringUp::Start => true,
+        DaemonBringUp::Restart => match current_pid {
+            None => false,
+            Some(pid) => Some(pid) != old_pid,
+        },
     }
 }
 
@@ -3174,24 +3334,36 @@ fn daemon_start_wanted(mode: &facelock_core::config::DaemonMode) -> bool {
     matches!(mode, DaemonMode::Daemon)
 }
 
-/// Poll until the daemon answers, or `timeout` elapses.
+/// Poll until the daemon the wizard asked for answers, or `timeout` elapses.
 ///
-/// Through the seam's [`crate::backend::probe_daemon`], which is the full
-/// `Ping` round-trip rather than the non-activating `name_has_owner` that
-/// backend selection uses. "The daemon answers method calls" is the property
-/// the next two steps need, and activating one systemd has not got to yet is a
-/// success here rather than the hazard it would be at selection time.
-fn wait_for_daemon(timeout: std::time::Duration) -> bool {
+/// The probe is the seam's [`crate::backend::probe_daemon`], the full `Ping`
+/// round-trip rather than the non-activating `name_has_owner` that backend
+/// selection uses. "The daemon answers method calls" is the property the next
+/// two steps need, and activating one systemd has not got to yet is a success
+/// here rather than the hazard it would be at selection time.
+///
+/// [`daemon_ready`] decides what a poll proves; `old_pid` is the main PID read
+/// before the restart was queued. The PID is read *before* the ping, and only
+/// on the branch that needs it: a PID that is already the successor's cannot
+/// then be paired with a ping the outgoing instance answered a moment earlier:
+/// systemd runs a restart as stop-then-start, so the old process has exited by
+/// the time its PID stops being the unit's.
+fn wait_for_daemon(
+    timeout: std::time::Duration,
+    bring_up: DaemonBringUp,
+    old_pid: Option<u32>,
+) -> bool {
     use crate::backend::DaemonPing;
     use facelock_core::config::DaemonMode;
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let responding = matches!(
+        let current_pid = bring_up.main_pid();
+        let ping_ok = matches!(
             crate::backend::probe_daemon(&DaemonMode::Daemon).known(),
             Some(DaemonPing::Responding)
         );
-        if responding {
+        if daemon_ready(bring_up, old_pid, current_pid, ping_ok) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -4266,6 +4438,82 @@ mod action_tests {
         use facelock_core::config::DaemonMode;
         assert!(daemon_start_wanted(&DaemonMode::Daemon));
         assert!(!daemon_start_wanted(&DaemonMode::Oneshot));
+    }
+
+    /// A second `setup` run must not enroll through the daemon the first run
+    /// left behind: the config the wizard just wrote is only read at startup.
+    /// The verbs are pinned because each is a no-op in the other's state —
+    /// `start` on a running unit is the stale daemon, `try-restart` on a
+    /// stopped one is no daemon at all.
+    #[test]
+    fn an_already_running_daemon_is_restarted_rather_than_left_alone() {
+        assert_eq!(daemon_bring_up_for(true), DaemonBringUp::Restart);
+        assert_eq!(daemon_bring_up_for(true).verb(), "try-restart");
+
+        assert_eq!(daemon_bring_up_for(false), DaemonBringUp::Start);
+        assert_eq!(daemon_bring_up_for(false).verb(), "start");
+    }
+
+    /// `try-restart --no-block` returns when systemd has *queued* the job, so
+    /// the outgoing daemon goes on answering `Ping` for as long as it takes to
+    /// stop it. On the restart branch a ping alone is therefore not evidence:
+    /// the unit's main PID has to have become a different, non-zero one.
+    #[test]
+    fn a_restart_is_only_ready_once_a_different_process_answers() {
+        // The outgoing instance answering its own replacement's wait.
+        assert!(!daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            Some(4242),
+            true
+        ));
+
+        // The successor: a different PID, and answering.
+        assert!(daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            Some(9001),
+            true
+        ));
+
+        // MainPID 0 — nothing is running, whatever answered the bus.
+        assert!(!daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            None,
+            true
+        ));
+
+        // A new process that is not answering yet: still loading its models.
+        assert!(!daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            Some(9001),
+            false
+        ));
+
+        // No outgoing PID to tell apart: degrades to the `Start` rule rather
+        // than waiting out the timeout on a daemon that is plainly up.
+        assert!(daemon_ready(DaemonBringUp::Restart, None, Some(9001), true));
+    }
+
+    /// The start branch has no outgoing instance an answer could have come
+    /// from, so the ping is the whole test and the PIDs are not consulted.
+    #[test]
+    fn a_start_is_ready_as_soon_as_the_daemon_answers() {
+        assert!(daemon_ready(DaemonBringUp::Start, None, None, true));
+        assert!(daemon_ready(DaemonBringUp::Start, Some(1), Some(1), true));
+        assert!(!daemon_ready(DaemonBringUp::Start, None, Some(9001), false));
+    }
+
+    /// The notice claims a replacement happened. A `systemctl` that refused
+    /// the job replaced nothing, and a start was never a replacement.
+    #[test]
+    fn only_a_restart_systemd_accepted_is_announced() {
+        assert!(restart_announced(DaemonBringUp::Restart, true));
+        assert!(!restart_announced(DaemonBringUp::Restart, false));
+        assert!(!restart_announced(DaemonBringUp::Start, true));
+        assert!(!restart_announced(DaemonBringUp::Start, false));
     }
 
     // -- `--no-enroll` ------------------------------------------------------

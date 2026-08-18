@@ -68,7 +68,13 @@ The daemon is configured before enrollment on purpose. `enroll` and `test`
 select their transport once, when they start, so on a first install a daemon
 configured after them would never be the one they used: enrollment would fall
 back to direct camera access and the recognition test would validate a
-transport no later authentication takes.
+transport no later authentication takes. The step starts the daemon, or
+restarts it if one is already running, because the daemon reads the encryption
+method, the model preset and the inference device once at startup: on a re-run
+of `setup` an untouched daemon would hold the answers from before the wizard.
+A restart interrupts any authentication that daemon is mid-way through, so a
+`sudo` prompt waiting on a face in another terminal falls back to a password
+that once.
 
 ```bash
 facelock setup                          # interactive wizard
