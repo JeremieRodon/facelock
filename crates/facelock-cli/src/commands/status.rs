@@ -9,11 +9,16 @@
 //! guessed value. "The daemon is unreachable" must never read as "no faces
 //! enrolled".
 //!
-//! Output contract: the container integration tests grep
-//! `[ok] responding` from this report, and the English fallback of every
-//! message here is byte-identical to the historical inline strings (D10).
-//! There is no `status --json`; if one appears, it renders from the same
-//! `Health` value without gettext (machine-facing exclusion, D2).
+//! Output contract: the English fallback of every message here is
+//! byte-identical to the historical inline strings (D10), and
+//! `healthy_report_renders_byte_exact` pins the whole report.
+//!
+//! `--json` renders the same `Health` through a second, independent renderer
+//! ([`crate::commands::status_json`]), which consults no catalog — machine
+//! output is the seam's documented exclusion (D2). The two are held together
+//! by `the_two_renderers_agree_about_every_section` over there, not by shared
+//! code: a section that reaches one renderer and not the other fails the
+//! build.
 
 use crate::backend::DaemonPing;
 use crate::health::{
@@ -24,14 +29,22 @@ use crate::ipc_client;
 use crate::message::{Message, StatusMessage};
 use crate::resolved::{EpStatus, ExecutionProviderFact, Fact, ModelFiles};
 
-pub fn run(loaded: crate::resolved::ConfigLoad) -> anyhow::Result<()> {
+pub fn run(loaded: crate::resolved::ConfigLoad, json: bool) -> anyhow::Result<()> {
     // DEC-6/N4: everything this report reads is root's — the daemon's
     // root-only methods, the 0600 database, other users' markers. Check
-    // before the first line of output (C6).
+    // before the first line of output (C6). `--json` does not soften it:
+    // the document is built from the same root-only probes.
     ipc_client::require_root("sudo facelock status")?;
 
     let health = Health::probe(&loaded);
-    print!("{}", render(&health));
+    if json {
+        // Through the payload sink, so `--quiet` reaches it without this
+        // command knowing the flag exists. The human report still prints
+        // directly; #140 tracks moving it onto the seam.
+        crate::message::payload(&crate::commands::status_json::render(&health)?);
+    } else {
+        print!("{}", render(&health));
+    }
     Ok(())
 }
 
@@ -541,8 +554,12 @@ fn render_pam(out: &mut String, pam: &PamWiring) {
     }
 }
 
+/// `pub(crate)` so `commands::status_json`'s tests render the *same*
+/// [`healthy`](tests::healthy) fixture. One fixture, two renderers: a second
+/// copy over there could drift, and the agreement test would then be comparing
+/// two different machines.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::path::PathBuf;
@@ -569,7 +586,7 @@ mod tests {
     }
 
     /// A fully healthy system, built literally — no root, camera, or bus.
-    fn healthy() -> Health {
+    pub(crate) fn healthy() -> Health {
         Health {
             config: ConfigHealth {
                 path: "/etc/facelock/config.toml".into(),

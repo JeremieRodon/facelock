@@ -17,6 +17,7 @@ pub mod preview;
 pub mod remove;
 pub mod setup;
 pub mod status;
+pub mod status_json;
 pub mod test_cmd;
 pub mod tpm;
 

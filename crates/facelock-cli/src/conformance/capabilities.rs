@@ -127,6 +127,7 @@ fn capability_names_are_all_implemented() {
             "setup-if-present" => assert_long(setup, "if_present", "if-present"),
             "setup-no-pam" => assert_long(setup, "no_pam", "no-pam"),
             "setup-systemd" => assert_long(setup, "systemd", "systemd"),
+            "status-json" => assert_long(sub(&root, "status"), "json", "json"),
             other => {
                 panic!("capability `{other}` has no predicate: a name nothing backs is a lie")
             }

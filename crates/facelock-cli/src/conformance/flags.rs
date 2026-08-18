@@ -563,6 +563,7 @@ const JSON_COMMANDS: &[&str] = &[
     "facelock list",
     "facelock devices",
     "facelock preview",
+    "facelock status",
     "facelock pam add",
     "facelock pam remove",
     "facelock pam status",
@@ -861,6 +862,11 @@ fn legacy_invocations_still_parse() {
         &["facelock", "pam", "status", "--all", "--json"],
         &["facelock", "pam", "status", "--all", "--if-present"],
         &["facelock", "--quiet", "pam", "status", "--all", "--json"],
+        // P6's `status --json`. `status` took no flag of its own before it,
+        // so the bare form is the one that must not have changed meaning.
+        &["facelock", "status"],
+        &["facelock", "status", "--json"],
+        &["facelock", "--quiet", "status", "--json"],
         // ADR 009. The bare forms are what five init-system units and
         // `commands::setup::run_systemd`'s `ExecStart` marker invoke, and
         // what a reader types; the explicit forms are the new spellings.

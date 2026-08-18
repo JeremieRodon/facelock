@@ -12,6 +12,7 @@ follow it.
   - [CLI Machine Output](#cli-machine-output)
   - [facelock setup Flag Composition](#facelock-setup-flag-composition)
   - [facelock pam Semantics](#facelock-pam-semantics)
+  - [facelock status Semantics](#facelock-status-semantics)
   - [facelock capabilities](#facelock-capabilities)
   - [CLI Privilege Model (DEC-6)](#cli-privilege-model-dec-6)
   - [facelock test Semantics (N11)](#facelock-test-semantics-n11)
@@ -66,7 +67,7 @@ follow it.
 | `facelock clear` | Remove all models for a user |
 | `facelock preview` | Live camera preview |
 | `facelock devices` | List V4L2 cameras |
-| `facelock status` | Check system status |
+| `facelock status` | Check system status. Root. `--json` renders the same report as one object a script can parse (see "facelock status Semantics") |
 | `facelock config show` | Show configuration. Bare `facelock config` is `config show` |
 | `facelock config edit` | Open the config file in `$EDITOR`, validate on save, restart the daemon when a cached setting changed. Root |
 | `facelock daemon run` | Run the persistent daemon. Bare `facelock daemon` is `daemon run` — the form every shipped service unit invokes |
@@ -216,6 +217,7 @@ someone states who parses the output.
 | `facelock list --json` | array of enrolled models |
 | `facelock devices --json` | array of `IpcDeviceInfo` (`facelock_core::ipc`): `path`, `name`, `driver`, `is_ir`, `formats` (empty whenever the daemon answers, which carries no format detail). Serde-derived, so it is a typed schema rather than a scrape of the human renderer, whose columns and `[IR]` tag are free to change |
 | `facelock preview --json` | one object per line, one per frame |
+| `facelock status --json` | one object, one key per report section, each carrying an `ok`/`problem`/`unknown` verdict. See "facelock status Semantics" |
 | `facelock pam add\|remove\|status --json` | one object, whose shape is a stability contract. See "facelock pam Semantics" |
 
 `preview` is on the list because it always emitted JSON. It shipped calling the
@@ -226,10 +228,14 @@ Machine output does not pass through the translation seam: every `--json`
 payload is built with `serde_json` and is C-locale by construction. It reaches
 stdout through `message::payload`, which takes an already-rendered `&str` and
 consults no catalog, so routing a payload through the seam to pick up `--quiet`
-cannot translate it on the way. The one documented exception to the C-locale
-rule is `pam`'s `error` field, which can interpolate a `strerror` string (see
-"facelock pam Semantics"), and which is a diagnostic rather than something to
-branch on.
+cannot translate it on the way. **Two** documented exceptions to the C-locale
+rule, both diagnostics rather than things to branch on: `pam`'s `error` field
+can interpolate a `strerror` string (see "facelock pam Semantics"), and
+`status`'s `reason` and `error` fields can interpolate an OS, parser or runtime
+message (see "facelock status Semantics"). Neither is a vocabulary — a consumer
+prints them and branches on the typed words beside them. Neither exception
+covers *facelock's own* catalog: a probe whose diagnostic is a translated string
+does not get a field, which is why `status`'s `daemon` section has no `error`.
 
 ### facelock setup Flag Composition
 
@@ -720,6 +726,256 @@ missing trailing newline stays missing; a backup is taken before every edit and
 never before a no-op. Golden fixtures captured from the pre-refactor code pin
 all of it.
 
+### facelock status Semantics
+
+`facelock status` renders one `Health` value twice: as the report a
+person reads, and — under `--json` — as one document a script parses. Both
+renderers are pure functions of that value, and a unit test walks the two
+outputs of one fixture and fails the build when they disagree about any
+section's verdict or when a section appears in one and not the other.
+
+It stays root-only (see "CLI Privilege Model" below): every fact in the report
+comes from root's view — the 0600 database, other users' markers, the daemon's
+root-only methods — so there is no unprivileged half to split out. The
+consumers are root-run scripts: `test/run-integration-tests.sh` waits on the
+daemon by parsing this document, and a setup script verifies the enumerated PAM
+state without reading prose.
+
+**Exit codes are unchanged and carry no verdict.** `status` exits 0 whenever it
+produced a report, whatever the report says, exactly as it did before `--json`
+existed; a failure to *reach* the report (not root) is the only non-zero exit.
+The verdicts are in the document. So `--quiet --json` prints nothing and exits
+0 — `--quiet` suppresses the payload as it does everywhere, but here the exit
+code is not an answer, which makes the combination a no-op rather than a
+terser query.
+
+**Every fact is a tri-state.** Each section object carries a `state` of `ok`,
+`problem` or `unknown`, and a `reason` string **on `problem` and `unknown`
+only**. `unknown` is the report's whole reason for existing: "the database
+could not be read" is a different answer from "this user has no models", and
+JSON makes that distinction easier to lose than prose does, because `null` and
+`false` read as answers. So a fact nobody established is never a `null` and
+never a `false` — it is `"state": "unknown"` with a reason. The nested facts
+that can be undetermined carry the same three words: `camera.device`,
+`encryption.embeddings`, `enrollment.marker` and `pam.services`.
+
+**Read `state` before anything beside it.** A section whose `state` is not `ok`
+may omit any of its detail keys, because a probe that did not finish has nothing
+to report there: on an unreadable database `enrollment` carries no `models` key
+at all. That is deliberate — an empty array would be a *known* "this user has no
+faces", which is the collapse this whole document is shaped to prevent — but it
+means a defaulting read is a bug. `jq '(.enrollment.models // []) | length > 0'`
+answers `false` for a machine whose database could not be opened. Branch on
+`.enrollment.state == "ok"` first, then read `models`.
+
+`reason` is never catalog output. The document is machine output and does not
+enter the message seam (`message/mod.rs`, "What must NOT come through here"), so
+no `reason` is ever a translated string: the ones facelock authors are C-locale
+literals, and the one localized `why` the health probe produces — the reason
+every config-dependent fact carries when the file did not parse — is replaced by
+the literal `config not available` on the way out.
+
+**`reason` is still not a fixed vocabulary.** Some of them embed the diagnostic
+the probe captured, because that text is the part worth having:
+`enrollment.reason` can read `database not accessible: <store error>`, and
+`enrollment.marker.reason` carries the marker file's own read or parse failure.
+The `error` fields are the same kind of thing — `config.error` is the `toml`
+parser's message, `execution_provider.error` the ONNX Runtime's own load
+failure, and each `pam.services.not_checked[].error` a listing or read failure.
+An OS error rendered by the C library follows the operator's `LC_MESSAGES` like
+any other `strerror` string, exactly as `pam`'s `error` field does. So `reason`
+and `error` are both **diagnostics, not contracts**: branch on `state` and on
+the section's typed words, print `reason` and `error`, and match on neither.
+
+**`daemon` carries no diagnostic, on purpose.** It is the one probe whose error
+string is not the transport's own words: the client attaches a *localized* hint
+to a D-Bus `AccessDenied` — advice for a human reading stderr — and rendering
+that chain yields the hint alone. Forwarding it would put translated text in a
+payload on exactly the machine this section exists to diagnose, so the field is
+not emitted. `reachability` and `reason` carry the fact; the hint still reaches
+the person, on the report and on stderr.
+
+**The typed words are what a consumer branches on.** `state` says how bad it
+is; the section's own word says what it is: `config.outcome`
+(`valid`/`not_found`/`invalid`), `daemon.reachability`
+(`responding`/`not_responding`/`not_configured`), `camera.selection`
+(`configured`/`auto_detect`), `execution_provider.availability`
+(`available`/`not_built_in`/`unrecognized`/`unqueryable`), `encryption.key.method`
+(`tpm`/`keyfile`/`none`), `notifications.mode`
+(`off`/`terminal`/`desktop`/`both`), `config.device.selection`
+(`configured`/`auto_detect`) and `models.files[].purpose`
+(`detector`/`embedder`).
+
+**Each section's `state` answers its own question, and some are narrower than
+the section name suggests.** A section that owns a nested fact keeps the broad
+question for itself and puts the specific one underneath, so reading only the
+outer `state` can pass a machine the nested fact condemns:
+
+| Section | Its `state` answers | And beside it |
+|---------|---------------------|---------------|
+| `config` | did the file parse | — |
+| `daemon` | did the bus round trip complete, **or was the bus deliberately never asked** (`reachability: not_configured`, which `daemon.mode = "oneshot"` produces) | — |
+| `oneshot_fallback` | are the three files daemon-less auth needs on disk | — |
+| `camera` | under `configured`, does the node exist; under `auto_detect`, **only that auto-detection is enabled** | `camera.device` — whether a device was actually found and interrogated |
+| `models` | is the model directory there, with both configured files | — |
+| `execution_provider` | can the installed ONNX Runtime use the configured provider | — |
+| `encryption` | is usable key material in place — `method: none` is a `problem` even though the config asked for nothing, because plaintext storage is a finding rather than a preference | `encryption.embeddings` — whether the stored embeddings could be counted |
+| `enrollment` | does this user have at least one model | `enrollment.marker` — whether the `is-enrolled` marker agrees with the database |
+| `security` | are the checks enabled at all | — |
+| `notifications` | never a finding: `ok` whenever the config was read | — |
+| `pam` | is `pam_facelock.so` installed | `pam.services` — what the `/etc/pam.d` scan found, and whether it could see everywhere |
+
+Two of those are worth stating outright, because the obvious read is wrong.
+Under auto-detection `"camera": {"state": "ok"}` says detection is on, **not
+that a camera exists** — a machine with no camera at all renders exactly that,
+with `camera.device.state` reporting `problem`. And `"pam": {"state": "ok"}`
+says the module is installed, **not that anything uses it** — a machine with the
+module in place and nothing wired up renders that, with
+`pam.services.configured` empty. The human report is equally generous in both
+cases (`[ok] auto-detect enabled`, `[ok] installed`); the nested fact is where
+the answer is.
+
+**The PAM section speaks `pam status --json`'s vocabulary.** Each row of
+`pam.services.configured` is a `{"service", "path", "action"}` object with the
+same `action` words, plus `shadows` when the file it names hides a vendor one
+— the same key, absent rather than `null` when nothing is shadowed. Only
+`present` rows appear, because a service that does not carry the line is not a
+configured service; `backup` is not on these rows, because `status` does not
+probe for backup files. `pam.services.state` is `ok` only when every directory
+and every service file was read; a single unread place makes it `unknown` and
+names each one in `not_checked`, so an incomplete list is never mistaken for a
+complete one. What was found is still listed and still true.
+
+**Stability tier.** Field names do not change and are not removed; new fields
+and new sections are additive; a removal is breaking. New words may be added to
+any of the typed vocabularies above, including `state`, so a consumer tolerates
+a word it does not know rather than treating it as an error. **Key order is not
+part of the contract** — parse the document, do not string-match it.
+
+A conditional field is **absent**, not `null`, when it does not apply. The whole
+list: `reason` (present unless `state` is `ok`), `error`, `shadows`,
+`installed_at`, `device`, `files`, `checks`, `delivery`,
+`daemon.reachability`, `camera.configured_path`, `camera.present`,
+`enrollment.models` and `enrollment.marker`. A consumer must tolerate a section
+carrying nothing but `state` and `reason`, which is what every
+config-dependent section renders when the config did not parse. There is no roll-up verdict for the machine as a whole: what
+counts as healthy is the consumer's policy, and the human report does not make
+that judgment either.
+
+The document for a fully healthy machine, which is the fixture both renderers
+are tested against:
+
+```json
+{
+  "config": {
+    "state": "ok",
+    "path": "/etc/facelock/config.toml",
+    "outcome": "valid",
+    "device": { "selection": "configured", "path": "/dev/video2" }
+  },
+  "daemon": {
+    "state": "ok",
+    "bus_name": "org.facelock.Daemon",
+    "reachability": "responding"
+  },
+  "oneshot_fallback": {
+    "state": "ok",
+    "auth_bin": "/usr/bin/facelock",
+    "binary_present": true,
+    "models_present": true,
+    "database_present": true
+  },
+  "camera": {
+    "state": "ok",
+    "selection": "configured",
+    "configured_path": "/dev/video2",
+    "present": true,
+    "device": {
+      "state": "ok",
+      "path": "/dev/video2",
+      "name": "Integrated IR Camera",
+      "ir": true,
+      "quirks": []
+    }
+  },
+  "models": {
+    "state": "ok",
+    "dir": "/usr/share/facelock/models",
+    "dir_present": true,
+    "files": [
+      { "purpose": "detector", "path": "/usr/share/facelock/models/det.onnx", "present": true },
+      { "purpose": "embedder", "path": "/usr/share/facelock/models/emb.onnx", "present": true }
+    ]
+  },
+  "execution_provider": {
+    "state": "ok",
+    "configured": "cpu",
+    "availability": "available"
+  },
+  "encryption": {
+    "state": "ok",
+    "key": {
+      "method": "tpm",
+      "sealed_key_path": "/etc/facelock/sealed.key",
+      "sealed_key_present": true,
+      "tpm_device_path": "/dev/tpmrm0",
+      "tpm_device_present": true
+    },
+    "embeddings": { "state": "ok", "encrypted": 2, "plaintext": 0 }
+  },
+  "enrollment": {
+    "state": "ok",
+    "user": "alice",
+    "models": [
+      { "id": 1, "label": "front" },
+      { "id": 2, "label": "side" }
+    ],
+    "marker": { "state": "ok" }
+  },
+  "security": {
+    "state": "ok",
+    "disabled": false,
+    "checks": {
+      "require_ir": true,
+      "require_frame_variance": true,
+      "require_landmark_liveness": false,
+      "min_auth_frames": 3
+    }
+  },
+  "notifications": {
+    "state": "ok",
+    "mode": "both",
+    "delivery": { "prompt": true, "on_success": true, "on_failure": false }
+  },
+  "pam": {
+    "state": "ok",
+    "module_path": "/lib/security/pam_facelock.so",
+    "installed_at": "/lib/security/pam_facelock.so",
+    "services": {
+      "state": "ok",
+      "configured": [
+        { "service": "sudo", "path": "/etc/pam.d/sudo", "action": "present" },
+        {
+          "service": "polkit-1",
+          "path": "/etc/pam.d/polkit-1",
+          "action": "present",
+          "shadows": "/usr/lib/pam.d/polkit-1"
+        }
+      ],
+      "not_checked": []
+    }
+  }
+}
+```
+
+A machine whose config did not parse renders all nine config-dependent sections
+as `{"state": "unknown", "reason": "config not available"}`, **plus whatever
+that section knows without the config**: `daemon` keeps `bus_name` (a property
+of the design, not of the machine) and `enrollment` keeps `user` (resolved from
+argv and the environment, never from the file). The other seven carry `state`
+and `reason` alone. Meanwhile `config` reports the parse failure itself, and
+`pam`, which is config-independent, still answers in full.
+
 ### facelock capabilities
 
 `facelock capabilities` answers "what can *this* build do?" — from the binary's
@@ -798,6 +1054,7 @@ that is not on this list is not being denied, only not yet promised.
 | `setup-if-present` | `setup --pam --if-present`, on add and on `--remove` alike |
 | `setup-no-pam` | `setup --no-pam` |
 | `setup-systemd` | `setup --systemd` |
+| `status-json` | `status --json` — the machine-readable system report, one key per section. See "facelock status Semantics" |
 | `tpm-decrypt` | `tpm decrypt` exists — the verb ADR 009 moved under `tpm` from the top-level `decrypt` |
 | `tpm-encrypt` | `tpm encrypt` exists — the verb ADR 009 moved under `tpm` from the top-level `encrypt` |
 | `tpm-reseal` | `tpm reseal` exists — the verb ADR 009 moved under `tpm` from the top-level `reseal` |

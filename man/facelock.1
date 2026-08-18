@@ -318,6 +318,21 @@ line, from the same scan
 runs, and marks how many are a local override of a vendor file. It reads
 \fBnone configured\fR only when every directory was read; when one could not
 be, it reads \fBnot checked\fR and names the place on a line of its own.
+.RS
+.TP
+.B \-\-json
+Print one JSON object instead of the report, with a key per section
+(\fBconfig\fR, \fBdaemon\fR, \fBoneshot_fallback\fR, \fBcamera\fR,
+\fBmodels\fR, \fBexecution_provider\fR, \fBencryption\fR, \fBenrollment\fR,
+\fBsecurity\fR, \fBnotifications\fR, \fBpam\fR). Each carries a \fBstate\fR of
+\fBok\fR, \fBproblem\fR or \fBunknown\fR and, when it is not \fBok\fR, a
+\fBreason\fR. A fact that could not be established is \fBunknown\fR with a
+reason and no value \(em never a JSON \fBnull\fR and never a \fBfalse\fR. This
+is the form to branch on instead of grepping the report. Exit codes are
+unchanged: \fBstatus\fR exits 0 whenever it produced a report, and the verdicts
+are in the document. See \fBfacelock status Semantics\fR in the contracts
+document for the schema and its stability tier.
+.RE
 .TP
 .B devices
 List available camera devices.
