@@ -221,14 +221,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   icon work the moment enrollment finishes. `/var/lib/facelock` and
   `/var/lib/facelock/enrolled` are `0711 root:root` (traversable by all,
   listable by none; database and markers keep their `0600` modes); the
-  `facelock` group grants signal receipt only, `sudo facelock setup` and `just
-  install-files` no longer add anyone to it, and the CLI's `AccessDenied` hint
-  says "root required" instead of "join the group". Existing memberships are
-  harmless. Upgrades converge through tmpfiles, the package scriptlets, and
-  the binary's own layout enforcement; the scriptlets and `setup --systemd`
-  also ask the bus to reload its policy. Widened residual, accepted: any local
-  user can `stat` a name it guesses under the state directory (previously
-  group members only).
+  `facelock` group is retired: the bus policy no longer names it (signals are
+  root-only), packaging no longer creates it, `/run/facelock` is `root:root`,
+  and setup, `just install-files` and the package scriptlets remove a leftover
+  group best-effort. The CLI's `AccessDenied` hint says "root required"
+  instead of "join the group". Upgrades converge through tmpfiles, the package
+  scriptlets, and the binary's own layout enforcement; the scriptlets and
+  `setup --systemd` also ask the bus to reload its policy. Widened residual,
+  accepted: any local user can `stat` a name it guesses under the state
+  directory (previously group members only).
 - **The setup wizard configures the daemon before enrolling** (#200): the order
   is now Camera → Model quality → Inference device → Model download →
   Encryption → **Daemon → Enrollment → Test** → PAM. On a first install

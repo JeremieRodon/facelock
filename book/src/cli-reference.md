@@ -239,7 +239,7 @@ It answers from a single marker file, and deliberately does **not**:
 - activate the facelock daemon over D-Bus (which is why `facelock list --json` cannot be used for this — `list` tries daemon IPC first and will bus-activate the system daemon)
 - open a camera
 - read the face database
-- error merely because the caller's marker is unreadable — a missing or unreadable marker reports `not-enrolled`, never an error; no group membership is involved (ADR 010)
+- error merely because the caller's marker is unreadable — a missing or unreadable marker reports `not-enrolled`, never an error; no group is involved (ADR 010)
 
 The only files it touches are `/etc/facelock/config.toml` (to find the state directory) and one marker.
 
@@ -253,7 +253,7 @@ The only files it touches are `/etc/facelock/config.toml` (to find the state dir
     <user>                    0600 <user>:<user>
 ```
 
-The markers live **inside** the state directory. Both directories on the path are `0711 root:root` — traversable by every local user, listable by none — so *"enrolled"* means **"face auth is operational for me"**: one `open(2)` of the caller's own marker answers it, with no group membership involved (ADR 010). Traverse-only means any user can open its own marker by name but cannot `readdir` the directory, so which other accounts have face auth enrolled is not listable (a guessed name can still be probed for existence — the accepted residual in `docs/security.md` § 3 A2). Each marker is `0600` and owned by its user, so "am I enrolled?" is answerable by that user and nobody else — the same privacy property as `~/.ssh/authorized_keys`. Both `ENOENT` and `EACCES` are reported as not-enrolled (exit 1), never as an error.
+The markers live **inside** the state directory. Both directories on the path are `0711 root:root` — traversable by every local user, listable by none — so *"enrolled"* means **"face auth is operational for me"**: one `open(2)` of the caller's own marker answers it, with no group involved (ADR 010). Traverse-only means any user can open its own marker by name but cannot `readdir` the directory, so which other accounts have face auth enrolled is not listable (a guessed name can still be probed for existence — the accepted residual in `docs/security.md` § 3 A2). Each marker is `0600` and owned by its user, so "am I enrolled?" is answerable by that user and nobody else — the same privacy property as `~/.ssh/authorized_keys`. Both `ENOENT` and `EACCES` are reported as not-enrolled (exit 1), never as an error.
 
 The database is `600 root:root` — encrypted biometric templates are read by the daemon, never by any other user — so the marker can in principle drift from it, for instance after an out-of-band database restore. That is acceptable because `is-enrolled` only decides whether to show a **UI affordance**. A stale marker degrades gracefully: the indicator appears, the PAM attempt fails, and the password context was running in parallel the whole time.
 
