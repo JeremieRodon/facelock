@@ -71,7 +71,8 @@ RestrictSUIDSGID=yes
 # startup steps need it on an install that is being upgraded rather than freshly
 # packaged:
 #   - state_layout::ensure_state_layout, which chowns /var/lib/facelock (and
-#     the files under it) to root:facelock. A failure here is fatal — the daemon
+#     the files under it) to root:root, which an install upgraded from the
+#     root:facelock layout still needs. A failure here is fatal — the daemon
 #     exits 1 — so without this cap an upgraded install can fail to start.
 #   - the enrollment-marker reconcile (#137), which chowns each marker to the
 #     user it describes. Without this cap it would silently write nothing on

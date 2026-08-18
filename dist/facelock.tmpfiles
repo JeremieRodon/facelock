@@ -2,21 +2,20 @@
 d /run/facelock 0755 root facelock -
 
 # State directory (biometric data - restricted).
-# 0710 root:facelock = traverse-only for the facelock group, nothing for
-# anyone else. A group member can open a path it knows by name — its own
-# enrolled/<user> marker, a model file — but cannot list the directory, and
-# users outside the group cannot reach anything below this point at all.
+# 0711 root:root = traversable by every local user, listable by nobody but
+# root (ADR 010). Anyone can open a path it knows by name — its own
+# enrolled/<user> marker, a model file — and nobody can enumerate what is
+# there. Every secret below carries its own 0600 mode. No group grant.
 # Parent must come before its children.
-d /var/lib/facelock 0710 root facelock -
+d /var/lib/facelock 0711 root root -
 
-# ONNX models. Public downloads, SHA256-verified at load; the 0710 parent is
-# what keeps non-group users out.
+# ONNX models. Public downloads, SHA256-verified at load.
 d /var/lib/facelock/models 0755 root root -
 
 # Enrollment markers for `facelock is-enrolled`, and nothing else.
-# 0710 root:facelock: a group member can open its own 0600 marker by name but
-# cannot enumerate who else is enrolled.
-d /var/lib/facelock/enrolled 0710 root facelock -
+# 0711 root:root: a user can open its own 0600 marker by name but cannot
+# enumerate who else is enrolled.
+d /var/lib/facelock/enrolled 0711 root root -
 
 # The database and its WAL sidecars hold encrypted biometric templates and are
 # read by the daemon (root) only. `z` adjusts an existing file and never

@@ -16,7 +16,7 @@ Facelock is designed to keep biometric data under the user's exclusive control:
 - **Local-only inference**: All face detection and recognition runs on-device via ONNX Runtime. No images, embeddings, or metadata are ever transmitted over the network.
 - **No telemetry**: Facelock contains zero analytics, tracking, or phone-home code. After the one-time model download during `facelock setup`, it never contacts any server.
 - **No cloud dependencies**: Authentication works fully offline. No account registration, no API keys, no external services.
-- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (600, root:root, inside a 710 root:facelock directory). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
+- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (600, root:root, inside a 711 root:root directory that nobody but root can list). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
 - **Open source**: All code is MIT/Apache-2.0 licensed. No proprietary blobs or obfuscated network calls. Privacy claims are verifiable by reading the source.
 
 ## Attack Vectors & Mitigations
@@ -337,9 +337,8 @@ chmod 644 /var/lib/facelock/models/*.onnx
 ```
 
 The model files are public, SHA-256-verified downloads, so their own modes are
-permissive — what keeps users outside the `facelock` group away from them is
-the `0710` state directory above; see `docs/contracts.md` § *One gate at the
-top*. What the modes here must guarantee is only that nobody but root can
+permissive; see `docs/contracts.md` § *Traversal for everyone, listing for
+nobody*. What the modes here must guarantee is only that nobody but root can
 **write** them.
 
 ### 3. Embedding / Database Security
@@ -351,8 +350,8 @@ top*. What the modes here must guarantee is only that nobody but root can
 #### A. Database File Permissions (Required)
 
 ```bash
-# Database owned by root, readable by root only. The facelock group requests
-# authentication through the daemon; it never reads templates.
+# Database owned by root, readable by root only. User-run PAM stacks request
+# authentication through the daemon; nothing but root reads templates.
 chown root:root /var/lib/facelock/facelock.db
 chmod 600 /var/lib/facelock/facelock.db
 ```
@@ -362,14 +361,14 @@ Runtime note:
 - Audit logs and snapshots must be created with explicit restrictive modes instead of relying on ambient umask
 - The systemd service should set `UMask=0027` as a baseline defense-in-depth default
 
-#### A2. One Gate at the Top (`/var/lib/facelock` is 0710)
+#### A2. Traversal for Everyone, Listing for Nobody (`/var/lib/facelock` is 0711)
 
 ```
-/var/lib/facelock/            0710 root:facelock   traverse-only, NOT listable
+/var/lib/facelock/            0711 root:root       traverse-only, NOT listable
   facelock.db                 0600 root:root
   facelock.db-wal / -shm      0600 root:root
   models/                     0755 root:root       public, SHA-256 verified
-  enrolled/                   0710 root:facelock   markers only
+  enrolled/                   0711 root:root       markers only
     <user>                    0600 <user>:<user>
 
 /var/log/facelock/            0700 root:root
@@ -377,66 +376,57 @@ Runtime note:
   snapshots/                  0700 root:root
 ```
 
-The state directory grants "other" **nothing**. A local user outside the
-`facelock` group cannot reach anything below it — not the database, not the
-markers, not even the world-readable models — regardless of the children's own
-modes. That single gate is the security boundary; the children's modes are
-defense in depth behind it.
-
-The `facelock` group gets traverse-only (`--x`): a member can open a path it
-already knows by name — its own `enrolled/<user>` marker, a model file — but
-cannot `readdir` the directory, cannot read the `0600 root:root` database, and
-cannot read the audit log or snapshots. **The group is a D-Bus access grant,
-not a file-read grant**: members request authentication through the daemon,
-which reads the templates as root and answers yes or no.
+The state directory grants every local user traversal (`--x`) and nobody but
+root listing (no `r` for group or other). Anyone can `open()` a path it
+already knows by name — its own `enrolled/<user>` marker, a model file — and
+nobody can `readdir` the directory, read the `0600 root:root` database, or
+reach the audit log or snapshots. Every secret is protected by its own mode;
+the directory protects only *what is there* from enumeration. There is no
+group grant (ADR 010): the `facelock` group owns nothing here.
 
 Two consequences worth stating explicitly:
 
-- **D-Bus is required for user-run screen lockers** (hyprlock/swaylock). Their
-  PAM stack runs as the user, and no group membership makes the database or
-  the `0600 root:root` encryption key readable, so the daemon is the only
-  path. Root-invoked PAM (`sudo`, `login`, `sshd`) additionally has the
-  oneshot fallback, which reads the files directly as root.
-- **Known residual**: a group member can `stat` a name it can guess —
+- **D-Bus is required for user-run screen lockers** (hyprlock/swaylock) and
+  the polkit agent. Their PAM stack runs as the user, and nothing makes the
+  database or the `0600 root:root` encryption key readable to them, so the
+  daemon is the only path — and the bus admits their `Authenticate` without a
+  group (§ 4 A). Root-invoked PAM (`sudo`, `login`, `sshd`) additionally has
+  the oneshot fallback, which reads the files directly as root.
+- **Known residual**: any local user can `stat` a name it can guess —
   `facelock.db` (size, mtime), `enrolled/<user>` (existence) — because
-  traversal permits exactly that. Closing it would mean denying the group the
-  traversal that `is-enrolled` and model loading depend on. Accepted.
+  traversal permits exactly that. Closing it would mean denying the traversal
+  that `is-enrolled` and model loading depend on. Accepted; before ADR 010 the
+  same residual existed for group members.
 
 **The enforcement mechanism is a guard test, not this document.** The test in
 `crates/facelock-cli/src/state_layout.rs` walks every entry under the state
-directory and asserts nothing carries "other" bits, with `models/` (public
-data) as the single allowed exception, and that the state directory itself
-grants "other" nothing. A future change that drops a world-readable file into
-the state directory fails that test with a message that explains the rule.
+directory and asserts that no file carries any "other" bit and no directory
+carries "other" read or write — traversal is the only thing granted — with
+`models/` (public data) as the single allowed exception. A future change that
+drops a world-readable file into the state directory fails that test with a
+message that explains the rule.
 
-#### A3. Enrollment Markers (`/var/lib/facelock/enrolled` is 0710)
+#### A3. Enrollment Markers (`/var/lib/facelock/enrolled` is 0711)
 
 `facelock is-enrolled` must not activate the daemon or open a camera — it runs
 repeatedly on the lock screen. It answers from a marker file rather than from
 the database, and *"enrolled"* means **"face auth is operational for me"**:
-reading the marker requires traversing two `0710 root:facelock` directories,
-so a caller outside the `facelock` group reads `EACCES` and reports
-not-enrolled — deliberately, since the group is required to reach the daemon
-at all. One `open(2)` answers group-membership and enrollment together,
-including the "enrolled but not yet re-logged-in after joining the group"
-state.
+the caller opens its own `0600` marker by name through two `0711 root:root`
+directories. No group membership is involved (ADR 010): the answer is
+`enrolled` the moment enrollment writes the marker.
 
 ```
-/var/lib/facelock/enrolled/          0710 root:facelock
+/var/lib/facelock/enrolled/          0711 root:root
 /var/lib/facelock/enrolled/<user>    0600 <user>:<user>
 ```
 
-- **`0710` on the directory** permits group traversal to a known filename but
-  not `readdir`, so which accounts have face auth enrolled is not listable.
-- **The ownership is half the contract.** The group-execute bit only works
-  because the directory is owned `root:facelock`; a "consistency fix" to
-  `root:root` silently turns every unprivileged `is-enrolled` into
-  "not-enrolled". A guard test pins mode and ownership together.
+- **`0711` on the directory** permits traversal to a known filename but not
+  `readdir`, so which accounts have face auth enrolled is not listable.
 - **`0600` owned by the user** means "am I enrolled?" is answerable by that
   user and by nobody else — the same privacy property as
   `~/.ssh/authorized_keys`.
 - `EACCES` and `ENOENT` are both reported as not-enrolled, never as an error.
-  Under the operational-for-me semantics this is correct, not a compromise.
+  An indicator that fails to show is the safe way to be wrong.
 
 Several places encode this layout and must stay in sync: `dist/facelock.tmpfiles`,
 `dist/facelock.install`, `dist/debian/postinst`, `dist/nix/module.nix`,
@@ -851,7 +841,7 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
     it. Root without `CAP_CHOWN` cannot `chown(2)` at all, and two
     startup steps need it on an install that is
     being *upgraded* rather than freshly packaged: `state_layout::ensure_state_layout`, which
-    chowns `/var/lib/facelock` and the files under it to `root:facelock` (a failure there is
+    chowns `/var/lib/facelock` and the files under it to `root:root` (a failure there is
     fatal — the daemon exits 1), and the enrollment-marker reconcile, which chowns each marker
     to the user it describes (#137). Both skip paths that are already correct, so a steady-state
     install never chowns. The reachable blast radius is small: `ProtectSystem=strict` leaves only
