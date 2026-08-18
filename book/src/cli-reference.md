@@ -27,7 +27,11 @@ Spelling", for the invariants and the short-letter registry.
 
 ## facelock setup
 
-Interactive setup wizard. Walks through camera selection, model quality, inference device (CPU / CUDA / ROCm / OpenVINO), model downloads, encryption, enrollment, systemd, and PAM configuration. Every step can also be answered — or declined — from the command line.
+Interactive setup wizard. Walks through camera selection, model quality, inference device (CPU / CUDA / ROCm / OpenVINO), model downloads, encryption, the daemon, enrollment, and PAM configuration. Every step can also be answered — or declined — from the command line.
+
+The daemon is configured before enrollment on purpose. `enroll` and `test` select their transport once, when they start, so on a first install a daemon configured after them would never be the one they used: enrollment would fall back to direct camera access and the recognition test would validate a transport no later authentication takes. It stays after the model download and encryption steps, because the daemon loads the models and opens the embedding key at startup.
+
+The step starts the daemon, or restarts it if one is already running. The encryption method, the model preset and the inference device are read once at daemon startup, so on a re-run of `setup` a daemon left running would answer enrollment and the recognition test with the configuration from before the wizard. A restart interrupts any authentication that daemon is mid-way through, which on a `sudo` prompt in another terminal means one password fallback.
 
 ```bash
 facelock setup                          # interactive wizard
@@ -103,8 +107,8 @@ Under `--non-interactive`, a choice flag applies before the model download, so `
 | Pair | Without either flag (wizard) | Without either flag (`--non-interactive`) |
 |------|------------------------------|-------------------------------------------|
 | `--pam` / `--no-pam` | prompt (step 9) | off |
-| `--systemd` / `--no-systemd` | prompt (step 8) | off |
-| `--enroll` / `--no-enroll` | prompt (step 6) | off — enrollment needs a human in front of the camera |
+| `--systemd` / `--no-systemd` | prompt (step 6) | off |
+| `--enroll` / `--no-enroll` | prompt (step 7) | off — enrollment needs a human in front of the camera |
 
 Each pair is a clap override pair: **a later flag wins over an earlier one.** `--pam --no-pam` declines PAM; `--no-pam --pam` installs it. This matters when a wrapper script appends an override to a command line it did not construct.
 
@@ -133,7 +137,7 @@ Flags **compose**; they are not mutually exclusive. The rule is:
 
 `-y` on its own does not force the base setup, so `facelock setup -y --pam` is still PAM-only.
 
-When the base setup does run alongside an action, the order is: base setup, then systemd, then PAM — the same order the wizard uses for steps 8 and 9. A wizard run that already configured PAM at step 9 is not asked to do it a second time.
+When the base setup does run alongside an action, the actions run inside it, at the step that owns them: `--systemd` at step 6 and `--pam` at step 9. `--systemd` used to be applied after the whole base setup had finished, which put it after enrollment; it is now applied where the wizard would have prompted for it. Standalone `--systemd` and `--pam`, with no base setup to host them, run in that same order afterwards. A wizard run that already configured PAM at step 9 is not asked to do it a second time.
 
 ### Compatibility matrix
 

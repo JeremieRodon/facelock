@@ -374,7 +374,7 @@ fn pam_request(action: PamAction, service: &str, knobs: PamKnobs, if_present: bo
 }
 
 /// Execute a resolved plan: base setup first (if any), then the standalone
-/// systemd and PAM actions, in that order — the wizard runs systemd (step 8)
+/// systemd and PAM actions, in that order — the wizard runs systemd (step 6)
 /// before PAM (step 9), and `--systemd --pam` must match.
 pub fn run_with_plan(plan: SetupPlan) -> anyhow::Result<()> {
     if needs_root_precheck(&plan) {
@@ -396,9 +396,16 @@ pub fn run_with_plan(plan: SetupPlan) -> anyhow::Result<()> {
     }
 
     match plan.systemd {
-        SystemdPref::Install => run_systemd(false)?,
-        SystemdPref::Disable => run_systemd(true)?,
-        // Under a wizard base `Ask` is step 8; everywhere else it means nothing.
+        // Only the standalone `--systemd` / `--systemd --disable` are applied
+        // here. A base flow applies its own, at step 6, because it has to
+        // land before enrollment: `enroll` and `test` select their transport
+        // at entry, so a daemon installed after them is never the one they
+        // used — both would run direct-by-fallback and the recognition test
+        // would validate a transport no later authentication takes.
+        SystemdPref::Install if plan.base.is_none() => run_systemd(false)?,
+        SystemdPref::Disable if plan.base.is_none() => run_systemd(true)?,
+        SystemdPref::Install | SystemdPref::Disable => {}
+        // Under a base flow `Ask` is step 6; everywhere else it means nothing.
         SystemdPref::Ask | SystemdPref::Skip => {}
     }
 
@@ -547,7 +554,59 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         },
     }
 
-    // -- Step 6: Face enrollment --
+    // -- Step 6: Daemon configuration --
+    //
+    // Ahead of enrollment on purpose. Both steps below select their transport
+    // once, at entry (`backend::Backend::select`), so a daemon installed after
+    // them is never the one they used: enrollment would run direct-by-fallback
+    // and the recognition test would validate a transport that no later
+    // authentication takes. Still after model download and encryption — the
+    // daemon loads the models and opens the embedding key at startup, so it
+    // has nothing to start from before those two steps have run.
+    Terminal.info(&SetupMessage::SetupStepDaemon);
+    let systemd_step = systemd_step_for(plan);
+    let systemd_enabled = match systemd_step {
+        SystemdStep::Ask => match wizard_systemd_setup(&theme, plan.yes) {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                Terminal.info(&SetupMessage::SystemdStepFailed {
+                    error: e.to_string(),
+                });
+                false
+            }
+        },
+        // Answered on the command line. Applied here rather than after the
+        // whole base flow, for the ordering reason above; the error it can
+        // raise is the one `run_with_plan` used to raise, only earlier.
+        SystemdStep::Install => {
+            Terminal.info(&SystemMessage::SystemdFromCommandLine);
+            run_systemd(false)?;
+            true
+        }
+        SystemdStep::Disable => {
+            Terminal.info(&SystemMessage::SystemdFromCommandLine);
+            run_systemd(true)?;
+            false
+        }
+        SystemdStep::Skip => {
+            Terminal.info(&SystemMessage::SystemdSkippedFlag);
+            false
+        }
+    };
+
+    // Group membership: without it, the first daemon command a normal user
+    // runs after setup fails with a bare D-Bus AccessDenied (issue #89).
+    if let Err(e) = setup_group_membership(Some(&theme)) {
+        Terminal.info(&SetupMessage::GroupStepFailed {
+            error: e.to_string(),
+        });
+    }
+
+    if systemd_enabled {
+        start_daemon_for_setup(&config);
+    }
+
+    // -- Step 7: Face enrollment --
     let enroll_steps = enroll_steps_for(plan);
     let enrolled = if enroll_steps.enroll {
         Terminal.info(&SetupMessage::SetupStepEnrollment);
@@ -565,7 +624,7 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         false
     };
 
-    // -- Step 7: Test recognition --
+    // -- Step 8: Test recognition --
     if test_recognition_runs(enroll_steps, enrolled) {
         Terminal.info(&SetupMessage::SetupStepTest);
         match wizard_test_recognition(&config, &theme, plan.yes) {
@@ -578,36 +637,6 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         }
     } else {
         Terminal.info(&SetupMessage::SetupStepTestSkipped);
-    }
-
-    // -- Step 8: Systemd setup --
-    Terminal.info(&SetupMessage::SetupStepDaemon);
-    let systemd_step = systemd_step_for(plan);
-    let systemd_enabled = if systemd_step.wizard_may_install() {
-        match wizard_systemd_setup(&theme, plan.yes) {
-            Ok(enabled) => enabled,
-            Err(e) => {
-                Terminal.info(&SetupMessage::SystemdStepFailed {
-                    error: e.to_string(),
-                });
-                false
-            }
-        }
-    } else {
-        if systemd_step == SystemdStep::Skip {
-            Terminal.info(&SystemMessage::SystemdSkippedFlag);
-        } else {
-            Terminal.info(&SystemMessage::SystemdDeferred);
-        }
-        false
-    };
-
-    // Group membership: without it, the first daemon command a normal user
-    // runs after setup fails with a bare D-Bus AccessDenied (issue #89).
-    if let Err(e) = setup_group_membership(Some(&theme)) {
-        Terminal.info(&SetupMessage::GroupStepFailed {
-            error: e.to_string(),
-        });
     }
 
     // -- Step 9: PAM configuration --
@@ -676,7 +705,9 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
     Terminal.info(&SetupMessage::SummaryDaemon {
         status: match systemd_step {
             SystemdStep::Skip => SetupMessage::DaemonStatusNotConfiguredNoSystemd,
-            SystemdStep::Deferred => SetupMessage::DaemonStatusDeferred,
+            SystemdStep::Install | SystemdStep::Disable => {
+                SetupMessage::DaemonStatusFromCommandLine
+            }
             SystemdStep::Ask if systemd_enabled => SetupMessage::DaemonStatusEnabled,
             SystemdStep::Ask => SetupMessage::DaemonStatusNotConfigured,
         }
@@ -1841,13 +1872,13 @@ fn resolve_configured_model_sha256(
 // not configure the candidate set's five `default_enabled` services.
 // ---------------------------------------------------------------------------
 
-/// Steps 6 and 7, decided up front. Step 7 exists only to exercise the
-/// enrollment step 6 produced, so `--no-enroll` suppresses both.
+/// Steps 7 and 8, decided up front. Step 8 exists only to exercise the
+/// enrollment step 7 produced, so `--no-enroll` suppresses both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EnrollSteps {
-    /// Step 6 runs at all.
+    /// Step 7 runs at all.
     enroll: bool,
-    /// Step 6 proceeds without its confirmation prompt.
+    /// Step 7 proceeds without its confirmation prompt.
     assume_yes: bool,
 }
 
@@ -1871,36 +1902,37 @@ fn enroll_steps_for(plan: &SetupPlan) -> EnrollSteps {
     }
 }
 
-/// Step 7 runs only when step 6 actually enrolled a face.
+/// Step 8 runs only when step 7 actually enrolled a face.
 fn test_recognition_runs(steps: EnrollSteps, enrolled: bool) -> bool {
     steps.enroll && enrolled
 }
 
-/// What step 8 does.
+/// What step 6 does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SystemdStep {
     /// No flag: prompt, then install if accepted.
     Ask,
     /// `--no-systemd`: declined. No unit files, no `systemctl`.
     Skip,
-    /// `--systemd` / `--systemd --disable`: already answered, and
-    /// [`run_with_plan`] performs the action after the base flow — the wizard
-    /// must not do it a second time.
-    Deferred,
+    /// `--systemd`: already answered — install without prompting.
+    Install,
+    /// `--systemd --disable`: already answered — disable without prompting.
+    Disable,
 }
 
-impl SystemdStep {
-    /// Whether the wizard itself may write unit files or invoke `systemctl`.
-    fn wizard_may_install(self) -> bool {
-        matches!(self, SystemdStep::Ask)
-    }
-}
-
+/// Which [`SystemdStep`] a plan's `--systemd` / `--no-systemd` answer means.
+///
+/// `Install` and `Disable` used to collapse into one `Deferred` variant, on
+/// the rule that [`run_with_plan`] applied both after the base flow. It now
+/// applies them only when there is no base flow: inside one, the daemon has to
+/// be configured before enrollment, so step 6 performs them and the two
+/// answers need to be told apart.
 fn systemd_step_for(plan: &SetupPlan) -> SystemdStep {
     match plan.systemd {
         SystemdPref::Ask => SystemdStep::Ask,
         SystemdPref::Skip => SystemdStep::Skip,
-        SystemdPref::Install | SystemdPref::Disable => SystemdStep::Deferred,
+        SystemdPref::Install => SystemdStep::Install,
+        SystemdPref::Disable => SystemdStep::Disable,
     }
 }
 
@@ -2337,6 +2369,20 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
 
     secure_setup_paths(&config, Some(&manifest))?;
     write_setup_marker()?;
+
+    // Daemon configuration, before enrollment and for the same reason the
+    // wizard puts step 6 there: `enroll::run` selects its transport at entry,
+    // so a daemon installed after it is never the one it used. `Ask` and
+    // `Skip` mean "do nothing here", exactly as before — this flow has never
+    // prompted about systemd.
+    match plan.systemd {
+        SystemdPref::Install => {
+            run_systemd(false)?;
+            start_daemon_for_setup(&config);
+        }
+        SystemdPref::Disable => run_systemd(true)?,
+        SystemdPref::Ask | SystemdPref::Skip => {}
+    }
 
     // Enrollment only happens here when it was explicitly asked for: `None` and
     // `--no-enroll` both mean "do nothing", which is what this flow has always
@@ -3051,6 +3097,16 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
         run_cmd("systemctl", &["daemon-reload"])?;
         Terminal.info(&SystemMessage::SystemctlDaemonReloadDone);
 
+        // The bus half of the same reload. Until the bus re-reads the policy
+        // written above, nothing may own `org.facelock.Daemon` — the system
+        // bus denies `own` by default and root is not exempt. Bus
+        // implementations differ on whether they pick the directory up over
+        // inotify, so ask; where it was unnecessary this is a no-op, and a
+        // failure is not worth failing an install over.
+        if let Err(e) = run_cmd("systemctl", &["reload", "dbus"]) {
+            tracing::debug!("could not reload the D-Bus configuration: {e}");
+        }
+
         run_cmd("systemctl", &["enable", SERVICE_FILENAME])?;
         Terminal.info(&SystemMessage::SystemctlEnableDone {
             unit: SERVICE_FILENAME.to_string(),
@@ -3060,6 +3116,261 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// How long a base flow waits for a freshly installed daemon to answer.
+///
+/// Bounded on purpose, and deliberately shorter than systemd's 90s start
+/// timeout: the daemon is a convenience for the two steps that follow, not a
+/// precondition for them, so a wizard must not stall a minute and a half on
+/// one that is never coming up.
+const DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Gap between readiness probes.
+const DAEMON_READY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bring the daemon up so the enrollment and test steps that follow select it
+/// instead of falling back to direct camera access.
+///
+/// A stopped unit is started; one that is already running is restarted. The
+/// daemon reads the encryption method (step 5), the model preset (step 2) and
+/// the inference device (step 3) once, at startup, so on a second `setup` run
+/// leaving the running instance alone would enroll and test through a daemon
+/// holding the configuration the wizard has just replaced.
+///
+/// A restart needs more than a `Ping` to be believed. `--no-block` returns
+/// when systemd has queued the job, not when it has run it, so the first
+/// probe would be answered by the process being replaced — and step 7, with
+/// no prompt in front of it under `--enroll`, would then select its backend
+/// during the window where the old instance has exited and the new one is
+/// still loading its models, falling back to direct camera access under a
+/// line claiming the opposite. So the unit's main PID is read before the
+/// restart and the wait requires a *different* non-zero PID as well as a
+/// responding daemon ([`daemon_ready`]). The `start` branch needs none of
+/// that: there is no outgoing instance for an answer to have come from.
+///
+/// Every failure here is survivable and none of them are fatal: [`run_systemd`]
+/// has already installed and enabled the unit, which is what the user asked
+/// for, and a daemon that does not come up leaves exactly the direct-access
+/// fallback those steps used before this ordering existed. Reported, not
+/// raised.
+///
+/// Only reached from a base flow — a standalone `facelock setup --systemd`
+/// installs and enables as it always has, and starts on the next boot or on
+/// the next D-Bus activation. The bus-config reload the daemon needs before it
+/// can own its name is [`run_systemd`]'s, next to the policy file it serves.
+fn start_daemon_for_setup(config: &Config) {
+    if !daemon_start_wanted(&config.daemon.mode) {
+        return;
+    }
+
+    let bring_up = daemon_bring_up_for(daemon_unit_is_active());
+    // Read before the job is queued, so it names the instance being replaced.
+    let outgoing_pid = bring_up.main_pid();
+
+    // `--no-block` because `Type=dbus` makes a blocking start or restart wait
+    // on bus-name acquisition under systemd's start timeout. The wait below is
+    // ours, and bounded by us.
+    let issued = run_cmd(
+        "systemctl",
+        &[bring_up.verb(), "--no-block", SERVICE_FILENAME],
+    );
+    if let Err(e) = &issued {
+        tracing::warn!("could not {} {SERVICE_FILENAME}: {e}", bring_up.verb());
+    }
+    if restart_announced(bring_up, issued.is_ok()) {
+        Terminal.info(&SystemMessage::DaemonRestarted);
+    }
+
+    if wait_for_daemon(DAEMON_READY_TIMEOUT, bring_up, outgoing_pid) {
+        Terminal.info(&SystemMessage::DaemonRunning);
+    } else {
+        Terminal.info(&SystemMessage::DaemonNotReady {
+            seconds: DAEMON_READY_TIMEOUT.as_secs(),
+        });
+    }
+}
+
+/// How the wizard brings the unit up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonBringUp {
+    /// Nothing is running: `systemctl start`.
+    Start,
+    /// Something is running, on the configuration from before the wizard:
+    /// `systemctl try-restart`.
+    Restart,
+}
+
+impl DaemonBringUp {
+    /// The two verbs differ in which starting state they do nothing for, and
+    /// that is the whole reason both exist here: `start` is a no-op on an
+    /// already-running unit — the stale daemon this pairing exists to replace
+    /// — and `try-restart` is a no-op on a stopped one.
+    ///
+    /// Both directions of the race between the check and the call therefore
+    /// end somewhere survivable. A unit that stops in that window is left
+    /// down, rather than started by a verb whose branch never checked for
+    /// that. A unit that starts in it — a concurrent D-Bus activation — takes
+    /// `Start`, which is then the no-op: the freshly activated daemon
+    /// survives with the pre-wizard configuration, and no restart is
+    /// announced, because none happened. Milliseconds wide, and the readiness
+    /// wait reports whatever is actually there either way.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Restart => "try-restart",
+        }
+    }
+
+    /// The unit's main PID, on the branch whose acceptance rule reads one.
+    ///
+    /// `Start` has no outgoing instance to tell a successor from, so it never
+    /// consults a PID and does not pay a `systemctl show` per poll for one.
+    fn main_pid(self) -> Option<u32> {
+        match self {
+            Self::Restart => daemon_main_pid(),
+            Self::Start => None,
+        }
+    }
+}
+
+/// Which verb the unit's current state calls for. Pure, so the choice is
+/// testable without systemd; [`daemon_unit_is_active`] is the part that is not.
+fn daemon_bring_up_for(unit_active: bool) -> DaemonBringUp {
+    if unit_active {
+        DaemonBringUp::Restart
+    } else {
+        DaemonBringUp::Start
+    }
+}
+
+/// Whether systemd reports the unit as already running.
+///
+/// `systemctl is-active` exits non-zero for every state that is not active, so
+/// a stopped unit, a failed one, and a systemd that is not there at all all
+/// read as inactive: the [`DaemonBringUp::Start`] branch, whose own failure is
+/// already best effort.
+///
+/// The `Err` is the *answer*, not a fault — do not propagate it with `?`, or a
+/// stopped unit becomes a fatal setup.
+fn daemon_unit_is_active() -> bool {
+    run_cmd("systemctl", &["is-active", "--quiet", SERVICE_FILENAME]).is_ok()
+}
+
+/// The PID of the running instance, or `None` when there is not one.
+///
+/// `systemctl show -p MainPID --value` prints `0` for a unit that is not
+/// running; a systemd that is absent or that fails the query prints nothing
+/// usable. All three mean the same thing here — no instance to tell apart from
+/// its successor — so all three answer `None`, which [`daemon_ready`] treats
+/// as "cannot prove a restart happened" on the restart branch and ignores
+/// entirely on the start branch.
+fn daemon_main_pid() -> Option<u32> {
+    let out = Command::new("systemctl")
+        .args(["show", "-p", "MainPID", "--value", SERVICE_FILENAME])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (pid != 0).then_some(pid)
+}
+
+/// Whether the step announces the restart it asked for.
+///
+/// Only a restart systemd accepted: a rejected one replaced nothing, so the
+/// daemon the wait goes on to find is the same one that was already there, and
+/// saying otherwise would be the lie the notice exists to prevent.
+fn restart_announced(bring_up: DaemonBringUp, systemctl_ok: bool) -> bool {
+    systemctl_ok && matches!(bring_up, DaemonBringUp::Restart)
+}
+
+/// Whether a poll of the unit means the daemon the wizard asked for is up.
+///
+/// The two branches accept different evidence, because they have different
+/// things to prove:
+///
+/// - `Start` had nothing running, so any daemon answering is the one it
+///   started. A `Ping` is the whole test.
+/// - `Restart` had something running, and that something answers `Ping` until
+///   systemd gets round to stopping it. So the answer only counts once the
+///   unit reports a *different*, non-zero main PID: systemd runs a restart as
+///   stop-then-start, so a changed PID means the process that could have
+///   answered falsely is gone.
+///
+/// `current_pid` of `None` — a stopped unit, or a systemd that would not say —
+/// is never proof of a restart. It fails the wait rather than passing it,
+/// which costs at worst a bounded 20s and the direct-access fallback the whole
+/// step is best-effort about. An `old_pid` of `None` is the one soft spot: the
+/// wizard could not name the outgoing instance, so any running one is accepted
+/// and the branch degrades to the `Start` rule.
+fn daemon_ready(
+    bring_up: DaemonBringUp,
+    old_pid: Option<u32>,
+    current_pid: Option<u32>,
+    ping_ok: bool,
+) -> bool {
+    if !ping_ok {
+        return false;
+    }
+    match bring_up {
+        DaemonBringUp::Start => true,
+        DaemonBringUp::Restart => match current_pid {
+            None => false,
+            Some(pid) => Some(pid) != old_pid,
+        },
+    }
+}
+
+/// Whether a running daemon is any use to the steps that follow.
+///
+/// `mode = "oneshot"` is the configuration, not a degraded state: backend
+/// selection never probes the bus under it, so enrollment and the test would
+/// take direct camera access whether or not a daemon were running. Starting
+/// one would cost the wizard a spurious wait and win it nothing.
+fn daemon_start_wanted(mode: &facelock_core::config::DaemonMode) -> bool {
+    use facelock_core::config::DaemonMode;
+    matches!(mode, DaemonMode::Daemon)
+}
+
+/// Poll until the daemon the wizard asked for answers, or `timeout` elapses.
+///
+/// The probe is the seam's [`crate::backend::probe_daemon`], the full `Ping`
+/// round-trip rather than the non-activating `name_has_owner` that backend
+/// selection uses. "The daemon answers method calls" is the property the next
+/// two steps need, and activating one systemd has not got to yet is a success
+/// here rather than the hazard it would be at selection time.
+///
+/// [`daemon_ready`] decides what a poll proves; `old_pid` is the main PID read
+/// before the restart was queued. The PID is read *before* the ping, and only
+/// on the branch that needs it: a PID that is already the successor's cannot
+/// then be paired with a ping the outgoing instance answered a moment earlier:
+/// systemd runs a restart as stop-then-start, so the old process has exited by
+/// the time its PID stops being the unit's.
+fn wait_for_daemon(
+    timeout: std::time::Duration,
+    bring_up: DaemonBringUp,
+    old_pid: Option<u32>,
+) -> bool {
+    use crate::backend::DaemonPing;
+    use facelock_core::config::DaemonMode;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let current_pid = bring_up.main_pid();
+        let ping_ok = matches!(
+            crate::backend::probe_daemon(&DaemonMode::Daemon).known(),
+            Some(DaemonPing::Responding)
+        );
+        if daemon_ready(bring_up, old_pid, current_pid, ping_ok) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(DAEMON_READY_POLL);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4040,44 +4351,184 @@ mod action_tests {
         let step = systemd_step_for(&plan);
         assert_eq!(step, SystemdStep::Skip);
 
-        // `wizard_systemd_setup` is the wizard's only path to unit files and
-        // `systemctl`, and it runs only when `wizard_may_install()` holds.
-        assert!(!step.wizard_may_install());
-        // `run_with_plan` acts only on Install/Disable.
+        // `Skip` is the one step-6 arm with no `run_systemd` behind it —
+        // the other three all reach it, by prompt or by flag. And
+        // `run_with_plan`'s standalone arms act only on Install/Disable.
         assert!(!matches!(
             plan.systemd,
             SystemdPref::Install | SystemdPref::Disable
         ));
     }
 
-    /// `--systemd` is applied by `run_with_plan`, so step 8 must defer rather
-    /// than install a second time.
+    /// `--systemd` and `--systemd --disable` are answers, not deferrals: step
+    /// 6 applies them itself so the daemon is configured before enrollment.
+    /// They used to share one `Deferred` variant, which is why the step could
+    /// not tell an install from a disable.
     #[test]
-    fn systemd_flag_is_deferred_to_run_with_plan() {
-        for pref in [SystemdPref::Install, SystemdPref::Disable] {
+    fn systemd_flags_are_applied_by_the_daemon_step() {
+        for (pref, expected) in [
+            (SystemdPref::Install, SystemdStep::Install),
+            (SystemdPref::Disable, SystemdStep::Disable),
+        ] {
             let plan = SetupPlan {
                 systemd: pref,
                 ..SetupPlan::default()
             };
-            let step = systemd_step_for(&plan);
-            assert_eq!(step, SystemdStep::Deferred);
-            assert!(!step.wizard_may_install());
+            assert_eq!(systemd_step_for(&plan), expected);
         }
+    }
+
+    /// The other half of that move: `run_with_plan` must not repeat what the
+    /// base flow's step 6 already did. Its `--systemd` arms are guarded on
+    /// `plan.base.is_none()`, which only a standalone `facelock setup
+    /// --systemd` satisfies.
+    #[test]
+    fn run_with_plan_applies_systemd_only_without_a_base_flow() {
+        // Standalone: no base flow exists to run step 6.
+        let standalone = resolve_setup_plan(SetupArgs {
+            systemd: true,
+            ..SetupArgs::default()
+        });
+        assert_eq!(standalone.base, None);
+        assert_eq!(standalone.systemd, SystemdPref::Install);
+
+        // Any flag that forces the base flow hands the action to step 6.
+        for args in [
+            SetupArgs {
+                systemd: true,
+                enroll: true,
+                ..SetupArgs::default()
+            },
+            SetupArgs {
+                systemd: true,
+                non_interactive: true,
+                ..SetupArgs::default()
+            },
+        ] {
+            let plan = resolve_setup_plan(args);
+            assert!(plan.base.is_some());
+            assert_eq!(plan.systemd, SystemdPref::Install);
+            assert_eq!(systemd_step_for(&plan), SystemdStep::Install);
+        }
+    }
+
+    /// A daemon-less install enrolls exactly as it did before the reorder.
+    /// `--no-systemd` declines step 6 and nothing else: steps 7 and 8 still
+    /// run, on the direct-access fallback they have always used.
+    #[test]
+    fn no_systemd_still_reaches_enrollment_and_the_test() {
+        let plan = resolve_setup_plan(SetupArgs {
+            no_systemd: true,
+            enroll: true,
+            ..SetupArgs::default()
+        });
+        assert_eq!(plan.base, Some(BaseMode::Wizard));
+        assert_eq!(systemd_step_for(&plan), SystemdStep::Skip);
+
+        let steps = enroll_steps_for(&plan);
+        assert!(steps.enroll, "step 7 runs without a daemon");
+        assert!(steps.assume_yes);
+        assert!(test_recognition_runs(steps, true), "step 8 runs too");
+    }
+
+    /// Oneshot mode wants no daemon started: backend selection never probes
+    /// the bus under it, so the wait would buy the steps below nothing.
+    #[test]
+    fn the_daemon_is_only_started_for_daemon_mode() {
+        use facelock_core::config::DaemonMode;
+        assert!(daemon_start_wanted(&DaemonMode::Daemon));
+        assert!(!daemon_start_wanted(&DaemonMode::Oneshot));
+    }
+
+    /// A second `setup` run must not enroll through the daemon the first run
+    /// left behind: the config the wizard just wrote is only read at startup.
+    /// The verbs are pinned because each is a no-op in the other's state —
+    /// `start` on a running unit is the stale daemon, `try-restart` on a
+    /// stopped one is no daemon at all.
+    #[test]
+    fn an_already_running_daemon_is_restarted_rather_than_left_alone() {
+        assert_eq!(daemon_bring_up_for(true), DaemonBringUp::Restart);
+        assert_eq!(daemon_bring_up_for(true).verb(), "try-restart");
+
+        assert_eq!(daemon_bring_up_for(false), DaemonBringUp::Start);
+        assert_eq!(daemon_bring_up_for(false).verb(), "start");
+    }
+
+    /// `try-restart --no-block` returns when systemd has *queued* the job, so
+    /// the outgoing daemon goes on answering `Ping` for as long as it takes to
+    /// stop it. On the restart branch a ping alone is therefore not evidence:
+    /// the unit's main PID has to have become a different, non-zero one.
+    #[test]
+    fn a_restart_is_only_ready_once_a_different_process_answers() {
+        // The outgoing instance answering its own replacement's wait.
+        assert!(!daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            Some(4242),
+            true
+        ));
+
+        // The successor: a different PID, and answering.
+        assert!(daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            Some(9001),
+            true
+        ));
+
+        // MainPID 0 — nothing is running, whatever answered the bus.
+        assert!(!daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            None,
+            true
+        ));
+
+        // A new process that is not answering yet: still loading its models.
+        assert!(!daemon_ready(
+            DaemonBringUp::Restart,
+            Some(4242),
+            Some(9001),
+            false
+        ));
+
+        // No outgoing PID to tell apart: degrades to the `Start` rule rather
+        // than waiting out the timeout on a daemon that is plainly up.
+        assert!(daemon_ready(DaemonBringUp::Restart, None, Some(9001), true));
+    }
+
+    /// The start branch has no outgoing instance an answer could have come
+    /// from, so the ping is the whole test and the PIDs are not consulted.
+    #[test]
+    fn a_start_is_ready_as_soon_as_the_daemon_answers() {
+        assert!(daemon_ready(DaemonBringUp::Start, None, None, true));
+        assert!(daemon_ready(DaemonBringUp::Start, Some(1), Some(1), true));
+        assert!(!daemon_ready(DaemonBringUp::Start, None, Some(9001), false));
+    }
+
+    /// The notice claims a replacement happened. A `systemctl` that refused
+    /// the job replaced nothing, and a start was never a replacement.
+    #[test]
+    fn only_a_restart_systemd_accepted_is_announced() {
+        assert!(restart_announced(DaemonBringUp::Restart, true));
+        assert!(!restart_announced(DaemonBringUp::Restart, false));
+        assert!(!restart_announced(DaemonBringUp::Start, true));
+        assert!(!restart_announced(DaemonBringUp::Start, false));
     }
 
     // -- `--no-enroll` ------------------------------------------------------
 
-    /// `--no-enroll` suppresses step 6 *and* step 7, which depends on it.
+    /// `--no-enroll` suppresses step 7 *and* step 8, which depends on it.
     #[test]
-    fn no_enroll_suppresses_steps_6_and_7() {
+    fn no_enroll_suppresses_steps_7_and_8() {
         let plan = SetupPlan {
             enroll: Some(false),
             ..SetupPlan::default()
         };
         let steps = enroll_steps_for(&plan);
 
-        assert!(!steps.enroll, "step 6 must not run");
-        // Step 7 is gated on step 6, so it cannot run whatever `enrolled` says.
+        assert!(!steps.enroll, "step 7 must not run");
+        // Step 8 is gated on step 7, so it cannot run whatever `enrolled` says.
         assert!(!test_recognition_runs(steps, true));
         assert!(!test_recognition_runs(steps, false));
     }
@@ -4104,11 +4555,10 @@ mod action_tests {
         let plan = SetupPlan::default();
 
         let steps = enroll_steps_for(&plan);
-        assert!(steps.enroll, "step 6");
-        assert!(!steps.assume_yes, "step 6 still prompts");
-        assert!(test_recognition_runs(steps, true), "step 7");
-        assert_eq!(systemd_step_for(&plan), SystemdStep::Ask, "step 8");
-        assert!(systemd_step_for(&plan).wizard_may_install());
+        assert_eq!(systemd_step_for(&plan), SystemdStep::Ask, "step 6");
+        assert!(steps.enroll, "step 7");
+        assert!(!steps.assume_yes, "step 7 still prompts");
+        assert!(test_recognition_runs(steps, true), "step 8");
         assert_eq!(pam_step_for(&plan), PamStep::Ask, "step 9");
         assert!(pam_step_for(&plan).touches_pam_d());
     }
@@ -4127,7 +4577,7 @@ mod action_tests {
             assert!(confirm_step(&theme, prompt, true).unwrap());
         }
 
-        // `-y` is what feeds `assume_yes` at the step 6 call site; steps 7 and 8
+        // `-y` is what feeds `assume_yes` at the step 7 call site; steps 6 and 8
         // are passed `plan.yes` directly.
         let plan = SetupPlan {
             yes: true,
