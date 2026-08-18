@@ -6,7 +6,8 @@
 //! `-u` on six commands and not on `auth`, `--yes` accepted `--no-confirm` on
 //! `setup` alone. One struct per flag family removes the opportunity: a command
 //! flattens the family or does not offer the flag, and cannot spell it a third
-//! way. `cli_flag_conformance` in `main.rs` fails the build if one tries.
+//! way. `cli_flag_conformance` in `conformance/flags.rs` fails the build if
+//! one tries.
 //!
 //! These types are deliberately bin-private (declared by `main.rs`, absent from
 //! `lib.rs`). Nothing outside the binary consumes clap types.
