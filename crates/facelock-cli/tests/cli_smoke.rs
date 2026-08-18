@@ -145,6 +145,29 @@ fn pam_remove_refuses_before_touching_pam_d_non_root() {
 }
 
 #[test]
+fn tpm_status_refuses_before_opening_database_non_root() {
+    // `tpm status` had no root check at all, so a non-root caller reached
+    // `FaceStore::open_readonly` on the root-only database and got a sqlite
+    // "unable to open database file" error instead of the refusal. The
+    // forbidden list includes that error text: reaching it means the check
+    // is gone again, not merely late.
+    assert_refuses_before_output(
+        &["tpm", "status"],
+        &["TPM Status", "TPM device", "failed to open face database"],
+    );
+}
+
+#[test]
+fn tpm_pcr_baseline_refuses_before_output_non_root() {
+    // `tpm pcr-baseline` also had no root check: it printed its header and
+    // the PCR values and exited 0 for any user. It now refuses and exits 1.
+    assert_refuses_before_output(
+        &["tpm", "pcr-baseline"],
+        &["PCR Baseline", "TPM support not compiled in"],
+    );
+}
+
+#[test]
 fn help_exits_successfully() {
     let output = facelock_bin()
         .arg("--help")

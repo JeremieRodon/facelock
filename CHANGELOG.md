@@ -128,6 +128,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`facelock tpm status` and `facelock tpm pcr-baseline` now require root**,
+  like every other `tpm` verb. Neither checked, which left `status` failing
+  with a raw sqlite "unable to open database file" error when it reached the
+  root-only face database, and left `pcr-baseline` printing its header
+  and PCR values and exiting **0** for an unprivileged caller — that
+  invocation now refuses with `Root required.` and exits **1**. `tpm status`
+  reports key and embedding state read from the face database, so it belongs
+  with `seal-key`/`unseal-key`, not with the world-readable-file probes
+  `pam status` and `capabilities`.
 - **An authentication at an empty chair ends early and costs no rate-limit
   budget** (ADR 008 §3/§4). A new `recognition.no_face_timeout_secs` (default
   **2**) ends an attempt once that many seconds have passed with no face

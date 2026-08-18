@@ -35,7 +35,7 @@ Stable contracts. Do not change without updating this document.
 | `facelock config` | Show/edit configuration |
 | `facelock daemon` | Run persistent daemon |
 | `facelock auth --user X` | One-shot auth (PAM helper). `--user` is required here and only here; `--config` is the global flag, not a per-command one |
-| `facelock tpm status` | TPM status |
+| `facelock tpm status` | TPM status, sealed-key presence and encrypted/plaintext embedding counts. Root, like every `tpm` verb |
 | `facelock hyprlock enable\|disable\|status` | Manage hyprlock lock-screen integration (user, no root); `enable` accepts `--no-icon` to skip the cosmetic face glyph |
 | `facelock encrypt` | Encrypt face database |
 | `facelock decrypt` | Decrypt face database |
