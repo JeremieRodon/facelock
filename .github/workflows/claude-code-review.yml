@@ -1,0 +1,56 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    # No `synchronize`: PRs here iterate through many pushes (stacked PRs,
+    # iterate-pr loops), and a full review per push is mostly noise. Review
+    # once when the PR is ready; ask for another with `@claude review`.
+    # `opened` is kept for the rare PR that opens non-draft.
+    types: [opened, ready_for_review, reopened]
+
+jobs:
+  claude-review:
+    # Same-repo, non-draft PRs only.
+    #   - Fork PRs get no secrets on `pull_request`, and the action rejects
+    #     actors without write access anyway; skip them cleanly instead of
+    #     failing red on the contributor's PR. Never switch this workflow to
+    #     `pull_request_target` to "fix" that: it would hand secrets to forks.
+    #   - PRs open as drafts by convention; reviewing the draft on `opened`
+    #     and again on `ready_for_review` doubles the spend for nothing.
+    if: |
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # The code-review skill hunts for bugs. AGENTS.md is loaded from the
+          # checkout, but it describes how to build the project, not what a
+          # reviewer should treat as a defect. Spell that out here.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
+            --append-system-prompt "This repository is a Linux PAM face-authentication module; a bug here is a security defect.
+            Read AGENTS.md, docs/security.md, and docs/contracts.md before reviewing.
+            Treat changes under crates/facelock-daemon/src (auth, handler, rate limiting, liveness, audit), crates/pam-facelock, crates/facelock-tpm, dbus/, systemd/, and polkit/ as security-sensitive and review them adversarially.
+            Report as findings: any weakening of the security.require_ir default or of frame-variance/liveness checks in the auth path; any change to binary names, install paths, config keys, the D-Bus interface, the database schema, or auth semantics that does not also update docs/contracts.md; any new dependency in pam-facelock beyond libc, toml, serde, zbus; unwrap()/expect()/panic paths in library crates; embedding comparisons that are not constant-time; loosened file permissions, D-Bus policy, or systemd hardening; error paths that fail open.
+            Docs are part of the product: review docs/**, book/**, website/**, man/, and CHANGELOG.md for accuracy against the code, stale contracts, and broken cross-references, not only the Rust."
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
