@@ -65,7 +65,7 @@ in
       SystemdService=facelock-daemon.service
     '';
 
-    # Create facelock group
+    # The facelock system group: the bus policy names it (members may receive AuthAttempted signals); it grants nothing on the auth path (ADR 010).
     users.groups.facelock = { };
 
     # systemd units
@@ -102,14 +102,14 @@ in
     # Must match dist/facelock.tmpfiles.
     systemd.tmpfiles.rules = [
       "d /run/facelock 0755 root facelock -"
-      # 0710 root:facelock = traverse-only for the facelock group, nothing
-      # for anyone else. Parent must come before its children.
-      "d /var/lib/facelock 0710 root facelock -"
-      # Public, SHA256-verified downloads; the 0710 parent is the gate.
+      # 0711 root:root = traversable by everyone, listable by root only
+      # (ADR 010). Parent must come before its children.
+      "d /var/lib/facelock 0711 root root -"
+      # Public, SHA256-verified downloads.
       "d /var/lib/facelock/models 0755 root root -"
-      # Markers only: a group member can open its own 0600 marker by name but
-      # cannot enumerate who else is enrolled.
-      "d /var/lib/facelock/enrolled 0710 root facelock -"
+      # Markers only: a user can open its own 0600 marker by name but cannot
+      # enumerate who else is enrolled.
+      "d /var/lib/facelock/enrolled 0711 root root -"
       # Encrypted biometric templates: root-only. `z` never creates.
       "z /var/lib/facelock/facelock.db 0600 root root -"
       "z /var/lib/facelock/facelock.db-wal 0600 root root -"

@@ -23,7 +23,7 @@ test-all:
 # `--all-targets` is load-bearing, not tidiness: without it clippy skips test,
 # bench and example targets entirely, so a deny-by-default lint in test code
 # never reaches this gate. That matters disproportionately here because file
-# modes ARE a security contract in this project (0600 database, 0710 state
+# modes ARE a security contract in this project (0600 database, 0711 state
 # dir), and `non_octal_unix_permissions` is exactly the lint that catches a
 # `from_mode(600)` — which means 0o1130, not 0o600 — before it ships.
 # Keep in sync with .github/workflows/ci.yml.
@@ -79,10 +79,10 @@ test-arch-pam: _build-test-container
 
 # Automated state-layout test (Arch container, camera-free).
 # Asserts the exact modes and ownership of everything under /var/lib/facelock
-# and /var/log/facelock, including that enrolled/ is traversable but not
-# listable for a facelock group member. This is the only test that exercises
-# the packaging wiring (install-files modes + the built-in defaults) end to
-# end — unit tests cannot.
+# and /var/log/facelock, including that any local user can traverse to its own
+# enrollment marker but list nothing and read no secret. This is the only test
+# that exercises the packaging wiring (install-files modes + the built-in
+# defaults) end to end — unit tests cannot.
 test-arch-layout: _build-test-container
     podman run --rm facelock-pam-test /run-layout-tests.sh
 
@@ -95,9 +95,8 @@ test-arch-layout: _build-test-container
 #   1. the main checkout's models/. A worktree normally lives inside the main
 #      checkout, so this is the same filesystem and the link costs nothing.
 #   2. /var/lib/facelock/models/, where `sudo facelock setup` puts them. The
-#      models are 0644 under a 0755 dir, so reading them needs no sudo — but
-#      /var/lib/facelock itself is 0710 root:facelock, so getting in needs the
-#      facelock group (or root).
+#      models are 0644 under a 0755 dir behind a 0711 state dir, so reading
+#      them by name needs no sudo and no group.
 #
 # Hardlink, never symlink: test/Containerfile does `COPY models/ /build/models/`
 # and podman's COPY does not follow a symlink pointing outside the build
@@ -500,15 +499,14 @@ install-files:
     [ -f target/release/facelock-polkit-agent ] && install -Dm755 target/release/facelock-polkit-agent /usr/bin/facelock-polkit-agent || true
 
     # Directories. Must match dist/facelock.tmpfiles.
-    # State dir 0710 root:facelock: traverse-only for the group, nothing for
-    # anyone else. Models are public, SHA256-verified downloads — the 0710
-    # parent is the gate. enrolled/ 0710 root:facelock: a group member can
-    # open its own 0600 marker by name but cannot list who else is enrolled.
-    # Audit log and snapshots are root-only (per-user auth history and raw
-    # face images).
-    install -dm710 -o root -g facelock /var/lib/facelock
+    # State dir 0711 root:root: traversable by every local user, listable by
+    # root only (ADR 010). Models are public, SHA256-verified downloads.
+    # enrolled/ 0711 root:root: a user can open its own 0600 marker by name
+    # but cannot list who else is enrolled. Audit log and snapshots are
+    # root-only (per-user auth history and raw face images).
+    install -dm711 -o root -g root /var/lib/facelock
     install -dm755 -o root -g root /var/lib/facelock/models
-    install -dm710 -o root -g facelock /var/lib/facelock/enrolled
+    install -dm711 -o root -g root /var/lib/facelock/enrolled
     install -dm700 -o root -g root /var/log/facelock
     install -dm700 -o root -g root /var/log/facelock/snapshots
 
@@ -525,9 +523,9 @@ install-files:
     [ -d /etc/facelock ] && chown root:root /etc/facelock && chmod 755 /etc/facelock || true
     [ -f /etc/facelock/config.toml ] && chown root:root /etc/facelock/config.toml && chmod 644 /etc/facelock/config.toml || true
     [ -f /etc/facelock/config.toml.default ] && chown root:root /etc/facelock/config.toml.default && chmod 644 /etc/facelock/config.toml.default || true
-    [ -d /var/lib/facelock ] && chown root:facelock /var/lib/facelock && chmod 710 /var/lib/facelock || true
+    [ -d /var/lib/facelock ] && chown root:root /var/lib/facelock && chmod 711 /var/lib/facelock || true
     [ -d /var/lib/facelock/models ] && chown root:root /var/lib/facelock/models && chmod 755 /var/lib/facelock/models || true
-    [ -d /var/lib/facelock/enrolled ] && chown root:facelock /var/lib/facelock/enrolled && chmod 710 /var/lib/facelock/enrolled || true
+    [ -d /var/lib/facelock/enrolled ] && chown root:root /var/lib/facelock/enrolled && chmod 711 /var/lib/facelock/enrolled || true
     [ -d /var/log/facelock ] && chown root:root /var/log/facelock && chmod 700 /var/log/facelock || true
     [ -d /var/log/facelock/snapshots ] && chown root:root /var/log/facelock/snapshots && chmod 700 /var/log/facelock/snapshots || true
     [ -f /var/log/facelock/audit.jsonl ] && chown root:root /var/log/facelock/audit.jsonl && chmod 600 /var/log/facelock/audit.jsonl || true

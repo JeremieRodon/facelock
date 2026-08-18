@@ -106,6 +106,9 @@ install -Dm644 LICENSE-APACHE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE-A
 
 %post
 %tmpfiles_create_compat dist/facelock.tmpfiles
+# Bus policy may have changed (ADR 010); ask the bus to re-read it.
+dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
 %systemd_post facelock-daemon.service
 
 echo ""

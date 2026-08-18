@@ -21,13 +21,12 @@ start_pre() {
     checkpath --directory --owner root:facelock --mode 0755 /run/facelock
 
     # checkpath does not create parents, so the state dir comes first.
-    # 0710 root:facelock: traverse-only for the facelock group, nothing for
-    # anyone else.
-    checkpath --directory --owner root:facelock --mode 0710 /var/lib/facelock
-    # Models are public, SHA256-verified downloads; the 0710 parent is the gate.
+    # 0711 root:root: traversable by everyone, listable by root only (ADR 010).
+    checkpath --directory --owner root:root --mode 0711 /var/lib/facelock
+    # Models are public, SHA256-verified downloads.
     checkpath --directory --owner root:root --mode 0755 /var/lib/facelock/models
-    # `facelock is-enrolled` markers: group-traversable, not listable.
-    checkpath --directory --owner root:facelock --mode 0710 /var/lib/facelock/enrolled
+    # `facelock is-enrolled` markers: traversable by all, listable by none.
+    checkpath --directory --owner root:root --mode 0711 /var/lib/facelock/enrolled
 
     # Database and sidecars hold encrypted biometric templates: root-only.
     # Tighten if present, never create.
