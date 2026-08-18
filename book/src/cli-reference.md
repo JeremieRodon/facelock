@@ -394,6 +394,8 @@ reported as "cannot determine" -- never as a guessed value.
 facelock status
 ```
 
+The `PAM services:` line lists every service that carries the facelock line, from the same scan `facelock pam status --all` runs, and marks how many are a local override of a vendor file. It reads `none configured` only when every directory was read; when one could not be, it reads `not checked` and names the place on a line of its own, because "nothing is configured" and "I could not look" are different answers.
+
 ## facelock config
 
 Show or edit the configuration file. Bare `facelock config` is `facelock config show`.
@@ -612,9 +614,11 @@ facelock pam status                                          # /etc/pam.d/sudo
 facelock pam status --service sudo --service polkit-1
 facelock pam status --service sudo --json
 facelock pam status --service hyprlock --if-present           # absent is not an error
+facelock pam status --all                                     # everything configured
+facelock pam status --all --json
 ```
 
-Unprivileged, and the probe to branch on instead of grepping `/etc/pam.d` yourself: it answers from the same file, without root, and reports "absent" and "unreadable" as themselves rather than as "not configured". It offers `--service`, `--if-present` and `--json`, and neither `--dry-run` nor `--allow-sensitive` — there is no write to preview or gate.
+Unprivileged, and the probe to branch on instead of grepping `/etc/pam.d` yourself: it answers from the same file, without root, and reports "absent" and "unreadable" as themselves rather than as "not configured". It offers `--service`, `--all`, `--if-present` and `--json`, and neither `--dry-run` nor `--allow-sensitive` — there is no write to preview or gate.
 
 The exit code is the answer, on the same 0/1/2 scale as `is-enrolled` and `grep`:
 
@@ -630,9 +634,15 @@ Across several services the worst outcome wins. `--if-present` means here what i
 {"command":"status","dry_run":false,"module_path":"/lib/security/pam_facelock.so","services":[{"action":"present","backup":null,"path":"/etc/pam.d/sudo","service":"sudo"}]}
 ```
 
+A service whose file is a local copy hiding a package's own of the same name reads `facelock PAM line present (local override of <vendor path>)` rather than `facelock PAM line present`, and its JSON row carries a `shadows` key naming that file. It is configured either way; the note says the copy will not follow the package's updates. This is a property of the row, so it appears with `--service` as it does with `--all`, and on `pam add` and `pam remove` rows too.
+
 `module_path` is where `pam_facelock.so` was found, or `null` when no candidate hit — a property of the machine rather than of a service, and what tells an integrator that a service carries the line while the module it names is at a path nothing looks at. `add` and `remove` refuse before writing when the module is missing, so their documents do not carry the key.
 
 The document's shape and the `action` vocabulary are a stability contract, including the rule that a consumer must tolerate an `action` it does not recognize rather than treat it as an error. See `docs/contracts.md`, "facelock pam Semantics", for that, for the `add`/`remove` exit codes, and for what `--json` does on a validation failure.
+
+`--all` answers the other question: not "is this name configured?" but "what is configured on this machine?". It replaces `--service` (the two conflict) with every service in the resolved directories whose file names `pam_facelock.so`, so a `polkit-1` or an `omarchy-lock-face` nobody thought to ask about is reported. It scans rather than reading a list of what facelock has edited, because such a list drifts the moment `/etc/pam.d` is edited by hand.
+
+Nothing configured exits 1 — a machine with no facelock line anywhere is not configured — and `--if-present` does not convert that, since a name reaches the report by having been found and there is no absent case to forgive. A directory that could not be listed exits 2 and is named, rather than reported as holding nothing; a directory that does not exist is neither, because it demonstrably holds no service files. `--all --json` adds a `directories` key listing every directory searched with a `status` of `scanned`, `absent` or `unreadable`. The "nothing is configured" sentence is scoped to the directories that were read and names the rest as unread in the same breath, so taking the human answer with `2>/dev/null` cannot turn "I could not look" into "nothing is there". Only regular files are read — a FIFO, socket, device node or symlink to a directory is skipped rather than opened, since reading a FIFO blocks until a writer appears — and an entry whose name is not valid UTF-8 is skipped and logged. The one `absent` row `--all` can produce is a file deleted between the listing and the read.
 
 ## facelock hyprlock
 

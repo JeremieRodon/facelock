@@ -208,6 +208,45 @@ pub enum PamMessage {
         path: String,
         error: String,
     },
+
+    // -- `pam status --all` (P3) -------------------------------------------
+    /// `status`: the service carries the line, and the file it carries it in
+    /// is a local copy hiding a package's own. Configured, with the
+    /// maintenance consequence named — the override will not follow the
+    /// vendor file's updates.
+    PamStatusOverride {
+        path: String,
+        vendor: String,
+    },
+    /// A directory on the search path that could not be listed. **Not** the
+    /// same as one that held nothing: this says the answer is incomplete, and
+    /// `--all` exits 2 rather than claiming a service count it could not
+    /// count.
+    PamStatusDirUnreadable {
+        dir: String,
+        error: String,
+    },
+    /// `--all` found nothing. Names the directories, so "none" is an answer
+    /// about somewhere rather than a bare word.
+    PamStatusNoServices {
+        dirs: String,
+    },
+    /// `--all` found nothing **and** could not read everywhere. The same
+    /// sentence as [`PamMessage::PamStatusNoServices`] would be a claim about
+    /// a directory that was never opened, which is the confusion the whole
+    /// flag exists to remove — so the emptiness is scoped to what was read and
+    /// the rest is named in the same breath.
+    PamStatusNoServicesIncomplete {
+        dirs: String,
+        unchecked: String,
+    },
+    /// `--all` could not read **any** directory on the search path. There is
+    /// no set of directories an emptiness could be scoped to, so this asserts
+    /// only what is true; it exists so stdout carries a line in every branch
+    /// rather than falling silent exactly when the machine is worst off.
+    PamStatusNothingReadable {
+        dirs: String,
+    },
 }
 
 impl Message for PamMessage {
@@ -448,6 +487,28 @@ impl Message for PamMessage {
                 translate("{path}: unreadable ({error})"),
                 &[("path", path.clone()), ("error", error.clone())],
             ),
+            PamStatusOverride { path, vendor } => fill(
+                translate("{path}: facelock PAM line present (local override of {vendor})"),
+                &[("path", path.clone()), ("vendor", vendor.clone())],
+            ),
+            PamStatusDirUnreadable { dir, error } => fill(
+                translate("{dir}: directory not checked ({error})"),
+                &[("dir", dir.clone()), ("error", error.clone())],
+            ),
+            PamStatusNoServices { dirs } => fill(
+                translate("No service file under {dirs} carries the facelock PAM line."),
+                &[("dirs", dirs.clone())],
+            ),
+            PamStatusNoServicesIncomplete { dirs, unchecked } => fill(
+                translate(
+                    "No service file under {dirs} carries the facelock PAM line, but {unchecked} could not be checked, so this is not an answer about the whole machine.",
+                ),
+                &[("dirs", dirs.clone()), ("unchecked", unchecked.clone())],
+            ),
+            PamStatusNothingReadable { dirs } => fill(
+                translate("No directory on the search path could be read: {dirs}."),
+                &[("dirs", dirs.clone())],
+            ),
         }
     }
 }
@@ -460,7 +521,7 @@ impl Message for PamMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for PamMessage {
-    const VARIANT_COUNT: usize = 42;
+    const VARIANT_COUNT: usize = 47;
 
     fn samples() -> Vec<Self> {
         use PamMessage::*;
@@ -568,6 +629,24 @@ impl super::Samples for PamMessage {
             PamStatusUnknown {
                 path: s("/p"),
                 error: s("e"),
+            },
+            PamStatusOverride {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+            },
+            PamStatusDirUnreadable {
+                dir: s("/etc/pam.d"),
+                error: s("Permission denied (os error 13)"),
+            },
+            PamStatusNoServices {
+                dirs: s("/etc/pam.d, /usr/lib/pam.d"),
+            },
+            PamStatusNoServicesIncomplete {
+                dirs: s("/etc/pam.d"),
+                unchecked: s("/usr/lib/pam.d"),
+            },
+            PamStatusNothingReadable {
+                dirs: s("/etc/pam.d, /usr/lib/pam.d"),
             },
         ]
     }

@@ -312,6 +312,12 @@ the target user's
 .B is\-enrolled
 marker agrees with the database. Requires root. A check that cannot be
 performed is reported as such; the report never substitutes a guessed value.
+The \fBPAM services\fR line lists every service that carries the facelock
+line, from the same scan
+.B "facelock pam status \-\-all"
+runs, and marks how many are a local override of a vendor file. It reads
+\fBnone configured\fR only when every directory was read; when one could not
+be, it reads \fBnot checked\fR and names the place on a line of its own.
 .TP
 .B devices
 List available camera devices.
@@ -481,12 +487,34 @@ Report whether services carry the line. Reads only and needs
 .B no
 root: this is the probe to branch on instead of grepping
 .I /etc/pam.d
-yourself. Offers \fB\-\-service\fR, \fB\-\-if\-present\fR and
+yourself. Offers \fB\-\-service\fR, \fB\-\-all\fR,
+\fB\-\-if\-present\fR and
 \fB\-\-json\fR, and neither
 \fB\-\-dry\-run\fR nor \fB\-\-allow\-sensitive\fR \(em there is no write
 to preview or gate. \fB\-\-if\-present\fR means what it means on
 \fBadd\fR and \fBremove\fR: an absent service file is reported and no longer
-forces exit 2. The exit status is the answer; see
+forces exit 2. \fB\-\-all\fR answers the other question \(em not "is this
+name configured?" but "what is configured on this machine?" \(em by replacing
+the service list (the two conflict) with every service in the resolved
+directories whose file names \fBpam_facelock.so\fR, so a \fBpolkit\-1\fR
+nobody thought to ask about is reported. It scans rather than reading a list of
+what facelock has edited, since such a list drifts the moment
+.I /etc/pam.d
+is edited by hand. A directory that could not be listed is named and exits 2
+rather than reported as holding nothing, and the "nothing is configured"
+sentence is scoped to the directories that were read, so taking the human
+answer with \fB2>/dev/null\fR cannot turn "I could not look" into "nothing is
+there"; a directory that does not exist is neither case, because it
+demonstrably holds no service files. Only regular files are read \(em a FIFO,
+socket, device node or symlink to a directory is skipped rather than opened,
+since reading a FIFO blocks until a writer appears \(em and an entry whose name
+is not valid UTF\-8 is skipped and logged. A service whose file is a local copy
+hiding a package's own of the same name reads
+.B "(local override of \fIpath\fB)"
+and carries a \fBshadows\fR key in \fB\-\-json\fR; that is a property of
+the row, so it appears with \fB\-\-service\fR too, and on \fBadd\fR and
+\fBremove\fR rows. The exit status is the
+answer; see
 .B EXIT STATUS
 below.
 .RE
@@ -633,6 +661,15 @@ At least one is absent, unreadable, misnamed, hard\-linked, or symlinked out of
 With \fB\-\-if\-present\fR an absent service file no longer forces this, and
 the status is decided by the services that do exist \(em absence only, so a
 dangling or looping symlink is still 2.
+.PP
+.B "facelock pam status \-\-all"
+uses the same scale about the machine rather than about a service list: 0 when
+at least one service carries the line and every directory was read, 1 when
+nothing carries it or an enumerated service has no line in the file Linux\-PAM
+reads, and 2 when a directory could not be listed or an enumerated service
+could not be answered for. \fB\-\-if\-present\fR does not change it \(em a
+name reaches the report by having been found, so there is no absent case to
+forgive, apart from a file deleted between the listing and the read.
 .PP
 .B facelock capabilities
 always exits 0 \(em it has no failure mode. A build too old to have the command

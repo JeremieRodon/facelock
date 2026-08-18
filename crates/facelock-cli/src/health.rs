@@ -42,6 +42,9 @@ pub const AUTH_BIN: &str = "/usr/bin/facelock";
 /// lists that drift apart is exactly the bug `status` would then fail to
 /// report (#170).
 pub use crate::commands::pam::PAM_MODULE_PATHS;
+pub use crate::commands::pam::{ConfiguredService, NotChecked};
+
+use crate::commands::pam::{PamDirs, configured_scan};
 
 /// The `why` shared by every fact that cannot be probed without a parsed
 /// config.
@@ -98,7 +101,7 @@ impl Health {
                 enrolled: Fact::unknown(config_not_available()),
                 security: Fact::unknown(config_not_available()),
                 notifications: Fact::unknown(config_not_available()),
-                pam: probe_pam(),
+                pam: probe_pam(loaded),
             };
         };
 
@@ -123,7 +126,7 @@ impl Health {
             enrolled: probe_enrolled(config, &user),
             security: Fact::claimed(SecurityHealth::from_config(config)),
             notifications: Fact::claimed(NotificationHealth::from_config(config)),
-            pam: probe_pam(),
+            pam: probe_pam(loaded),
             models: Fact::probed(models),
             user,
         }
@@ -507,17 +510,44 @@ pub struct PamWiring {
     pub module_path: String,
     /// Where the module was actually found, if anywhere.
     pub installed_at: Option<String>,
-    /// Whether `/etc/pam.d/sudo` names `pam_facelock`; `None` when there is
-    /// no readable sudo service file to inspect.
-    pub sudo_configured: Option<bool>,
+    /// Every service on the search path that carries the facelock line.
+    ///
+    /// A list rather than the single `sudo_configured: Option<bool>` this
+    /// replaces: that field could not report a configured `polkit-1` or
+    /// `omarchy-lock-face` at all, because it stat-ed `/etc/pam.d/sudo` and
+    /// nothing else. Empty means nothing is configured **where the scan could
+    /// look**, which is only the whole answer when [`PamWiring::not_checked`]
+    /// is empty too.
+    pub configured: Vec<ConfiguredService>,
+    /// Where the scan could not get an answer: a directory it could not list,
+    /// or a service file it could not read.
+    ///
+    /// The module header's rule, applied to PAM: an unknown is never rendered
+    /// as a value. `configured` being empty while this is not means "I could
+    /// not look", which is a different report line from "nothing is
+    /// configured" — and rendering the two identically is what made a broken
+    /// lock stack and a healthy one look the same.
+    pub not_checked: Vec<NotChecked>,
 }
 
-fn probe_pam() -> PamWiring {
+fn probe_pam(loaded: &ConfigLoad) -> PamWiring {
     let paths: Vec<PathBuf> = PAM_MODULE_PATHS.iter().map(PathBuf::from).collect();
-    probe_pam_at(&paths, Path::new("/etc/pam.d/sudo"))
+    // The config is already parsed here, so the search path comes off the
+    // value rather than through `PamDirs::system`, which would open the file a
+    // second time. A config that did not parse yields the default list, which
+    // is what makes this section config-independent.
+    let dirs = loaded
+        .config()
+        .map_or_else(PamDirs::default, PamDirs::from_config);
+    probe_pam_at(&paths, &dirs)
 }
 
-fn probe_pam_at(module_paths: &[PathBuf], sudo_pam: &Path) -> PamWiring {
+fn probe_pam_at(module_paths: &[PathBuf], dirs: &PamDirs) -> PamWiring {
+    // `commands::pam::configured_scan`, not a local reimplementation: it is
+    // the same scan `pam status --all` runs, down to the row builder, so
+    // `facelock status` cannot claim a service is configured where
+    // `pam status` says it is not.
+    let scan = configured_scan(dirs);
     PamWiring {
         module_path: module_paths
             .first()
@@ -527,9 +557,8 @@ fn probe_pam_at(module_paths: &[PathBuf], sudo_pam: &Path) -> PamWiring {
             .iter()
             .find(|p| p.exists())
             .map(|p| p.display().to_string()),
-        sudo_configured: std::fs::read_to_string(sudo_pam)
-            .ok()
-            .map(|content| content.contains("pam_facelock")),
+        configured: scan.services,
+        not_checked: scan.not_checked,
     }
 }
 
@@ -914,35 +943,106 @@ mod tests {
         let primary = dir.path().join("lib/security/pam_facelock.so");
         let alt = dir.path().join("usr/lib/security/pam_facelock.so");
         let paths = vec![primary.clone(), alt.clone()];
-        let sudo = dir.path().join("pam.d/sudo");
+        let pam_d = dir.path().join("pam.d");
+        fs::create_dir_all(&pam_d).unwrap();
+        let dirs = PamDirs::new(vec![pam_d.clone()]);
 
-        let wiring = probe_pam_at(&paths, &sudo);
+        let wiring = probe_pam_at(&paths, &dirs);
         assert_eq!(wiring.module_path, primary.display().to_string());
         assert_eq!(wiring.installed_at, None);
-        assert_eq!(wiring.sudo_configured, None, "no sudo file: nothing to say");
 
         fs::create_dir_all(alt.parent().unwrap()).unwrap();
         fs::write(&alt, b"elf").unwrap();
-        let wiring = probe_pam_at(&paths, &sudo);
+        let wiring = probe_pam_at(&paths, &dirs);
         assert_eq!(wiring.installed_at, Some(alt.display().to_string()));
 
         fs::create_dir_all(primary.parent().unwrap()).unwrap();
         fs::write(&primary, b"elf").unwrap();
-        let wiring = probe_pam_at(&paths, &sudo);
+        let wiring = probe_pam_at(&paths, &dirs);
         assert_eq!(
             wiring.installed_at,
             Some(primary.display().to_string()),
             "the primary path wins when both exist"
         );
+    }
 
-        fs::create_dir_all(sudo.parent().unwrap()).unwrap();
-        fs::write(&sudo, b"auth sufficient pam_facelock.so\n").unwrap();
-        let wiring = probe_pam_at(&paths, &sudo);
-        assert_eq!(wiring.sudo_configured, Some(true));
+    /// The defect this section replaces: the probe stat-ed `/etc/pam.d/sudo`
+    /// and nothing else, so a configured `polkit-1` or `omarchy-lock-face` was
+    /// invisible to `facelock status` however correctly it was wired up.
+    #[test]
+    fn the_pam_probe_reports_every_configured_service_not_just_sudo() {
+        let dir = tempfile::tempdir().unwrap();
+        let pam_d = dir.path().join("pam.d");
+        fs::create_dir_all(&pam_d).unwrap();
+        fs::write(pam_d.join("sudo"), b"auth sufficient pam_facelock.so\n").unwrap();
+        fs::write(
+            pam_d.join("omarchy-lock-face"),
+            b"auth sufficient pam_facelock.so\n",
+        )
+        .unwrap();
+        fs::write(pam_d.join("login"), b"auth include system-auth\n").unwrap();
 
-        fs::write(&sudo, b"auth include system-auth\n").unwrap();
-        let wiring = probe_pam_at(&paths, &sudo);
-        assert_eq!(wiring.sudo_configured, Some(false));
+        let wiring = probe_pam_at(&[], &PamDirs::new(vec![pam_d.clone()]));
+
+        let names: Vec<&str> = wiring
+            .configured
+            .iter()
+            .map(|service| service.service.as_str())
+            .collect();
+        assert_eq!(names, ["omarchy-lock-face", "sudo"]);
+        assert_eq!(
+            wiring.configured[1].path,
+            pam_d.join("sudo").display().to_string()
+        );
+        assert!(wiring.not_checked.is_empty());
+    }
+
+    /// An `/etc` copy of a package's file is configured **and** carries the
+    /// vendor path it hides, which is what says it will not follow the
+    /// package's updates.
+    #[test]
+    fn a_local_override_carries_the_vendor_path_it_shadows() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        let vendor = dir.path().join("vendor");
+        fs::create_dir_all(&etc).unwrap();
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("polkit-1"), b"auth include system-auth\n").unwrap();
+        fs::write(etc.join("polkit-1"), b"auth sufficient pam_facelock.so\n").unwrap();
+
+        let wiring = probe_pam_at(&[], &PamDirs::new(vec![etc.clone(), vendor.clone()]));
+
+        assert_eq!(wiring.configured.len(), 1);
+        assert_eq!(
+            wiring.configured[0].shadows,
+            Some(vendor.join("polkit-1").display().to_string())
+        );
+    }
+
+    /// **Unknown is never guessed** (the module header's rule): a directory
+    /// the probe could not read is reported as unchecked rather than folded
+    /// into "nothing configured". Skipped as root, which ignores the mode
+    /// bits.
+    #[test]
+    fn an_unreadable_directory_is_not_checked_rather_than_not_configured() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pam_d = dir.path().join("pam.d");
+        fs::create_dir_all(&pam_d).unwrap();
+        fs::set_permissions(&pam_d, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let wiring = probe_pam_at(&[], &PamDirs::new(vec![pam_d.clone()]));
+
+        assert!(wiring.configured.is_empty());
+        assert_eq!(wiring.not_checked.len(), 1);
+        assert_eq!(wiring.not_checked[0].path, pam_d.display().to_string());
+        assert!(!wiring.not_checked[0].error.is_empty());
+
+        fs::set_permissions(&pam_d, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     // -----------------------------------------------------------------------

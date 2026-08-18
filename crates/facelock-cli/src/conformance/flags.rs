@@ -637,7 +637,12 @@ fn cli_flag_conformance() {
                         "`{path} --yes` must accept the historical `--no-confirm`"
                     );
                 }
-                "json" | "dry_run" => {
+                // `--all` widens what a command reports rather than how it is
+                // spelled, and it is the sort of flag a later command would
+                // reach for too, so the letter it must not spend is pinned
+                // here beside `--json`'s rather than left to SHORT_REGISTRY's
+                // default refusal.
+                "json" | "dry_run" | "all" => {
                     assert_eq!(
                         arg.get_short(),
                         None,
@@ -850,6 +855,12 @@ fn legacy_invocations_still_parse() {
         &["facelock", "pam", "status"],
         &["facelock", "pam", "status", "--service", "sudo", "--json"],
         &["facelock", "--quiet", "pam", "status", "--json"],
+        // P3's `--all`. Additive in the same way: a bare `pam status` still
+        // means `sudo`, so no invocation above changes meaning.
+        &["facelock", "pam", "status", "--all"],
+        &["facelock", "pam", "status", "--all", "--json"],
+        &["facelock", "pam", "status", "--all", "--if-present"],
+        &["facelock", "--quiet", "pam", "status", "--all", "--json"],
         // ADR 009. The bare forms are what five init-system units and
         // `commands::setup::run_systemd`'s `ExecStart` marker invoke, and
         // what a reader types; the explicit forms are the new spellings.
@@ -1021,6 +1032,47 @@ fn remove_and_status_do_not_offer_allow_sensitive() {
         &["facelock", "pam", "remove", "--allow-sensitive"][..],
         &["facelock", "pam", "status", "--allow-sensitive"],
         &["facelock", "pam", "status", "--dry-run"],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "`{}` must not parse",
+            argv.join(" ")
+        );
+    }
+}
+
+/// `--all` is `status`-only, takes no `--service`, and leaves the bare form
+/// alone.
+///
+/// The last clause is the compatibility one: `pam status` with no flags has
+/// meant `sudo` since the verb shipped, and its exit code is 0/1/2 about that
+/// one service. Enumerating instead would have changed an integrator's answer
+/// without changing their command line, which is why `--all` is a flag rather
+/// than a new default (docs/contracts.md, "facelock pam Semantics").
+#[test]
+fn all_is_a_status_only_flag_and_leaves_the_bare_form_alone() {
+    assert!(pam_request(&["status", "--all"]).all);
+    assert!(pam_request(&["status", "--all", "--json"]).json);
+
+    let bare = pam_request(&["status"]);
+    assert!(!bare.all, "bare `pam status` must still mean one service");
+    assert!(
+        bare.services.is_empty(),
+        "...resolved to sudo in the command"
+    );
+
+    // `--if-present` composes: the pair is documented as answering
+    // "everything configured, and absence is not an error".
+    assert!(pam_request(&["status", "--all", "--if-present"]).if_present);
+
+    for argv in [
+        // Enumerating and naming are two questions; a request that did both
+        // would have to drop one silently.
+        &["facelock", "pam", "status", "--all", "--service", "sudo"][..],
+        // A write verb has nothing to enumerate: `add --all` would have to
+        // mean "edit every service file on the machine".
+        &["facelock", "pam", "add", "--all"],
+        &["facelock", "pam", "remove", "--all"],
     ] {
         assert!(
             Cli::try_parse_from(argv).is_err(),

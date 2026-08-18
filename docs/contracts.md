@@ -451,6 +451,10 @@ validation phase, before any prompt exists to skip, so an unattended
 | `pam status --if-present` | 0 | every requested service **that exists** carries the line |
 | `pam status --if-present` | 1 | at least one existing service carries no line |
 | `pam status --if-present` | 2 | as above, minus the absent case, which no longer forces 2 |
+| `pam status --all` | 0 | at least one service carries the line, and every directory was read |
+| `pam status --all` | 1 | nothing on the machine carries it, or an enumerated service has no line in the file Linux-PAM reads |
+| `pam status --all` | 2 | a directory could not be listed, or an enumerated service could not be answered for |
+| `pam status --all --if-present` | 0/1/2 | unchanged from `--all`: an enumerated name was found, so there is no absent case to forgive |
 | `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `overridden` (`add` created the `/etc/pam.d` copy), `vendor-only` (`remove` had nothing of its own to take out of a package-owned file), `absent` under `--if-present`, and `declined` |
 | `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure |
 
@@ -477,6 +481,89 @@ exist. That is what lets "install the optional integrations with
 `--if-present`, then verify" be written as a pair. It converts *absence* and
 nothing else — an unreadable file, a rejected name, or a link out of the
 directory is still an error on every verb.
+
+**`pam status --all` reports every configured service; a bare `pam status`
+still means `sudo`.** Without `--all` the command answers only about names it is
+given, so a configured `polkit-1` or `omarchy-lock-face` is invisible to it.
+`--all` replaces the service list with every service in the resolved
+directories whose file names `pam_facelock.so`. It is a flag rather than a new
+default because a bare `pam status` exits 0/1/2 *about `sudo`* today, and an
+integrator branching on that would have got a different answer without changing
+a command line. `--all` and `--service` are mutually exclusive: enumerating and
+naming are two questions, and a request that asked both would have to drop one
+silently.
+
+**The scan parses; it keeps no manifest.** A state file listing what facelock
+has edited drifts the moment anyone edits `/etc/pam.d` by hand, restores a
+backup, or removes a package, and the report is then confidently wrong. Names
+are collected across every directory and then resolved through the rules above,
+so `--all` and `--service X` cannot answer differently about one service. Four
+consequences:
+
+- a **vendor file carrying the line while an `/etc` file shadows it without
+  one** is reported `missing`. The file Linux-PAM reads has no line in it, and
+  dropping the name would hide the one machine an operator cannot otherwise
+  explain.
+- an entry the resolver refuses (symlinked out of its directory, hard-linked)
+  is an `unknown` row with its usual reason: never followed, never dropped.
+- a service file that could not be **read** is an `unknown` row too. Omitting it
+  would report "not configured" for a machine this could not check.
+- `.facelock-backup`, `.pacnew`, `.pacsave`, `.pacorig`, `.rpmnew`, `.rpmsave`,
+  `.rpmorig`, `.dpkg-old`, `.dpkg-new`, `.dpkg-dist`, names ending in `~`, and
+  dotfiles are not services. Each can carry the line, and none is a name
+  Linux-PAM is ever asked for.
+- only a **regular file** is read. A FIFO blocks the read until a writer
+  appears, and a diagnostic command that hangs on a malformed `/etc/pam.d` is
+  worse than one that omits an entry no PAM stack could use; device nodes,
+  sockets and symlinks to directories go the same way. The check is on the
+  *followed* metadata, since a symlink is how a non-regular file reaches the
+  scan. **"Not a regular file" and "could not be examined" are different
+  answers, and only the first is a skip**: an entry whose `stat` fails — a
+  symlink into a directory the caller may not traverse, a symlink loop, a dead
+  network mount — is carried into the report as `unknown`, the same answer
+  `--service` gives for it. The one exception is `ENOENT`, which is an absence
+  and is skipped like any other file that is not there; a dangling symlink is
+  therefore absent from an `--all` report while `--service` on the same name
+  reports `unknown`, because a link pointing at nothing carries no facelock
+  line but is still an entry the writer refuses to follow.
+- an entry whose name is not valid UTF-8 is skipped and logged. Spelling it
+  lossily would hand the resolver a name no file has and report a configured
+  service as `absent` at a path that does not exist.
+
+**A directory that could not be listed is reported, not treated as empty.**
+"Nothing is configured here" and "I could not look here" are different answers,
+and rendering them identically is what made a broken lock stack and a healthy
+one look the same. Every directory searched appears in the `--all` document
+with a `status` of `scanned`, `absent` or `unreadable`, and an `unreadable` one
+makes the exit code 2 whatever the services said. An **absent** directory is
+not an error: one that does not exist demonstrably holds no service files, and
+the default search path names a vendor directory many machines lack, so
+treating that as unanswerable would make every one of them exit 2 forever.
+
+**Nothing configured is exit 1.** A machine with no facelock line anywhere is
+not configured, which is the answer `pam status` already gives for a service
+file with no line in it. `--if-present` does not change it. A name reaches an
+`--all` report by having been found, so there is nothing for the flag to
+forgive, and `pam status --all --if-present` on an unconfigured machine exits 1
+like the bare form. One state produces an `absent` row anyway: a file deleted
+between the listing and the read. It is the only one, and `--if-present` scores
+it 0 there as everywhere else.
+
+**The empty answer is scoped to what could be read.** "No service file under
+these directories carries the line" is a claim, and it may only name directories
+that were listed or proven not to exist. When some directory could not be read,
+the sentence names the ones that could and says in the same breath which could
+not; when *none* could be read there is no set to make the claim about, so only
+the per-directory lines are printed. Without that scoping the sentence read
+under `2>/dev/null` asserts exactly what `--all` exists to stop it asserting.
+
+**`facelock status` summarizes the same scan.** Its report carries one
+`PAM services:` line built by running the scan above, so the two commands
+cannot disagree about whether a service is configured. The detailed listing
+stays in `pam status --all`. The summary keeps the "not checked" distinction:
+it reads `none configured` only when every directory was read, `not checked`
+when nothing was found and something could not be, and it names each unread
+place on a `not checked:` line of its own.
 
 **Every write is atomic.** A temp file in the destination's own directory,
 `fsync`, then a rename — so a reader sees the old file or the new one and never
@@ -545,10 +632,36 @@ that the line is present but names a module at a path nothing looks at. `add`
 and `remove` refuse before writing when the module is missing, so their
 documents do not carry the key.
 
+`pam status --all --json` carries a second additive top-level key,
+`directories`: every directory searched, in search order, each an object with
+`path` and a `status` of `scanned`, `absent` or `unreadable`, and `error` on an
+unreadable one. Only `--all` carries it, because only `--all` claims to have
+looked everywhere; a named request resolves through the search path without
+enumerating it.
+
+A service object carries `shadows` when the file it names is a local copy
+hiding a package's own: the value is the vendor path it hides. The key is
+**absent** rather than `null` when nothing is shadowed, which is every row on a
+machine with no vendor directory. It is a maintenance fact rather than a state
+one, since the service is `present` either way, and it says the copy will not
+follow the package's updates.
+
+**`shadows` is a property of the row, not of a flag or a verb.** It appears on
+any row whose file hides a vendor one — `pam status` with `--service` as well as
+with `--all`, and `pam add` and `pam remove` alike — because one resolver
+answers for every verb and a row that knows the fact does not withhold it. On an
+`overridden` row it is the vendor file the copy was made from, which is what
+that row has just started shadowing. The human line gained the same fact at the
+same time: a configured service whose file shadows a vendor one reads
+`facelock PAM line present (local override of <path>)` instead of
+`facelock PAM line present`, on every form of `pam status`. Exit codes are
+unchanged by it.
+
 **This shape is a stability contract.** An object rather than a bare array so a
 new top-level field is additive. Field names do not change and are not removed;
 `service`, `path`, `action` and `backup` are always present on every service
-object, and `error` is present when `action` is `failed` or `unknown`. **`error` is a
+object; `error` is present when `action` is `failed` or `unknown`, and
+`shadows` when the file the row names hides a vendor one. **`error` is a
 diagnostic, not a contract** — branch on `action`, never on `error`'s text. A
 rejected service name reports the fixed C-locale string `invalid service name`,
 a service symlinked out of the directory it was found in
@@ -680,6 +793,7 @@ that is not on this list is not being denied, only not yet promised.
 | `pam-json` | `pam add`/`pam remove`/`pam status` accept `--json` |
 | `pam-multi-service` | `pam add`/`pam remove`/`pam status` take a repeatable `--service` — several services in one process, one root check |
 | `pam-status` | `pam status` exists — the unprivileged `/etc/pam.d` read (DEC-6 below) |
+| `pam-status-all` | `pam status --all` exists, and conflicts with `--service` — the enumerating form, which answers "what is configured on this machine?" rather than "is this name configured?" |
 | `quiet` | the global `--quiet` |
 | `setup-if-present` | `setup --pam --if-present`, on add and on `--remove` alike |
 | `setup-no-pam` | `setup --no-pam` |

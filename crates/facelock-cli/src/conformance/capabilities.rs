@@ -103,6 +103,20 @@ fn capability_names_are_all_implemented() {
             "pam-status" => {
                 sub(pam, "status");
             }
+            // The flag exists on `status` and nowhere else. That it *conflicts*
+            // with `--service` is not askable of an `Arg` — clap exposes no
+            // getter for conflicts — so it is proved by parsing, in
+            // `flags.rs`'s `all_is_a_status_only_flag_and_leaves_the_bare_form_alone`.
+            "pam-status-all" => {
+                assert_long(sub(pam, "status"), "all", "all");
+                for verb in ["add", "remove"] {
+                    assert!(
+                        !sub(pam, verb).get_arguments().any(|a| a.get_id() == "all"),
+                        "`pam {verb}` must not offer --all: a write verb has \
+                         nothing to enumerate"
+                    );
+                }
+            }
             "quiet" => {
                 assert_long(&root, "quiet", "quiet");
                 assert!(
