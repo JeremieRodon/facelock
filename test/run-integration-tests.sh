@@ -306,12 +306,11 @@ run_test "Rate limit: clear seeded attempts" \
 
 # --- D-Bus hardening assertions (security plan 06) ---
 
-# sigwatcher: unprivileged, NOT in the facelock group — a plain local user
-# under ADR 010 (may call Authenticate for itself, receives no signals).
-# testuser: added to the facelock group (may receive signals; the group grants
-# nothing else).
+# ADR 010 left no groups: testuser is just an enrolled local user and
+# sigwatcher an unenrolled one, and neither is a member of anything facelock
+# knows about. Both may call Authenticate for themselves and nothing else;
+# only root receives AuthAttempted.
 useradd -m sigwatcher 2>/dev/null || true
-usermod -aG facelock testuser
 
 # (a) Signal hardening — needs the daemon up plus one auth attempt to emit
 # the signal. Unprivileged users must not receive AuthAttempted, and the
@@ -338,11 +337,11 @@ run_test "Unprivileged user receives no AuthAttempted signal" \
     "! grep -q 'member=AuthAttempted' /tmp/sig-unpriv.log"
 
 # (a2) ADR 010: Authenticate is open to every local user for its own username
-# and nothing else is. sigwatcher is not enrolled and not in the group, so its
-# own Authenticate is answered by the enrollment pre-check (model_id -1, or -3
-# under suppress_unknown) without opening the camera; naming another user is
-# refused by the daemon; Ping is refused by the bus.
-run_test_contains "Non-member Authenticate for own user reaches the daemon (no model)" \
+# and nothing else is. sigwatcher is not enrolled, so its own Authenticate is
+# answered by the enrollment pre-check (model_id -1, or -3 under
+# suppress_unknown) without opening the camera; naming another user is refused
+# by the daemon; Ping is refused by the bus.
+run_test_contains "A plain local user's Authenticate for its own user reaches the daemon (no model)" \
     "runuser -u sigwatcher -- dbus-send --system --print-reply --reply-timeout=30000 --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:sigwatcher" \
     "int32 -[13]"
 
@@ -361,9 +360,9 @@ check_denied_as() {
     echo "$out" | grep -qi "AccessDenied" || return 1
     return 0
 }
-run_test "Non-member Authenticate for another user is denied by the daemon" \
+run_test "A plain local user's Authenticate for another user is denied by the daemon" \
     "check_denied_as sigwatcher Authenticate string:testuser"
-run_test "Non-member Ping is denied by the bus" \
+run_test "A plain local user's Ping is denied by the bus" \
     "check_denied_as sigwatcher Ping"
 
 # Policy: the default context explicitly denies owning the daemon name —
@@ -386,11 +385,11 @@ run_test "Unprivileged user cannot own org.facelock.Daemon" \
 
 # (b) PreviewDetectFrame authz parity — the intent here has always been that a
 # non-root caller obtains no imagery. Under N13 the method became root-only, so
-# the way that holds changed: a facelock-group non-root caller is now denied
-# outright, before the method reaches the camera, rather than receiving a reply
-# with jpeg_data stripped. This asserts the denial AND that the error reply
-# carries no frame bytes (dbus-send renders non-empty byte arrays as hex; a
-# JPEG starts with ff d8).
+# the way that holds changed: a non-root caller is now denied outright, before
+# the method reaches the camera, rather than receiving a reply with jpeg_data
+# stripped. This asserts the denial AND that the error reply carries no frame
+# bytes (dbus-send renders non-empty byte arrays as hex; a JPEG starts with
+# ff d8).
 check_preview_detect_frame_denied() {
     local out rc
     set +e

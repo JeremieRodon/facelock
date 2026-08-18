@@ -53,7 +53,6 @@ mkdir -p "${PKG_DIR}/usr/bin"
 mkdir -p "${PKG_DIR}/lib/security"
 mkdir -p "${PKG_DIR}/etc/facelock"
 mkdir -p "${PKG_DIR}/usr/lib/systemd/system"
-mkdir -p "${PKG_DIR}/usr/lib/sysusers.d"
 mkdir -p "${PKG_DIR}/usr/lib/tmpfiles.d"
 mkdir -p "${PKG_DIR}/usr/lib/facelock"
 mkdir -p "${PKG_DIR}/usr/share/pam-configs"
@@ -107,8 +106,7 @@ install -m644 systemd/facelock-daemon.service "${PKG_DIR}/usr/lib/systemd/system
 install -m644 dbus/org.facelock.Daemon.conf "${PKG_DIR}/usr/share/dbus-1/system.d/org.facelock.Daemon.conf"
 install -m644 dbus/org.facelock.Daemon.service "${PKG_DIR}/usr/share/dbus-1/system-services/org.facelock.Daemon.service"
 
-# sysusers.d and tmpfiles.d
-install -m644 dist/facelock.sysusers "${PKG_DIR}/usr/lib/sysusers.d/facelock.conf"
+# tmpfiles.d
 install -m644 dist/facelock.tmpfiles "${PKG_DIR}/usr/lib/tmpfiles.d/facelock.conf"
 
 # pam-auth-update profile

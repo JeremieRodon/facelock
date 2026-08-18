@@ -64,9 +64,6 @@ install -Dm644 -t %{buildroot}%{_datadir}/facelock/quirks.d/ config/quirks.d/*.t
 # systemd units
 install -Dm644 systemd/facelock-daemon.service %{buildroot}%{_unitdir}/facelock-daemon.service
 
-# sysusers.d
-install -Dm644 dist/facelock.sysusers %{buildroot}%{_sysusersdir}/facelock.conf
-
 # tmpfiles.d
 install -Dm644 dist/facelock.tmpfiles %{buildroot}%{_tmpfilesdir}/facelock.conf
 
@@ -101,11 +98,14 @@ install -Dm644 LICENSE-APACHE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE-A
 %check
 # Tests require hardware (camera); skip in package build
 
-%pre
-%sysusers_create_compat dist/facelock.sysusers
-
 %post
 %tmpfiles_create %{_tmpfilesdir}/facelock.conf
+# ADR 010 retired the facelock group: nothing is group-owned any more, so
+# remove a group an older install created. Best-effort.
+[ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
+if getent group facelock >/dev/null 2>&1; then
+    groupdel facelock 2>/dev/null || true
+fi
 # A legacy copy in /etc/dbus-1/system.d is read after /usr/share and would
 # re-deny Authenticate (last matching rule wins); refresh it if present.
 if [ -f /etc/dbus-1/system.d/org.facelock.Daemon.conf ] && \
@@ -186,7 +186,6 @@ fi
 %config(noreplace) %{_sysconfdir}/facelock/config.toml
 %{_datadir}/facelock/quirks.d/
 %{_unitdir}/facelock-daemon.service
-%{_sysusersdir}/facelock.conf
 %{_tmpfilesdir}/facelock.conf
 %{_datadir}/dbus-1/system.d/org.facelock.Daemon.conf
 %{_datadir}/dbus-1/system-services/org.facelock.Daemon.service

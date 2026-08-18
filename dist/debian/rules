@@ -34,9 +34,6 @@ override_dh_auto_install:
 	install -Dm644 dbus/org.facelock.Daemon.conf debian/facelock/usr/share/dbus-1/system.d/org.facelock.Daemon.conf
 	install -Dm644 dbus/org.facelock.Daemon.service debian/facelock/usr/share/dbus-1/system-services/org.facelock.Daemon.service
 
-	# sysusers.d
-	install -Dm644 dist/facelock.sysusers debian/facelock/usr/lib/sysusers.d/facelock.conf
-
 	# tmpfiles.d
 	install -Dm644 dist/facelock.tmpfiles debian/facelock/usr/lib/tmpfiles.d/facelock.conf
 

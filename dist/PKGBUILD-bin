@@ -38,7 +38,6 @@ package() {
     install -Dm644 systemd/facelock-daemon.service "$pkgdir/usr/lib/systemd/system/facelock-daemon.service"
     install -Dm644 dbus/org.facelock.Daemon.conf "$pkgdir/usr/share/dbus-1/system.d/org.facelock.Daemon.conf"
     install -Dm644 dbus/org.facelock.Daemon.service "$pkgdir/usr/share/dbus-1/system-services/org.facelock.Daemon.service"
-    install -Dm644 dist/facelock.sysusers "$pkgdir/usr/lib/sysusers.d/facelock.conf"
     install -Dm644 dist/facelock.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/facelock.conf"
 
     install -Dm755 dist/omarchy/omarchy-setup-security-face "$pkgdir/usr/bin/omarchy-setup-security-face"

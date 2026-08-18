@@ -1,3 +1,0 @@
-# facelock system group. Named by the D-Bus policy (members may receive the
-# daemon's AuthAttempted signals); grants nothing on the auth path (ADR 010).
-g facelock -

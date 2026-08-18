@@ -716,12 +716,13 @@ run_test "env_clear: oneshot child PATH pinned to /usr/bin:/bin" \
     0
 
 # (c) Bus policy (ADR 010): the default context may call Authenticate and
-# nothing else; the facelock group grants signals only. A fake daemon owned by
-# ROOT stands in for the real one — the real daemon needs a camera to start,
-# and the bus enforces the policy regardless of who answers. `outsider` is a
-# plain account: not root, not in the facelock group. The daemon-side check
-# that a caller may only name its own username has its own unit tests
-# (facelock-daemon server.rs) and runs live in the integration tier.
+# nothing else. There is no group policy — signals are root-only. A fake
+# daemon owned by ROOT stands in for the real one — the real daemon needs a
+# camera to start, and the bus enforces the policy regardless of who answers.
+# `outsider` is a plain account: not root, with no group that grants it
+# anything. The daemon-side check that a caller may only name its own username
+# has its own unit tests (facelock-daemon server.rs) and runs live in the
+# integration tier.
 useradd -m outsider 2>/dev/null || true
 mkdir -p /run/dbus
 dbus-uuidgen --ensure=/etc/machine-id > /dev/null 2>&1 || true
@@ -741,7 +742,7 @@ python3 /fake-facelock-daemon.py > /tmp/fake-daemon-root.log 2>&1 &
 FAKE_ROOT_PID=$!
 wait_for_daemon_name || echo "warning: root fake daemon did not claim the name"
 
-run_test "bus policy: a non-member user may call Authenticate" \
+run_test "bus policy: a plain local user may call Authenticate" \
     "runuser -u outsider -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:outsider | grep -q 'boolean true'" \
     0
 
@@ -750,35 +751,26 @@ run_test "bus policy: a non-member user may call Authenticate" \
 FAKE_OWNER=$(dbus-send --system --print-reply --dest=org.freedesktop.DBus \
     /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
     string:org.facelock.Daemon 2>/dev/null | awk '/string/ {gsub(/"/, "", $2); print $2}' || true)
-run_test "bus policy: a non-member user may call Authenticate on the daemon's unique name" \
+run_test "bus policy: a plain local user may call Authenticate on the daemon's unique name" \
     "[ -n '$FAKE_OWNER' ] && runuser -u outsider -- dbus-send --system --print-reply --dest=$FAKE_OWNER /org/facelock/Daemon org.facelock.Daemon.Authenticate string:outsider | grep -q 'boolean true'" \
     0
-run_test "bus policy: a non-member user cannot call Ping on the unique name either" \
+run_test "bus policy: a plain local user cannot call Ping on the unique name either" \
     "[ -n '$FAKE_OWNER' ] && runuser -u outsider -- dbus-send --system --print-reply --dest=$FAKE_OWNER /org/facelock/Daemon org.facelock.Daemon.Ping 2>&1 | grep -q AccessDenied" \
     0
 
-run_test "bus policy: a non-member user cannot call Ping" \
+run_test "bus policy: a plain local user cannot call Ping" \
     "runuser -u outsider -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Ping 2>&1 | grep -q AccessDenied" \
     0
 
-run_test "bus policy: a non-member user cannot call ListModels" \
+run_test "bus policy: a plain local user cannot call ListModels" \
     "runuser -u outsider -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.ListModels 2>&1 | grep -q AccessDenied" \
     0
 
-usermod -aG facelock testuser
-run_test "bus policy: a group member cannot call Ping either (group grants signals only)" \
-    "runuser -u testuser -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Ping 2>&1 | grep -q AccessDenied" \
-    0
-
-run_test "bus policy: a group member may still call Authenticate" \
-    "runuser -u testuser -- dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:testuser | grep -q 'boolean true'" \
-    0
-
 # The whole user-run PAM path under the real policy: pam_facelock as a plain
-# non-member user → verify_daemon_peer (owner is root) → Authenticate on the
+# local user → verify_daemon_peer (owner is root) → Authenticate on the
 # daemon's unique name → the (fake, root-owned) daemon answers matched=true →
 # PAM_SUCCESS. Before ADR 010 the bus denied this send.
-run_test "bus policy: non-member pamtester succeeds through pam_facelock against the root fake daemon" \
+run_test "bus policy: plain-local-user pamtester succeeds through pam_facelock against the root fake daemon" \
     "timeout 15 runuser -u outsider -- pamtester facelock-test outsider authenticate < /dev/null" \
     0
 

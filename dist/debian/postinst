@@ -3,9 +3,6 @@ set -e
 
 case "$1" in
     configure)
-        # Create facelock group and directories
-        systemd-sysusers 2>/dev/null || true
-
         systemd-tmpfiles --create 2>/dev/null || true
 
         # Modes for the current layout, mirroring dist/facelock.tmpfiles for
@@ -37,6 +34,13 @@ case "$1" in
         if [ -f /var/log/facelock/audit.jsonl ]; then
             chown root:root /var/log/facelock/audit.jsonl 2>/dev/null || true
             chmod 600 /var/log/facelock/audit.jsonl 2>/dev/null || true
+        fi
+
+        # ADR 010 retired the facelock group: nothing is group-owned any more,
+        # so remove a group an older install created. Best-effort.
+        [ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
+        if getent group facelock >/dev/null 2>&1; then
+            groupdel facelock 2>/dev/null || true
         fi
 
         # Reload systemd for D-Bus activation
