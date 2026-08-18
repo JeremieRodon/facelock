@@ -362,6 +362,13 @@ reported as "cannot determine" — never as a guessed value.
 facelock status
 ```
 
+The `PAM services:` line lists every service that carries the facelock line,
+from the same scan [`facelock pam status --all`](#facelock-pam-status---all)
+runs, and marks how many are a local override of a vendor file. It reads `none
+configured` only when every directory was read; when one could not be, it reads
+`not checked` and names the place on a line of its own, because "nothing is
+configured" and "I could not look" are different answers.
+
 ## facelock config
 
 Show or edit the configuration file. Bare `facelock config` is

@@ -495,13 +495,49 @@ fn render_pam(out: &mut String, pam: &PamWiring) {
         ),
         None => result(out, false, &StatusMessage::StatusPamNotInstalled),
     }
-    if let Some(configured) = pam.sudo_configured {
-        let value = if configured {
-            StatusMessage::StatusPamSudoConfigured
-        } else {
-            StatusMessage::StatusPamSudoNotConfigured
-        };
-        detail(out, "sudo PAM", &value.localized());
+    // One line, not the whole listing: `facelock pam status --all` is where
+    // the per-service detail lives, and this report has ten other sections.
+    // What it must never do is render "could not look" as "nothing there" —
+    // so the empty case has two spellings, decided by whether anything went
+    // unchecked.
+    let names: Vec<&str> = pam
+        .configured
+        .iter()
+        .map(|service| service.service.as_str())
+        .collect();
+    let overrides = pam
+        .configured
+        .iter()
+        .filter(|service| service.shadows.is_some())
+        .count();
+
+    let value = match (names.is_empty(), pam.not_checked.is_empty(), overrides) {
+        (true, true, _) => StatusMessage::StatusPamNoServices,
+        (true, false, _) => StatusMessage::StatusPamNotChecked,
+        (false, _, 0) => StatusMessage::StatusPamServices {
+            services: names.join(", "),
+            count: names.len().to_string(),
+        },
+        (false, _, overrides) => StatusMessage::StatusPamServicesWithOverrides {
+            services: names.join(", "),
+            count: names.len().to_string(),
+            overrides: overrides.to_string(),
+        },
+    };
+    detail(out, "PAM services", &value.localized());
+
+    // Named one per line rather than joined: each is a path and an errno, and
+    // a reader has to be able to act on the one that concerns them.
+    for unchecked in &pam.not_checked {
+        detail(
+            out,
+            "not checked",
+            &StatusMessage::StatusPamNotCheckedAt {
+                path: unchecked.path.clone(),
+                error: unchecked.error.clone(),
+            }
+            .localized(),
+        );
     }
 }
 
@@ -513,7 +549,7 @@ mod tests {
 
     use facelock_core::config::NotificationMode;
 
-    use crate::health::{ConfigHealth, ModelSummary};
+    use crate::health::{ConfigHealth, ConfiguredService, ModelSummary, NotChecked};
     use crate::resolved::ProbedFile;
 
     fn model_files(dir: &str, detector_present: bool, embedder_present: bool) -> ModelFiles {
@@ -603,7 +639,19 @@ mod tests {
             pam: PamWiring {
                 module_path: "/lib/security/pam_facelock.so".into(),
                 installed_at: Some("/lib/security/pam_facelock.so".into()),
-                sudo_configured: Some(true),
+                configured: vec![
+                    ConfiguredService {
+                        service: "sudo".into(),
+                        path: "/etc/pam.d/sudo".into(),
+                        shadows: None,
+                    },
+                    ConfiguredService {
+                        service: "polkit-1".into(),
+                        path: "/etc/pam.d/polkit-1".into(),
+                        shadows: Some("/usr/lib/pam.d/polkit-1".into()),
+                    },
+                ],
+                not_checked: Vec::new(),
             },
         }
     }
@@ -651,7 +699,7 @@ facelock system status
     - on failure: no
   PAM module: /lib/security/pam_facelock.so
     [ok] installed
-    - sudo PAM: configured
+    - PAM services: sudo, polkit-1 (2 configured, 1 shadowing a vendor file)
 ";
         assert_eq!(render(&healthy()), expected);
     }
@@ -726,7 +774,8 @@ facelock system status
             pam: PamWiring {
                 module_path: "/lib/security/pam_facelock.so".into(),
                 installed_at: None,
-                sudo_configured: None,
+                configured: Vec::new(),
+                not_checked: Vec::new(),
             },
         };
 
@@ -961,7 +1010,8 @@ facelock system status
         health.pam = PamWiring {
             module_path: "/lib/security/pam_facelock.so".into(),
             installed_at: Some("/usr/lib/security/pam_facelock.so".into()),
-            sudo_configured: Some(false),
+            configured: Vec::new(),
+            not_checked: Vec::new(),
         };
         let report = render(&health);
         assert!(
@@ -969,8 +1019,55 @@ facelock system status
             "{report}"
         );
         assert!(
-            report.contains("    - sudo PAM: not configured for facelock\n"),
+            report.contains("    - PAM services: none configured\n"),
             "{report}"
+        );
+    }
+
+    /// **The distinction the report exists to make.** A machine where nothing
+    /// is configured and a machine the scan could not read must not render the
+    /// same line — that ambiguity is what made a broken lock stack and a
+    /// healthy one look identical for an hour.
+    #[test]
+    fn nothing_configured_and_nothing_checked_are_different_lines() {
+        let mut health = healthy();
+        health.pam.configured = Vec::new();
+        health.pam.not_checked = Vec::new();
+        assert!(
+            render(&health).contains("    - PAM services: none configured\n"),
+            "nothing configured, and the scan saw everywhere it meant to"
+        );
+
+        health.pam.not_checked = vec![NotChecked {
+            path: "/usr/lib/pam.d".into(),
+            error: "Permission denied (os error 13)".into(),
+        }];
+        let report = render(&health);
+        assert!(
+            report.contains("    - PAM services: not checked\n"),
+            "an unread directory must never render as 'none configured': {report}"
+        );
+        assert!(
+            report
+                .contains("    - not checked: /usr/lib/pam.d (Permission denied (os error 13))\n"),
+            "{report}"
+        );
+    }
+
+    /// A service configured through a local copy of a package's file is
+    /// counted as configured and says so, because the copy will not follow the
+    /// package's updates.
+    #[test]
+    fn a_local_override_is_counted_and_named() {
+        let mut health = healthy();
+        health.pam.configured = vec![ConfiguredService {
+            service: "sudo".into(),
+            path: "/etc/pam.d/sudo".into(),
+            shadows: None,
+        }];
+        assert!(
+            render(&health).contains("    - PAM services: sudo (1 configured)\n"),
+            "no override, no note"
         );
     }
 

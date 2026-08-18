@@ -104,8 +104,30 @@ pub enum StatusMessage {
         path: String,
     },
     StatusPamNotInstalled,
-    StatusPamSudoConfigured,
-    StatusPamSudoNotConfigured,
+    /// The services that carry the facelock line, listed and counted.
+    /// `overrides` is how many of them are a local copy of a package's file,
+    /// which is the one thing about a configured service that needs saying:
+    /// the copy will not follow the package's updates.
+    StatusPamServices {
+        services: String,
+        count: String,
+    },
+    StatusPamServicesWithOverrides {
+        services: String,
+        count: String,
+        overrides: String,
+    },
+    /// Nothing carries the line, and the scan saw everywhere it meant to.
+    StatusPamNoServices,
+    /// Nothing carries the line **and** somewhere could not be read, so this
+    /// is not an answer about the machine. N4, applied to PAM: an unknown is
+    /// never rendered as a value.
+    StatusPamNotChecked,
+    /// One place the scan could not get an answer from.
+    StatusPamNotCheckedAt {
+        path: String,
+        error: String,
+    },
 }
 
 impl Message for StatusMessage {
@@ -216,8 +238,28 @@ impl Message for StatusMessage {
                 fill(translate("installed at {path}"), &[("path", path.clone())])
             }
             StatusPamNotInstalled => translate("not installed"),
-            StatusPamSudoConfigured => translate("configured"),
-            StatusPamSudoNotConfigured => translate("not configured for facelock"),
+            StatusPamServices { services, count } => fill(
+                translate("{services} ({count} configured)"),
+                &[("services", services.clone()), ("count", count.clone())],
+            ),
+            StatusPamServicesWithOverrides {
+                services,
+                count,
+                overrides,
+            } => fill(
+                translate("{services} ({count} configured, {overrides} shadowing a vendor file)"),
+                &[
+                    ("services", services.clone()),
+                    ("count", count.clone()),
+                    ("overrides", overrides.clone()),
+                ],
+            ),
+            StatusPamNoServices => translate("none configured"),
+            StatusPamNotChecked => translate("not checked"),
+            StatusPamNotCheckedAt { path, error } => fill(
+                translate("{path} ({error})"),
+                &[("path", path.clone()), ("error", error.clone())],
+            ),
         }
     }
 }
@@ -230,7 +272,7 @@ impl Message for StatusMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for StatusMessage {
-    const VARIANT_COUNT: usize = 56;
+    const VARIANT_COUNT: usize = 59;
 
     fn samples() -> Vec<Self> {
         use StatusMessage::*;
@@ -292,8 +334,21 @@ impl super::Samples for StatusMessage {
             StatusPamInstalled,
             StatusPamInstalledAt { path: s("/p") },
             StatusPamNotInstalled,
-            StatusPamSudoConfigured,
-            StatusPamSudoNotConfigured,
+            StatusPamServices {
+                services: s("sudo, polkit-1"),
+                count: s("2"),
+            },
+            StatusPamServicesWithOverrides {
+                services: s("sudo, polkit-1"),
+                count: s("2"),
+                overrides: s("1"),
+            },
+            StatusPamNoServices,
+            StatusPamNotChecked,
+            StatusPamNotCheckedAt {
+                path: s("/usr/lib/pam.d"),
+                error: s("Permission denied (os error 13)"),
+            },
         ]
     }
 }

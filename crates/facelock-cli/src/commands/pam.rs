@@ -1334,6 +1334,92 @@ fn scan_directories(dirs: &PamDirs) -> Scan {
     Scan { names, directories }
 }
 
+/// One service that carries the facelock line, as `facelock status` sees it.
+///
+/// Lives here rather than in `crate::health` because it is this module's
+/// answer: the scan, the resolution and the read all belong to the writer, and
+/// a second implementation in the health probe is the drift this replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredService {
+    pub service: String,
+    /// The file the name resolved to — the one Linux-PAM reads.
+    pub path: String,
+    /// The vendor file this `/etc` copy hides, when it hides one. A service
+    /// configured this way will not track the package's updates.
+    pub shadows: Option<String>,
+}
+
+/// A place the scan could not get an answer from: a directory it could not
+/// list, or a service file it could not read.
+///
+/// Kept separate from the configured list rather than merged into it as a
+/// falsy entry — "not checked" is not "not configured", and a report that
+/// cannot tell them apart is the one this gap replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotChecked {
+    pub path: String,
+    pub error: String,
+}
+
+/// What `facelock status` reports in one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredScan {
+    pub services: Vec<ConfiguredService>,
+    pub not_checked: Vec<NotChecked>,
+}
+
+/// Everything on this machine that carries the facelock line, for
+/// `facelock status`'s summary.
+///
+/// **The same scan `pam status --all` runs**, down to the row builder, so the
+/// two commands cannot disagree about one service. The sink is silent because
+/// `status` renders a report and the writer's per-service lines interleaved
+/// into it would be output from a probe, not from the renderer.
+pub(crate) fn configured_scan(dirs: &PamDirs) -> ConfiguredScan {
+    let sink = Sink::silent();
+    let scan = scan_directories(dirs);
+    let reports = status_reports(dirs, &scan.names, &sink);
+
+    let services = reports
+        .iter()
+        .filter(|report| report.outcome == Outcome::Present)
+        .map(|report| ConfiguredService {
+            service: report.service.clone(),
+            path: report.path.clone().unwrap_or_default(),
+            shadows: report.shadows.clone(),
+        })
+        .collect();
+
+    // Both kinds of "could not tell", in one list: a directory that would not
+    // list and a service file that would not read are the same fact about the
+    // report — part of it is missing — and the summary line has to be able to
+    // say so without knowing which.
+    let not_checked = scan
+        .unreadable()
+        .map(|(path, error)| NotChecked {
+            path: path.display().to_string(),
+            error: error.to_string(),
+        })
+        .chain(reports.iter().filter_map(|report| {
+            match &report.outcome {
+                Outcome::Unknown(error) => Some(NotChecked {
+                    path: report
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| report.service.clone()),
+                    error: error.clone(),
+                }),
+                _ => None,
+            }
+        }))
+        .collect();
+
+    ConfiguredScan {
+        services,
+        not_checked,
+    }
+}
+
 /// Refuse a [`SENSITIVE_SERVICES`] entry unless the caller accepted the risk.
 ///
 /// Called twice per service, on the name as typed and again on the file that
@@ -1830,6 +1916,15 @@ struct Sink {
     /// standalone path through `main` — so rendering it here as well would
     /// print it twice.
     report_failures: bool,
+    /// Print nothing at all, on either stream.
+    ///
+    /// Not the same as `--json`, which silences the human rendering because a
+    /// document replaces it and still writes diagnostics to stderr. This is
+    /// for a caller that is not producing output at this moment:
+    /// [`configured_scan`], whose rows become one line of a report a different
+    /// module renders. Without it, `facelock status` would interleave the
+    /// writer's per-service lines into its own report.
+    silent: bool,
 }
 
 impl Sink {
@@ -1839,6 +1934,7 @@ impl Sink {
         Sink {
             json,
             report_failures: true,
+            silent: false,
         }
     }
 
@@ -1848,6 +1944,17 @@ impl Sink {
         Sink {
             json: false,
             report_failures: false,
+            silent: false,
+        }
+    }
+
+    /// The sink of a caller that is gathering facts rather than reporting
+    /// them: [`configured_scan`]. See [`Sink::silent`].
+    fn silent() -> Self {
+        Sink {
+            json: false,
+            report_failures: false,
+            silent: true,
         }
     }
 
@@ -1897,6 +2004,9 @@ impl Sink {
     }
 
     fn emit(&self, route: Route, msg: &dyn Message) {
+        if self.silent {
+            return;
+        }
         match route {
             Route::Info => Terminal.info(msg),
             Route::Notice => Terminal.notice(msg),

@@ -38,7 +38,8 @@ fn health_all_unknown() -> Health {
         pam: PamWiring {
             module_path: "/lib/security/pam_facelock.so".to_string(),
             installed_at: None,
-            sudo_configured: None,
+            configured: Vec::new(),
+            not_checked: Vec::new(),
         },
     }
 }

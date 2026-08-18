@@ -535,6 +535,60 @@ rm -f /etc/pam.d/facelock-all-scratch /tmp/pam-all-services.py /tmp/pam-all-dir.
       /tmp/pam-all-absent.json /tmp/pam-all-real.json
 rm -rf "$PAM_ALL_ROOT"
 
+# --- P3: `facelock status` reports the same scan ---
+#
+# The report could only ever say something about /etc/pam.d/sudo, so a
+# correctly wired omarchy-lock-face was invisible to it and "not configured"
+# and "not checked" rendered identically. These rows prove the summary reaches
+# the machine's real directories and keeps the two apart. The report needs
+# root and probes a daemon, camera and models that are absent here; only the
+# PAM lines are asserted.
+
+cat > /etc/pam.d/facelock-status-scratch <<'EOF'
+#%PAM-1.0
+auth      sufficient pam_facelock.so
+auth       include        system-auth
+EOF
+chmod 644 /etc/pam.d/facelock-status-scratch
+
+run_test "facelock status names every configured PAM service" \
+    "facelock status 2>&1 | grep -E '^    - PAM services:' | grep -q facelock-status-scratch" \
+    0
+
+rm -f /etc/pam.d/facelock-status-scratch
+
+# A directory that cannot be listed must not read as "none configured". Root
+# ignores mode bits, so the unreadable directory here is a regular file where a
+# directory was configured (ENOTDIR) rather than a chmod 000 one.
+PAM_STATUS_ROOT=/tmp/pam-status
+rm -rf "$PAM_STATUS_ROOT"
+mkdir -p "$PAM_STATUS_ROOT/etc"
+touch "$PAM_STATUS_ROOT/notadir"
+cat > "$PAM_STATUS_ROOT/config.toml" <<EOF
+[pam]
+config_dirs = ["$PAM_STATUS_ROOT/etc", "$PAM_STATUS_ROOT/notadir"]
+EOF
+
+run_test "facelock status says 'not checked', not 'none configured'" \
+    "facelock --config $PAM_STATUS_ROOT/config.toml status > /tmp/pam-status.out 2>&1; grep -q '^    - PAM services: not checked$' /tmp/pam-status.out && grep -q '^    - not checked: $PAM_STATUS_ROOT/notadir ' /tmp/pam-status.out && ! grep -q 'none configured' /tmp/pam-status.out" \
+    0
+
+# ...and with every directory readable and nothing configured, it is the other
+# line. The pair is the whole point: one string per answer.
+rm -f "$PAM_STATUS_ROOT/notadir"
+mkdir -p "$PAM_STATUS_ROOT/vendor"
+cat > "$PAM_STATUS_ROOT/config.toml" <<EOF
+[pam]
+config_dirs = ["$PAM_STATUS_ROOT/etc", "$PAM_STATUS_ROOT/vendor"]
+EOF
+
+run_test "facelock status says 'none configured' when it could read everywhere" \
+    "facelock --config $PAM_STATUS_ROOT/config.toml status 2>&1 | grep -q '^    - PAM services: none configured$'" \
+    0
+
+rm -rf "$PAM_STATUS_ROOT" /tmp/pam-status.out
+
+
 rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
       /etc/pam.d/facelock-scratch.facelock-backup \
       /etc/pam.d/facelock-scratch2.facelock-backup \

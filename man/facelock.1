@@ -302,6 +302,12 @@ the target user's
 .B is\-enrolled
 marker agrees with the database. Requires root. A check that cannot be
 performed is reported as such; the report never substitutes a guessed value.
+The \fBPAM services\fR line lists every service that carries the facelock
+line, from the same scan
+.B "facelock pam status \-\-all"
+runs, and marks how many are a local override of a vendor file. It reads
+\fBnone configured\fR only when every directory was read; when one could not
+be, it reads \fBnot checked\fR and names the place on a line of its own.
 .TP
 .B devices
 List available camera devices.

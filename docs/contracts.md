@@ -529,6 +529,14 @@ not; when *none* could be read there is no set to make the claim about, so only
 the per-directory lines are printed. Without that scoping the sentence read
 under `2>/dev/null` asserts exactly what `--all` exists to stop it asserting.
 
+**`facelock status` summarizes the same scan.** Its report carries one
+`PAM services:` line built by running the scan above, so the two commands
+cannot disagree about whether a service is configured. The detailed listing
+stays in `pam status --all`. The summary keeps the "not checked" distinction:
+it reads `none configured` only when every directory was read, `not checked`
+when nothing was found and something could not be, and it names each unread
+place on a `not checked:` line of its own.
+
 **Every write is atomic.** A temp file in the destination's own directory,
 `fsync`, then a rename — so a reader sees the old file or the new one and never
 a short one, which matters because a truncated `/etc/pam.d/polkit-1` breaks
