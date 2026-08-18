@@ -24,7 +24,7 @@ use crate::message::{
 // it is the list of services setup offers to configure, which is a property of
 // the setup flow rather than of the writer, and moving it would have split the
 // multi-select from the entries it renders for no gain.
-use super::pam::{PAM_DIR, PAM_LINE, PAM_MODULE_PATH, is_facelock_pam_line};
+use super::pam::{PAM_DIR, PAM_LINE, PAM_MODULE_PATH, PamAction, PamRequest};
 
 /// Embedded systemd unit file.
 const SERVICE_UNIT: &str = include_str!("../../../../systemd/facelock-daemon.service");
@@ -317,19 +317,49 @@ pub fn needs_root_precheck(plan: &SetupPlan) -> bool {
     plan.base.is_some()
 }
 
-/// How `setup`'s flags map onto the writer's two independent knobs
-/// (`--no-confirm`, `--allow-sensitive`).
+/// The writer's two independent knobs, named.
+///
+/// A pair of `bool`s in a tuple is how `install_for_setup(services,
+/// no_confirm, allow_sensitive)` and `install_one_in(base, service,
+/// allow_sensitive, no_confirm)` came to disagree about their order — a swap
+/// type-checks and silently unlocks the gate. Every hop from here to the
+/// writer now names the field it is filling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PamKnobs {
+    no_confirm: bool,
+    allow_sensitive: bool,
+}
+
+/// How `setup`'s flags map onto the writer's two knobs.
 ///
 /// A pure function rather than an expression inline in [`run_with_plan`]
 /// because it *is* the security property: `--non-interactive` promises no
 /// prompts, so it suppresses the per-file "Proceed?" confirmation, and it
 /// deliberately does **not** bypass the sensitive-service gate. `setup --yes`
 /// is the one flag that still means both halves — "skip the prompt" *and*
-/// "unlock system-auth/login/sshd" — and so maps onto both. On `facelock pam
+/// "unlock the sensitive services" — and so maps onto both. On `facelock pam
 /// add` the two are separate flags and neither implies the other.
-fn setup_pam_knobs(plan: &SetupPlan) -> (bool, bool) {
+fn setup_pam_knobs(plan: &SetupPlan) -> PamKnobs {
     let no_prompt = plan.base == Some(BaseMode::NonInteractive);
-    (plan.yes || no_prompt, plan.yes)
+    PamKnobs {
+        no_confirm: plan.yes || no_prompt,
+        allow_sensitive: plan.yes,
+    }
+}
+
+/// The request one `setup --pam` service makes of the writer.
+///
+/// Spelled once, so the four call sites — two in [`run_with_plan`], two in the
+/// wizard — cannot fill the same struct four slightly different ways.
+fn pam_request(action: PamAction, service: &str, knobs: PamKnobs, if_present: bool) -> PamRequest {
+    PamRequest {
+        action,
+        services: vec![service.to_string()],
+        no_confirm: knobs.no_confirm,
+        allow_sensitive: knobs.allow_sensitive,
+        if_present,
+        ..PamRequest::default()
+    }
 }
 
 /// Execute a resolved plan: base setup first (if any), then the standalone
@@ -367,17 +397,28 @@ pub fn run_with_plan(plan: SetupPlan) -> anyhow::Result<()> {
         PamPref::Remove {
             service,
             if_present,
-        } => super::pam::remove_for_setup(std::slice::from_ref(service), *if_present)?,
+        } => super::pam::remove_for_setup(&pam_request(
+            PamAction::Remove,
+            service,
+            // Removal is never gated on sensitivity and never prompts, so
+            // neither knob has anything to do here. Default rather than
+            // `setup_pam_knobs(&plan)`: handing a path that ignores the gate a
+            // request that says "gate unlocked" pre-arms a bypass for whoever
+            // later makes it read the field.
+            PamKnobs::default(),
+            *if_present,
+        ))?,
         PamPref::Install { service } => {
             // The wizard's step 9 already applied `--pam`; installing again here
             // would be a second, unasked-for edit of the same file.
             if !wizard_ran {
-                let service = service
-                    .as_deref()
-                    .unwrap_or(DEFAULT_PAM_SERVICE)
-                    .to_string();
-                let (no_confirm, allow_sensitive) = setup_pam_knobs(&plan);
-                super::pam::install_for_setup(&[service], no_confirm, allow_sensitive)?;
+                let service = service.as_deref().unwrap_or(DEFAULT_PAM_SERVICE);
+                super::pam::install_for_setup(&pam_request(
+                    PamAction::Add,
+                    service,
+                    setup_pam_knobs(&plan),
+                    false,
+                ))?;
             }
         }
         PamPref::Ask | PamPref::Skip => {}
@@ -561,7 +602,7 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         Path::new(PAM_DIR),
         plan,
         &theme,
-        Path::new(PAM_MODULE_PATH).exists(),
+        super::pam::module_installed(),
     ) {
         Ok(services) => services,
         Err(e) => {
@@ -2000,8 +2041,10 @@ fn pam_step_in(
             // `--non-interactive`, so `setup_pam_knobs` reduces to `plan.yes`
             // on both knobs here. Splitting them would make `--pam --service X
             // --yes` start prompting where it never did.
-            let (no_confirm, allow_sensitive) = setup_pam_knobs(plan);
-            super::pam::install_one_in(base, &service, allow_sensitive, no_confirm)?;
+            super::pam::install_one_in(
+                base,
+                &pam_request(PamAction::Add, &service, setup_pam_knobs(plan), false),
+            )?;
             Ok(vec![service])
         }
         PamStep::Ask => wizard_pam_setup_in(base, theme),
@@ -2053,8 +2096,14 @@ fn wizard_pam_setup_in(base: &Path, theme: &ColorfulTheme) -> anyhow::Result<Vec
         });
         // The multi-select above *is* the per-service consent, so no
         // confirmation is asked for again; no candidate is in
-        // SENSITIVE_SERVICES, so the gate is moot either way.
-        match super::pam::install_one_in(base, &service, true, true) {
+        // SENSITIVE_SERVICES (`no_candidate_is_a_sensitive_service`), so the
+        // gate is moot either way.
+        let knobs = PamKnobs {
+            no_confirm: true,
+            allow_sensitive: true,
+        };
+        match super::pam::install_one_in(base, &pam_request(PamAction::Add, &service, knobs, false))
+        {
             Ok(()) => configured.push(service),
             Err(e) => {
                 Terminal.info(&PamMessage::PamConfigureFailed {
@@ -2258,9 +2307,7 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
         tracing::warn!("could not reconcile enrollment markers: {e}");
     }
 
-    if let Ok(pam_content) = fs::read_to_string(Path::new("/etc/pam.d/hyprlock"))
-        && pam_content.lines().any(is_facelock_pam_line)
-    {
+    if super::pam::is_configured(Path::new(PAM_DIR), "hyprlock") {
         print_hyprlock_hint();
     }
 
@@ -3737,12 +3784,7 @@ mod action_tests {
             after.contains_key("sudo.facelock-backup"),
             "a backup file must have appeared: {after:?}"
         );
-        assert!(
-            fs::read_to_string(dir.path().join("sudo"))
-                .unwrap()
-                .lines()
-                .any(is_facelock_pam_line)
-        );
+        assert!(super::super::pam::is_configured(dir.path(), "sudo"));
     }
 
     /// `--pam --remove` is `run_with_plan`'s job; step 9 must not pre-empt it.
@@ -3830,13 +3872,24 @@ mod action_tests {
             })
         };
 
+        let knobs = |no_confirm, allow_sensitive| PamKnobs {
+            no_confirm,
+            allow_sensitive,
+        };
+
         // Standalone `--pam`: ask, and refuse the sensitive services.
-        assert_eq!(with(None, false), (false, false));
+        assert_eq!(with(None, false), knobs(false, false));
         // `--non-interactive --pam`: no prompts, and *still* refuse them.
-        assert_eq!(with(Some(BaseMode::NonInteractive), false), (true, false));
+        assert_eq!(
+            with(Some(BaseMode::NonInteractive), false),
+            knobs(true, false)
+        );
         // `--pam --yes`: the documented combined meaning — both halves.
-        assert_eq!(with(None, true), (true, true));
-        assert_eq!(with(Some(BaseMode::NonInteractive), true), (true, true));
+        assert_eq!(with(None, true), knobs(true, true));
+        assert_eq!(
+            with(Some(BaseMode::NonInteractive), true),
+            knobs(true, true)
+        );
     }
 
     // -- `--no-systemd` -----------------------------------------------------
