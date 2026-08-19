@@ -62,7 +62,7 @@
 //! | [`setup`] | the wizard spine, step failures, closing summary |
 //! | [`device`] | camera and inference-device selection |
 //! | [`download`] | model download and verification |
-//! | [`system`] | daemon unit and `facelock` group setup |
+//! | [`system`] | daemon unit setup and legacy group cleanup |
 //! | [`pam`] | `/etc/pam.d/*` configuration |
 //!
 //! # Adding a message (the conversion pattern)

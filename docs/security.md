@@ -16,7 +16,7 @@ Facelock is designed to keep biometric data under the user's exclusive control:
 - **Local-only inference**: All face detection and recognition runs on-device via ONNX Runtime. No images, embeddings, or metadata are ever transmitted over the network.
 - **No telemetry**: Facelock contains zero analytics, tracking, or phone-home code. After the one-time model download during `facelock setup`, it never contacts any server.
 - **No cloud dependencies**: Authentication works fully offline. No account registration, no API keys, no external services.
-- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (600, root:root, inside a 710 root:facelock directory). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
+- **Data stays on disk**: Face embeddings are stored in a local SQLite database (`/var/lib/facelock/facelock.db`) with restrictive permissions (600, root:root, inside a 711 root:root directory that nobody but root can list). Optional AES-256-GCM encryption with TPM-sealed keys provides defense in depth.
 - **Open source**: All code is MIT/Apache-2.0 licensed. No proprietary blobs or obfuscated network calls. Privacy claims are verifiable by reading the source.
 
 ## Attack Vectors & Mitigations
@@ -337,9 +337,8 @@ chmod 644 /var/lib/facelock/models/*.onnx
 ```
 
 The model files are public, SHA-256-verified downloads, so their own modes are
-permissive — what keeps users outside the `facelock` group away from them is
-the `0710` state directory above; see `docs/contracts.md` § *One gate at the
-top*. What the modes here must guarantee is only that nobody but root can
+permissive; see `docs/contracts.md` § *Traversal for everyone, listing for
+nobody*. What the modes here must guarantee is only that nobody but root can
 **write** them.
 
 ### 3. Embedding / Database Security
@@ -351,8 +350,8 @@ top*. What the modes here must guarantee is only that nobody but root can
 #### A. Database File Permissions (Required)
 
 ```bash
-# Database owned by root, readable by root only. The facelock group requests
-# authentication through the daemon; it never reads templates.
+# Database owned by root, readable by root only. User-run PAM stacks request
+# authentication through the daemon; nothing but root reads templates.
 chown root:root /var/lib/facelock/facelock.db
 chmod 600 /var/lib/facelock/facelock.db
 ```
@@ -362,14 +361,14 @@ Runtime note:
 - Audit logs and snapshots must be created with explicit restrictive modes instead of relying on ambient umask
 - The systemd service should set `UMask=0027` as a baseline defense-in-depth default
 
-#### A2. One Gate at the Top (`/var/lib/facelock` is 0710)
+#### A2. Traversal for Everyone, Listing for Nobody (`/var/lib/facelock` is 0711)
 
 ```
-/var/lib/facelock/            0710 root:facelock   traverse-only, NOT listable
+/var/lib/facelock/            0711 root:root       traverse-only, NOT listable
   facelock.db                 0600 root:root
   facelock.db-wal / -shm      0600 root:root
   models/                     0755 root:root       public, SHA-256 verified
-  enrolled/                   0710 root:facelock   markers only
+  enrolled/                   0711 root:root       markers only
     <user>                    0600 <user>:<user>
 
 /var/log/facelock/            0700 root:root
@@ -377,66 +376,58 @@ Runtime note:
   snapshots/                  0700 root:root
 ```
 
-The state directory grants "other" **nothing**. A local user outside the
-`facelock` group cannot reach anything below it — not the database, not the
-markers, not even the world-readable models — regardless of the children's own
-modes. That single gate is the security boundary; the children's modes are
-defense in depth behind it.
-
-The `facelock` group gets traverse-only (`--x`): a member can open a path it
-already knows by name — its own `enrolled/<user>` marker, a model file — but
-cannot `readdir` the directory, cannot read the `0600 root:root` database, and
-cannot read the audit log or snapshots. **The group is a D-Bus access grant,
-not a file-read grant**: members request authentication through the daemon,
-which reads the templates as root and answers yes or no.
+The state directory grants every local user traversal (`--x`) and nobody but
+root listing (no `r` for group or other). Anyone can `open()` a path it
+already knows by name — its own `enrolled/<user>` marker, a model file — and
+nobody can `readdir` the directory, read the `0600 root:root` database, or
+reach the audit log or snapshots. Every secret is protected by its own mode;
+the directory protects only *what is there* from enumeration. There is no
+group (ADR 010): nothing here is group-owned.
 
 Two consequences worth stating explicitly:
 
-- **D-Bus is required for user-run screen lockers** (hyprlock/swaylock). Their
-  PAM stack runs as the user, and no group membership makes the database or
-  the `0600 root:root` encryption key readable, so the daemon is the only
-  path. Root-invoked PAM (`sudo`, `login`, `sshd`) additionally has the
-  oneshot fallback, which reads the files directly as root.
-- **Known residual**: a group member can `stat` a name it can guess —
+- **D-Bus is required for user-run screen lockers** (hyprlock/swaylock) and
+  the polkit agent. Their PAM stack runs as the user, and nothing makes the
+  database or the `0600 root:root` encryption key readable to them, so the
+  daemon is the only path — and the bus admits their `Authenticate` without a
+  group (§ 4 A). Root-invoked PAM (`sudo`, `login`, `sshd`) additionally has
+  the oneshot fallback, which reads the files directly as root.
+- **Known residual**: any local user can `stat` a name it can guess —
   `facelock.db` (size, mtime), `enrolled/<user>` (existence) — because
-  traversal permits exactly that. Closing it would mean denying the group the
-  traversal that `is-enrolled` and model loading depend on. Accepted.
+  traversal permits exactly that. Closing it would mean denying the traversal
+  that `is-enrolled` and model loading depend on. Accepted; before ADR 010 the
+  same residual existed for group members.
 
 **The enforcement mechanism is a guard test, not this document.** The test in
 `crates/facelock-cli/src/state_layout.rs` walks every entry under the state
-directory and asserts nothing carries "other" bits, with `models/` (public
-data) as the single allowed exception, and that the state directory itself
-grants "other" nothing. A future change that drops a world-readable file into
-the state directory fails that test with a message that explains the rule.
+directory and asserts that no file carries any "other" bit and no directory
+carries "other" read or write — traversal is the only thing granted — with
+`models/` (public data) as the single allowed exception. A future change that
+drops a world-readable file into the state directory fails that test with a
+message that explains the rule.
 
-#### A3. Enrollment Markers (`/var/lib/facelock/enrolled` is 0710)
+#### A3. Enrollment Markers (`/var/lib/facelock/enrolled` is 0711)
 
 `facelock is-enrolled` must not activate the daemon or open a camera — it runs
 repeatedly on the lock screen. It answers from a marker file rather than from
 the database, and *"enrolled"* means **"face auth is operational for me"**:
-reading the marker requires traversing two `0710 root:facelock` directories,
-so a caller outside the `facelock` group reads `EACCES` and reports
-not-enrolled — deliberately, since the group is required to reach the daemon
-at all. One `open(2)` answers group-membership and enrollment together,
-including the "enrolled but not yet re-logged-in after joining the group"
-state.
+the caller opens its own `0600` marker by name through two `0711 root:root`
+directories. No group is involved (ADR 010): the answer is
+`enrolled` the moment enrollment writes the marker.
 
 ```
-/var/lib/facelock/enrolled/          0710 root:facelock
+/var/lib/facelock/enrolled/          0711 root:root
 /var/lib/facelock/enrolled/<user>    0600 <user>:<user>
 ```
 
-- **`0710` on the directory** permits group traversal to a known filename but
-  not `readdir`, so which accounts have face auth enrolled is not listable.
-- **The ownership is half the contract.** The group-execute bit only works
-  because the directory is owned `root:facelock`; a "consistency fix" to
-  `root:root` silently turns every unprivileged `is-enrolled` into
-  "not-enrolled". A guard test pins mode and ownership together.
+- **`0711` on the directory** permits traversal to a known filename but not
+  `readdir`, so which accounts have face auth enrolled is not listable (a
+  guessed name can be probed for existence — the § A2 residual).
 - **`0600` owned by the user** means "am I enrolled?" is answerable by that
   user and by nobody else — the same privacy property as
   `~/.ssh/authorized_keys`.
 - `EACCES` and `ENOENT` are both reported as not-enrolled, never as an error.
-  Under the operational-for-me semantics this is correct, not a compromise.
+  An indicator that fails to show is the safe way to be wrong.
 
 Several places encode this layout and must stay in sync: `dist/facelock.tmpfiles`,
 `dist/facelock.install`, `dist/debian/postinst`, `dist/nix/module.nix`,
@@ -525,11 +516,60 @@ enabling it is a deliberate operator choice that commits to the reseal workflow.
 
 #### A. D-Bus System Bus Policy (Required)
 
-Access to the daemon is restricted by the D-Bus system bus policy defined in `dbus/org.facelock.Daemon.conf`. Only root and members of the `facelock` group are allowed to send messages to the daemon interface. The policy file is installed to `/usr/share/dbus-1/system.d/` and enforced by the bus daemon itself. Setup and package install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present, but `/usr/share/...` is the canonical install path.
+Access to the daemon is governed by the D-Bus system bus policy in
+`dbus/org.facelock.Daemon.conf`, installed to `/usr/share/dbus-1/system.d/`
+and enforced by the bus itself (dbus-daemon or dbus-broker). Setup and package
+install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present,
+but `/usr/share/...` is the canonical install path. Two grants (ADR 010):
 
-The daemon must also verify the caller UID via `GetConnectionUnixUser` on every method call and apply method-level authorization:
+- **root**: may own the name, send anything on the interface, and receive the
+  daemon's signals.
+- **every local user** (`default` context): may send exactly one method,
+  `org.facelock.Daemon.Authenticate`. Screen lockers and the polkit agent run
+  their PAM stack as the user, so this is what lets face unlock work with no
+  group and no re-login. Everything else stays denied at the bus.
+
+There is no group policy: the `facelock` group is retired (ADR 010) —
+packaging no longer creates it and `facelock setup` removes a leftover one.
+
+Because the bus lets any local user reach `Authenticate`, the daemon's own
+check — it verifies the caller UID via `GetConnectionUnixUser` on every method
+call and applies method-level authorization — is the boundary for that method
+rather than a second layer:
 - `Authenticate`: root, or a non-root caller acting on their own username. This is the **only** user-scoped method, and it is architecture rather than policy: screen lockers run their PAM stack as the user, so a user must be able to request authentication for themselves.
 - Everything else is **root only**: `TestAuthenticate`, `Enroll`, `ListModels`, `RemoveModel`, `ClearModels`, `PreviewFrame`, `PreviewDetectFrame`, `ListDevices`, `ReleaseCamera`, `Ping`, `Shutdown`.
+
+What opening `Authenticate` exposes, and why it is acceptable: any local UID
+may ask the daemon to authenticate **itself**. An unenrolled UID is answered by
+`pre_check` from SQLite (`has_models`) before the camera is opened. An enrolled
+UID could already do this before ADR 010 — it was in the group. No UID can name
+another user (`require_user_authorized`), learn another user's enrollment, or
+see a similarity score (redacted for non-root). Every attempt is audited when
+auditing is enabled; an enrolled UID's failed attempts are rate-limited per
+user, while an unenrolled UID's calls are answered before the limiter and are
+not charged. This is the same shape as fprintd, whose bus policy admits every
+user and whose daemon authorizes per call.
+
+What it costs, stated plainly: the bus policy also bounded *who could make the
+daemon do cheap work*. Any local UID can now (a) bus-activate the daemon (it
+already could — `StartServiceByName` is open to every context in
+`system.conf`), (b) reset its idle timer (`daemon.idle_timeout_secs` defaults
+to 0, so no default install idles out anyway), (c) hold the single capture
+slot for the brief time an unenrolled `Authenticate` takes, so a tight loop
+from any local account can make a concurrent lock-screen `Authenticate`
+return `daemon busy` and fall back to the password prompt, and (d) write one
+audit row per call without a rate-limit charge, so a local loop can roll
+`audit.jsonl` past `audit.rotate_size_mb` twice and evict genuine history —
+audit is off by default; operators who enable it should size
+`rotate_size_mb` accordingly or ship the log off-host. That is a local
+availability margin on a convenience feature — face unlock fails closed to
+the password — and it is accepted (ADR 010). Note also that `abort_if_ssh` is
+enforced by the PAM client from its own environment; a direct bus caller is
+not subject to it, which was already true for group members. A config-file
+mtime change also makes the *first* message after it pay a handler rebuild
+(`maybe_reload_handler` runs before `authorize_method` in `server.rs`), and
+that message may now come from any local UID; the trigger is a
+`644 root:root` file, so it is not attacker-controlled.
 
 The scope table's catch-all arm is root-only, so a method added later is closed until it is deliberately opened up. Two entries are spelled out explicitly rather than left to that catch-all, because their root-only scope is load-bearing rather than incidental:
 - `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter. For any weaker caller it would be a continuous similarity feed at camera framerate; together with score redaction, denying non-root callers closes the hill-climbing oracle by construction (see A5 below).
@@ -537,7 +577,7 @@ The scope table's catch-all arm is root-only, so a method added later is closed 
 
 The policy also self-contains two explicit defaults rather than relying on system-wide bus defaults:
 - `<deny own="org.facelock.Daemon"/>` in the default context (name-squatting protection; only root may own the name).
-- `<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>` in the default context, with explicit allows for root and the `facelock` group (see below).
+- `<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>` in the default context; the only allow is in the root block (see below).
 
 #### A2. PAM Peer-UID Verification (Required)
 
@@ -584,12 +624,12 @@ is not redacted.
 **Attack**: Any local user adds a match rule (or runs `dbus-monitor`) and passively observes `AuthAttempted` broadcast signals to learn who authenticates when — and, if the payload carried the raw similarity score, uses it as a spoof-tuning oracle (iterate on a photo/mask until the score climbs).
 
 **Mitigations**:
-- The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to the authorized caller.
-- The bus policy denies delivery of the daemon's signals in the default context; only root and `facelock`-group members may receive them.
+- The `AuthAttempted` signal payload is `(user: s, matched: b)` only. It **never** carries the similarity score; the raw biometric score is available only in the `Authenticate` method reply to a **root** caller; it is redacted to `0.0` for every non-root caller (ADR 010 opened `Authenticate` to every local user).
+- The bus policy denies delivery of the daemon's signals in the default context; only root may receive them.
 
 #### A5. Raw Frame Access Parity (Implemented — root-only)
 
-**Attack**: `PreviewFrame` is root-only, but a `facelock`-group member pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead — silently, with no user consent.
+**Attack**: `PreviewFrame` is root-only, but any local user pulls raw camera/IR frames through the weaker-gated `PreviewDetectFrame` "detect" variant instead — silently, with no user consent.
 
 **Mitigation**: both methods are root-only. `PreviewDetectFrame` runs per-frame with neither `pre_check` nor the rate limiter, so for any weaker caller it would be a continuous similarity feed at camera framerate; `authorize_method` therefore denies every non-root caller with `AccessDenied` before the method reaches the camera or the capture slot.
 
@@ -599,7 +639,7 @@ is not redacted.
 
 #### A6. Capture Contention Guard (Implemented)
 
-**Attack**: Local DoS — an authorized caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request.
+**Attack**: Local DoS — a caller loops `Authenticate`/`PreviewDetectFrame`, keeping the global handler mutex held so every other caller (including root) queues up to the 10-second handler-lock timeout per request. Under ADR 010 any local UID may call `Authenticate` for itself, so for that method the caller set the guard bounds is every local account, not root and the (pre-ADR 010) `facelock` group; `PreviewDetectFrame` remains root-only.
 
 **Mitigation**: A cheap in-flight capture guard is checked *before* the expensive handler lock. If a capture is already in flight, a concurrent `Authenticate`/`Enroll`/`PreviewFrame`/`PreviewDetectFrame` call is rejected **immediately** with a `daemon busy` error instead of queueing. PAM treats this like any daemon error (`PAM_IGNORE`) and falls through to password — degraded, never locked out. Per-user rate limiting is unchanged and orthogonal.
 
@@ -812,7 +852,7 @@ The systemd unit (`systemd/facelock-daemon.service`) includes layered hardening:
     it. Root without `CAP_CHOWN` cannot `chown(2)` at all, and two
     startup steps need it on an install that is
     being *upgraded* rather than freshly packaged: `state_layout::ensure_state_layout`, which
-    chowns `/var/lib/facelock` and the files under it to `root:facelock` (a failure there is
+    chowns `/var/lib/facelock` and the files under it to `root:root` (a failure there is
     fatal — the daemon exits 1), and the enrollment-marker reconcile, which chowns each marker
     to the user it describes (#137). Both skip paths that are already correct, so a steady-state
     install never chowns. The reachable blast radius is small: `ProtectSystem=strict` leaves only

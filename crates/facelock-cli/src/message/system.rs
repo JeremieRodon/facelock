@@ -1,10 +1,10 @@
-//! Wiring facelock into the system: the daemon unit and the `facelock` group.
+//! Wiring facelock into the system: the daemon unit and legacy group cleanup.
 
 #[cfg(test)]
 use super::sample_text as s;
 use super::{Message, fill, translate};
 
-/// Daemon unit and `facelock` group setup.
+/// Daemon unit setup and legacy `facelock` group cleanup.
 ///
 /// Variant and field names are the machine vocabulary: [`Message::machine`]
 /// derives its event line from them.
@@ -22,13 +22,8 @@ pub enum SystemMessage {
     DaemonRunning,
     DaemonNotReady { seconds: u64 },
 
-    // -- group membership --
-    CreatingFacelockGroup,
-    GroupMembershipNote,
-    AlreadyInGroup { user: String },
-    ConfirmAddToGroup { user: String },
-    GroupAddSkipped { user: String },
-    AddedToGroup { user: String },
+    // -- the legacy facelock system group (ADR 010) --
+    RetiredFacelockGroup,
 
     // -- installing and removing the unit files --
     DisablingSystemdUnits,
@@ -66,30 +61,9 @@ impl Message for SystemMessage {
                 ),
                 &[("seconds", seconds.to_string())],
             ),
-            CreatingFacelockGroup => translate("  Creating 'facelock' system group..."),
-            GroupMembershipNote => translate(
-                "  Note: running daemon commands (preview/test) as a normal user requires\n  membership in the 'facelock' group: sudo usermod -aG facelock <user>",
-            ),
-            AlreadyInGroup { user } => fill(
-                translate("  User '{user}' is already in the 'facelock' group."),
-                &[("user", user.clone())],
-            ),
-            ConfirmAddToGroup { user } => fill(
-                translate(
-                    "Add user '{user}' to the 'facelock' group? (required to run facelock preview/test without sudo)",
-                ),
-                &[("user", user.clone())],
-            ),
-            GroupAddSkipped { user } => fill(
-                translate("  Skipped. Add later with: sudo usermod -aG facelock {user}"),
-                &[("user", user.clone())],
-            ),
-            AddedToGroup { user } => fill(
-                translate(
-                    "  Added '{user}' to the 'facelock' group.\n  NOTE: log out and back in for the new group membership to take effect.",
-                ),
-                &[("user", user.clone())],
-            ),
+            RetiredFacelockGroup => {
+                translate("  Removed the legacy 'facelock' group; face unlock no longer uses it.")
+            }
             DisablingSystemdUnits => translate("Disabling facelock-daemon systemd units..."),
             SystemdUnitsDisabled => translate("facelock-daemon service disabled and stopped."),
             InstallingSystemdUnits => {
@@ -120,7 +94,7 @@ impl Message for SystemMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SystemMessage {
-    const VARIANT_COUNT: usize = 22;
+    const VARIANT_COUNT: usize = 17;
 
     fn samples() -> Vec<Self> {
         use SystemMessage::*;
@@ -133,12 +107,7 @@ impl super::Samples for SystemMessage {
             DaemonRestarted,
             DaemonRunning,
             DaemonNotReady { seconds: 20 },
-            CreatingFacelockGroup,
-            GroupMembershipNote,
-            AlreadyInGroup { user: s("u") },
-            ConfirmAddToGroup { user: s("u") },
-            GroupAddSkipped { user: s("u") },
-            AddedToGroup { user: s("u") },
+            RetiredFacelockGroup,
             DisablingSystemdUnits,
             SystemdUnitsDisabled,
             InstallingSystemdUnits,

@@ -1,2 +1,0 @@
-# Create facelock system group for daemon and database access
-g facelock -

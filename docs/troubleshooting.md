@@ -198,17 +198,26 @@ The ONNX runtime requires access to `/dev/null`, `/dev/urandom`, and `/proc/sys`
 
 ### "Permission denied" / "AccessDenied" when running facelock commands
 
-**Symptom**: `facelock preview` or `facelock test` fails with a D-Bus
-`AccessDenied` error as a normal user (root works fine).
+**Symptom**: `facelock preview`, `facelock test`, `facelock list` or another
+command fails with a D-Bus `AccessDenied` error as a normal user (root works
+fine).
 
-The D-Bus system-bus policy only allows root and the `facelock` group to talk
-to the daemon. `sudo facelock setup` offers to add you to the group; if you
-skipped it (or are on another account), add yourself:
+Every management command is root-only; the CLI offers to re-run itself under
+`sudo` on a terminal. Face unlock itself (hyprlock, swaylock, the polkit
+agent, `facelock is-enrolled`) needs no group and no re-login: the bus admits
+any local user's `Authenticate` for their own account (ADR 010). If a lock
+screen still reports `AccessDenied` right after an upgrade, the bus has not
+re-read the policy yet — `sudo facelock setup --systemd` rewrites it and asks
+for a reload, or reboot.
+
+The `facelock` group is no longer used (ADR 010). `sudo facelock setup`, `just
+install-files` and the package scriptlets remove a leftover group; if it
+lingers:
 ```bash
-groups  # check current groups
-sudo usermod -aG facelock $USER
-# Log out and back in for group changes to take effect
+sudo groupdel facelock
 ```
+Face unlock is turned off per user by removing that user's models
+(`sudo facelock remove` / `sudo facelock clear`).
 
 ### Database permission errors
 
@@ -217,10 +226,10 @@ The SQLite database requires specific permissions:
 sudo chown root:root /var/lib/facelock/facelock.db
 sudo chmod 600 /var/lib/facelock/facelock.db
 # The daemon (root) writes the -wal/-shm sidecars next to the database; the
-# state directory itself ships at 710 root:facelock (traverse-only for the
-# group, nothing for anyone else):
-sudo chown root:facelock /var/lib/facelock
-sudo chmod 710 /var/lib/facelock
+# state directory and enrolled/ ship at 711 root:root (traversable by every
+# local user, listable by none):
+sudo chown root:root /var/lib/facelock /var/lib/facelock/enrolled
+sudo chmod 711 /var/lib/facelock /var/lib/facelock/enrolled
 ```
 
 ### PAM module cannot reach daemon

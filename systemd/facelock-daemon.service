@@ -39,7 +39,7 @@ RestrictSUIDSGID=yes
 # /dev/video* and /dev/tpmrm0, both protected by standard Unix permissions.
 # Note: ProtectSystem=strict does NOT cover /dev/ — it only remounts /usr,
 # /etc, and /boot read-only. Device access here is restricted solely by
-# standard Unix file permissions (root:facelock ownership/mode) on
+# standard Unix file permissions (root:video / root:tss ownership and mode) on
 # /dev/video* and /dev/tpmrm0.
 
 # Phase 3: Capabilities, seccomp, and network lockdown
@@ -71,7 +71,8 @@ RestrictSUIDSGID=yes
 # startup steps need it on an install that is being upgraded rather than freshly
 # packaged:
 #   - state_layout::ensure_state_layout, which chowns /var/lib/facelock (and
-#     the files under it) to root:facelock. A failure here is fatal — the daemon
+#     the files under it) to root:root, which an install upgraded from the
+#     root:facelock layout still needs. A failure here is fatal — the daemon
 #     exits 1 — so without this cap an upgraded install can fail to start.
 #   - the enrollment-marker reconcile (#137), which chowns each marker to the
 #     user it describes. Without this cap it would silently write nothing on

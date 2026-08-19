@@ -123,7 +123,7 @@ facelock is-enrolled --quiet && show_face_indicator
 
 It is named after systemd's `is-*` family (`systemctl is-active --quiet`), and like those it prints the state word — `enrolled` or `not-enrolled` — when not quiet.
 
-It is cheap and safe to call repeatedly: no daemon activation, no camera, no database access. It answers "enrolled" only when face auth is actually operational for the caller — which includes `facelock` group membership; a caller outside the group reports `not-enrolled` rather than erroring. The marker it reads is a hint for the UI — PAM at auth time remains authoritative. See the [CLI reference](book/src/cli-reference.md#facelock-is-enrolled).
+It is cheap and safe to call repeatedly: no daemon activation, no camera, no database access. It answers "enrolled" as soon as the caller's own enrollment marker exists — no group, no re-login (ADR 010); an unreadable or missing marker reports `not-enrolled` rather than erroring. The marker it reads is a hint for the UI — PAM at auth time remains authoritative. See the [CLI reference](book/src/cli-reference.md#facelock-is-enrolled).
 
 ## Architecture
 
@@ -222,7 +222,7 @@ See [docs/testing-safety.md](docs/testing-safety.md) before editing PAM config o
 - Constant-time embedding comparison via `subtle` crate
 - AES-256-GCM encryption at rest with optional TPM-sealed keys
 - Model SHA256 verification at every load
-- D-Bus system bus policy: deny-all default, facelock group ACL
+- D-Bus system bus policy: deny-all default; `Authenticate` open to every local user (daemon-checked UID), everything else root-only; no group
 - D-Bus caller UID verification on all daemon methods
 - PAM audit logging to syslog
 - Rate limiting (5 attempts/user/60s)

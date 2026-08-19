@@ -3,24 +3,21 @@
 //! Layout (see [`crate::state_layout`], which owns it):
 //!
 //! ```text
-//! /var/lib/facelock/                   0710 root:facelock  traverse-only, not listable
-//! /var/lib/facelock/enrolled/          0710 root:facelock  markers only
+//! /var/lib/facelock/                   0711 root:root  traverse-only, not listable
+//! /var/lib/facelock/enrolled/          0711 root:root  markers only
 //! /var/lib/facelock/enrolled/<user>    0600 <user>:<user>
 //! ```
 //!
-//! The markers live **inside** the state directory, and reaching one takes
-//! membership of the `facelock` group: both directories grant the group
-//! traversal (`g+x`) and everyone else nothing. That is deliberate —
-//! `is-enrolled` means *"is face auth operational for me"*, and the group is
-//! required to reach the daemon at all, so a caller outside it reads `EACCES`,
-//! reports not-enrolled, and that is the **correct** answer, not a failure
-//! mode. One `open(2)` answers group-membership and enrollment together.
-//!
-//! Traverse-only (`0710`, no `r`) means a group member can open its own marker
-//! by name but cannot `readdir` the directory, so which *other* accounts have
-//! face auth enrolled stays private. Each marker is `0600` and owned by its
-//! user, so "am I enrolled?" is answerable by that user and nobody else — the
-//! same privacy property as `~/.ssh/authorized_keys`.
+//! The markers live **inside** the state directory. Both directories grant
+//! everyone traversal (`--x`) and nobody but root listing (ADR 010), so any
+//! local user can open its own marker by name but cannot `readdir` the
+//! directory, so the enrolled roster is not enumerable; a guessed name can
+//! still be probed for existence with `stat(2)` — the accepted residual
+//! recorded in `docs/security.md` § 3 A2. Each marker is `0600` and owned by
+//! its user, so "am I enrolled?" is answerable by that user and nobody else —
+//! the same privacy property as `~/.ssh/authorized_keys`. No group is
+//! involved (ADR 010); `is-enrolled` answers `enrolled` as soon as the marker
+//! exists.
 //!
 //! The marker is a **hint, not authority**; see the module docs in
 //! [`crate::commands::is_enrolled`]. Every write is best-effort: a marker that
@@ -39,12 +36,10 @@ use serde::{Deserialize, Serialize};
 use facelock_core::Config;
 use facelock_core::fs_security::{ensure_private_dir, write_file};
 
+use crate::state_layout::ENROLLED_DIR_MODE;
+
 /// Fallback marker directory when the configured DB path yields no parent.
 pub const DEFAULT_MARKER_DIR: &str = "/var/lib/facelock/enrolled";
-
-/// Group-traversable but not listable — see the module docs and the ownership
-/// contract on [`crate::state_layout::ENROLLED_DIR_MODE`], which this equals.
-pub const MARKER_DIR_MODE: u32 = crate::state_layout::ENROLLED_DIR_MODE;
 
 /// Readable only by the user the marker describes.
 pub const MARKER_FILE_MODE: u32 = 0o600;
@@ -211,7 +206,7 @@ pub fn write_marker_in(
     owner: Option<(u32, u32)>,
 ) -> io::Result<()> {
     let final_path = marker_path(base, user)?;
-    ensure_private_dir(base, MARKER_DIR_MODE)?;
+    ensure_private_dir(base, ENROLLED_DIR_MODE)?;
 
     let marker = Marker {
         models,
@@ -339,7 +334,7 @@ pub fn reconcile_all(config: &Config) -> anyhow::Result<()> {
     // No database yet: nothing to backfill. Do not create one as a side effect
     // of reconciling — setup calls this before anyone has enrolled.
     if !db_path.exists() {
-        ensure_private_dir(&base, MARKER_DIR_MODE)?;
+        ensure_private_dir(&base, ENROLLED_DIR_MODE)?;
         return Ok(());
     }
 
@@ -351,7 +346,7 @@ pub fn reconcile_all(config: &Config) -> anyhow::Result<()> {
         .list_users()
         .map_err(|e| anyhow::anyhow!("failed to list enrolled users: {e}"))?;
 
-    ensure_private_dir(&base, MARKER_DIR_MODE)?;
+    ensure_private_dir(&base, ENROLLED_DIR_MODE)?;
 
     let mut wanted: Vec<String> = Vec::new();
     for user in users {
@@ -386,7 +381,7 @@ pub fn reconcile_all(config: &Config) -> anyhow::Result<()> {
 
 /// Delete every marker in `base` whose user is not in `keep`.
 ///
-/// Requires read access to the directory, which `0710` grants only to root —
+/// Requires read access to the directory, which `0711` grants only to root —
 /// exactly the privilege level reconcile already runs at.
 fn prune_markers_in(base: &Path, keep: &[String]) -> io::Result<()> {
     let entries = match fs::read_dir(base) {
@@ -493,15 +488,15 @@ mod tests {
     }
 
     #[test]
-    fn directory_mode_is_0710_and_file_mode_is_0600() {
+    fn directory_mode_is_0711_and_file_mode_is_0600() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("enrolled");
         write_marker_in(&base, "alice", 2, None).unwrap();
 
         assert_eq!(
             mode_of(&base),
-            0o710,
-            "marker dir must be group-traversable, not listable, and closed to other"
+            0o711,
+            "marker dir must be traversable by all and listable by none"
         );
         assert_eq!(
             mode_of(&base.join("alice")),
@@ -720,7 +715,7 @@ mod tests {
 
         reconcile_all(&config).unwrap();
 
-        assert_eq!(mode_of(&base), 0o710);
+        assert_eq!(mode_of(&base), 0o711);
         match read_marker_in(&base, &me) {
             MarkerState::Enrolled(m) => assert_eq!(m.models, 2, "backfilled from the database"),
             other => panic!("expected {me} enrolled, got {other:?}"),
@@ -824,7 +819,11 @@ mod tests {
             first[0].1
         );
         assert_eq!(first[0].2, MARKER_FILE_MODE);
-        assert_eq!(mode_of(&base), MARKER_DIR_MODE, "directory mode is stable");
+        assert_eq!(
+            mode_of(&base),
+            ENROLLED_DIR_MODE,
+            "directory mode is stable"
+        );
     }
 
     /// A marker the reconcile could not *write* must survive it.
@@ -890,7 +889,7 @@ mod tests {
 
         let base = marker_dir(&config);
         assert!(base.is_dir(), "reconcile must create the marker directory");
-        assert_eq!(mode_of(&base), 0o710);
+        assert_eq!(mode_of(&base), 0o711);
         assert!(
             !Path::new(&config.storage.db_path).exists(),
             "reconcile must not create a database as a side effect"

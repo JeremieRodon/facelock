@@ -11,3 +11,4 @@
 | [007](007-systemd-hardening-tradeoffs.md) | Selective systemd hardening with documented exclusions | Accepted |
 | [008](008-camera-lifecycle.md) | Outcome-based camera hold and cancellable authentication | Accepted |
 | [009](009-cli-verb-noun-shape.md) | Verb/noun shape of the CLI command tree | Accepted |
+| [010](010-open-authenticate-retire-group-grant.md) | `Authenticate` open to every local user; the `facelock` group retired | Accepted |

@@ -21,13 +21,12 @@
 //!
 //! This command answers from the per-user marker file written by
 //! [`crate::commands::enrollment_marker`] — never from the database, which is
-//! `0600 root:root`. Reaching the marker requires traversing two
-//! `0710 root:facelock` directories, so a caller outside the `facelock` group
-//! reads `EACCES` and reports not-enrolled — **deliberately**: the group is
-//! required to reach the daemon at all, so face auth genuinely is not
-//! operational for that caller yet. One `open(2)` answers group-membership
-//! and enrollment together, including "enrolled but not yet re-logged-in
-//! after being added to the group".
+//! `0600 root:root`. The marker sits under two `0711 root:root` directories,
+//! so any local user can open its own `0600` marker by name (ADR 010): one
+//! `open(2)` answers the question with no group, no daemon and no
+//! camera. `EACCES` on that open (a hardened or foreign layout) is reported
+//! as not-enrolled rather than as an error — an indicator that fails to show
+//! is the safe way to be wrong.
 //!
 //! # The marker is a hint, not authority
 //!
@@ -41,7 +40,7 @@
 //!
 //! This runs on the lock screen, repeatedly, as an unprivileged user. It must
 //! not activate the daemon over D-Bus, must not open a camera, and must never
-//! error merely because the caller lacks `facelock` group membership. This is
+//! error merely because the marker is unreadable. This is
 //! why `list --json` cannot be reused: `commands::list` tries daemon IPC
 //! first, which *activates* the system daemon. Nothing in this module may call
 //! [`crate::ipc_client::send_request`],

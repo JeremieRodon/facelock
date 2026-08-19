@@ -102,7 +102,7 @@ since omitting a flag already gives the default.
 | Flag | Meaning |
 |------|---------|
 | *(none)* | Full interactive wizard. Falls back to the non-interactive flow when stdin is not a terminal. |
-| `--non-interactive` | No prompts. Choices resolve to config-or-default. Runs the base setup only: directories, model download and verification, encryption, group membership, path permissions. No PAM, no systemd, no enrollment unless asked for explicitly. |
+| `--non-interactive` | No prompts. Choices resolve to config-or-default. Runs the base setup only: directories, model download and verification, encryption, path permissions. No PAM, no systemd, no enrollment unless asked for explicitly. |
 | `-y`, `--yes` (alias `--no-confirm`) | Suppress confirmation prompts, and unlock the sensitive-service gate. |
 
 `--non-interactive` suppresses the per-file "Proceed?" confirmation on its own,
@@ -196,12 +196,10 @@ enough to call repeatedly from a lock screen: it reads one marker file under
 `/var/lib/facelock/enrolled/` and never activates the daemon, opens a camera,
 or reads the face database.
 
-It never errors merely because the caller is outside the `facelock` group, but
-it cannot report `enrolled` for one either: the marker sits under two
-`0710 root:facelock` directories, so a non-member reads `EACCES` and is
-reported `not-enrolled`. That is the correct answer — the group is required to
-reach the daemon at all, so face auth genuinely is not operational for that
-caller yet.
+No group is involved (ADR 010): the marker sits under two `0711 root:root`
+directories, so any local user can open its own marker by name. A missing or
+unreadable marker (`ENOENT` or `EACCES`) is reported `not-enrolled` rather than
+as an error.
 
 ```bash
 facelock is-enrolled                    # prints enrolled / not-enrolled

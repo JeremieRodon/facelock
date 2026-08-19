@@ -89,7 +89,7 @@ chmod 644 /var/lib/facelock/models/*.onnx
 #### A. Database File Permissions (Required)
 
 ```bash
-# Database owned by root, readable only by root and facelock group
+# Database owned by root, readable by root only
 chown root:root /var/lib/facelock/facelock.db
 chmod 600 /var/lib/facelock/facelock.db
 ```
@@ -110,9 +110,9 @@ For high-security deployments, embeddings can be encrypted with AES-256-GCM usin
 
 #### A. D-Bus System Bus Policy (Required)
 
-The D-Bus system bus policy (`/usr/share/dbus-1/system.d/org.facelock.Daemon.conf`) restricts which users and groups can own the bus name and invoke methods. Only root and members of the `facelock` group are granted access. (`/etc/dbus-1/system.d/` is the admin-override location for local customization.)
+The D-Bus system bus policy (`/usr/share/dbus-1/system.d/org.facelock.Daemon.conf`) governs who may own the bus name and which methods each caller may send. Two grants (ADR 010): root may send anything on the interface and receive its signals; every local user may send exactly one method, `org.facelock.Daemon.Authenticate`, which is what lets screen lockers and the polkit agent unlock with no group and no re-login. There is no `facelock` group; signal receipt is root-only. (`/etc/dbus-1/system.d/` is the admin-override location for local customization.)
 
-Beyond bus-level access, the daemon enforces per-method UID authorization. Before executing any method, the daemon calls `GetConnectionUnixUser` to verify the caller's UID. `Authenticate` allows the caller's own UID — a user must be able to request authentication for themselves, since screen lockers run their PAM stack as that user. Every other method, including `Enroll`, `Shutdown`, and the preview methods, is restricted to root (UID 0). This prevents a `facelock` group member from enrolling faces, pulling camera frames, or shutting down the daemon without root privileges.
+Because the bus admits every local user's `Authenticate`, the in-daemon per-method UID check is the boundary for that method. Before executing any method, the daemon calls `GetConnectionUnixUser` to verify the caller's UID. `Authenticate` allows root, or a non-root caller acting on its own username — a user must be able to request authentication for themselves, since screen lockers run their PAM stack as that user. Every other method, including `Enroll`, `Shutdown`, and the preview methods, is restricted to root (UID 0), so no non-root caller can enroll faces, pull camera frames, or shut down the daemon.
 
 #### B. D-Bus Message Size Limits (Required)
 

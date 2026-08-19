@@ -91,7 +91,7 @@ just test-rpm-release-shell  # Fedora .rpm clean room — real user experience
 The `test-rpm` / `test-deb` recipes validate file layout from manually installed binaries.
 The `*-pkg` recipes build real packages using the same scripts as CI, install them with
 the actual package manager (`dnf` / `dpkg`), and validate the result — testing postinst
-scripts, dependency resolution, ORT bundling, sysusers/tmpfiles triggers, and the full
+scripts, dependency resolution, ORT bundling, tmpfiles triggers, and the full
 install path.
 
 The `*-dev-shell` recipes mount host models for fast interactive camera testing.

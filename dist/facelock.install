@@ -3,14 +3,14 @@
 # creates, or deletes data: directories are created, existing files are
 # re-chmod/chowned, and that is all. Every line is idempotent.
 _facelock_secure_paths() {
-    # State dir: traverse-only for the facelock group, nothing for others.
-    chown root:facelock /var/lib/facelock 2>/dev/null || true
-    chmod 710 /var/lib/facelock 2>/dev/null || true
-    # Models are public, SHA256-verified downloads; the 0710 parent is the gate.
+    # State dir: traversable by everyone, listable by root only (ADR 010).
+    chown root:root /var/lib/facelock 2>/dev/null || true
+    chmod 711 /var/lib/facelock 2>/dev/null || true
+    # Models are public, SHA256-verified downloads.
     chown root:root /var/lib/facelock/models 2>/dev/null || true
     chmod 755 /var/lib/facelock/models 2>/dev/null || true
-    # `facelock is-enrolled` marker dir: group-traversable, not listable.
-    install -d -o root -g facelock -m 0710 /var/lib/facelock/enrolled 2>/dev/null || true
+    # `facelock is-enrolled` marker dir: traversable by all, listable by none.
+    install -d -o root -g root -m 0711 /var/lib/facelock/enrolled 2>/dev/null || true
     # Database and sidecars: root-only. Tighten if present, never create.
     for f in /var/lib/facelock/facelock.db /var/lib/facelock/facelock.db-wal /var/lib/facelock/facelock.db-shm; do
         [ -f "$f" ] && chown root:root "$f" 2>/dev/null && chmod 600 "$f" 2>/dev/null
@@ -22,13 +22,45 @@ _facelock_secure_paths() {
     chown root:root /var/log/facelock/snapshots 2>/dev/null || true
     chmod 700 /var/log/facelock/snapshots 2>/dev/null || true
     [ -f /var/log/facelock/audit.jsonl ] && chown root:root /var/log/facelock/audit.jsonl 2>/dev/null && chmod 600 /var/log/facelock/audit.jsonl 2>/dev/null
+    # Runtime dir: tmpfiles recreates it root:root at boot; converge a live one.
+    [ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
+    return 0
+}
+
+# ADR 010 retired the facelock group: nothing is group-owned any more, so
+# remove a group an older install created. Best-effort — a groupdel the system
+# refuses (a member still logged in, another package's group of the same name)
+# is not an install failure.
+_facelock_retire_group() {
+    if getent group facelock >/dev/null 2>&1; then
+        groupdel facelock 2>/dev/null || true
+    fi
+    return 0
+}
+
+# The bus policy may have changed (ADR 010). Refresh any legacy copy, then ask
+# the bus to re-read. Best-effort throughout.
+_facelock_refresh_bus_policy() {
+    # A legacy copy in /etc/dbus-1/system.d is read after /usr/share and would
+    # re-deny Authenticate (last matching rule wins); refresh it if present.
+    if [ -f /etc/dbus-1/system.d/org.facelock.Daemon.conf ] && \
+       grep -q 'org.facelock.Daemon' /etc/dbus-1/system.d/org.facelock.Daemon.conf; then
+        install -Dm644 /usr/share/dbus-1/system.d/org.facelock.Daemon.conf \
+            /etc/dbus-1/system.d/org.facelock.Daemon.conf 2>/dev/null || true
+    fi
+    # Both dbus-daemon and dbus-broker watch the policy directory, but a
+    # running lock screen may call Authenticate before they notice — ask
+    # explicitly.
+    dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+        /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
     return 0
 }
 
 post_install() {
-    systemd-sysusers
     systemd-tmpfiles --create
     _facelock_secure_paths
+    _facelock_retire_group
+    _facelock_refresh_bus_policy
 
     # Reload systemd for D-Bus activation
     systemctl daemon-reload 2>/dev/null || true
@@ -39,9 +71,10 @@ post_install() {
 }
 
 post_upgrade() {
-    systemd-sysusers
     systemd-tmpfiles --create
     _facelock_secure_paths
+    _facelock_retire_group
+    _facelock_refresh_bus_policy
 
     # Pick up unit changes before the restart below, not after. Without this,
     # `systemctl restart` re-runs the *cached* unit and every change the new

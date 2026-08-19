@@ -17,6 +17,7 @@ use crate::message::{
     DeviceMessage, DownloadMessage, Message, PamMessage, SetupMessage, SystemMessage, Terminal,
     fail,
 };
+use crate::state_layout::{apply_dir, apply_file};
 
 // The `/etc/pam.d` writer lives in `commands/pam.rs` (#174) — `facelock pam
 // add|remove|status` is its command, and `setup --pam` is an alias onto it.
@@ -593,14 +594,6 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
             false
         }
     };
-
-    // Group membership: without it, the first daemon command a normal user
-    // runs after setup fails with a bare D-Bus AccessDenied (issue #89).
-    if let Err(e) = setup_group_membership(Some(&theme)) {
-        Terminal.info(&SetupMessage::GroupStepFailed {
-            error: e.to_string(),
-        });
-    }
 
     if systemd_enabled {
         start_daemon_for_setup(&config);
@@ -2363,10 +2356,6 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
         None => setup_encryption_auto(&config)?,
     }
 
-    // Ensure the facelock group exists (secure_setup_paths chowns to it) and
-    // add the invoking user so daemon commands work without sudo (#89).
-    setup_group_membership(None)?;
-
     secure_setup_paths(&config, Some(&manifest))?;
     write_setup_marker()?;
 
@@ -2471,128 +2460,34 @@ fn setup_encryption_auto(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn chown_path(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("path contains embedded NUL: {}", path.display()))?;
-    let result = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
-    if result != 0 {
-        anyhow::bail!(
-            "failed to chown {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> anyhow::Result<()> {
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
-// facelock group membership
+// legacy facelock system group
 // ---------------------------------------------------------------------------
 
-/// Resolve the invoking (non-root) user behind `sudo facelock setup`.
-fn invoking_user() -> Option<String> {
-    let valid = |u: &String| !u.is_empty() && u != "root";
-    std::env::var("SUDO_USER")
-        .ok()
-        .filter(valid)
-        .or_else(|| std::env::var("DOAS_USER").ok().filter(valid))
-}
-
-/// True if `user` is a member of `group` (supplementary or primary).
-fn user_in_group(user: &str, group: &nix::unistd::Group) -> bool {
-    if group.mem.iter().any(|m| m == user) {
-        return true;
-    }
-    // Primary-group membership is recorded in passwd, not in group.mem.
-    matches!(nix::unistd::User::from_name(user), Ok(Some(u)) if u.gid == group.gid)
-}
-
-/// Ensure the `facelock` system group exists and the invoking user is in it.
+/// Remove a `facelock` group left behind by an older install, best-effort.
 ///
-/// The D-Bus system-bus policy admits only root and the `facelock` group, so
-/// without membership the first `facelock preview`/`test` after setup fails
-/// with AccessDenied (issue #89). Packaging creates the group but cannot know
-/// which human user to add — setup is the right place. Pass `theme` for an
-/// interactive Y/n prompt; `None` adds the invoking sudo/doas user without
-/// prompting, and prints a manual `usermod` command when no invoking user can
-/// be determined.
-fn setup_group_membership(theme: Option<&ColorfulTheme>) -> anyhow::Result<()> {
-    // Create the system group if packaging didn't (e.g. source installs).
-    if nix::unistd::Group::from_name("facelock")
-        .context("failed to look up facelock group")?
-        .is_none()
-    {
-        Terminal.info(&SystemMessage::CreatingFacelockGroup);
-        run_cmd("groupadd", &["-r", "facelock"])?;
+/// ADR 010 retired the group: the bus policy no longer names it and packaging
+/// no longer creates it. This runs at the end of `secure_setup_paths`, once
+/// every path setup owns has converged to `root:root`, so nothing under
+/// `/var/lib/facelock` is group-owned by the time the group goes away;
+/// `/run/facelock` converges through tmpfiles at the next boot or through the
+/// package scriptlets. `groupdel` fails only when the group is some account's
+/// primary group, which facelock never did; a failure is reported, never
+/// fatal.
+fn retire_facelock_group() {
+    match nix::unistd::Group::from_name("facelock") {
+        Ok(Some(_)) => match run_cmd("groupdel", &["facelock"]) {
+            Ok(()) => Terminal.info(&SystemMessage::RetiredFacelockGroup),
+            Err(e) => tracing::warn!("could not remove the legacy facelock group: {e}"),
+        },
+        Ok(None) => {}
+        Err(e) => tracing::warn!("could not look up the facelock group: {e}"),
     }
-    let group = nix::unistd::Group::from_name("facelock")
-        .context("failed to look up facelock group")?
-        .context("facelock group missing after creation")?;
-
-    let Some(user) = invoking_user() else {
-        Terminal.info(&SystemMessage::GroupMembershipNote);
-        return Ok(());
-    };
-
-    if user_in_group(&user, &group) {
-        Terminal.info(&SystemMessage::AlreadyInGroup { user: user.clone() });
-        return Ok(());
-    }
-
-    if let Some(theme) = theme {
-        // Propagate prompt failures instead of treating them as "declined":
-        // the wizard's caller prints the error plus the manual usermod command,
-        // so a broken stdin surfaces rather than silently skipping the add.
-        let proceed = Confirm::with_theme(theme)
-            .with_prompt(SystemMessage::ConfirmAddToGroup { user: user.clone() }.localized())
-            .default(true)
-            .interact()
-            .context("group membership prompt failed")?;
-        if !proceed {
-            Terminal.info(&SystemMessage::GroupAddSkipped { user: user.clone() });
-            return Ok(());
-        }
-    }
-
-    run_cmd("usermod", &["-aG", "facelock", &user])?;
-    Terminal.info(&SystemMessage::AddedToGroup { user: user.clone() });
-    Ok(())
 }
 
-fn facelock_group_gid() -> anyhow::Result<u32> {
-    nix::unistd::Group::from_name("facelock")
-        .context("failed to look up facelock group")?
-        .map(|group| group.gid.as_raw())
-        .context(
-            "facelock group is missing; install package assets or create the facelock system group",
-        )
-}
-
-fn secure_existing_path(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    ensure_mode(path, mode)
-        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-
-    if nix::unistd::Uid::current().is_root() {
-        chown_path(path, 0, gid)?;
-    }
-
-    Ok(())
-}
-
-fn secure_dir_if_exists(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> {
+/// Tighten an existing directory to `mode` and, when running as root, make it
+/// `root:root`. Every directory setup secures is root-owned by construction.
+fn secure_dir_if_exists(path: &Path, mode: u32, is_root: bool) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -2604,64 +2499,57 @@ fn secure_dir_if_exists(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> 
         );
     }
 
-    ensure_private_dir(path, mode)
-        .with_context(|| format!("failed to secure directory {}", path.display()))?;
-    if nix::unistd::Uid::current().is_root() {
-        chown_path(path, 0, gid)?;
-    }
-
-    Ok(())
+    apply_dir(path, mode, is_root)
 }
 
 fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyhow::Result<()> {
-    let facelock_gid = facelock_group_gid()?;
     let config_path = facelock_core::paths::config_path();
     let config_dir = config_path
         .parent()
         .unwrap_or_else(|| Path::new("/etc/facelock"));
-    let db_path = Path::new(&config.storage.db_path);
     let audit_path = Path::new(&config.audit.path);
     let key_path = Path::new(&config.encryption.key_path);
     let sealed_key_path = Path::new(&config.encryption.sealed_key_path);
+    // Every path setup secures is root-owned by construction: enforce that when
+    // running as root, apply modes alone otherwise.
+    let is_root = nix::unistd::Uid::current().is_root();
 
-    secure_dir_if_exists(config_dir, 0o755, 0)?;
+    secure_dir_if_exists(config_dir, 0o755, is_root)?;
     // Snapshots hold raw face images: root-only, no group access.
-    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700, 0)?;
+    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700, is_root)?;
 
     // The state directory subtree — state dir, models/, enrolled/, and the
-    // database file modes — is owned by `state_layout`. Re-applied here
-    // because setup only creates the `facelock` group partway through, so the
-    // earlier call could not chown.
-    if let Some(layout) = crate::state_layout::StateLayout::from_config(config) {
-        let owners = nix::unistd::Uid::current()
-            .is_root()
-            .then_some(crate::state_layout::Owners { facelock_gid });
-        crate::state_layout::apply_layout(&layout, owners)?;
-    }
+    // database file with its -wal/-shm sidecars — is owned by `state_layout`.
+    // Re-applied here so a path created earlier in setup with a looser mode
+    // converges before the marker reconcile runs.
+    ensure_state_layout_or_bail(config)?;
     if let Some(parent) = audit_path.parent() {
         // Per-user auth history: root-only, like the snapshots.
-        secure_dir_if_exists(parent, 0o700, 0)?;
+        secure_dir_if_exists(parent, 0o700, is_root)?;
     }
     if let Some(parent) = key_path.parent() {
-        secure_dir_if_exists(parent, 0o755, 0)?;
+        secure_dir_if_exists(parent, 0o755, is_root)?;
     }
     if let Some(parent) = sealed_key_path.parent() {
-        secure_dir_if_exists(parent, 0o755, 0)?;
+        secure_dir_if_exists(parent, 0o755, is_root)?;
     }
 
-    secure_existing_path(&config_path, 0o644, 0)?;
-    secure_existing_path(db_path, 0o600, 0)?;
-    secure_existing_path(audit_path, 0o600, 0)?;
-    secure_existing_path(key_path, 0o600, 0)?;
-    secure_existing_path(sealed_key_path, 0o600, 0)?;
-    secure_existing_path(Path::new(SETUP_COMPLETE_MARKER), 0o644, 0)?;
+    apply_file(&config_path, 0o644, is_root)?;
+    apply_file(audit_path, 0o600, is_root)?;
+    apply_file(key_path, 0o600, is_root)?;
+    apply_file(sealed_key_path, 0o600, is_root)?;
+    apply_file(Path::new(SETUP_COMPLETE_MARKER), 0o644, is_root)?;
 
     if let Some(manifest) = manifest {
         for entry in &manifest.models {
             let model_path = Path::new(&config.daemon.model_dir).join(&entry.filename);
-            secure_existing_path(&model_path, 0o644, 0)?;
+            apply_file(&model_path, 0o644, is_root)?;
         }
     }
+
+    // ADR 010: everything above is root:root now, so a facelock group left by
+    // an older install owns nothing; remove it (best-effort, reported).
+    retire_facelock_group();
 
     Ok(())
 }
@@ -3102,7 +2990,9 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
         // bus denies `own` by default and root is not exempt. Bus
         // implementations differ on whether they pick the directory up over
         // inotify, so ask; where it was unnecessary this is a no-op, and a
-        // failure is not worth failing an install over.
+        // failure is not worth failing an install over. ADR 010 also relies
+        // on this: a lock screen may call `Authenticate` as soon as the
+        // policy changes.
         if let Err(e) = run_cmd("systemctl", &["reload", "dbus"]) {
             tracing::debug!("could not reload the D-Bus configuration: {e}");
         }
@@ -4039,6 +3929,84 @@ mod tests {
             "embedder_sha256 = \"4ab1d6435d639628a6f3e5008dd4f929edf4c4124b1a7169e1048f9fef534cdf\""
         ));
         assert!(result.contains("threshold = 0.75"));
+    }
+
+    /// ADR 010: the default context may call exactly `Authenticate`; there
+    /// is no group policy and only root may receive signals. Pinned on the
+    /// embedded policy so a "cleanup" of the XML cannot silently close the
+    /// lock screen out again, reopen the whole interface, or bring the group
+    /// back. Order matters — dbus-daemon and dbus-broker apply the last
+    /// matching rule in a context — so the allow must follow the deny.
+    #[test]
+    fn dbus_policy_opens_authenticate_to_the_default_context_only() {
+        /// The text between the first `open` and the `close` that follows it.
+        fn between<'a>(hay: &'a str, open: &str, close: &str) -> &'a str {
+            let start = hay
+                .find(open)
+                .unwrap_or_else(|| panic!("{open:?} not found in the policy"))
+                + open.len();
+            let len = hay[start..]
+                .find(close)
+                .unwrap_or_else(|| panic!("{close:?} does not follow {open:?} in the policy"));
+            &hay[start..start + len]
+        }
+
+        let policy = DBUS_POLICY;
+        assert_eq!(
+            policy.matches(r#"<policy context="default">"#).count(),
+            1,
+            "exactly one default-context policy block; a second one could reopen the interface below this test's slice"
+        );
+        let default = between(policy, r#"<policy context="default">"#, "</policy>");
+
+        let deny = default
+            .find(r#"<deny send_destination="org.facelock.Daemon"/>"#)
+            .expect("default context denies the interface");
+        assert_eq!(
+            default.matches("<allow").count(),
+            1,
+            "exactly one allow in the default context"
+        );
+        let allow_start = default.find("<allow").expect("the one allow");
+        let allow = between(default, "<allow", "/>");
+        assert!(
+            allow_start > deny,
+            "the Authenticate allow must follow the deny"
+        );
+        for attr in [
+            r#"send_destination="org.facelock.Daemon""#,
+            r#"send_interface="org.facelock.Daemon""#,
+            r#"send_member="Authenticate""#,
+        ] {
+            assert!(allow.contains(attr), "allow lacks {attr}: {allow}");
+        }
+        assert!(
+            default
+                .contains(r#"<deny receive_sender="org.facelock.Daemon" receive_type="signal"/>"#),
+            "signals stay denied to the default context"
+        );
+
+        assert!(
+            !policy.contains("<policy group"),
+            "no group policy (ADR 010: the group is retired)"
+        );
+        let root = between(policy, r#"<policy user="root">"#, "</policy>");
+        let signal_at = root
+            .find(r#"receive_type="signal""#)
+            .expect("root may receive the daemon's signals");
+        let allow_at = root[..signal_at]
+            .rfind("<allow")
+            .expect("the root signal rule is an allow");
+        let signal_allow = between(&root[allow_at..], "<allow", "/>");
+        assert!(
+            signal_allow.contains(r#"receive_sender="org.facelock.Daemon""#),
+            "root signal allow lacks receive_sender: {signal_allow}"
+        );
+        assert_eq!(
+            policy.matches(r#"receive_type="signal""#).count(),
+            2,
+            "signal rules: the root allow and the default-context deny, nothing else"
+        );
     }
 }
 

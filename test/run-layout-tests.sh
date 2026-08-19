@@ -1,23 +1,22 @@
 #!/bin/bash
 # State-layout conformance tests (camera-free).
 #
-# Asserts the exact on-disk contract from docs/contracts.md:
+# Asserts the exact on-disk contract from docs/contracts.md (ADR 010):
 #
-#   /var/lib/facelock/       0710 root:facelock    traverse-only, not listable
+#   /var/lib/facelock/       0711 root:root    traverse-only, not listable
 #     facelock.db            0600 root:root
 #     facelock.db-wal/-shm   0600 root:root
-#     models/                0755 root:root        public, SHA256-verified
-#     enrolled/              0710 root:facelock
+#     models/                0755 root:root    public, SHA256-verified
+#     enrolled/              0711 root:root
 #       <user>               0600 <user>:<user>
 #   /var/log/facelock/       0700 root:root
 #     snapshots/             0700 root:root
 #
 # The image is built with `just install-files`, so this is the one place the
 # packaging wiring (install recipe + built-in defaults) is exercised end to
-# end. It also asserts the semantics the modes exist for: a facelock group
-# member can traverse to a marker it knows by name but cannot list the state
-# directory or read the database, and a user outside the group can reach
-# nothing at all.
+# end. It also asserts the semantics the modes exist for: any local user —
+# there is no facelock group any more (ADR 010) — can traverse to a marker it
+# knows by name but cannot list the state directory or read the database.
 set -uo pipefail
 
 PASS=0
@@ -46,7 +45,7 @@ run_test() {
     fi
 }
 
-# stat-based assertion: mode owner group, e.g. assert_path /var/lib/facelock 710 root facelock
+# stat-based assertion: mode owner group, e.g. assert_path /var/lib/facelock 711 root root
 assert_path() {
     local path="$1" mode="$2" owner="$3" group="$4"
     run_test "$path is $mode $owner:$group" \
@@ -54,109 +53,133 @@ assert_path() {
         0
 }
 
-echo "=== State Layout Tests ==="
+echo "=== Facelock state-layout tests ==="
 echo ""
 
 # ---------------------------------------------------------------------------
 # The static layout, as `just install-files` shipped it
 # ---------------------------------------------------------------------------
 
-assert_path /var/lib/facelock          710 root facelock
+assert_path /var/lib/facelock          711 root root
 assert_path /var/lib/facelock/models   755 root root
-assert_path /var/lib/facelock/enrolled 710 root facelock
+assert_path /var/lib/facelock/enrolled 711 root root
 assert_path /var/log/facelock          700 root root
 assert_path /var/log/facelock/snapshots 700 root root
 
+run_test "no facelock group is shipped (ADR 010 retired it)" \
+    "! getent group facelock" \
+    0
+
 # ---------------------------------------------------------------------------
-# The binary converges a loosened install back onto the layout
+# The binary converges an older install back onto the layout
 # ---------------------------------------------------------------------------
 
-# Simulate a pre-0710 install: group-readable database, wide directories.
+# Simulate the pre-ADR-010 layout (0710 root:facelock, group-readable
+# database) plus a wide-open state dir. The group is no longer shipped, so the
+# simulation has to create the one an old install would have left behind; it
+# is deleted again at the end of this block.
+getent group facelock >/dev/null || groupadd -r facelock
 install -m 640 -o root -g facelock /dev/null /var/lib/facelock/facelock.db
+chown root:facelock /var/lib/facelock /var/lib/facelock/enrolled
+chmod 710 /var/lib/facelock/enrolled
 chmod 755 /var/lib/facelock
-chmod 711 /var/lib/facelock/enrolled
 
 # Any root invocation that touches the store applies the layout first; `list`
 # is the cheapest one that needs no camera. Its own exit code is irrelevant
 # here (the seeded database is empty).
 facelock list --user testuser > /dev/null 2>&1 || true
 
-assert_path /var/lib/facelock             710 root facelock
-assert_path /var/lib/facelock/enrolled    710 root facelock
+assert_path /var/lib/facelock             711 root root
+assert_path /var/lib/facelock/enrolled    711 root root
 assert_path /var/lib/facelock/facelock.db 600 root root
 
+# Back to the shipped state for everything below: no facelock group.
+groupdel facelock 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
-# Nothing under the state directory is reachable or readable by "other"
+# Nothing under the state directory is readable or listable by "other"
 # ---------------------------------------------------------------------------
 
-# models/ is the single entry allowed to carry "other" bits (public data
-# behind the 0710 parent); everything else must carry none.
-run_test "no entry under the state dir is other-accessible (models/ excepted)" \
-    "[ -z \"\$(find /var/lib/facelock -mindepth 1 -path /var/lib/facelock/models -prune -o -perm /o+rwx -print)\" ]" \
+# Files carry no "other" bits; directories carry at most traverse (o+x).
+# models/ is the single subtree allowed to carry "other" bits of its own
+# (public data).
+run_test "no file under the state dir is other-accessible (models/ excepted)" \
+    "[ -z \"\$(find /var/lib/facelock -mindepth 1 -path /var/lib/facelock/models -prune -o -type f -perm /o+rwx -print)\" ]" \
     0
 
-run_test "the state dir itself grants 'other' nothing" \
-    "[ \$(( 0\$(stat -c '%a' /var/lib/facelock) & 07 )) -eq 0 ]" \
+run_test "no directory under the state dir is other-readable or -writable (models/ excepted)" \
+    "[ -z \"\$(find /var/lib/facelock -mindepth 1 -path /var/lib/facelock/models -prune -o -type d -perm /o+rw -print)\" ]" \
+    0
+
+run_test "the state dir grants 'other' traversal only" \
+    "[ \$(( 0\$(stat -c '%a' /var/lib/facelock) & 07 )) -eq 1 ]" \
+    0
+
+# `[ -eq ]` reads its operands as decimal, so the expected value goes through
+# $(( )) too — a bare `010` on the right would mean ten, not 0o10.
+run_test "the state dir grants group traversal only (no listing)" \
+    "[ \$(( 0\$(stat -c '%a' /var/lib/facelock) & 070 )) -eq \$(( 010 )) ]" \
     0
 
 # ---------------------------------------------------------------------------
-# Group semantics: traverse-only, not listable, database unreadable
+# Semantics for a plain local user: traverse by name, list nothing, read no
+# secret. `outsider` is an ordinary account with no privileges of any kind —
+# ADR 010 left no group for it to be inside or outside of.
 # ---------------------------------------------------------------------------
 
-usermod -aG facelock testuser
 useradd -m outsider
 
-# A marker for testuser, as enrollment would write it.
+# A marker for outsider, as enrollment would write it.
+install -m 600 -o outsider -g outsider /dev/null /var/lib/facelock/enrolled/outsider
+echo '{"models":2,"updated":"2026-08-13T00:00:00Z"}' > /var/lib/facelock/enrolled/outsider
+# And one for testuser, which outsider must not be able to read.
 install -m 600 -o testuser -g testuser /dev/null /var/lib/facelock/enrolled/testuser
-echo '{"models":2,"updated":"2026-08-13T00:00:00Z"}' > /var/lib/facelock/enrolled/testuser
+echo '{"models":1,"updated":"2026-08-13T00:00:00Z"}' > /var/lib/facelock/enrolled/testuser
 
-run_test "group member reads own marker through 0710 dirs" \
-    "runuser -u testuser -- cat /var/lib/facelock/enrolled/testuser" \
+run_test "a plain local user reads own marker through 0711 dirs" \
+    "runuser -u outsider -- cat /var/lib/facelock/enrolled/outsider" \
     0
 
-run_test "group member cannot list the state dir" \
-    "runuser -u testuser -- ls /var/lib/facelock" \
-    2
-
-run_test "group member cannot list enrolled/" \
-    "runuser -u testuser -- ls /var/lib/facelock/enrolled" \
-    2
-
-run_test "group member cannot read the database" \
-    "runuser -u testuser -- cat /var/lib/facelock/facelock.db" \
-    1
-
-run_test "group member can read a model file by name" \
-    "touch /var/lib/facelock/models/probe.onnx && chmod 644 /var/lib/facelock/models/probe.onnx && runuser -u testuser -- cat /var/lib/facelock/models/probe.onnx && rm /var/lib/facelock/models/probe.onnx" \
-    0
-
-run_test "non-member cannot traverse the state dir at all" \
+run_test "a plain local user cannot read another user's marker" \
     "runuser -u outsider -- cat /var/lib/facelock/enrolled/testuser" \
     1
 
-run_test "non-member cannot list models/ either" \
-    "runuser -u outsider -- ls /var/lib/facelock/models" \
+run_test "a plain local user cannot list the state dir" \
+    "runuser -u outsider -- ls /var/lib/facelock" \
     2
 
-run_test "non-member cannot read the audit log directory" \
+run_test "a plain local user cannot list enrolled/" \
+    "runuser -u outsider -- ls /var/lib/facelock/enrolled" \
+    2
+
+run_test "a plain local user cannot read the database" \
+    "runuser -u outsider -- cat /var/lib/facelock/facelock.db" \
+    1
+
+run_test "a plain local user can read a model file by name" \
+    "touch /var/lib/facelock/models/probe.onnx && chmod 644 /var/lib/facelock/models/probe.onnx && runuser -u outsider -- cat /var/lib/facelock/models/probe.onnx && rm /var/lib/facelock/models/probe.onnx" \
+    0
+
+run_test "a plain local user cannot read the audit log directory" \
     "runuser -u outsider -- ls /var/log/facelock" \
     2
 
 # ---------------------------------------------------------------------------
-# is-enrolled answers from the marker, per group membership
+# is-enrolled answers from the marker, for any local user
 # ---------------------------------------------------------------------------
 
-run_test "is-enrolled exits 0 for an enrolled group member" \
-    "runuser -u testuser -- facelock is-enrolled" \
-    0
-
-run_test "is-enrolled exits 1 for a user outside the group" \
+run_test "is-enrolled exits 0 for an enrolled plain local user" \
     "runuser -u outsider -- facelock is-enrolled" \
-    1
-
-run_test "is-enrolled --json reports the model count" \
-    "runuser -u testuser -- facelock is-enrolled --json | grep -q '\"models\":2'" \
     0
+
+run_test "is-enrolled --json reports the model count for a plain local user" \
+    "runuser -u outsider -- facelock is-enrolled --json | grep -q '\"models\":2'" \
+    0
+
+useradd -m nobody-enrolled
+run_test "is-enrolled exits 1 for a user with no marker" \
+    "runuser -u nobody-enrolled -- facelock is-enrolled" \
+    1
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
