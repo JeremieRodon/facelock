@@ -20,19 +20,61 @@ The project is pre-1.0. The public contract is:
 
 Rust crate APIs are internal and not part of the versioning contract.
 
+### Prerelease identity conversions
+
+Release input is strict SemVer: `X.Y.Z` or `X.Y.Z-{alpha,beta,rc}.N`. The same
+identity is converted explicitly for each package manager:
+
+| Surface | Alpha 1 | Stable |
+|---------|---------|--------|
+| Git tag | `v0.2.0-alpha.1` | `v0.2.0` |
+| Cargo | `0.2.0-alpha.1` | `0.2.0` |
+| Debian upstream | `0.2.0~alpha.1` | `0.2.0` |
+| RPM Version-Release | `0.2.0-0.1.alpha.1` | `0.2.0-1` |
+| Arch pkgver-pkgrel | `0.2.0alpha1-1` | `0.2.0-1` |
+| GitHub Release | prerelease | release |
+
+The first alpha Debian revisions are
+`0.2.0~alpha.1-1~deb13u1` (trixie),
+`0.2.0~alpha.1-1~deb12u1` (bookworm),
+`0.2.0~alpha.1-1~ubuntu26.04.1` (resolute), and
+`0.2.0~alpha.1-1~ubuntu24.04.1` (noble).
+
+Package rebuilds advance independently of the Cargo version. Debian and Arch
+increment their package revision for a rebuild of the same prerelease and reset
+it for the next semantic prerelease. RPM uses one monotonic prerelease counter
+across the whole series:
+
+```text
+Debian: 0.1.4-1 < 0.2.0~alpha.1-1 < 0.2.0~alpha.1-2 < 0.2.0~alpha.2-1 < 0.2.0~beta.1-1 < 0.2.0~rc.1-1 < 0.2.0-1
+RPM:    0.1.4-1 < 0.2.0-0.1.alpha.1 < 0.2.0-0.2.alpha.1 < 0.2.0-0.3.alpha.2 < 0.2.0-0.4.beta.1 < 0.2.0-0.5.rc.1 < 0.2.0-1
+Arch:   0.1.4-1 < 0.2.0alpha1-1 < 0.2.0alpha1-2 < 0.2.0alpha2-1 < 0.2.0beta1-1 < 0.2.0rc1-1 < 0.2.0-1
+```
+
+`scripts/release-versions.sh` is the executable conversion contract.
+Repeating the same prerelease is a package rebuild; repeating a stable version
+is rejected because Debian/Arch would otherwise advance while RPM remains at
+release 1. Semantic version regressions are rejected before any file is edited.
+`just test-release-matrix` verifies the exact order with native
+`dpkg --compare-versions`, `rpmdev-vercmp`, and `vercmp` in disposable,
+digest-pinned containers.
+
 ## How to Release
 
 ### Automated (recommended)
 
 ```bash
 just release 0.2.0
+# or
+just release 0.2.0-alpha.1
 ```
 
 This will:
-1. Bump version in `Cargo.toml`, `dist/PKGBUILD`, `dist/PKGBUILD-bin`, `dist/facelock.spec`, `dist/debian/changelog`
+1. Convert and bump Cargo, Arch tag/pkgver/pkgrel, RPM Version/Release, and Debian upstream/revision metadata
 2. Run `cargo check --workspace` to verify the version bump compiles
-3. Prompt you to update `CHANGELOG.md` (add entries under the new version heading)
-4. Print the `git commit` / `git tag` / `git push` commands for you to run
+3. Preserve package rebuild ordering, including the monotonic RPM prerelease counter
+4. Prompt you to update `CHANGELOG.md` (add entries under the new version heading)
+5. Print the `git commit` / `git tag` / `git push` commands for you to run
 
 Then push the tag to trigger the release workflow:
 
@@ -46,14 +88,16 @@ The `.github/workflows/release.yml` workflow:
 
 1. Builds release binaries and creates a GitHub Release
 2. Downloads ONNX Runtime for bundling in non-Arch packages
-3. Builds `.deb` package — **TPM** (Debian trixie container) and **legacy** (Ubuntu 24.04)
-4. Builds `.rpm` package in Fedora container (with TPM feature) and validates contents
+3. Builds four suite-specific `.deb` packages for trixie, bookworm, resolute, and noble
+4. Builds the direct `.rpm` package in the pinned Fedora 44 container and validates contents
 5. Validates Nix flake evaluation
-6. Publishes to AUR — `facelock` (source build), `facelock-bin` (prebuilt), and `facelock-git` (VCS) — if `AUR_SSH_KEY` secret is configured
-7. Publishes signed APT repository (if `APT_GPG_PRIVATE_KEY` and `APT_GPG_PASSPHRASE` are configured)
+6. Publishes stable releases to AUR — `facelock`, `facelock-bin`, and `facelock-git` — if `AUR_SSH_KEY` is configured
+7. Publishes stable releases to the signed, codenamed APT suites if the APT signing secrets are configured
 8. Triggers GitHub Pages rebuild to include updated APT repo
 
-Pre-release tags (containing `alpha`, `beta`, or `rc`) skip AUR and APT publishing.
+Validated prerelease tags set the GitHub Release `prerelease` output and upload
+direct artifacts, but skip stable APT and all AUR publication. The workflow
+guards use the validated release identity rather than substring matching.
 
 COPR (Fedora) is **not** built by `release.yml`. It is handled by [Packit](https://packit.dev),
 which reacts to the GitHub Release published in step 1. See the COPR section below.
@@ -62,10 +106,40 @@ which reacts to the GitHub Release published in step 1. See the COPR section bel
 
 | Channel | Build env | TPM | Version suffix | Use case |
 |---------|-----------|-----|----------------|----------|
-| `main` | Debian trixie container | Yes | `X.Y.Z-1` | Modern systems (trixie+, Ubuntu 25.04+) |
-| `legacy` | Ubuntu 24.04 runner | No | `X.Y.Z-1~legacy1` | Older systems (bookworm, Ubuntu 24.04) |
+| `trixie` | Debian 13 | Yes | `X.Y.Z-1~deb13u1` | Debian 13 |
+| `bookworm` | Debian 12 | No | `X.Y.Z-1~deb12u1` | Debian 12 LTS |
+| `resolute` | Ubuntu 26.04 | Yes | `X.Y.Z-1~ubuntu26.04.1` | Ubuntu 26.04 LTS |
+| `noble` | Ubuntu 24.04 | No | `X.Y.Z-1~ubuntu24.04.1` | Ubuntu 24.04 LTS |
 
-Both `.deb` packages are uploaded to the GitHub Release for direct download. For `apt install`, they are published to the signed APT repository at `https://tysmith.me/facelock/apt/`.
+All four `.deb` packages are uploaded to the GitHub Release for direct download.
+Stable packages are published under the matching codename at
+`https://tysmith.me/facelock/apt/`; ABI-distinct packages never share one suite.
+
+### Supported release matrix
+
+`dist/release-matrix.json` is the checked-in authority. The release workflow,
+APT configuration, Packit targets, and this table are checked against it.
+
+| Platform | Architecture | Variant/channel | Runtime | Lifecycle depth |
+|----------|--------------|-----------------|---------|-----------------|
+| Debian 13 trixie | amd64 | TPM, staged APT/direct deb | bundled ORT 1.20.1 | full |
+| Debian 12 bookworm LTS | amd64 | legacy, staged APT/direct deb | bundled ORT 1.20.1 | full |
+| Ubuntu 26.04 LTS | amd64 | TPM, staged APT/direct deb | bundled ORT 1.20.1 | full |
+| Ubuntu 24.04 LTS | amd64 | legacy, staged APT/direct deb | bundled ORT 1.20.1 | full |
+| Fedora 43 | x86_64 | staging COPR | system ORT | full through the 2026-12-02 EOL gate |
+| Fedora 44 | x86_64 | staging COPR | system ORT | full |
+| Fedora 45 branched | x86_64 | staging COPR | system ORT | build/runtime smoke |
+| Fedora Rawhide (Fedora 46 development) | x86_64 | development | system ORT | build/runtime smoke |
+| Fedora 44 | x86_64 | direct RPM | bundled ORT 1.20.1 | full |
+| Arch Linux Archive snapshot 2026-08-18 | x86_64 | PKGBUILD and binary recipe | system ORT | full |
+
+Container identities are pinned by registry/index digest, with the linux/amd64
+manifest digest retained where the registry exposes both. They were resolved
+from Docker Hub registry metadata and Fedora registry `Docker-Content-Digest`
+on 2026-08-18. The Arch repository identity is pinned separately to
+`https://archive.archlinux.org/repos/2026/08/18/`; every matrix-associated CI
+and AUR `pacman` invocation installs that exact mirror before refreshing package
+metadata.
 
 ### Local distro validation
 
@@ -104,7 +178,8 @@ Run this before creating/pushing a release tag:
 
 ```bash
 just release-preflight              # stable release checks
-just release-preflight v0.2.0-rc1  # prerelease checks (AUR/COPR secrets optional)
+just release-preflight v0.2.0-rc.1 # prerelease checks; no stable secret access
+just test-release-matrix            # converters, matrix drift, native ordering
 just check
 just test-arch-pam
 just test-rpm
@@ -117,7 +192,12 @@ just test-rpm-pkg
 `just release-preflight` checks local tools, required packaging files (including
 `.packit.yaml`), and whether `AUR_SSH_KEY`, `APT_GPG_PRIVATE_KEY`, and
 `APT_GPG_PASSPHRASE` are configured in GitHub secrets (via `gh`). COPR needs no
-secret — it is driven by Packit.
+secret — it is driven by Packit. Preflight and CI also read the public
+production COPR API and require its enabled chroots to equal the checked-in
+43/44/45 authority. An extra or missing live chroot is a release-blocking drift;
+the checker never modifies the project. When the Packit CLI is available,
+preflight runs `packit config validate --offline`; `just test-copr` always runs
+that real schema gate inside its Fedora Packit container.
 
 ### Package repository setup (one-time)
 
@@ -182,14 +262,28 @@ After this, every non-prerelease tag push automatically updates the AUR package.
 
 #### COPR (Fedora/RHEL)
 
-Automated after setup, via [Packit](https://packit.dev) — the Fedora-ecosystem
-standard for upstream→COPR builds. There is **no webhook and no GitHub secret**.
+Packit reads `.packit.yaml` from the released tag. Packit's documented
+`upstream_tag_exclude` filtering applies to downstream synchronization jobs,
+not to `copr_build`, so it is not a prerelease safety boundary.
 
-The configuration lives in `.packit.yaml` at the repository root. It declares a
-single `copr_build` job with `trigger: release`: when `release.yml` publishes a
-GitHub Release, Packit generates an SRPM from `dist/facelock.spec` and builds it
-into the existing COPR project `tyvsmith/facelock` for `fedora-rawhide`,
-`fedora-42`, and `fedora-43` (x86_64).
+The prerelease-capable configuration keeps the production
+`tyvsmith/facelock` job at `trigger: ignore`. That makes an alpha-tagged config
+structurally incapable of selecting a release-triggered production project.
+Before a stable release, the maintainer deliberately changes that trigger to
+`release` in the stable-tagged config. `just release-preflight` rejects a
+production release job for a prerelease and rejects its absence for a stable.
+The deliberate stable restoration targets `fedora-43-x86_64`,
+`fedora-44-x86_64`, and the separate `fedora-45-x86_64` branched target.
+Rawhide is Fedora 46 development in this matrix and is not an alias for Fedora
+45.
+
+`.packit.yaml` deliberately uses JSON syntax, which is a valid YAML subset.
+Release guards therefore parse its jobs semantically with the Python standard
+library instead of comparing YAML spelling; general YAML outside that subset
+fails closed. The production project is `tyvsmith/facelock`. The planned
+prerelease staging project is `tyvsmith/facelock-testing`, but provisioning or
+changing it belongs to issue #236 and is not performed by this release-identity
+change.
 
 The COPR RPM is built **from source** and does **not** bundle ONNX Runtime — the
 spec's `Requires: onnxruntime` pulls Fedora's system `onnxruntime` package
@@ -200,8 +294,8 @@ Fedora's ONNX Runtime.)
 
 1. Create a Fedora Account at https://accounts.fedoraproject.org
 2. Log in to COPR at https://copr.fedorainfracloud.org and ensure the
-   `tyvsmith/facelock` project exists with the `fedora-rawhide-x86_64`,
-   `fedora-42-x86_64`, and `fedora-43-x86_64` chroots enabled
+   `tyvsmith/facelock` project exists with the `fedora-43-x86_64`,
+   `fedora-44-x86_64`, and `fedora-45-x86_64` chroots enabled
    (Settings → Chroots).
 3. Install the **Packit-as-a-Service** GitHub App on the repository:
    https://github.com/marketplace/packit-as-a-service
@@ -216,9 +310,10 @@ Fedora's ONNX Runtime.)
 Verify the COPR build locally before relying on it with `just test-copr`, which
 reproduces the Packit SRPM + `mock` from-source rebuild on a Fedora chroot.
 
-After setup, every non-prerelease GitHub Release triggers a COPR build
-automatically. To populate COPR without cutting a release (e.g. after first-time
-setup), run `packit build in-copr --owner tyvsmith --project facelock` locally.
+Only a stable-tagged config with the deliberately restored production release
+trigger can populate production COPR automatically. Prerelease staging project
+provisioning and served-repository validation are separate release-infrastructure
+work; do not point prerelease tags at production while it is unavailable.
 
 Note: a previously published release will **not** retroactively build — Packit
 reacts only to *new* Release events.
@@ -251,10 +346,20 @@ Automated after setup. The release workflow publishes a signed APT repository to
 
    Or use the web UI: https://github.com/tyvsmith/facelock/settings/secrets/actions
 
-The repository configuration lives in `dist/apt/conf/distributions`. Two suites are published:
+The repository configuration lives in `dist/apt/conf/distributions`. Four
+codenamed suites are published:
 
-- **`main`**: TPM-enabled build (Debian trixie+, Ubuntu 25.04+)
-- **`legacy`**: Non-TPM build (Ubuntu 24.04, Debian bookworm)
+- **`trixie`**: Debian 13 TPM build
+- **`bookworm`**: Debian 12 legacy build
+- **`resolute`**: Ubuntu 26.04 TPM build
+- **`noble`**: Ubuntu 24.04 legacy build
+
+The former ambiguous `main` and `legacy` suite names are retired. Existing
+clients must replace that suite component in their Facelock source entry with
+their operating-system codename before the first codenamed stable publication.
+Prerelease packages are never inserted into these stable suites.
+Stable publication requires exactly one suite-matching package for all four
+codenames before signing or repository writes begin.
 
 The APT repo is hosted at `https://tysmith.me/facelock/apt/` alongside the docs site. The public keyring is at `https://tysmith.me/facelock/apt/tysmith-archive-keyring.gpg`.
 
@@ -289,14 +394,20 @@ If CI is not configured or fails:
 ## Version Sources
 
 The canonical version is in the root `Cargo.toml` under `[workspace.package]`.
-All other files are synced by `just release`:
+The version fields synced by `just release` are:
 
 | File | Field |
 |------|-------|
 | `Cargo.toml` | `[workspace.package] version` |
-| `dist/PKGBUILD` | `pkgver` |
-| `dist/facelock.spec` | `Version` |
-| `dist/debian/changelog` | Version in first entry |
+| `dist/PKGBUILD`, `dist/PKGBUILD-bin` | upstream `_tag`, converted `pkgver`, package `pkgrel` |
+| `dist/PKGBUILD-git` | converted display `pkgver` |
+| `dist/facelock.spec` | converted `Version` and monotonic prerelease `Release` |
+| `dist/debian/changelog` | converted upstream and package revision in first entry |
+
+The independently maintained `dist/release-matrix.json` records supported
+targets, lifecycle depth, and immutable environment identities. Release
+preflight, CI, and release metadata checks validate that authority; `just
+release` does not rewrite it.
 
 ## ONNX Runtime Bundling
 

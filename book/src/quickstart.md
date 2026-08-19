@@ -12,7 +12,14 @@ yay -S facelock           # or paru -S facelock
 
 ### Debian / Ubuntu (APT)
 
-For **modern systems** (Debian trixie+, Ubuntu 25.04+) with TPM support:
+Use the exact suite and package variant for your platform:
+
+| Platform | Suite | Variant |
+|----------|-------|---------|
+| Debian 13 | trixie | TPM |
+| Debian 12 | bookworm | legacy |
+| Ubuntu 26.04 | resolute | TPM |
+| Ubuntu 24.04 | noble | legacy |
 
 ```bash
 # Add signing key
@@ -20,25 +27,9 @@ sudo install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://tysmith.me/facelock/apt/tysmith-archive-keyring.gpg \
   | sudo tee /etc/apt/keyrings/tysmith-archive-keyring.gpg >/dev/null
 
-# Add repository (main = TPM enabled)
-echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] https://tysmith.me/facelock/apt main facelock" \
-  | sudo tee /etc/apt/sources.list.d/facelock.list
-
-# Install
-sudo apt update
-sudo apt install facelock
-```
-
-For **older systems** (Ubuntu 24.04, Debian bookworm) without TPM:
-
-```bash
-# Add signing key (same as above)
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://tysmith.me/facelock/apt/tysmith-archive-keyring.gpg \
-  | sudo tee /etc/apt/keyrings/tysmith-archive-keyring.gpg >/dev/null
-
-# Add repository (legacy = non-TPM)
-echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] https://tysmith.me/facelock/apt legacy facelock" \
+# Set this to the suite in the table above; trixie is the Debian 13 example.
+APT_SUITE=trixie
+echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] https://tysmith.me/facelock/apt ${APT_SUITE} facelock" \
   | sudo tee /etc/apt/sources.list.d/facelock.list
 
 # Install

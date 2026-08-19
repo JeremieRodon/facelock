@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PKG_VERSION_RAW="${1:?Usage: build-rpm.sh <VERSION_RAW>}"
-PKG_VERSION="$PKG_VERSION_RAW"
-PKG_RELEASE='1%{?dist}'
+PKG_VERSION_RAW="${1:?Usage: build-rpm.sh <VERSION_RAW> <PRERELEASE_COUNTER>}"
+PRERELEASE_COUNTER="${2:?Usage: build-rpm.sh <VERSION_RAW> <PRERELEASE_COUNTER>}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../../scripts/release-versions.sh
+source "$SCRIPT_DIR/../../../scripts/release-versions.sh"
+PKG_VERSION="$(release_rpm_version "$PKG_VERSION_RAW")"
+PKG_RELEASE="$(release_rpm_release "$PKG_VERSION_RAW" "$PRERELEASE_COUNTER")%{?dist}"
 
 echo "=== Building RPM package ==="
 echo "Raw version: ${PKG_VERSION_RAW}"
-
-# RPM Version cannot contain '-'. For prereleases, keep the base
-# version and move the prerelease marker into Release so it sorts
-# before final releases.
-if [ "${PKG_VERSION_RAW#*-}" != "$PKG_VERSION_RAW" ]; then
-  PRERELEASE_SUFFIX="${PKG_VERSION_RAW#*-}"
-  PKG_VERSION="${PKG_VERSION_RAW%%-*}"
-  PRERELEASE_SUFFIX="${PRERELEASE_SUFFIX//-/.}"
-  PKG_RELEASE="0.${PRERELEASE_SUFFIX}%{?dist}"
-fi
 
 echo "RPM Version: ${PKG_VERSION}"
 echo "RPM Release: ${PKG_RELEASE}"

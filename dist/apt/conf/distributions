@@ -1,15 +1,31 @@
 Origin: tysmith
 Label: Ty Smith Packages
-Codename: main
+Codename: trixie
 Architectures: amd64
 Components: facelock
-Description: Facelock APT repository - TPM enabled (modern Debian/Ubuntu)
+Description: Facelock APT repository - Debian 13 trixie TPM
 SignWith: default
 
 Origin: tysmith
 Label: Ty Smith Packages
-Codename: legacy
+Codename: bookworm
 Architectures: amd64
 Components: facelock
-Description: Facelock APT repository - non-TPM (older Debian/Ubuntu)
+Description: Facelock APT repository - Debian 12 bookworm legacy
+SignWith: default
+
+Origin: tysmith
+Label: Ty Smith Packages
+Codename: resolute
+Architectures: amd64
+Components: facelock
+Description: Facelock APT repository - Ubuntu 26.04 resolute TPM
+SignWith: default
+
+Origin: tysmith
+Label: Ty Smith Packages
+Codename: noble
+Architectures: amd64
+Components: facelock
+Description: Facelock APT repository - Ubuntu 24.04 noble legacy
 SignWith: default

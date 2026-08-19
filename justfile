@@ -26,6 +26,7 @@ test-all:
 # modes ARE a security contract in this project (0600 database, 0711 state
 # dir), and `non_octal_unix_permissions` is exactly the lint that catches a
 # `from_mode(600)` — which means 0o1130, not 0o600 — before it ships.
+
 # Keep in sync with .github/workflows/ci.yml.
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
@@ -40,6 +41,7 @@ fmt:
 
 # Scan the dependency tree for RustSec advisories (mirrors the CI cargo-audit job).
 # Ignore policy lives in .cargo/audit.toml; deny policy is set here so CI matches.
+
 # Requires cargo-audit: cargo install cargo-audit --locked
 audit:
     cargo audit --deny unmaintained --deny unsound
@@ -51,6 +53,7 @@ audit:
 # polling + the async-executor/async-fs/async-lock trio) while allowing
 # signal-hook-registry, which the correct tokio backend legitimately pulls via
 # tokio's "process" feature. Keep in sync with .github/workflows/ci.yml
+
 # ("Build pam-facelock in isolation" + "Verify pam-facelock dependency surface").
 check-pam-standalone:
     #!/usr/bin/env bash
@@ -65,12 +68,13 @@ check-pam-standalone:
     echo "pam-facelock dependency guard passed"
 
 # Verify agent-facing docs still describe the tree they describe.
+
 # Pass a git ref to also run the coupling check against it.
 check-agent-docs base='':
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -n "{{base}}" ]; then
-        python3 test/check-agent-docs.py --base "{{base}}"
+    if [ -n "{{ base }}" ]; then
+        python3 test/check-agent-docs.py --base "{{ base }}"
     else
         python3 test/check-agent-docs.py
     fi
@@ -80,6 +84,7 @@ check: test lint fmt-check audit check-pam-standalone check-agent-docs
 
 # Build the PAM test container image (uses host-built release binaries).
 # Keep in sync with .github/workflows/ci.yml, which builds this same image
+
 # directly rather than going through this recipe.
 _build-test-container: build-release
     podman build -t facelock-pam-test -f test/Containerfile .
@@ -93,6 +98,7 @@ test-arch-pam: _build-test-container
 # and /var/log/facelock, including that any local user can traverse to its own
 # enrollment marker but list nothing and read no secret. This is the only test
 # that exercises the packaging wiring (install-files modes + the built-in
+
 # defaults) end to end — unit tests cannot.
 test-arch-layout: _build-test-container
     podman run --rm facelock-pam-test /run-layout-tests.sh
@@ -120,6 +126,7 @@ test-arch-layout: _build-test-container
 # lands, and lands via a temp name, so an interrupted copy cannot leave a
 # truncated model behind for the daemon to reject later.
 #
+
 # Populate models/*.onnx from an existing checkout or install tree
 link-models src="": (_link-models "explicit" src)
 
@@ -129,12 +136,13 @@ link-models src="": (_link-models "explicit" src)
 #   there is nothing to do, and never fail. A copy can be 435MB; that is worth
 #   opting into, not something `just test-arch-integration` should spend behind
 #   your back. When auto cannot finish the job it stays quiet and leaves the
-#   diagnosis to _require-models, which owns that message.
+
+# diagnosis to _require-models, which owns that message.
 _link-models mode="explicit" src="":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    if [ "{{mode}}" = "explicit" ]; then explicit=1; else explicit=0; fi
+    if [ "{{ mode }}" = "explicit" ]; then explicit=1; else explicit=0; fi
 
     manifest=models/manifest.toml
     if [ ! -f "$manifest" ]; then
@@ -173,8 +181,8 @@ _link-models mode="explicit" src="":
     fi
 
     candidates=()
-    if [ -n "{{src}}" ]; then
-        candidates+=("{{src}}")
+    if [ -n "{{ src }}" ]; then
+        candidates+=("{{ src }}")
     else
         # `git worktree list` prints the main worktree first. That is the
         # checkout a worktree can hardlink from for free.
@@ -333,6 +341,7 @@ _link-models mode="explicit" src="":
 # The _link-models dependency makes the common case not happen at all: a fresh
 # worktree hardlinks from the main checkout on the way in, so neither the
 # refusal nor the opt-out is reached. It only ever uses free mechanisms, so when
+
 # it declines, everything below still applies unchanged.
 _require-models allow_opt_out="0": (_link-models "auto")
     #!/usr/bin/env bash
@@ -342,7 +351,7 @@ _require-models allow_opt_out="0": (_link-models "auto")
         [ -f "$m" ] || missing+=("$m")
     done
     [ ${#missing[@]} -gt 0 ] || exit 0
-    if [ "{{allow_opt_out}}" = "1" ] && [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = "1" ]; then
+    if [ "{{ allow_opt_out }}" = "1" ] && [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = "1" ]; then
         echo "warning: missing ONNX models, continuing (FACELOCK_ALLOW_MISSING_MODELS=1):" >&2
         for m in "${missing[@]}"; do echo "           $m" >&2; done
         echo "         The daemon-start assertions will be reported as SKIPPED, not passed." >&2
@@ -356,7 +365,7 @@ _require-models allow_opt_out="0": (_link-models "auto")
     echo "       It names what it looked at, and how to get the models, if it finds" >&2
     echo "       no source. (models/*.onnx is gitignored, so nothing you link in can" >&2
     echo "       be committed by accident.)" >&2
-    if [ "{{allow_opt_out}}" = "1" ]; then
+    if [ "{{ allow_opt_out }}" = "1" ]; then
         echo "       To validate packaging only, with the daemon-start assertions counted" >&2
         echo "       as skipped: FACELOCK_ALLOW_MISSING_MODELS=1 just <recipe>" >&2
     fi
@@ -387,6 +396,7 @@ test-arch-integration: _require-models _build-test-container
     podman run --rm $devices "${env_args[@]}" facelock-pam-test /run-integration-tests.sh
 
 # FACELOCK_LIVE_TIMEOUT=300s just test-arch-oneshot      # relax the live steps
+
 # Automated oneshot (daemonless) integration tests (Arch, requires camera)
 test-arch-oneshot: _require-models _build-test-container
     #!/usr/bin/env bash
@@ -445,6 +455,7 @@ test-arch-release-shell: _build-test-container
     podman run --rm -it $devices facelock-pam-test /bin/bash
 
 # Build release and install to system
+
 # Run as: just install (builds as you, installs as root)
 install: build-release
     sudo env PATH="$PATH" just install-files
@@ -595,6 +606,7 @@ install-files:
     fi
 
 # Uninstall from system
+
 # Run as: just uninstall (elevates to root, preserving PATH)
 uninstall:
     sudo env PATH="$PATH" just uninstall-files
@@ -691,7 +703,6 @@ uninstall-files:
 # compiled in as the fallback. These recipes exist for translators and fail
 # with a clear message when the gettext tools are absent.
 # ---------------------------------------------------------------------------
-
 # Regenerate translation templates (po/*.pot) from source. The CLI catalog
 # extracts every `translate("...")` literal in the message seam
 # (crates/facelock-cli/src/message/ — the one place CLI user-facing English
@@ -701,6 +712,7 @@ uninstall-files:
 # because the seam keeps msgids as single-line plain literals (see the
 # "Adding a message" pattern in message/mod.rs). The domain modules are
 # globbed and sorted so a new one is picked up without editing this recipe
+
 # and the output stays byte-stable.
 pot:
     #!/usr/bin/env bash
@@ -763,6 +775,7 @@ pot:
 # `msgfmt --check` is what enforces the `{placeholder}` contract: paired with the
 # python-brace-format flags `just pot` writes, it rejects a translation that
 # typos, drops or invents a placeholder. Dropping --check would silently turn
+
 # that back off.
 mo:
     #!/usr/bin/env bash
@@ -788,17 +801,16 @@ mo:
     fi
 
 # Bump version and prepare a release commit + tag
+
 # Usage: just release 0.2.0
 release version:
     #!/usr/bin/env bash
     set -euo pipefail
-    VERSION="{{version}}"
+    VERSION="{{ version }}"
+    source scripts/release-versions.sh
 
     # Validate version format
-    if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "Error: Version must be semver (e.g. 0.2.0), got '$VERSION'"
-        exit 1
-    fi
+    release_validate_cargo_version "$VERSION"
 
     # Check for clean working tree
     if [ -n "$(git status --porcelain)" ]; then
@@ -807,6 +819,14 @@ release version:
     fi
 
     OLD_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    release_validate_transition "$OLD_VERSION" "$VERSION"
+    ARCH_VERSION=$(release_arch_pkgver "$VERSION")
+    ARCH_RELEASE=$(release_next_arch_revision "$VERSION" dist/PKGBUILD)
+    DEBIAN_RELEASE=$(release_next_debian_revision "$VERSION" dist/debian/changelog)
+    DEBIAN_VERSION=$(release_debian_common_version "$VERSION" "$DEBIAN_RELEASE")
+    RPM_VERSION=$(release_rpm_version "$VERSION")
+    RPM_COUNTER=$(release_next_rpm_counter "$VERSION" dist/facelock.spec)
+    RPM_RELEASE=$(release_rpm_release "$VERSION" "$RPM_COUNTER")
     echo "Bumping version: $OLD_VERSION → $VERSION"
 
     # 1. Cargo.toml (workspace version)
@@ -815,13 +835,13 @@ release version:
 
     # 2. dist/PKGBUILD
     if [ -f dist/PKGBUILD ]; then
-        sed -i "s/^pkgver=.*/pkgver=$VERSION/" dist/PKGBUILD
+        sed -i "s/^_tag=.*/_tag=$VERSION/; s/^pkgver=.*/pkgver=$ARCH_VERSION/; s/^pkgrel=.*/pkgrel=$ARCH_RELEASE/" dist/PKGBUILD
         echo "  ✓ dist/PKGBUILD"
     fi
 
     # 2b. dist/PKGBUILD-bin (per-binary sha256sums are filled in by CI)
     if [ -f dist/PKGBUILD-bin ]; then
-        sed -i "s/^pkgver=.*/pkgver=$VERSION/" dist/PKGBUILD-bin
+        sed -i "s/^_tag=.*/_tag=$VERSION/; s/^pkgver=.*/pkgver=$ARCH_VERSION/; s/^pkgrel=.*/pkgrel=$ARCH_RELEASE/" dist/PKGBUILD-bin
         echo "  ✓ dist/PKGBUILD-bin"
     fi
 
@@ -830,20 +850,20 @@ release version:
     # without a git checkout, so AUR's web display falls back to this static
     # pkgver. Keep it in sync with the release so the AUR page doesn't drift.
     if [ -f dist/PKGBUILD-git ]; then
-        sed -i "s/^pkgver=.*/pkgver=$VERSION/" dist/PKGBUILD-git
+        sed -i "s/^pkgver=.*/pkgver=$ARCH_VERSION/" dist/PKGBUILD-git
         echo "  ✓ dist/PKGBUILD-git"
     fi
 
     # 3. dist/facelock.spec
     if [ -f dist/facelock.spec ]; then
-        sed -i "s/^Version:.*/Version:        $VERSION/" dist/facelock.spec
+        sed -i "s/^Version:.*/Version:        $RPM_VERSION/; s/^Release:.*/Release:        $RPM_RELEASE%{?dist}/" dist/facelock.spec
         echo "  ✓ dist/facelock.spec"
     fi
 
     # 4. dist/debian/changelog (prepend new entry)
     if [ -f dist/debian/changelog ]; then
         DATE=$(date -R)
-        sed -i "1i facelock ($VERSION-1) unstable; urgency=medium\n\n  * Release v$VERSION.\n\n -- Facelock Contributors <facelock@m.tysmith.me>  $DATE\n" dist/debian/changelog
+        sed -i "1i facelock ($DEBIAN_VERSION) unstable; urgency=medium\n\n  * Release v$VERSION.\n\n -- Facelock Contributors <facelock@m.tysmith.me>  $DATE\n" dist/debian/changelog
         echo "  ✓ dist/debian/changelog"
     fi
 
@@ -886,6 +906,8 @@ show-paths:
 # Detect host ONNX Runtime version for container builds.
 # Local binaries are built against the host ORT, so bundled ORT must match.
 # CI uses 1.20.1 (set in release.yml); local builds use whatever is installed.
+
+[private]
 _ort-version := `for ort in /usr/lib/libonnxruntime.so /usr/lib64/libonnxruntime.so; do if [ -e "$ort" ]; then readlink -f "$ort" | grep -oP '\d+\.\d+\.\d+$'; exit; fi; done; echo "1.20.1"`
 
 # Test RPM packaging in Fedora container
@@ -905,26 +927,28 @@ test-deb: build-release
 # Needs models/*.onnx: the validation starts the daemon under the hardened unit
 # and checks what it holds at runtime. FACELOCK_ALLOW_MISSING_MODELS=1 runs the
 # packaging half only, with the rest counted as skipped.
+
 # Package test — build real .deb, install via dpkg, validate under booted systemd
 test-deb-pkg: (_require-models "1") build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
+    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
     test/run-pkg-validate-systemd.sh facelock-deb-pkg
 
 # Package test — build real TPM .deb (trixie), install via dpkg, run automated validation
 test-deb-tpm-pkg: build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-tpm-pkg -f test/Containerfile.deb-tpm-e2e .
+    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-deb-tpm-pkg -f test/Containerfile.deb-tpm-e2e .
     podman run --rm facelock-deb-tpm-pkg
 
 # Same model requirement (and same opt-out) as test-deb-pkg.
+
 # Package test — build real .rpm, install via dnf, validate under booted systemd
 test-rpm-pkg: (_require-models "1") build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
+    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
     test/run-pkg-validate-systemd.sh facelock-rpm-pkg
 
 # COPR-equivalent build — Packit SRPM + mock from-source rebuild on a Fedora chroot (slow, opt-in)
@@ -938,7 +962,7 @@ test-copr:
 test-deb-dev-shell: build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
+    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
@@ -958,7 +982,7 @@ test-deb-dev-shell: build-release
 test-rpm-dev-shell: build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
+    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
@@ -978,7 +1002,7 @@ test-rpm-dev-shell: build-release
 test-deb-release-shell: build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
+    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-deb-pkg -f test/Containerfile.deb-e2e .
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
@@ -995,7 +1019,7 @@ test-deb-release-shell: build-release
 test-rpm-release-shell: build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{_ort-version}} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
+    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
@@ -1034,8 +1058,8 @@ test-apt-repo:
     # For local testing without GPG, strip SignWith lines
     sed -i '/^SignWith:/d' "${REPO_DIR}/conf/distributions"
 
-    # Find any .deb files (from just test-deb or CI artifacts)
-    DEB_FILES=$({ find . -maxdepth 1 -name 'facelock_*.deb'; find ./target -maxdepth 1 -name 'facelock_*.deb' 2>/dev/null; } | head -2)
+    # Find suite-versioned .deb files (from CI artifacts or local package tests).
+    DEB_FILES=$({ find . -maxdepth 1 -name 'facelock_*.deb'; find ./target -maxdepth 1 -name 'facelock_*.deb' 2>/dev/null; })
     if [ -z "$DEB_FILES" ]; then
         echo "No .deb files found. Building a test .deb is not required."
         echo "Validating reprepro config only..."
@@ -1046,23 +1070,31 @@ test-apt-repo:
         exit 0
     fi
 
-    # Add first .deb to main, second to legacy (or same to both)
-    FIRST_DEB=$(echo "$DEB_FILES" | head -1)
-    SECOND_DEB=$(echo "$DEB_FILES" | tail -1)
-
-    reprepro -b "${REPO_DIR}" includedeb main "$FIRST_DEB"
-    reprepro -b "${REPO_DIR}" includedeb legacy "$SECOND_DEB"
+    while IFS= read -r deb; do
+        version=$(dpkg-deb -f "$deb" Version)
+        case "$version" in
+            *~deb13u1) suite=trixie ;;
+            *~deb12u1) suite=bookworm ;;
+            *~ubuntu26.04.1) suite=resolute ;;
+            *~ubuntu24.04.1) suite=noble ;;
+            *) echo "SKIP: $deb has no supported suite suffix"; continue ;;
+        esac
+        reprepro -b "${REPO_DIR}" includedeb "$suite" "$deb"
+    done <<< "$DEB_FILES"
 
     echo ""
     echo "=== APT repo structure ==="
     find "${REPO_DIR}" -type f -not -path '*/db/*' -not -path '*/conf/*' | sort
 
     # Validate expected structure
-    for SUITE in main legacy; do
-        [ -f "${REPO_DIR}/dists/${SUITE}/Release" ] && echo "OK: dists/${SUITE}/Release"
-        [ -d "${REPO_DIR}/dists/${SUITE}/facelock/binary-amd64" ] && echo "OK: dists/${SUITE}/facelock/binary-amd64/"
+    for SUITE in trixie bookworm resolute noble; do
+        [ -f "${REPO_DIR}/dists/${SUITE}/Release" ] || { echo "MISSING: dists/${SUITE}/Release" >&2; exit 1; }
+        echo "OK: dists/${SUITE}/Release"
+        [ -d "${REPO_DIR}/dists/${SUITE}/facelock/binary-amd64" ] || { echo "MISSING: dists/${SUITE}/facelock/binary-amd64/" >&2; exit 1; }
+        echo "OK: dists/${SUITE}/facelock/binary-amd64/"
     done
-    [ -d "${REPO_DIR}/pool/facelock" ] && echo "OK: pool/facelock/"
+    [ -d "${REPO_DIR}/pool/facelock" ] || { echo "MISSING: pool/facelock/" >&2; exit 1; }
+    echo "OK: pool/facelock/"
 
     echo ""
     echo "APT repo generation: OK"
@@ -1070,17 +1102,20 @@ test-apt-repo:
 # Quick preflight before tagging a release
 # Usage:
 #   just release-preflight                 # assume stable release
-#   just release-preflight v0.2.0-rc1      # prerelease (secrets optional)
+
+# just release-preflight v0.2.0-rc.1     # prerelease (stable channels excluded)
 release-preflight tag='':
     #!/usr/bin/env bash
     set -euo pipefail
 
     failed=0
-    TAG="{{tag}}"
-    prerelease=0
-    if [ -n "$TAG" ] && echo "$TAG" | grep -Eq '(alpha|beta|rc)'; then
-        prerelease=1
+    source scripts/release-versions.sh
+    TAG="{{ tag }}"
+    if [ -z "$TAG" ]; then
+        TAG=$(release_tag_from_cargo "$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')")
     fi
+    VERSION=$(release_cargo_from_tag "$TAG")
+    if release_is_prerelease "$VERSION"; then prerelease=1; else prerelease=0; fi
 
     check_cmd() {
         local cmd="$1"
@@ -1102,12 +1137,18 @@ release-preflight tag='':
     echo "== Packaging file checks =="
     for f in \
         dist/PKGBUILD \
+        dist/PKGBUILD-bin \
         dist/PKGBUILD-git \
+        dist/release-matrix.json \
         dist/facelock.spec \
         dist/debian/control \
         dist/debian/rules \
         dist/apt/conf/distributions \
         .packit.yaml \
+        scripts/release-versions.sh \
+        test/release-version-contract.sh \
+        test/check-release-matrix.py \
+        test/check-live-release-channels.py \
         .github/workflows/release.yml; do
         if [ -f "$f" ]; then
             echo "OK: $f"
@@ -1117,16 +1158,31 @@ release-preflight tag='':
         fi
     done
 
+    if command -v packit >/dev/null 2>&1; then
+        packit config validate --offline -c .packit.yaml || failed=1
+    else
+        echo "SKIP: packit CLI not installed; test-copr runs the required schema gate"
+    fi
+
+    echo ""
+    echo "== Release identity and target contract =="
+    release_check_metadata "$TAG" || failed=1
+    bash test/release-version-contract.sh || failed=1
+    RELEASE_MATRIX_VERSION="$VERSION" python3 test/check-release-matrix.py || failed=1
+    python3 test/check-live-release-channels.py || failed=1
+
     echo ""
     echo "== GitHub release secret checks =="
     if [ "$prerelease" -eq 1 ]; then
-        echo "Mode: prerelease ($TAG) — AUR secrets are optional"
+        echo "Mode: prerelease ($TAG) — stable APT/AUR and production COPR are excluded"
     else
-        echo "Mode: stable release — AUR secrets are required"
+        echo "Mode: stable release — stable APT/AUR secrets and a production COPR release job are required"
     fi
     echo "Note: COPR builds are handled by Packit (.packit.yaml) — no secret required."
 
-    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    if [ "$prerelease" -eq 1 ]; then
+        echo "SKIP: prerelease preflight does not access stable publication secrets"
+    elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
         if gh secret list | grep -q '^AUR_SSH_KEY\b'; then
             echo "OK: AUR_SSH_KEY configured"
         else
@@ -1167,4 +1223,18 @@ release-preflight tag='':
     fi
 
     echo "Release preflight: OK"
-    echo "Next: run 'just check', 'just test-pam', 'just test-rpm', and 'just test-deb' before tagging."
+    echo "Next: run 'just check', 'just test-release-matrix', 'just test-arch-pam', 'just test-rpm', and 'just test-deb' before tagging."
+
+# Fast release contract tests that do not require distro package tools.
+test-release-contract:
+    bash test/release-version-contract.sh
+    python3 test/check-release-matrix.py
+
+# Native version comparison tools run only inside disposable, digest-pinned containers.
+test-release-native-ordering:
+    podman run --rm -v "$PWD:/repo:ro" -w /repo docker.io/library/debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958 bash test/release-native-ordering.sh debian
+    podman run --rm -v "$PWD:/repo:ro" -w /repo registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e90866c488d5d04fc6612284169e20a1bdb bash -lc 'dnf -qy install rpmdevtools && bash test/release-native-ordering.sh rpm'
+    podman run --rm -v "$PWD:/repo:ro" -w /repo docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b bash test/release-native-ordering.sh arch
+
+# Complete Track V version/matrix gate.
+test-release-matrix: test-release-contract test-release-native-ordering

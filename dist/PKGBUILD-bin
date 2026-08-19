@@ -1,6 +1,7 @@
 # Maintainer: facelock contributors
 pkgname=facelock-bin
 _pkgname=facelock
+_tag=0.1.4
 pkgver=0.1.4
 pkgrel=1
 pkgdesc="Face authentication PAM module for Linux (prebuilt binaries)"
@@ -17,20 +18,20 @@ conflicts=('facelock' 'facelock-git')
 backup=('etc/facelock/config.toml')
 install=facelock.install
 source=(
-    "$_pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
-    "facelock-$pkgver-x86_64::$url/releases/download/v$pkgver/facelock-x86_64-linux-gnu"
-    "pam_facelock-$pkgver.so::$url/releases/download/v$pkgver/pam_facelock.so"
-    "facelock-polkit-agent-$pkgver-x86_64::$url/releases/download/v$pkgver/facelock-polkit-agent-x86_64-linux-gnu"
+    "$_pkgname-$_tag.tar.gz::$url/archive/v$_tag.tar.gz"
+    "facelock-$_tag-x86_64::$url/releases/download/v$_tag/facelock-x86_64-linux-gnu"
+    "pam_facelock-$_tag.so::$url/releases/download/v$_tag/pam_facelock.so"
+    "facelock-polkit-agent-$_tag-x86_64::$url/releases/download/v$_tag/facelock-polkit-agent-x86_64-linux-gnu"
 )
 sha256sums=('__SRC_SHA256__' '__FACELOCK_SHA256__' '__PAM_SHA256__' '__POLKIT_SHA256__')
 
 package() {
-    cd "$_pkgname-$pkgver"
+    cd "$_pkgname-$_tag"
 
     # Prebuilt binaries from the GitHub Release
-    install -Dm755 "$srcdir/facelock-$pkgver-x86_64" "$pkgdir/usr/bin/facelock"
-    install -Dm755 "$srcdir/facelock-polkit-agent-$pkgver-x86_64" "$pkgdir/usr/bin/facelock-polkit-agent"
-    install -Dm755 "$srcdir/pam_facelock-$pkgver.so" "$pkgdir/usr/lib/security/pam_facelock.so"
+    install -Dm755 "$srcdir/facelock-$_tag-x86_64" "$pkgdir/usr/bin/facelock"
+    install -Dm755 "$srcdir/facelock-polkit-agent-$_tag-x86_64" "$pkgdir/usr/bin/facelock-polkit-agent"
+    install -Dm755 "$srcdir/pam_facelock-$_tag.so" "$pkgdir/usr/lib/security/pam_facelock.so"
 
     # Ancillary assets from the source tarball
     install -Dm644 config/facelock.toml "$pkgdir/etc/facelock/config.toml"

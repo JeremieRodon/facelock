@@ -16,10 +16,11 @@ jobs:
   build-and-test:
     name: Build, Test, Lint
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
     steps:
       - name: Install system dependencies
         run: |
+          printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           pacman -Syu --noconfirm \
             git \
             rust \
@@ -103,7 +104,7 @@ jobs:
   cargo-audit:
     name: Supply-chain Audit (cargo-audit)
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
     # Override the workflow-level -Dwarnings: this job compiles cargo-audit's
     # own third-party dependency tree, which we don't control. A future
     # warning upstream shouldn't fail this job for reasons unrelated to the
@@ -113,6 +114,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
+          printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           pacman -Syu --noconfirm \
             git \
             rust
@@ -134,11 +136,12 @@ jobs:
   tpm-tests:
     name: TPM Tests (swtpm)
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
     needs: build-and-test
     steps:
       - name: Install dependencies
         run: |
+          printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           pacman -Syu --noconfirm \
             git \
             rust \
@@ -174,10 +177,11 @@ jobs:
   agent-docs:
     name: Agent Docs Consistency
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
     steps:
       - name: Install system dependencies
         run: |
+          printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           pacman -Syu --noconfirm \
             git \
             just \
@@ -193,13 +197,20 @@ jobs:
       - name: Verify agent docs still describe the tree
         run: just check-agent-docs "${{ github.event.pull_request.base.sha }}"
 
+      - name: Verify release target declarations
+        run: python3 test/check-release-matrix.py
+
+      - name: Compare live production release channels with checked-in authority
+        run: python3 test/check-live-release-channels.py
+
   catalog-check:
     name: Translation Catalog Freshness
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
     steps:
       - name: Install system dependencies
         run: |
+          printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           pacman -Syu --noconfirm \
             git \
             gettext \

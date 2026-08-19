@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${1:?Usage: build-deb.sh <VERSION> <VARIANT> [EXTRA_DEPENDS]}"
-VARIANT="${2:?Usage: build-deb.sh <VERSION> <VARIANT> [EXTRA_DEPENDS]}"
-EXTRA_DEPENDS="${3:-}"
+VERSION="${1:?Usage: build-deb.sh <VERSION> <SUITE> <REVISION> [EXTRA_DEPENDS]}"
+SUITE="${2:?Usage: build-deb.sh <VERSION> <SUITE> <REVISION> [EXTRA_DEPENDS]}"
+REVISION="${3:?Usage: build-deb.sh <VERSION> <SUITE> <REVISION> [EXTRA_DEPENDS]}"
+EXTRA_DEPENDS="${4:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../../scripts/release-versions.sh
+source "$SCRIPT_DIR/../../../scripts/release-versions.sh"
+
+VARIANT="$(release_debian_variant "$SUITE")"
+PKG_VERSION="$(release_debian_version "$VERSION" "$REVISION" "$SUITE")"
+SOURCE_BASENAME="$(release_debian_source_basename "$VERSION" "$REVISION" "$SUITE")"
 
 # Set version suffix and description based on variant
 case "$VARIANT" in
   legacy)
-    PKG_VERSION="${VERSION}-1~legacy1"
     DESCRIPTION="Face authentication for Linux PAM (legacy, no TPM)"
     DESCRIPTION_LONG=" Facelock provides Windows Hello-style face authentication for Linux
  using IR anti-spoofing, ONNX inference, and PAM integration.
@@ -21,7 +28,6 @@ case "$VARIANT" in
     DEPENDS="libpam-runtime, dbus"
     ;;
   tpm)
-    PKG_VERSION="${VERSION}-1"
     DESCRIPTION="Face authentication for Linux PAM (TPM enabled)"
     DESCRIPTION_LONG=" Facelock provides Windows Hello-style face authentication for Linux
  using IR anti-spoofing, ONNX inference, and PAM integration.
@@ -42,9 +48,10 @@ case "$VARIANT" in
     ;;
 esac
 
-PKG_DIR="facelock_${PKG_VERSION}_amd64"
-echo "=== Building .deb package (${VARIANT}) ==="
+PKG_DIR="$(release_debian_binary_basename "$VERSION" "$REVISION" "$SUITE" amd64)"
+echo "=== Building .deb package (${SUITE}, ${VARIANT}) ==="
 echo "Version: ${PKG_VERSION}"
+echo "Source package: ${SOURCE_BASENAME}"
 echo "Package dir: ${PKG_DIR}"
 
 # Create directory tree

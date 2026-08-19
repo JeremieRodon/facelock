@@ -19,6 +19,7 @@ follow it.
 - [Operating Modes](#operating-modes)
   - [facelock is-enrolled Exit Codes](#facelock-is-enrolled-exit-codes)
   - [facelock auth Exit Codes](#facelock-auth-exit-codes)
+- [Release Channels and APT Paths](#release-channels-and-apt-paths)
 - [Filesystem Paths](#filesystem-paths)
   - [Audit Log Entries](#audit-log-entries)
 - [Config Schema](#config-schema)
@@ -1278,6 +1279,38 @@ and never a correct one.
 | 0 | Face matched | PAM_SUCCESS |
 | 1 | No match / timeout / dark | PAM_AUTH_ERR |
 | 2 | Error / no enrolled faces | PAM_IGNORE |
+
+## Release Channels and APT Paths
+
+`dist/release-matrix.json` is the checked-in release-target authority. A strict
+prerelease tag has the form `vX.Y.Z-{alpha,beta,rc}.N`; it creates a GitHub
+prerelease and direct artifacts, but it must not publish to stable APT, stable AUR, or production COPR. Staging COPR infrastructure is owned by issue #236
+and is not provisioned or modified by the prerelease identity workflow.
+
+A stable `vX.Y.Z` tag may publish to stable APT and AUR only after validated
+release metadata classifies it as stable. Production COPR additionally
+requires a deliberately restored `trigger: release` job in the stable-tagged
+Packit configuration. Prerelease-capable configurations keep that job inert.
+Preflight and CI compare the public `tyvsmith/facelock` COPR API read-only with
+the exact production chroot authority and fail closed on missing or extra
+chroots; they never change the project.
+
+The public APT base is `https://tysmith.me/facelock/apt/`. Its stable suite
+paths and payload identities are:
+
+| Suite | Public Release path | Architecture | Variant |
+|-------|---------------------|--------------|---------|
+| `trixie` | `https://tysmith.me/facelock/apt/dists/trixie/Release` | amd64 | TPM |
+| `bookworm` | `https://tysmith.me/facelock/apt/dists/bookworm/Release` | amd64 | legacy |
+| `resolute` | `https://tysmith.me/facelock/apt/dists/resolute/Release` | amd64 | TPM |
+| `noble` | `https://tysmith.me/facelock/apt/dists/noble/Release` | amd64 | legacy |
+
+The former `main` and `legacy` suite names are retired; they are not aliases or
+redirects. Existing source entries must replace that suite component with the
+host operating-system codename while keeping the `facelock` component. Each
+stable publication consumes exactly one matching package for all four suites,
+and a prerelease or cross-suite version is rejected before signing or repository
+writes.
 
 ## Filesystem Paths
 

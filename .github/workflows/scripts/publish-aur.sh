@@ -3,6 +3,15 @@ set -euo pipefail
 
 VERSION="${1:?Usage: publish-aur.sh <VERSION> <CHECKSUM>}"
 CHECKSUM="${2:?Usage: publish-aur.sh <VERSION> <CHECKSUM>}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../../scripts/release-versions.sh
+source "$SCRIPT_DIR/../../../scripts/release-versions.sh"
+release_validate_cargo_version "$VERSION"
+if release_is_prerelease "$VERSION"; then
+  echo "refusing to publish prerelease $VERSION to stable AUR packages" >&2
+  exit 1
+fi
+ARCH_VERSION="$(release_arch_pkgver "$VERSION")"
 
 echo "=== Publishing to AUR ==="
 
@@ -41,7 +50,8 @@ RUNNER_GID="$(id -g)"
 
 generate_srcinfo() {
   local dir="$1"
-  ( cd "$dir" && docker run --rm -v "$(pwd):/pkg" -w /pkg archlinux:base-devel bash -c "
+  ( cd "$dir" && docker run --rm -v "$(pwd):/pkg" -w /pkg docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b bash -c "
+      printf '%s\\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/\$repo/os/\$arch' > /etc/pacman.d/mirrorlist
       pacman -Sy --noconfirm pacman-contrib >/dev/null
       useradd -m builder
       chown -R builder:builder /pkg
@@ -101,7 +111,7 @@ publish_facelock() {
   get_or_init_repo "$dir" facelock
   cp dist/PKGBUILD "$dir/PKGBUILD"
   cp dist/facelock.install "$dir/facelock.install"
-  sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "$dir/PKGBUILD"
+  sed -i "s/^_tag=.*/_tag=${VERSION}/; s/^pkgver=.*/pkgver=${ARCH_VERSION}/" "$dir/PKGBUILD"
   sed -i "s/sha256sums=('SKIP')/sha256sums=('${CHECKSUM}')/" "$dir/PKGBUILD"
   generate_srcinfo "$dir"
   commit_and_push "$dir" "Update to v${VERSION}"
@@ -113,7 +123,7 @@ publish_facelock_bin() {
   get_or_init_repo "$dir" facelock-bin
   cp dist/PKGBUILD-bin "$dir/PKGBUILD"
   cp dist/facelock.install "$dir/facelock.install"
-  sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "$dir/PKGBUILD"
+  sed -i "s/^_tag=.*/_tag=${VERSION}/; s/^pkgver=.*/pkgver=${ARCH_VERSION}/" "$dir/PKGBUILD"
   sed -i "s/__SRC_SHA256__/${CHECKSUM}/" "$dir/PKGBUILD"
   sed -i "s/__FACELOCK_SHA256__/${SHA_FACELOCK}/" "$dir/PKGBUILD"
   sed -i "s/__PAM_SHA256__/${SHA_PAM}/" "$dir/PKGBUILD"

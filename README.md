@@ -22,14 +22,14 @@ sudo install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://tysmith.me/facelock/apt/tysmith-archive-keyring.gpg \
   | sudo tee /etc/apt/keyrings/tysmith-archive-keyring.gpg >/dev/null
 
-# Add repository — pick ONE:
-# Modern (Debian trixie+, Ubuntu 25.04+) — TPM enabled:
-echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] https://tysmith.me/facelock/apt main facelock" \
+# Set APT_SUITE to the exact suite for your host:
+# Debian 13 — trixie — TPM
+# Debian 12 — bookworm — legacy
+# Ubuntu 26.04 — resolute — TPM
+# Ubuntu 24.04 — noble — legacy
+APT_SUITE=trixie  # Debian 13 example
+echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] https://tysmith.me/facelock/apt ${APT_SUITE} facelock" \
   | sudo tee /etc/apt/sources.list.d/facelock.list
-
-# Legacy (Ubuntu 24.04, Debian bookworm) — no TPM:
-# echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] https://tysmith.me/facelock/apt legacy facelock" \
-#   | sudo tee /etc/apt/sources.list.d/facelock.list
 
 sudo apt update && sudo apt install facelock
 ```
@@ -238,7 +238,12 @@ just release 0.2.0        # bump version across all packaging files
 git push origin main --tags  # trigger CI release workflow
 ```
 
-Tagging `vX.Y.Z` builds release binaries, `.deb` (TPM + legacy), `.rpm`, publishes to AUR/COPR/APT via GitHub Actions. See [docs/releasing.md](docs/releasing.md) for the full process and versioning contract.
+Tagging `vX.Y.Z` builds release binaries, four suite-specific `.deb` artifacts
+(trixie, bookworm, resolute, and noble), and the direct Fedora `.rpm` artifact.
+Stable tags publish the stable AUR and APT channels; Packit handles production
+COPR builds. Prerelease tags create a GitHub prerelease without entering those
+stable channels. See [docs/releasing.md](docs/releasing.md) for the full process
+and versioning contract.
 
 ## License
 

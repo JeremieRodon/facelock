@@ -19,9 +19,9 @@ disagrees with the tree — the doc wins and this skill is stale.
 just release-preflight v<X.Y.Z>
 ```
 
-Pass the tag. The recipe is **prerelease-aware**: a tag matching
-`alpha|beta|rc` relaxes the secret requirements, a final tag does not. Running
-it bare skips that branch, so always pass the tag you intend to push.
+Pass the tag you intend to push. Tags are parsed strictly as `vX.Y.Z` or `vX.Y.Z-{alpha,beta,rc}.N`.
+A validated prerelease relaxes the stable secret requirements; a final version
+does not. A bare invocation derives the version from `Cargo.toml` and classifies it with the same parser.
 
 It checks local tools (`git`, `cargo`, `just`, `podman`), the packaging files,
 and release secrets. Fix every `MISSING` before continuing.
@@ -99,8 +99,8 @@ Only after explicit confirmation. No AI attribution in the commit or tag message
 The `v*` tag triggers `.github/workflows/release.yml`, which has 9 jobs:
 
 ```
-build · download-ort · build-deb
-build-deb-tpm · build-rpm · build-nix
+metadata · build · download-ort
+build-deb · build-rpm · build-nix
 publish-aur · publish-apt · trigger-pages
 ```
 

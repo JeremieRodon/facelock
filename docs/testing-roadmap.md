@@ -176,7 +176,7 @@ production-ready in the justfile install recipe.
 | Format | Location | Status |
 |--------|----------|--------|
 | Raw binaries | `release.yml` | Released. Triggered on `v*` tags. Uploads `facelock-x86_64-linux-gnu`, `pam_facelock.so`, SHA256SUMS to GitHub Releases. |
-| `.deb` | `release.yml` (build-deb job) | Released. Built in CI, uploaded to GitHub Release. Signed APT repository at `tysmith.me/facelock/apt` (main/legacy variants). |
+| `.deb` | `release.yml` (build-deb job) | Released. Four suite-specific `.deb` artifacts for trixie, bookworm, resolute, and noble are built in CI and uploaded to GitHub Release. Stable releases publish the matching signed APT suites at `tysmith.me/facelock/apt`. |
 | `.rpm` | `release.yml` (build-rpm job) | Released. Built in CI for the GitHub Release asset. COPR builds from source via Packit (`tyvsmith/facelock`) per `releasing.md`. |
 | PKGBUILD (Arch) | `dist/PKGBUILD` | Released. Automated via tag CI; published to AUR (`facelock`, `facelock-git`). References `facelock.install` file. |
 | Nix flake | `dist/nix/flake.nix` | Exists with NixOS module (`module.nix`), derivation (`default.nix`), and dev shell. Not in nixpkgs. `doCheck = false` (needs camera). |
@@ -193,7 +193,7 @@ production-ready in the justfile install recipe.
 
 ### GitHub release workflow
 - Triggered by pushing a `v*` tag
-- Builds release binaries (with TPM support), .deb, and .rpm
+- Builds release binaries, four suite-specific `.deb` artifacts (trixie, bookworm, resolute, and noble), and the direct Fedora `.rpm` artifact
 - Uploads all artifacts to the GitHub Release with auto-generated release notes
 - Single architecture: x86_64 only
 

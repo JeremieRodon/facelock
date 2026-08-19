@@ -1,6 +1,6 @@
 # E2E package test — builds a real .deb and installs via dpkg
 # Uses host-built release binaries (from `just build-release`); no Rust compilation in container.
-FROM ubuntu:24.04
+FROM docker.io/library/ubuntu:24.04@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -41,6 +41,7 @@ COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/
 COPY dist/ /build/dist/
 COPY .github/workflows/scripts/build-deb.sh /build/.github/workflows/scripts/build-deb.sh
+COPY scripts/release-versions.sh /build/scripts/release-versions.sh
 
 # Copy test validation script and PAM test config
 COPY test/pkg-validate.sh /pkg-validate.sh
@@ -59,9 +60,9 @@ RUN mkdir -p /build/onnxruntime/lib && \
 
 # Build the .deb from the host-built binaries and install it
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
-RUN bash /build/.github/workflows/scripts/build-deb.sh "0.0.0-test" "legacy" && \
-    (dpkg -i facelock_0.0.0-test-1~legacy1_amd64.deb || true) && \
+RUN bash /build/.github/workflows/scripts/build-deb.sh "0.0.0" "noble" "1" && \
+    (dpkg -i facelock_0.0.0-1~ubuntu24.04.1_amd64.deb || true) && \
     apt-get update && apt-get install -f -y && \
-    rm -rf facelock_0.0.0-test-1~legacy1_amd64 facelock_0.0.0-test-1~legacy1_amd64.deb
+    rm -rf facelock_0.0.0-1~ubuntu24.04.1_amd64 facelock_0.0.0-1~ubuntu24.04.1_amd64.deb
 
 CMD ["/pkg-validate.sh"]

@@ -367,14 +367,19 @@
               <span class="terminal-title">terminal</span>
             </div>
             <div class="terminal-body">
-              <div><span class="comment"># Add signing key (Debian trixie+, Ubuntu 25.04+)</span></div>
+              <div><span class="comment"># Debian 13 — trixie — TPM</span></div>
+              <div><span class="comment"># Debian 12 — bookworm — legacy</span></div>
+              <div><span class="comment"># Ubuntu 26.04 — resolute — TPM</span></div>
+              <div><span class="comment"># Ubuntu 24.04 — noble — legacy</span></div>
+              <div><span class="comment"># Add signing key</span></div>
               <div><span class="prompt">$</span> <span class="command">sudo install -d -m 0755 /etc/apt/keyrings</span></div>
               <div><span class="prompt">$</span> <span class="command">curl -fsSL https://tysmith.me/facelock/apt/tysmith-archive-keyring.gpg \</span></div>
               <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="command">| sudo tee /etc/apt/keyrings/tysmith-archive-keyring.gpg &gt;/dev/null</span></div>
               <div>&nbsp;</div>
-              <div><span class="comment"># Add repository</span></div>
+              <div><span class="comment"># Set the exact suite above; trixie is the Debian 13 example</span></div>
+              <div><span class="prompt">$</span> <span class="command">APT_SUITE=trixie</span></div>
               <div><span class="prompt">$</span> <span class="command">echo "deb [signed-by=/etc/apt/keyrings/tysmith-archive-keyring.gpg] \</span></div>
-              <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="command">https://tysmith.me/facelock/apt main facelock" \</span></div>
+              <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="command">https://tysmith.me/facelock/apt ${APT_SUITE} facelock" \</span></div>
               <div>&nbsp;&nbsp;&nbsp;&nbsp;<span class="command">| sudo tee /etc/apt/sources.list.d/facelock.list</span></div>
               <div>&nbsp;</div>
               <div><span class="comment"># Install + run setup wizard</span></div>
