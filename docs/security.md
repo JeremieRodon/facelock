@@ -64,11 +64,13 @@ pub fn ir_source_with_quirks(device, quirks) -> IrSource { ... }
 // physical camera can expose several V4L2 nodes under one VID:PID (Logitech
 // BRIO 046d:085e: /dev/video0 = RGB YUYV/MJPG, /dev/video2 = IR native GREY).
 // When multiple nodes share a quirk-matched USB identity AND at least one has
-// an IR-like format (GREY/Y16, or the quirk's format_preference), only the
-// node(s) with that format classify IR; siblings fall back to the quirk-free
-// heuristic. If NO node has an IR-like format, force_ir is trusted for all
-// (some quirk entries exist precisely because the camera advertises no
-// IR-like format). Anything gating require_ir uses these sibling-aware forms:
+// an IR-typical format (GREY/Y8/Y10/Y12/Y16), only the node(s) with that
+// format classify IR; siblings fall back to the quirk-free heuristic. A
+// quirk's format_preference counts as this evidence only when it is itself
+// IR-typical and the node actually advertises it. If NO node has an IR-like
+// format, force_ir is trusted for all (some quirk entries exist precisely
+// because the camera advertises no IR-like format). Anything gating require_ir
+// uses these sibling-aware forms:
 pub fn classify_ir_sources(devices, quirks) -> Vec<IrSource> { ... }
 pub fn ir_source_resolved(device, quirks) -> IrSource { ... } // enumerates siblings
 
@@ -88,7 +90,7 @@ if config.security.require_ir && !device_is_ir {
 
 **Honest residual — format evidence is not unforgeable**: deriving IR-ness from queried formats raises the attacker's cost from "set a free-text `CARD_LABEL` string" to "also negotiate a mono-**only** pixel format", and removes the old path where a bare name token (or a name-only quirk) could escalate a device to IR. It does **not** make the evidence unforgeable. A `v4l2loopback` device (loading the module requires **root**) or a programmable USB gadget can present a mono-only (GREY/Y16/…) format set and **will** classify as IR — the format check cannot distinguish a genuine IR sensor from a device that merely advertises IR-typical formats. The remaining backstops against a fabricated IR device are the **liveness / frame-variance checks** (§B) and the **privilege required to create such a device** in the first place (root to load `v4l2loopback`, or physical access to attach USB-gadget hardware). `require_ir` is one layer of a layered defense, not a standalone attestation of a real IR sensor.
 
-**Why `force_ir` is device-level, not node-level (hardware-verified regression)**: on a real Logitech BRIO, treating every quirk-matched node as IR made *both* `/dev/video0` (the RGB sensor) and `/dev/video2` (the IR sensor) classify IR — so setup stopped auto-selecting and auto-detect captured from the RGB sensor (white LED) instead of the IR sensor. The sibling-format disambiguation above restores per-node honesty: exactly one BRIO node is `[IR]`, and auto-detection prefers the format-corroborated IR node.
+**Why `force_ir` is device-level, not node-level (hardware-verified regression)**: on a real Logitech BRIO, treating every quirk-matched node as IR made *both* `/dev/video0` (the RGB sensor) and `/dev/video2` (the IR sensor) classify IR — so setup stopped auto-selecting and auto-detect captured from the RGB sensor (white LED) instead of the IR sensor. The sibling-format disambiguation above restores per-node honesty: exactly one BRIO node is `[IR]`, and auto-detection prefers the format-corroborated IR node. A quirk preference for an RGB format such as MJPG may still guide capture negotiation, but it is not IR evidence and cannot exempt an RGB sibling from demotion.
 
 **Limitation**: classification is capability-based, not a hardware allow-list. A genuine IR camera that exposes its IR and color streams on a *single* V4L2 node (so its format set is not mono-only) and is not covered by a shipped quirk will not auto-classify as IR. Add a quirks `force_ir` entry keyed by **USB vendor:product ID** (`/etc/facelock/quirks.d/`) for such hardware — a VID:PID match is authoritative — and set `format_preference` to the IR node's native format (e.g. `"GREY"`) when the camera exposes multiple capture nodes. Prefer a USB-ID quirk over a name-only one: a name-only `force_ir` is trusted only when corroborated by the device's own mono-format evidence or a real USB identity, so it is not a reliable override on its own. The `facelock devices` command displays whether each camera is detected as IR. Device *identity* pinning (rather than capability heuristics) is implemented as its robust successor — see §1.D Device Coupling (Plan 02).
 

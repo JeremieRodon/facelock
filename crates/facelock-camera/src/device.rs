@@ -103,7 +103,7 @@ pub fn ir_source(device: &DeviceInfo) -> IrSource {
 /// space-padded to 4 chars by the V4L2 API; compare trimmed.
 const IR_TYPICAL_FOURCCS: [&str; 5] = ["GREY", "Y16", "Y12", "Y10", "Y8"];
 
-fn is_ir_typical_fourcc(fourcc: &str) -> bool {
+pub(crate) fn is_ir_typical_fourcc(fourcc: &str) -> bool {
     IR_TYPICAL_FOURCCS.contains(&fourcc.trim())
 }
 
@@ -276,11 +276,13 @@ fn ir_source_with_quirks_and_ids(
 /// V4L2 nodes sharing the same VID:PID — e.g. the Logitech BRIO (046d:085e) has
 /// an RGB node (YUYV/MJPG) *and* an IR node (native GREY). When multiple nodes
 /// share one quirk-matched USB identity AND at least one of them exposes an
-/// IR-like format (GREY/Y16, or the quirk's `format_preference`), only the
-/// node(s) with that format are IR; siblings without it fall back to the
-/// quirk-free heuristic. If NO node has an IR-like format there is no evidence
-/// to disambiguate with, so `force_ir` is trusted for all nodes (some quirk
-/// entries exist precisely because the camera advertises no IR-like format).
+/// IR-typical format (GREY/Y8/Y10/Y12/Y16), only the node(s) with that format
+/// are IR; siblings without it fall back to the quirk-free heuristic. A
+/// quirk's `format_preference` counts as this evidence only when the preference
+/// is itself IR-typical and the node advertises it. If NO node has an IR-like
+/// format there is no evidence to disambiguate with, so `force_ir` is trusted
+/// for all nodes (some quirk entries exist precisely because the camera
+/// advertises no IR-like format).
 pub fn classify_ir_sources(
     devices: &[DeviceInfo],
     quirks: Option<&crate::quirks::QuirksDb>,
@@ -325,7 +327,8 @@ fn classify_ir_sources_with_ids(
             continue;
         }
 
-        // IR-like formats: GREY/Y16 plus the quirk's format_preference, if any.
+        // IR-like formats: native GREY/Y8/Y10/Y12/Y16, including the quirk's
+        // format_preference only when the preference is itself IR-typical.
         let pref = quirks
             .and_then(|db| db.find_match_with_ids(&devices[i], Some(ids)))
             .and_then(|q| q.format_preference.clone());
@@ -338,10 +341,11 @@ fn classify_ir_sources_with_ids(
         let node_has_ir_format = |j: usize| {
             has_native_ir_format(&devices[j])
                 || pref.as_deref().is_some_and(|p| {
-                    devices[j]
-                        .formats
-                        .iter()
-                        .any(|f| f.fourcc.trim() == p.trim())
+                    is_ir_typical_fourcc(p)
+                        && devices[j]
+                            .formats
+                            .iter()
+                            .any(|f| f.fourcc.trim() == p.trim())
                 })
         };
 
@@ -843,6 +847,30 @@ mod tests {
 
         let sources = classify_ir_sources_with_ids(&devices, Some(&db), &ids);
         assert_eq!(sources[0], IrSource::None);
+        assert_eq!(sources[1], IrSource::Quirk);
+    }
+
+    #[test]
+    fn rgb_format_preference_does_not_exempt_rgb_sibling_from_demotion() {
+        // Regression #164: format_preference is node-level IR evidence only
+        // when the preferred format is itself IR-typical. An RGB preference
+        // such as MJPG must not let the RGB sibling keep force_ir when a GREY
+        // sibling provides real evidence for disambiguation.
+        let mut db = crate::quirks::QuirksDb::default();
+        db.push_quirk_for_test(brio_quirk(Some("MJPG")));
+
+        let devices = [
+            device_at("/dev/video0", "Logitech BRIO", &["YUYV", "MJPG"]),
+            device_at("/dev/video2", "Logitech BRIO", &["GREY"]),
+        ];
+        let ids = vec![brio_ids(), brio_ids()];
+
+        let sources = classify_ir_sources_with_ids(&devices, Some(&db), &ids);
+        assert_eq!(
+            sources[0],
+            IrSource::None,
+            "an RGB format preference must not preserve force_ir on the RGB sibling"
+        );
         assert_eq!(sources[1], IrSource::Quirk);
     }
 
