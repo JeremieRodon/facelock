@@ -595,9 +595,6 @@ fn run_wizard(plan: &SetupPlan) -> anyhow::Result<()> {
         }
     };
 
-    // ADR 010: nothing needs the group; remove a leftover one, best-effort.
-    retire_facelock_group();
-
     if systemd_enabled {
         start_daemon_for_setup(&config);
     }
@@ -2360,8 +2357,6 @@ fn run_non_interactive(plan: &SetupPlan) -> anyhow::Result<()> {
     }
 
     secure_setup_paths(&config, Some(&manifest))?;
-    // ADR 010: nothing needs the group; remove a leftover one, best-effort.
-    retire_facelock_group();
     write_setup_marker()?;
 
     // Daemon configuration, before enrollment and for the same reason the
@@ -2472,8 +2467,9 @@ fn setup_encryption_auto(config: &Config) -> anyhow::Result<()> {
 /// Remove a `facelock` group left behind by an older install, best-effort.
 ///
 /// ADR 010 retired the group: the bus policy no longer names it and packaging
-/// no longer creates it. By the time this runs the state layout has been
-/// applied, so nothing under `/var/lib/facelock` is group-owned;
+/// no longer creates it. This runs at the end of `secure_setup_paths`, once
+/// every path setup owns has converged to `root:root`, so nothing under
+/// `/var/lib/facelock` is group-owned by the time the group goes away;
 /// `/run/facelock` converges through tmpfiles at the next boot or through the
 /// package scriptlets. `groupdel` fails only when the group is some account's
 /// primary group, which facelock never did; a failure is reported, never
@@ -2550,6 +2546,10 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
             apply_file(&model_path, 0o644, is_root)?;
         }
     }
+
+    // ADR 010: everything above is root:root now, so a facelock group left by
+    // an older install owns nothing; remove it (best-effort, reported).
+    retire_facelock_group();
 
     Ok(())
 }
