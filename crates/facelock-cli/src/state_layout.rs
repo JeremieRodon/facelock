@@ -159,8 +159,8 @@ struct DirSpec<'a> {
 // Applying one path
 // ---------------------------------------------------------------------------
 
-/// `chown(2)` to `root:root`; shared with setup, which secures the same paths.
-pub(crate) fn chown_root(path: &Path) -> anyhow::Result<()> {
+/// `chown(2)` to `root:root`.
+fn chown_root(path: &Path) -> anyhow::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -177,11 +177,12 @@ pub(crate) fn chown_root(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Create-or-tighten one directory, then optionally make it `root:root`.
+/// Shared with setup, which secures its other directories the same way.
 ///
 /// Already-correct directories are left entirely alone rather than re-`chmod`ed
 /// and re-`chown`ed: this can run on the PAM path on every authentication, so
 /// the steady state must cost one `stat` per path and no writes.
-fn apply_dir(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()> {
+pub(crate) fn apply_dir(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()> {
     let current = fs::metadata(path).ok().filter(|m| m.is_dir());
     let mode_ok = current
         .as_ref()
@@ -201,8 +202,9 @@ fn apply_dir(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Tighten one file if it exists. Never creates it.
-fn apply_file(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()> {
+/// Tighten one file if it exists, then optionally make it `root:root`. Never
+/// creates it. Shared with setup, which secures its other files the same way.
+pub(crate) fn apply_file(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()> {
     let Ok(meta) = fs::metadata(path) else {
         return Ok(());
     };
@@ -230,8 +232,6 @@ fn apply_file(path: &Path, mode: u32, enforce_owner: bool) -> anyhow::Result<()>
 /// ever moved, copied, or deleted. Run as root it also enforces `root:root`
 /// ownership; run unprivileged it applies modes alone.
 pub fn apply_layout(layout: &StateLayout) -> anyhow::Result<()> {
-    // chown(2) to root needs root; an unprivileged caller — tests, a user-run
-    // best-effort pass — applies modes alone.
     let enforce_owner = nix::unistd::Uid::current().is_root();
     for spec in layout.dir_specs() {
         apply_dir(spec.path, spec.mode, enforce_owner)?;

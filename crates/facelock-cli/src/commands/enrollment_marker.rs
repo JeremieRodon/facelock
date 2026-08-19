@@ -13,10 +13,11 @@
 //! local user can open its own marker by name but cannot `readdir` the
 //! directory, so the enrolled roster is not enumerable; a guessed name can
 //! still be probed for existence with `stat(2)` — the accepted residual
-//! recorded in `docs/security.md` § 3 A2. Each marker is `0600` and owned by its user, so "am I enrolled?" is
-//! answerable by that user and nobody else — the same privacy property as
-//! `~/.ssh/authorized_keys`. No group is involved (ADR 010); `is-enrolled`
-//! answers `enrolled` as soon as the marker exists.
+//! recorded in `docs/security.md` § 3 A2. Each marker is `0600` and owned by
+//! its user, so "am I enrolled?" is answerable by that user and nobody else —
+//! the same privacy property as `~/.ssh/authorized_keys`. No group is
+//! involved (ADR 010); `is-enrolled` answers `enrolled` as soon as the marker
+//! exists.
 //!
 //! The marker is a **hint, not authority**; see the module docs in
 //! [`crate::commands::is_enrolled`]. Every write is best-effort: a marker that

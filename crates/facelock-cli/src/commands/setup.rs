@@ -17,6 +17,7 @@ use crate::message::{
     DeviceMessage, DownloadMessage, Message, PamMessage, SetupMessage, SystemMessage, Terminal,
     fail,
 };
+use crate::state_layout::{apply_dir, apply_file};
 
 // The `/etc/pam.d` writer lives in `commands/pam.rs` (#174) — `facelock pam
 // add|remove|status` is its command, and `setup --pam` is an alias onto it.
@@ -2488,26 +2489,9 @@ fn retire_facelock_group() {
     }
 }
 
-/// Tighten an existing file to `mode` and, when running as root, make it
-/// `root:root`. Every path setup secures is root-owned by construction.
-fn secure_existing_path(path: &Path, mode: u32) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    ensure_mode(path, mode)
-        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-
-    if nix::unistd::Uid::current().is_root() {
-        crate::state_layout::chown_root(path)?;
-    }
-
-    Ok(())
-}
-
 /// Tighten an existing directory to `mode` and, when running as root, make it
 /// `root:root`. Every directory setup secures is root-owned by construction.
-fn secure_dir_if_exists(path: &Path, mode: u32) -> anyhow::Result<()> {
+fn secure_dir_if_exists(path: &Path, mode: u32, is_root: bool) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -2519,13 +2503,7 @@ fn secure_dir_if_exists(path: &Path, mode: u32) -> anyhow::Result<()> {
         );
     }
 
-    ensure_private_dir(path, mode)
-        .with_context(|| format!("failed to secure directory {}", path.display()))?;
-    if nix::unistd::Uid::current().is_root() {
-        crate::state_layout::chown_root(path)?;
-    }
-
-    Ok(())
+    apply_dir(path, mode, is_root)
 }
 
 fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyhow::Result<()> {
@@ -2533,42 +2511,43 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     let config_dir = config_path
         .parent()
         .unwrap_or_else(|| Path::new("/etc/facelock"));
-    let db_path = Path::new(&config.storage.db_path);
     let audit_path = Path::new(&config.audit.path);
     let key_path = Path::new(&config.encryption.key_path);
     let sealed_key_path = Path::new(&config.encryption.sealed_key_path);
+    // Every path setup secures is root-owned by construction: enforce that when
+    // running as root, apply modes alone otherwise.
+    let is_root = nix::unistd::Uid::current().is_root();
 
-    secure_dir_if_exists(config_dir, 0o755)?;
+    secure_dir_if_exists(config_dir, 0o755, is_root)?;
     // Snapshots hold raw face images: root-only, no group access.
-    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700)?;
+    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700, is_root)?;
 
     // The state directory subtree — state dir, models/, enrolled/, and the
-    // database file modes — is owned by `state_layout`. Re-applied here so a
-    // path created earlier in setup with a looser mode converges before the
-    // marker reconcile runs.
+    // database file with its -wal/-shm sidecars — is owned by `state_layout`.
+    // Re-applied here so a path created earlier in setup with a looser mode
+    // converges before the marker reconcile runs.
     ensure_state_layout_or_bail(config)?;
     if let Some(parent) = audit_path.parent() {
         // Per-user auth history: root-only, like the snapshots.
-        secure_dir_if_exists(parent, 0o700)?;
+        secure_dir_if_exists(parent, 0o700, is_root)?;
     }
     if let Some(parent) = key_path.parent() {
-        secure_dir_if_exists(parent, 0o755)?;
+        secure_dir_if_exists(parent, 0o755, is_root)?;
     }
     if let Some(parent) = sealed_key_path.parent() {
-        secure_dir_if_exists(parent, 0o755)?;
+        secure_dir_if_exists(parent, 0o755, is_root)?;
     }
 
-    secure_existing_path(&config_path, 0o644)?;
-    secure_existing_path(db_path, 0o600)?;
-    secure_existing_path(audit_path, 0o600)?;
-    secure_existing_path(key_path, 0o600)?;
-    secure_existing_path(sealed_key_path, 0o600)?;
-    secure_existing_path(Path::new(SETUP_COMPLETE_MARKER), 0o644)?;
+    apply_file(&config_path, 0o644, is_root)?;
+    apply_file(audit_path, 0o600, is_root)?;
+    apply_file(key_path, 0o600, is_root)?;
+    apply_file(sealed_key_path, 0o600, is_root)?;
+    apply_file(Path::new(SETUP_COMPLETE_MARKER), 0o644, is_root)?;
 
     if let Some(manifest) = manifest {
         for entry in &manifest.models {
             let model_path = Path::new(&config.daemon.model_dir).join(&entry.filename);
-            secure_existing_path(&model_path, 0o644)?;
+            apply_file(&model_path, 0o644, is_root)?;
         }
     }
 
@@ -3960,20 +3939,25 @@ mod tests {
     /// matching rule in a context — so the allow must follow the deny.
     #[test]
     fn dbus_policy_opens_authenticate_to_the_default_context_only() {
+        /// The text between the first `open` and the `close` that follows it.
+        fn between<'a>(hay: &'a str, open: &str, close: &str) -> &'a str {
+            let start = hay
+                .find(open)
+                .unwrap_or_else(|| panic!("{open:?} not found in the policy"))
+                + open.len();
+            let len = hay[start..]
+                .find(close)
+                .unwrap_or_else(|| panic!("{close:?} does not follow {open:?} in the policy"));
+            &hay[start..start + len]
+        }
+
         let policy = DBUS_POLICY;
         assert_eq!(
             policy.matches(r#"<policy context="default">"#).count(),
             1,
             "exactly one default-context policy block; a second one could reopen the interface below this test's slice"
         );
-        let default_start = policy
-            .find(r#"<policy context="default">"#)
-            .expect("default context policy");
-        let default_end = policy[default_start..]
-            .find("</policy>")
-            .map(|i| default_start + i)
-            .expect("default context closes");
-        let default = &policy[default_start..default_end];
+        let default = between(policy, r#"<policy context="default">"#, "</policy>");
 
         let deny = default
             .find(r#"<deny send_destination="org.facelock.Daemon"/>"#)
@@ -3984,11 +3968,7 @@ mod tests {
             "exactly one allow in the default context"
         );
         let allow_start = default.find("<allow").expect("the one allow");
-        let allow_end = default[allow_start..]
-            .find("/>")
-            .map(|i| allow_start + i)
-            .expect("allow element closes");
-        let allow = &default[allow_start..allow_end];
+        let allow = between(default, "<allow", "/>");
         assert!(
             allow_start > deny,
             "the Authenticate allow must follow the deny"
@@ -4010,18 +3990,14 @@ mod tests {
             !policy.contains("<policy group"),
             "no group policy (ADR 010: the group is retired)"
         );
-        let root_start = policy.find(r#"<policy user="root">"#).expect("root policy");
-        let root_end = policy[root_start..]
-            .find("</policy>")
-            .map(|i| root_start + i)
-            .expect("root policy closes");
-        let root = &policy[root_start..root_end];
-        let signal_allow = root
-            .split("<allow")
-            .skip(1)
-            .map(|rest| &rest[..rest.find("/>").expect("allow element closes")])
-            .find(|allow| allow.contains(r#"receive_type="signal""#))
+        let root = between(policy, r#"<policy user="root">"#, "</policy>");
+        let signal_at = root
+            .find(r#"receive_type="signal""#)
             .expect("root may receive the daemon's signals");
+        let allow_at = root[..signal_at]
+            .rfind("<allow")
+            .expect("the root signal rule is an allow");
+        let signal_allow = between(&root[allow_at..], "<allow", "/>");
         assert!(
             signal_allow.contains(r#"receive_sender="org.facelock.Daemon""#),
             "root signal allow lacks receive_sender: {signal_allow}"

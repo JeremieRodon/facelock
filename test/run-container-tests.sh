@@ -793,9 +793,8 @@ cat > /usr/share/dbus-1/system.d/zz-facelock-peer-test.conf <<'EOF'
   </policy>
 </busconfig>
 EOF
-dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
-    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig
-sleep 1
+dbus-send --system --print-reply --type=method_call --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig >/dev/null
 runuser -u testuser -- python3 /fake-facelock-daemon.py > /tmp/fake-daemon.log 2>&1 &
 FAKE_PID=$!
 wait_for_daemon_name || echo "warning: fake non-root daemon did not claim the name"

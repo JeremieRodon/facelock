@@ -422,37 +422,28 @@ mod tests {
     //
     // ADR 010: a bus-policy denial can only mean a non-root caller reached
     // for a root-only method (every local user may send `Authenticate`), so
-    // the hint says root — never "join the group"; there is no group.
+    // the hint says root — never "join the group"; there is no group. The
+    // daemon's own `authorize_method` -> `require_root` denial (issue #108)
+    // gets the same hint: under DEC-6 it is the common case.
     #[test]
-    fn access_denied_bus_policy_denial_gets_root_hint() {
-        let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
-            "rejected by policy".into(),
-        ))))
-        .context("D-Bus PreviewFrame call failed");
-        let hinted = add_access_denied_hint(err);
-        let msg = format!("{hinted:#}");
-        assert!(msg.contains("requires root"), "got: {msg}");
-        assert!(!msg.contains("usermod"), "got: {msg}");
-        assert!(!msg.contains("facelock' group"), "got: {msg}");
-    }
-
-    // The daemon's `authorize_method` -> `require_root` denial (issue #108,
-    // Wave-1 cross-PR note): under DEC-6 this is now the common case, and it
-    // must say root is required rather than suggesting group membership,
-    // which would not fix anything.
-    #[test]
-    fn access_denied_root_required_gets_root_hint() {
-        let err = anyhow::Error::new(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
-            "ListModels requires root (caller: 'alice', UID 1000)".into(),
-        ))))
-        .context("D-Bus ListModels call failed");
-        let hinted = add_access_denied_hint(err);
-        let msg = format!("{hinted:#}");
-        assert!(msg.contains("requires root"), "got: {msg}");
-        assert!(
-            !msg.contains("usermod -aG facelock"),
-            "a root-only denial must not suggest joining the group, got: {msg}"
-        );
+    fn access_denied_gets_root_hint() {
+        for (detail, call) in [
+            ("rejected by policy", "PreviewFrame"),
+            (
+                "ListModels requires root (caller: 'alice', UID 1000)",
+                "ListModels",
+            ),
+        ] {
+            let err = anyhow::Error::new(zbus::Error::FDO(Box::new(
+                zbus::fdo::Error::AccessDenied(detail.into()),
+            )))
+            .context(format!("D-Bus {call} call failed"));
+            let hinted = add_access_denied_hint(err);
+            let msg = format!("{hinted:#}");
+            assert!(msg.contains("Re-run with sudo"), "got: {msg}");
+            assert!(!msg.contains("usermod"), "got: {msg}");
+            assert!(!msg.contains("facelock' group"), "got: {msg}");
+        }
     }
 
     #[test]
