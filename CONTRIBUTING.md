@@ -45,7 +45,7 @@ Version is declared once in the root `Cargo.toml` and inherited via `version.wor
 
 The PAM module (`pam-facelock`) must stay lightweight: **libc, toml, serde, zbus only**. No ort, no v4l, no facelock-core. This keeps the shared library small and avoids dragging heavy dependencies into every PAM-using process.
 
-Each crate has a defined dependency boundary. See `AGENTS.md` for the full table.
+Each crate has a defined dependency boundary. See each crate's `Cargo.toml` for its actual dependencies.
 
 ### Supply-chain auditing
 
