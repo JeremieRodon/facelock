@@ -383,7 +383,7 @@ macro_rules! declare_methods {
         /// sync with the `#[interface]` block below — the one direction no
         /// type can enforce, and what
         /// `interface_methods_and_the_authz_matrix_are_the_same_set` pins by
-        /// scanning this file. This enum plus [`Method::scope`] is the
+        /// parsing this file. This enum plus [`Method::scope`] is the
         /// authorization matrix; the in-module unit tests pin the table
         /// itself, and tests/server_authz.rs exercises it through the
         /// method-level entry points (D6).
@@ -1985,43 +1985,20 @@ mod tests {
     /// the wire name from the `#[interface]` function name — nothing in the
     /// type system ties the two together, so a method added to the interface
     /// without a `Method` variant would be a wire method the matrix tests
-    /// above never see. Scanning the source is how the repo pins structural
+    /// above never see. Parsing the source AST is how the repo pins structural
     /// facts a type cannot (same idiom as the CLI's backend-seam pins); the
     /// live introspection XML is unavailable here because `#[interface]` is
     /// implemented only for the production `Camera`/`FaceEngine` handler.
     #[test]
     fn interface_methods_and_the_authz_matrix_are_the_same_set() {
-        // Assembled at runtime so this literal doesn't match itself.
-        let marker = format!("#[{}(name = \"org.facelock.Daemon\")]", "interface");
-        let after_marker = include_str!("server.rs")
-            .split_once(&marker)
-            .expect("the #[interface] block")
-            .1;
-        // The impl ends at the first `}` in column 0; every brace inside it
-        // is indented.
-        let block = after_marker
-            .split_once("\n}\n")
-            .expect("the #[interface] block's closing brace")
-            .0;
-
-        let mut on_wire: Vec<String> = Vec::new();
-        let mut previous = "";
-        for line in block.lines() {
-            let line = line.trim();
-            // Signals are declared in the same block but are not methods.
-            if let Some(rest) = line.strip_prefix("async fn ") {
-                if !previous.contains("(signal)") {
-                    on_wire.push(rest.split('(').next().unwrap().to_string());
-                }
-            }
-            if !line.is_empty() {
-                previous = line;
-            }
-        }
-
-        let mut in_matrix: Vec<String> = Method::ALL.iter().map(|m| snake_case(m.name())).collect();
-        on_wire.sort();
-        in_matrix.sort();
+        let on_wire = interface_method_names(include_str!("server.rs"));
+        let in_matrix: std::collections::BTreeSet<String> =
+            Method::ALL.iter().map(|m| snake_case(m.name())).collect();
+        assert_eq!(
+            on_wire.len(),
+            Method::ALL.len(),
+            "the parser must recover exactly one wire method for every Method variant"
+        );
         assert_eq!(
             on_wire, in_matrix,
             "every #[interface] method needs a Method variant (and vice versa) — \
@@ -2029,8 +2006,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ast_guard_catches_unauthorized_methods_after_column_zero_brace() {
+        let source = r#"
+#[interface(name = "org.facelock.Daemon")]
+impl SyntheticService {
+    async fn authorized() {
+        if true {
+}
+    }
+
+    pub async fn unauthorized() {}
+    pub(crate) async fn crate_visible() {}
+    pub fn synchronous_unauthorized() {}
+}
+"#;
+        let on_wire = interface_method_names(source);
+        let synthetic_matrix: std::collections::BTreeSet<String> = ["authorized", "crate_visible"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let unauthorized: Vec<&str> = on_wire
+            .difference(&synthetic_matrix)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            on_wire,
+            [
+                "authorized",
+                "crate_visible",
+                "synchronous_unauthorized",
+                "unauthorized",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            "all methods must be recovered regardless of sync, visibility, or brace layout"
+        );
+        assert_eq!(
+            unauthorized,
+            ["synchronous_unauthorized", "unauthorized"],
+            "the guard must expose sync and async wire methods with no authorization row"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "zbus properties are not covered by the method authorization matrix")]
+    fn ast_guard_refuses_unclassified_zbus_properties() {
+        let source = r#"
+#[interface(name = "org.facelock.Daemon")]
+impl SyntheticService {
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn status(&self) -> bool {
+        true
+    }
+}
+"#;
+        let _ = interface_method_names(source);
+    }
+
+    fn interface_method_names(source: &str) -> std::collections::BTreeSet<String> {
+        let file = syn::parse_file(source).expect("server source must parse as Rust");
+        let mut interfaces = file.items.iter().filter_map(|item| match item {
+            syn::Item::Impl(item_impl)
+                if item_impl
+                    .attrs
+                    .iter()
+                    .any(|attr| attr.path().is_ident("interface")) =>
+            {
+                Some(item_impl)
+            }
+            _ => None,
+        });
+        let interface = interfaces.next().expect("the #[interface] impl");
+        assert!(
+            interfaces.next().is_none(),
+            "expected exactly one #[interface] impl"
+        );
+
+        interface
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::ImplItem::Fn(method) if !has_zbus_flag(method, "signal") => {
+                    assert!(
+                        !has_zbus_flag(method, "property"),
+                        "zbus properties are not covered by the method authorization matrix"
+                    );
+                    Some(method.sig.ident.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_zbus_flag(method: &syn::ImplItemFn, flag: &str) -> bool {
+        method.attrs.iter().any(|attr| {
+            if !attr.path().is_ident("zbus") {
+                return false;
+            }
+            attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .expect("#[zbus(...)] metadata must parse")
+            .iter()
+            .any(|meta| meta.path().is_ident(flag))
+        })
+    }
+
     /// The wire name in the snake_case form zbus derives for the
-    /// `#[interface]` function, which is what the scan above compares
+    /// `#[interface]` function, which is what the AST parser above compares
     /// against.
     fn snake_case(name: &str) -> String {
         let mut out = String::with_capacity(name.len() + 3);
