@@ -667,7 +667,7 @@ struct ServiceReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
     /// The file needs rewriting, from these bytes.
-    Rewrite { content: String },
+    Rewrite { content: Vec<u8> },
     /// The service resolved only in a vendor directory and `add` will create
     /// the local override from these bytes — the vendor file's, which the copy
     /// carries the facelock line and a provenance header on top of.
@@ -676,7 +676,7 @@ enum Plan {
     /// write different files and print different things, and which one is
     /// happening is decided once, in [`plan_writes`], rather than re-derived
     /// by each applier from the target's origin.
-    Override { content: String },
+    Override { content: Vec<u8> },
     /// The service resolves only in a vendor directory and this verb does not
     /// write there. `remove`'s answer, and a no-op.
     VendorOnly,
@@ -981,7 +981,7 @@ fn confined(service: &str) -> anyhow::Result<()> {
 /// and there are two ways for a well-formed name to reach a file this cannot
 /// account for.
 ///
-/// **Symlinks.** `read_to_string` follows one, and so does every write that is
+/// **Symlinks.** `fs::read` follows one, and so does every write that is
 /// not a `rename`,
 /// so on an authselect system `/etc/pam.d/system-auth -> /etc/authselect/…`
 /// would be edited in place — a file authselect regenerates, with the backup
@@ -1238,7 +1238,7 @@ fn is_service_name(name: &str) -> bool {
 /// read is not carried: it is gone, which is an answer.
 ///
 /// **Only a regular file is read, and the metadata that decides it is the
-/// *followed* one.** `read_to_string` on a FIFO blocks until a writer appears,
+/// *followed* one.** `fs::read` on a FIFO blocks until a writer appears,
 /// which is forever on a `/etc/pam.d` nobody is writing to — and this scan is
 /// what `facelock status` runs, so the command whose whole job is to report a
 /// broken machine would hang on one. A socket or a device node is the same
@@ -1266,8 +1266,8 @@ fn worth_reporting(path: &Path) -> bool {
         // read, which distinguishes them.
         _ => {}
     }
-    match fs::read_to_string(path) {
-        Ok(content) => content.lines().any(is_facelock_pam_line),
+    match fs::read(path) {
+        Ok(content) => PamDocument::new(&content).has_facelock_rule(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
@@ -1497,7 +1497,7 @@ fn plan_writes(dirs: &PamDirs, write: &WriteRequest) -> anyhow::Result<Vec<Targe
 
         let display = located.path_string();
 
-        let content = match fs::read_to_string(&located.path) {
+        let content = match fs::read(&located.path) {
             Ok(content) => Some(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !write.request.if_present {
@@ -1529,7 +1529,7 @@ fn plan_writes(dirs: &PamDirs, write: &WriteRequest) -> anyhow::Result<Vec<Targe
             // package's file, unless the vendor file already carries the line,
             // in which case there is nothing an override would add.
             (Some(content), Origin::Vendor { override_path }) => {
-                if content.lines().any(is_facelock_pam_line) {
+                if PamDocument::new(&content).has_facelock_rule() {
                     Plan::NoChange
                 } else {
                     // Phase one, so the copy's destination is validated before
@@ -1545,7 +1545,7 @@ fn plan_writes(dirs: &PamDirs, write: &WriteRequest) -> anyhow::Result<Vec<Targe
             // The same question for both verbs — "does the line exist?" — and
             // opposite answers about whether that means work to do.
             (Some(content), Origin::Local | Origin::Nowhere { .. }) => {
-                let present = content.lines().any(is_facelock_pam_line);
+                let present = PamDocument::new(&content).has_facelock_rule();
                 if present == (write.action == WriteAction::Remove) {
                     Plan::Rewrite { content }
                 } else {
@@ -1607,72 +1607,316 @@ fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}{BACKUP_SUFFIX}", path.display()))
 }
 
+/// A PAM service file viewed as bytes and logical rules.
+///
+/// Linux-PAM permits horizontal whitespace after a continuation backslash,
+/// and a `#` ends the semantic rule even when an earlier physical line asked
+/// to continue. The parser below mirrors those boundaries while every edit
+/// still copies the untouched raw spans byte for byte.
+struct PamDocument<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> PamDocument<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn logical_rules(&self) -> LogicalRules<'a> {
+        LogicalRules {
+            bytes: self.bytes,
+            next: 0,
+        }
+    }
+
+    fn has_facelock_rule(&self) -> bool {
+        self.logical_rules()
+            .any(|rule| is_facelock_rule(rule.bytes))
+    }
+
+    fn auth_insertion_offset(&self) -> Option<usize> {
+        self.logical_rules()
+            .find(|rule| is_auth_rule(rule.bytes))
+            .map(|rule| rule.start)
+    }
+
+    fn pam_header_end(&self) -> Option<usize> {
+        let header = PhysicalLine::at(self.bytes, 0)?;
+        (header.content() == b"#%PAM-1.0").then_some(header.end)
+    }
+
+    fn line_ending_from(&self, from: usize) -> Option<&'a [u8]> {
+        let newline = self.bytes[from..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|relative| from + relative)?;
+        if newline > from && self.bytes[newline - 1] == b'\r' {
+            Some(&self.bytes[newline - 1..=newline])
+        } else {
+            Some(&self.bytes[newline..=newline])
+        }
+    }
+
+    fn with_facelock_inserted(&self) -> Vec<u8> {
+        let auth_offset = self.auth_insertion_offset();
+        let header_end = if auth_offset.is_none() {
+            self.pam_header_end()
+        } else {
+            None
+        };
+        let offset = auth_offset.or(header_end).unwrap_or(0);
+        let ending_from = if auth_offset.is_some() { offset } else { 0 };
+        let ending = self
+            .line_ending_from(ending_from)
+            .or_else(|| self.line_ending_from(0))
+            .unwrap_or(b"\n");
+
+        let mut output = Vec::with_capacity(self.bytes.len() + PAM_LINE.len() + 2);
+        output.extend_from_slice(&self.bytes[..offset]);
+
+        // A header with no newline needs a separator before an appended rule,
+        // while the appended rule itself stays unterminated so the document's
+        // no-final-newline property survives.
+        if header_end == Some(self.bytes.len()) && !self.bytes.ends_with(b"\n") {
+            output.extend_from_slice(ending);
+            output.extend_from_slice(PAM_LINE.as_bytes());
+            return output;
+        }
+
+        output.extend_from_slice(PAM_LINE.as_bytes());
+        if !self.bytes.is_empty() {
+            output.extend_from_slice(ending);
+        }
+        output.extend_from_slice(&self.bytes[offset..]);
+        output
+    }
+
+    fn with_facelock_removed(&self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(self.bytes.len());
+        let mut copied_through = 0;
+        for rule in self.logical_rules() {
+            if !is_facelock_rule(rule.bytes) {
+                continue;
+            }
+
+            // Older facelock releases could inject the canonical physical
+            // line after a continued administrator line. That structural
+            // position, not the administrator rule's type, distinguishes the
+            // legacy damage from a genuine Facelock logical rule.
+            let mut next = rule.start;
+            let mut previous_continued = false;
+            let mut repaired_legacy_injection = false;
+            while next < rule.end {
+                let Some(line) = PhysicalLine::at(self.bytes, next) else {
+                    break;
+                };
+                if previous_continued && line.content() == PAM_LINE.as_bytes() {
+                    output.extend_from_slice(&self.bytes[copied_through..line.start]);
+                    copied_through = line.end;
+                    repaired_legacy_injection = true;
+                }
+                previous_continued = line.continuation_backslash().is_some();
+                next = line.end;
+            }
+            if repaired_legacy_injection {
+                continue;
+            }
+
+            output.extend_from_slice(&self.bytes[copied_through..rule.start]);
+            copied_through = rule.end;
+        }
+        output.extend_from_slice(&self.bytes[copied_through..]);
+        output
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LogicalRule<'a> {
+    start: usize,
+    end: usize,
+    bytes: &'a [u8],
+}
+
+struct LogicalRules<'a> {
+    bytes: &'a [u8],
+    next: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalLine<'a> {
+    bytes: &'a [u8],
+    start: usize,
+    end: usize,
+    content_end: usize,
+}
+
+impl<'a> PhysicalLine<'a> {
+    fn at(bytes: &'a [u8], start: usize) -> Option<Self> {
+        if start >= bytes.len() {
+            return None;
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |relative| start + relative + 1);
+        let mut content_end = end;
+        if bytes[content_end - 1] == b'\n' {
+            content_end -= 1;
+            if content_end > start && bytes[content_end - 1] == b'\r' {
+                content_end -= 1;
+            }
+        }
+        Some(Self {
+            bytes,
+            start,
+            end,
+            content_end,
+        })
+    }
+
+    fn content(self) -> &'a [u8] {
+        &self.bytes[self.start..self.content_end]
+    }
+
+    fn semantic(self) -> &'a [u8] {
+        let content = self.content();
+        let end = content
+            .iter()
+            .position(|byte| *byte == b'#')
+            .unwrap_or(content.len());
+        &content[..end]
+    }
+
+    fn has_semantic_content(self) -> bool {
+        self.semantic()
+            .iter()
+            .any(|byte| !matches!(byte, b' ' | b'\t'))
+    }
+
+    fn continuation_backslash(self) -> Option<usize> {
+        let content = self.content();
+        if content.contains(&b'#') {
+            return None;
+        }
+        let mut end = content.len();
+        while end > 0 && matches!(content[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        (end > 0 && content[end - 1] == b'\\').then_some(end - 1)
+    }
+}
+
+impl<'a> Iterator for LogicalRules<'a> {
+    type Item = LogicalRule<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = loop {
+            let line = PhysicalLine::at(self.bytes, self.next)?;
+            if line.has_semantic_content() {
+                break line;
+            }
+            self.next = line.end;
+        };
+
+        let start = first.start;
+        let mut line = first;
+        loop {
+            if line.continuation_backslash().is_none() || line.end == self.bytes.len() {
+                break;
+            }
+            let Some(next) = PhysicalLine::at(self.bytes, line.end) else {
+                break;
+            };
+            // Linux-PAM consumes a blank/comment physical line to terminate
+            // an assembled rule. Leaving it out of the raw rule span keeps
+            // that administrator-owned line intact when the rule is removed.
+            if !next.has_semantic_content() {
+                break;
+            }
+            line = next;
+        }
+
+        let end = line.end;
+        self.next = end;
+        Some(LogicalRule {
+            start,
+            end,
+            bytes: &self.bytes[start..end],
+        })
+    }
+}
+
+fn semantic_rule(rule: &[u8]) -> Vec<u8> {
+    let mut semantic = Vec::with_capacity(rule.len());
+    let mut next = 0;
+    while let Some(line) = PhysicalLine::at(rule, next) {
+        let segment = line.semantic();
+        if let Some(backslash) = line.continuation_backslash() {
+            semantic.extend_from_slice(&segment[..backslash]);
+            semantic.push(b' ');
+        } else {
+            semantic.extend_from_slice(segment);
+        }
+        next = line.end;
+    }
+    semantic
+}
+
+fn first_token(semantic: &[u8]) -> Option<&[u8]> {
+    let start = semantic
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())?;
+    let end = semantic[start..]
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .map_or(semantic.len(), |relative| start + relative);
+    Some(&semantic[start..end])
+}
+
+fn is_auth_rule(rule: &[u8]) -> bool {
+    let semantic = semantic_rule(rule);
+    let Some(token) = first_token(&semantic) else {
+        return false;
+    };
+    token
+        .strip_prefix(b"-")
+        .unwrap_or(token)
+        .eq_ignore_ascii_case(b"auth")
+}
+
+fn is_facelock_rule(rule: &[u8]) -> bool {
+    semantic_rule(rule)
+        .windows(b"pam_facelock.so".len())
+        .any(|window| window == b"pam_facelock.so")
+}
+
 /// Whether a PAM config line references pam_facelock, regardless of spacing.
 ///
-/// Matches on the module name, not on [`PAM_LINE`]'s bytes, so a hand-edited
-/// line with different spacing is still recognized — and a commented-out one
-/// is not.
+/// Matches on the module name, not on the canonical line's bytes, so a
+/// hand-edited line with different spacing is still recognized — and a
+/// commented-out one is not.
 pub fn is_facelock_pam_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    !trimmed.starts_with('#') && trimmed.contains("pam_facelock.so")
+    is_facelock_rule(line.as_bytes())
 }
 
-/// Whether a line begins a PAM `auth` rule, which is where the facelock line
-/// has to go above.
-fn has_auth_keyword(line: &str) -> bool {
-    line.trim_start().starts_with("auth")
-}
-
-/// Where the line will land in `content`, as the message that says so.
-///
-/// Derived from the same scan [`with_line_inserted`] makes, at the two places
-/// that report it — the preview and the dry-run row. Recording the answer on
-/// the plan instead gave the preview a way to promise a placement the write
-/// then contradicted.
-fn insertion_hint(content: &str) -> PamMessage {
-    if content.lines().any(has_auth_keyword) {
+/// Where the line will land in content, as the message that says so.
+fn insertion_hint(content: &[u8]) -> PamMessage {
+    let document = PamDocument::new(content);
+    if document.auth_insertion_offset().is_some() {
         PamMessage::PamInsertBeforeAuthHint
+    } else if document.pam_header_end().is_some() {
+        PamMessage::PamInsertAfterHeaderHint
     } else {
         PamMessage::PamInsertAtTopHint
     }
 }
 
-/// Insert [`PAM_LINE`] above the first `auth` line, or at the very top if
-/// there is none. Trailing-newline behavior of the original is preserved.
-fn with_line_inserted(content: &str) -> String {
-    let mut new_lines: Vec<String> = Vec::new();
-    let mut inserted = false;
-
-    for line in content.lines() {
-        if !inserted && has_auth_keyword(line) {
-            new_lines.push(PAM_LINE.to_string());
-            inserted = true;
-        }
-        new_lines.push(line.to_string());
-    }
-
-    if !inserted {
-        new_lines.insert(0, PAM_LINE.to_string());
-    }
-
-    let mut output = new_lines.join("\n");
-    if content.ends_with('\n') {
-        output.push('\n');
-    }
-    output
+fn with_line_inserted(content: &[u8]) -> Vec<u8> {
+    PamDocument::new(content).with_facelock_inserted()
 }
 
-/// Drop every facelock line, preserving the original's trailing newline.
-fn with_line_removed(content: &str) -> String {
-    let mut output = content
-        .lines()
-        .filter(|line| !is_facelock_pam_line(line))
-        .collect::<Vec<&str>>()
-        .join("\n");
-    if content.ends_with('\n') {
-        output.push('\n');
-    }
-    output
+fn with_line_removed(content: &[u8]) -> Vec<u8> {
+    PamDocument::new(content).with_facelock_removed()
 }
 
 /// The two comment lines a vendor copy carries, so the next reader knows the
@@ -1724,7 +1968,7 @@ fn provenance_header(vendor: &Path) -> String {
 /// is the label the new file should have. So the copy is best-effort by
 /// construction: failing it degrades to the label the file would have had
 /// anyway.
-fn replace_atomically(path: &Path, content: &str, model: &Path) -> std::io::Result<()> {
+fn replace_atomically(path: &Path, content: &[u8], model: &Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -1761,7 +2005,7 @@ fn replace_atomically(path: &Path, content: &str, model: &Path) -> std::io::Resu
             .write(true)
             .mode(model.mode())
             .open(&temp)?;
-        file.write_all(content.as_bytes())?;
+        file.write_all(content)?;
 
         // `OpenOptions::mode` is masked by the umask, so the mode is set again
         // rather than trusted: a service file that came out 0600 because the
@@ -2089,8 +2333,8 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
             sink.info(&PamMessage::PamVendorOnly { path });
             return Outcome::VendorOnly;
         }
-        Plan::Rewrite { content } => (content.as_str(), false),
-        Plan::Override { content } => (content.as_str(), true),
+        Plan::Rewrite { content } => (content.as_slice(), false),
+        Plan::Override { content } => (content.as_slice(), true),
     };
     let backup = target.backup_string();
 
@@ -2176,7 +2420,11 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink) -> Outcome {
     // the file itself for an edit, the vendor original for a copy.
     let with_line = with_line_inserted(content);
     let written = if from_vendor {
-        format!("{}{with_line}", provenance_header(&target.path))
+        let header = provenance_header(&target.path);
+        let mut written = Vec::with_capacity(header.len() + with_line.len());
+        written.extend_from_slice(header.as_bytes());
+        written.extend_from_slice(&with_line);
+        written
     } else {
         with_line
     };
@@ -2519,7 +2767,7 @@ pub(crate) fn is_configured(dirs: &PamDirs, service: &str) -> bool {
     let Ok(target) = Target::locate(dirs, service) else {
         return false;
     };
-    fs::read_to_string(&target.path).is_ok_and(|content| content.lines().any(is_facelock_pam_line))
+    fs::read(&target.path).is_ok_and(|content| PamDocument::new(&content).has_facelock_rule())
 }
 
 /// Phase two, for every target.
@@ -2777,13 +3025,13 @@ fn status_reports(dirs: &PamDirs, services: &[String], sink: &Sink) -> Vec<Servi
 
             let vendor_only = matches!(target.origin, Origin::Vendor { .. });
 
-            let outcome = match fs::read_to_string(&target.path) {
+            let outcome = match fs::read(&target.path) {
                 // Read before the vendor test, not after: a service whose
                 // vendor file already carries the line — a distribution that
                 // ships face auth in its own PAM stack — *is* configured, and
                 // reporting it `vendor-only` would send an integrator off to
                 // create an override that adds nothing.
-                Ok(content) if content.lines().any(is_facelock_pam_line) => {
+                Ok(content) if PamDocument::new(&content).has_facelock_rule() => {
                     // Configured either way; the second line says the copy is
                     // a local override, which is what tells an operator it
                     // will not follow the package's updates.
@@ -2994,22 +3242,19 @@ mod tests {
     //
     // Produced by running that commit's `pam_install_in` / `pam_remove_in`
     // against a tempdir and dumping the resulting bytes — not written by hand.
-    // They are the regression guard the whole refactor turns on: the file this
-    // command leaves behind must be the file the old one left behind, byte for
-    // byte, including where the line lands and whether a trailing newline
-    // survives.
+    // They are the regression guard the whole refactor turns on. Issue #192
+    // intentionally changes the no-auth placement to follow the magic header;
+    // every other byte remains pinned to the pre-refactor output.
     // -----------------------------------------------------------------------
 
     /// A service whose first `auth` line is not its first line.
     const SUDO_BEFORE: &str = "#%PAM-1.0\nauth\t\tinclude\t\tsystem-auth\naccount\t\tinclude\t\tsystem-auth\nsession\t\tinclude\t\tsystem-auth\n";
     const SUDO_AFTER: &str = "#%PAM-1.0\nauth      sufficient pam_facelock.so\nauth\t\tinclude\t\tsystem-auth\naccount\t\tinclude\t\tsystem-auth\nsession\t\tinclude\t\tsystem-auth\n";
 
-    /// A service with no `auth` line at all: the line goes to the very top,
-    /// *above* the `#%PAM-1.0` header. That is what `main` did, so that is
-    /// what the golden says.
+    /// A service with no `auth` line at all: the magic header stays first.
     const POLKIT_BEFORE: &str =
         "#%PAM-1.0\naccount\t\tinclude\t\tsystem-auth\npassword\tinclude\t\tsystem-auth\n";
-    const POLKIT_AFTER: &str = "auth      sufficient pam_facelock.so\n#%PAM-1.0\naccount\t\tinclude\t\tsystem-auth\npassword\tinclude\t\tsystem-auth\n";
+    const POLKIT_AFTER: &str = "#%PAM-1.0\nauth      sufficient pam_facelock.so\naccount\t\tinclude\t\tsystem-auth\npassword\tinclude\t\tsystem-auth\n";
 
     /// A service that already carries the line: untouched, and no backup.
     const OMARCHY_PRESENT: &str = "#%PAM-1.0\nauth      sufficient pam_facelock.so\nauth\t\tinclude\t\tsystem-auth\naccount\t\tinclude\t\tsystem-auth\n";
@@ -3083,6 +3328,252 @@ mod tests {
             assert_eq!(code, WRITE_OK, "{service}");
             assert_eq!(read(&dir, service), after, "{service} content");
         }
+    }
+
+    #[test]
+    fn insertion_treats_a_backslash_continuation_as_one_logical_rule() {
+        let before = concat!(
+            "password required pam_pwquality.so \\ \t\n",
+            "    auth\n",
+            "auth include system-auth\n",
+        );
+        let after = concat!(
+            "password required pam_pwquality.so \\ \t\n",
+            "    auth\n",
+            "auth      sufficient pam_facelock.so\n",
+            "auth include system-auth\n",
+        );
+
+        assert_eq!(with_line_inserted(before.as_bytes()), after.as_bytes());
+    }
+
+    #[test]
+    fn insertion_does_not_split_the_issue_192_authtok_continuation() {
+        let before = concat!(
+            "password required pam_pwquality.so \\\n",
+            "    authtok_type=\n",
+            "auth include system-auth\n",
+        );
+        let after = concat!(
+            "password required pam_pwquality.so \\\n",
+            "    authtok_type=\n",
+            "auth      sufficient pam_facelock.so\n",
+            "auth include system-auth\n",
+        );
+
+        assert_eq!(with_line_inserted(before.as_bytes()), after.as_bytes());
+    }
+
+    #[test]
+    fn insertion_and_removal_preserve_crlf_bytes() {
+        let before = b"#%PAM-1.0\r\nauth include system-auth\r\n";
+        let installed =
+            b"#%PAM-1.0\r\nauth      sufficient pam_facelock.so\r\nauth include system-auth\r\n";
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("sudo"), before).unwrap();
+
+        assert_eq!(
+            write_in(&only(dir.path()), &add(&["sudo"])).unwrap(),
+            WRITE_OK
+        );
+        assert_eq!(fs::read(dir.path().join("sudo")).unwrap(), installed);
+        assert_eq!(
+            fs::read(dir.path().join("sudo.facelock-backup")).unwrap(),
+            before
+        );
+        assert_eq!(
+            write_in(&only(dir.path()), &remove(&["sudo"])).unwrap(),
+            WRITE_OK
+        );
+        assert_eq!(fs::read(dir.path().join("sudo")).unwrap(), before);
+    }
+
+    #[test]
+    fn unterminated_auth_rule_uses_the_documents_crlf_ending() {
+        let before = b"#%PAM-1.0\r\nauth include system-auth";
+        let installed =
+            b"#%PAM-1.0\r\nauth      sufficient pam_facelock.so\r\nauth include system-auth";
+
+        assert_eq!(with_line_inserted(before), installed);
+    }
+
+    #[test]
+    fn insertion_accepts_linux_pam_auth_types_but_not_authtok_type() {
+        let before = "#%PAM-1.0\nauthtok_type=\n-AUTH include system-auth\n";
+        let after = concat!(
+            "#%PAM-1.0\n",
+            "authtok_type=\n",
+            "auth      sufficient pam_facelock.so\n",
+            "-AUTH include system-auth\n",
+        );
+
+        assert_eq!(with_line_inserted(before.as_bytes()), after.as_bytes());
+    }
+
+    #[test]
+    fn no_auth_insertion_follows_the_pam_header_and_preserves_line_endings() {
+        for (before, after) in [
+            (
+                b"#%PAM-1.0\naccount include system-auth\n".as_slice(),
+                b"#%PAM-1.0\nauth      sufficient pam_facelock.so\naccount include system-auth\n"
+                    .as_slice(),
+            ),
+            (
+                b"#%PAM-1.0\r\naccount include system-auth\r\n".as_slice(),
+                b"#%PAM-1.0\r\nauth      sufficient pam_facelock.so\r\naccount include system-auth\r\n"
+                    .as_slice(),
+            ),
+            (
+                b"#%PAM-1.0".as_slice(),
+                b"#%PAM-1.0\nauth      sufficient pam_facelock.so".as_slice(),
+            ),
+        ] {
+            assert_eq!(with_line_inserted(before), after);
+        }
+    }
+
+    #[test]
+    fn no_auth_preview_describes_header_aware_insertion() {
+        assert_eq!(
+            insertion_hint(b"#%PAM-1.0\naccount required pam_unix.so\n").localized(),
+            "no 'auth' line found — inserted after the PAM header"
+        );
+        assert_eq!(
+            insertion_hint(b"account required pam_unix.so\n").localized(),
+            "no 'auth' line found — inserted at the top of the file"
+        );
+    }
+
+    #[test]
+    fn add_preserves_invalid_bytes_and_no_op_is_byte_identical() {
+        let before = b"#%PAM-1.0\n# vendor byte: \xff\nauth include system-auth\n";
+        let installed = b"#%PAM-1.0\n# vendor byte: \xff\nauth      sufficient pam_facelock.so\nauth include system-auth\n";
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("sudo"), before).unwrap();
+
+        assert_eq!(
+            write_in(&only(dir.path()), &add(&["sudo"])).unwrap(),
+            WRITE_OK
+        );
+        assert_eq!(fs::read(dir.path().join("sudo")).unwrap(), installed);
+        assert_eq!(
+            fs::read(dir.path().join("sudo.facelock-backup")).unwrap(),
+            before
+        );
+
+        let unchanged = snapshot(dir.path());
+        assert_eq!(
+            write_in(&only(dir.path()), &add(&["sudo"])).unwrap(),
+            WRITE_OK
+        );
+        assert_eq!(
+            snapshot(dir.path()),
+            unchanged,
+            "a configured non-UTF-8 document is a byte-identical no-op"
+        );
+    }
+
+    #[test]
+    fn removal_drops_the_whole_continued_rule_and_preserves_other_bytes() {
+        let installed = b"#%PAM-1.0\r\nauth sufficient pam_facelock.so \\\r\n    debug=\xff\r\nauth include system-auth";
+        let expected = b"#%PAM-1.0\r\nauth include system-auth";
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("sudo"), installed).unwrap();
+
+        assert_eq!(
+            write_in(&only(dir.path()), &remove(&["sudo"])).unwrap(),
+            WRITE_OK
+        );
+        assert_eq!(fs::read(dir.path().join("sudo")).unwrap(), expected);
+    }
+
+    #[test]
+    fn removal_repairs_a_legacy_line_inserted_inside_an_admin_rule() {
+        let installed = concat!(
+            "#%PAM-1.0\n",
+            "password required pam_pwquality.so \\\n",
+            "auth      sufficient pam_facelock.so\n",
+            "    authtok_type=\n",
+            "auth include system-auth\n",
+        );
+        let expected = concat!(
+            "#%PAM-1.0\n",
+            "password required pam_pwquality.so \\\n",
+            "    authtok_type=\n",
+            "auth include system-auth\n",
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("sudo"), installed).unwrap();
+
+        assert!(is_configured(&only(dir.path()), "sudo"));
+        assert_eq!(
+            write_in(&only(dir.path()), &remove(&["sudo"])).unwrap(),
+            WRITE_OK
+        );
+        assert_eq!(
+            fs::read(dir.path().join("sudo")).unwrap(),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn legacy_repair_is_structural_for_auth_typed_admin_rules() {
+        for (installed, expected) in [
+            (
+                concat!(
+                    "AUTH required pam_unix.so \\\n",
+                    "auth      sufficient pam_facelock.so\n",
+                    "    debug\n",
+                    "auth requisite pam_deny.so\n",
+                ),
+                concat!(
+                    "AUTH required pam_unix.so \\\n",
+                    "    debug\n",
+                    "auth requisite pam_deny.so\n",
+                ),
+            ),
+            (
+                concat!(
+                    "-auth required pam_unix.so \\\n",
+                    "auth      sufficient pam_facelock.so\n",
+                    "    debug\n",
+                    "auth requisite pam_deny.so\n",
+                ),
+                concat!(
+                    "-auth required pam_unix.so \\\n",
+                    "    debug\n",
+                    "auth requisite pam_deny.so\n",
+                ),
+            ),
+        ] {
+            assert!(PamDocument::new(installed.as_bytes()).has_facelock_rule());
+            assert_eq!(with_line_removed(installed.as_bytes()), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn comments_terminate_continuations_without_hiding_or_removing_rules() {
+        let commented_module = concat!(
+            "auth required pam_unix.so \\\n",
+            "# pam_facelock.so\n",
+            "auth requisite pam_deny.so\n",
+        );
+        assert!(!PamDocument::new(commented_module.as_bytes()).has_facelock_rule());
+        assert_eq!(
+            with_line_removed(commented_module.as_bytes()),
+            commented_module.as_bytes()
+        );
+
+        let active_module = concat!(
+            "# note \\\n",
+            "auth sufficient pam_facelock.so\n",
+            "auth requisite pam_deny.so\n",
+        );
+        assert!(PamDocument::new(active_module.as_bytes()).has_facelock_rule());
+        assert_eq!(
+            with_line_removed(active_module.as_bytes()),
+            b"# note \\\nauth requisite pam_deny.so\n"
+        );
     }
 
     /// The backup is a byte copy of the original, and it only appears when
@@ -4591,7 +5082,7 @@ mod tests {
         // land, so the write fails after the temp file has been created.
         fs::create_dir(dir.path().join("sudo")).unwrap();
 
-        assert!(replace_atomically(&dir.path().join("sudo"), "x\n", dir.path()).is_err());
+        assert!(replace_atomically(&dir.path().join("sudo"), b"x\n", dir.path()).is_err());
 
         let leftovers: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
@@ -5419,7 +5910,7 @@ mod tests {
     }
 
     /// **A FIFO in a scanned directory must not hang the command.**
-    /// `read_to_string` on one blocks until a writer appears, which is forever
+    /// `fs::read` on one blocks until a writer appears, which is forever
     /// on a `/etc/pam.d` nobody is writing to — and this scan is what
     /// `facelock status` runs, so the diagnostic command would hang on exactly
     /// the broken machine it exists to describe. The test *is* the assertion:
