@@ -33,16 +33,26 @@ except json.JSONDecodeError as error:
     fail(f"invalid release matrix JSON: {error}")
 
 expected_rows = [
-    ("debian-13", "Debian 13 trixie", "amd64", "TPM, staged APT/direct deb", "bundled ORT 1.20.1", "full"),
-    ("debian-12", "Debian 12 bookworm LTS", "amd64", "legacy, staged APT/direct deb", "bundled ORT 1.20.1", "full"),
-    ("ubuntu-26.04", "Ubuntu 26.04 LTS", "amd64", "TPM, staged APT/direct deb", "bundled ORT 1.20.1", "full"),
-    ("ubuntu-24.04", "Ubuntu 24.04 LTS", "amd64", "legacy, staged APT/direct deb", "bundled ORT 1.20.1", "full"),
-    ("fedora-43", "Fedora 43", "x86_64", "staging COPR", "system ORT", "full"),
-    ("fedora-44-copr", "Fedora 44", "x86_64", "staging COPR", "system ORT", "full"),
-    ("fedora-45", "Fedora 45 branched", "x86_64", "staging COPR", "system ORT", "build/runtime smoke"),
-    ("fedora-rawhide", "Fedora Rawhide (Fedora 46 development)", "x86_64", "development", "system ORT", "build/runtime smoke"),
-    ("fedora-44-direct", "Fedora 44", "x86_64", "direct RPM", "bundled ORT 1.20.1", "full"),
-    ("arch-2026-08-18", "Arch Linux Archive snapshot 2026-08-18", "x86_64", "PKGBUILD and binary recipe", "system ORT", "full"),
+    ("debian-13", "Debian 13 trixie", "amd64", "TPM, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("debian-12", "Debian 12 bookworm LTS", "amd64", "legacy, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("ubuntu-26.04", "Ubuntu 26.04 LTS", "amd64", "TPM, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("ubuntu-24.04", "Ubuntu 24.04 LTS", "amd64", "legacy, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("fedora-43", "Fedora 43", "x86_64", "staging COPR", "system ORT", "supported", True, False, "full"),
+    ("fedora-44-copr", "Fedora 44", "x86_64", "staging COPR", "system ORT", "supported", True, False, "full"),
+    ("fedora-45", "Fedora 45 branched", "x86_64", "staging COPR", "system ORT", "supported", True, False, "build/runtime smoke"),
+    (
+        "fedora-rawhide",
+        "Fedora Rawhide (Fedora 46 development)",
+        "x86_64",
+        "optional experimental production COPR chroot",
+        "system ORT",
+        "experimental",
+        False,
+        True,
+        "best-effort pinned Track D smoke only",
+    ),
+    ("fedora-44-direct", "Fedora 44", "x86_64", "direct RPM", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("arch-2026-08-18", "Arch Linux Archive snapshot 2026-08-18", "x86_64", "PKGBUILD and binary recipe", "system ORT", "supported", True, False, "full"),
 ]
 actual_rows = [
     (
@@ -51,11 +61,17 @@ actual_rows = [
         row["architecture"],
         row["variant"],
         row.get("runtime"),
+        row.get("support_tier"),
+        row.get("release_target"),
+        row.get("optional"),
         row["lifecycle_depth"],
     )
     for row in matrix.get("platforms", [])
 ]
-require(actual_rows == expected_rows, "platform/architecture/variant/runtime/lifecycle rows differ from issue #234")
+require(
+    actual_rows == expected_rows,
+    "platform/architecture/variant/runtime/support-tier/release-target/optional/lifecycle rows differ from issue #234",
+)
 require(matrix.get("reviewed_on") == "2026-08-18", "matrix review date must be 2026-08-18")
 require(matrix.get("fedora", {}).get("43_eol_gate") == "2026-12-02", "Fedora 43 EOL gate drifted")
 today = date.fromisoformat(os.environ.get("RELEASE_MATRIX_TODAY", date.today().isoformat()))
@@ -67,6 +83,20 @@ copr_channels = matrix.get("copr_channels", {})
 production_copr = copr_channels.get("production", {})
 staging_copr = copr_channels.get("staging", {})
 expected_copr_targets = {"fedora-43-x86_64", "fedora-44-x86_64", "fedora-45-x86_64"}
+expected_experimental_chroots = {"fedora-rawhide-x86_64"}
+
+
+def require_string_set(value: object, expected: set[str], description: str) -> set[str]:
+    require(
+        isinstance(value, list) and all(isinstance(item, str) for item in value),
+        f"{description} must be a list of strings",
+    )
+    actual = set(value)
+    require(len(value) == len(actual), f"{description} must not contain duplicates")
+    require(actual == expected, f"{description} drifted: {sorted(actual)}")
+    return actual
+
+
 require(production_copr.get("owner") == "tyvsmith", "production COPR owner drifted")
 require(production_copr.get("project") == "facelock", "production COPR project drifted")
 require(
@@ -74,12 +104,38 @@ require(
     == "https://copr.fedorainfracloud.org/api_3/project?ownername=tyvsmith&projectname=facelock",
     "production COPR public API drifted",
 )
-require(set(production_copr.get("expected_enabled_chroots", [])) == expected_copr_targets, "production COPR chroot authority drifted")
+required_supported_chroots = require_string_set(
+    production_copr.get("required_supported_chroots"),
+    expected_copr_targets,
+    "production COPR required supported chroots",
+)
+optional_experimental_chroots = require_string_set(
+    production_copr.get("optional_experimental_chroots"),
+    expected_experimental_chroots,
+    "production COPR optional experimental chroots",
+)
+require(
+    required_supported_chroots.isdisjoint(optional_experimental_chroots),
+    "production COPR required supported and optional experimental chroots must be disjoint",
+)
+require(
+    "expected_enabled_chroots" not in production_copr,
+    "production COPR authority must separate required supported and optional experimental chroots",
+)
 require(production_copr.get("prerelease_publication") is False, "production COPR must exclude prereleases")
 require(staging_copr.get("project") == "facelock-testing", "staging COPR identity drifted")
 require(staging_copr.get("provisioning_issue") == 236, "staging COPR provisioning must remain owned by issue #236")
 require(staging_copr.get("managed_by_this_change") is False, "issue #234 cannot provision staging COPR")
-require(set(matrix.get("fedora", {}).get("staging_copr_targets", [])) == expected_copr_targets, "staging COPR target authority drifted")
+staging_copr_targets = require_string_set(
+    matrix.get("fedora", {}).get("staging_copr_targets"),
+    expected_copr_targets,
+    "staging COPR target authority",
+)
+packit_release_targets = require_string_set(
+    matrix.get("fedora", {}).get("packit_release_targets"),
+    expected_copr_targets,
+    "Packit release target authority",
+)
 require(matrix.get("arch", {}).get("snapshot") == "2026-08-18", "Arch snapshot drifted")
 arch_repository = matrix.get("arch", {}).get("repository")
 require(
@@ -128,6 +184,27 @@ expected_suite_contracts = {
     },
 }
 platforms_by_id = {row["id"]: row for row in matrix.get("platforms", [])}
+rawhide = platforms_by_id.get("fedora-rawhide", {})
+require(rawhide.get("smoke_track") == "Track D", "Rawhide must remain on pinned Track D smoke")
+require(rawhide.get("smoke_policy") == "best-effort", "Rawhide smoke must remain best-effort")
+require(rawhide.get("alpha_blocking") is False, "a Rawhide-only failure cannot block an alpha")
+require(rawhide.get("prerelease_publication") is False, "no prerelease may publish to Rawhide")
+require(
+    rawhide.get("evidence_eligibility")
+    == {
+        "lifecycle": False,
+        "artifact": False,
+        "upgrade": False,
+        "rollback": False,
+        "served_version": False,
+        "availability": False,
+    },
+    "Rawhide cannot supply release evidence",
+)
+require(
+    rawhide.get("promotion_requires") == "separately reviewed amendment and full Fedora gates",
+    "Rawhide promotion contract drifted",
+)
 for suite, expected in expected_suite_contracts.items():
     details = suite_map[suite]
     for field, value in expected.items():
@@ -152,6 +229,29 @@ try:
     require(isinstance(packit_jobs, list), "Packit jobs must be a list")
 except (KeyError, TypeError, json.JSONDecodeError) as error:
     fail(f"Packit config must remain valid JSON-subset YAML: {error}")
+for job_index, job in enumerate(packit_jobs):
+    if not isinstance(job, dict) or job.get("job") != "copr_build":
+        continue
+    target_list = job.get("targets")
+    target_description = f"Packit copr_build job {job_index} targets"
+    require(
+        isinstance(target_list, list)
+        and bool(target_list)
+        and all(isinstance(target, str) and bool(target) for target in target_list),
+        f"{target_description} must be a non-empty list of non-empty strings",
+    )
+    targets = set(target_list)
+    require(len(target_list) == len(targets), f"{target_description} must be unique")
+    undeclared_targets = targets - packit_release_targets
+    require(
+        not undeclared_targets,
+        f"{target_description} contain undeclared targets outside the explicit allowlist: {sorted(undeclared_targets)}",
+    )
+    if job.get("project") == staging_copr["project"]:
+        require(
+            targets == staging_copr_targets,
+            f"Packit staging COPR targets drifted: {sorted(targets)}",
+        )
 production_jobs = [
     job
     for job in packit_jobs
@@ -192,8 +292,7 @@ require(
 )
 packit_targets = set(packit_target_list)
 require(len(packit_target_list) == len(packit_targets), "Packit production COPR targets must be unique")
-require(packit_targets == expected_copr_targets, f"Packit targets drifted: {sorted(packit_targets)}")
-require("fedora-rawhide-x86_64" not in packit_targets, "Rawhide/F46 must not be conflated with Fedora 45 staging COPR")
+require(packit_targets == packit_release_targets, f"Packit targets drifted: {sorted(packit_targets)}")
 
 workflow = (ROOT / ".github/workflows/release.yml").read_text()
 for suite, details in suite_map.items():
@@ -267,6 +366,7 @@ for pkgbuild_name in ("PKGBUILD", "PKGBUILD-bin"):
     require("v$_tag" in pkgbuild, f"dist/{pkgbuild_name} does not fetch the upstream _tag")
 
 docs = (ROOT / "docs/releasing.md").read_text()
+normalized_docs = re.sub(r"\s+", " ", docs)
 for phrase in (
     "0.2.0~alpha.1-1~deb13u1",
     "0.2.0-0.1.alpha.1",
@@ -275,12 +375,20 @@ for phrase in (
     "2026-12-02",
     "Fedora 45 branched",
     "Fedora Rawhide (Fedora 46 development)",
+    "optional experimental production COPR chroot",
+    "best-effort pinned Track D smoke only",
+    "not a release target",
+    "Every Packit `copr_build` target must be an explicit member of the checked-in allowlist",
+    "Mutable aliases such as `fedora-all`, `fedora-development`, and their architecture-suffixed forms are rejected",
+    "cannot supply lifecycle, artifact, upgrade, rollback, served-version, or availability evidence",
+    "separately reviewed amendment and full Fedora gates",
     "Arch Linux Archive snapshot 2026-08-18",
     "stable-tagged config",
 ):
-    require(phrase in docs, f"release documentation omits matrix/version phrase: {phrase}")
+    require(phrase in normalized_docs, f"release documentation omits matrix/version phrase: {phrase}")
 
 contracts = (ROOT / "docs/contracts.md").read_text()
+normalized_contracts = re.sub(r"\s+", " ", contracts)
 for phrase in (
     "## Release Channels and APT Paths",
     "https://tysmith.me/facelock/apt/dists/trixie/Release",
@@ -289,9 +397,17 @@ for phrase in (
     "https://tysmith.me/facelock/apt/dists/noble/Release",
     "`main` and `legacy`",
     "stable APT, stable AUR, or production COPR",
+    "required supported production COPR chroots are exactly Fedora 43, Fedora 44, and Fedora 45",
+    "Rawhide is the only optional allowed experimental production chroot",
+    "Every Packit `copr_build` target must be an explicit member of the checked-in allowlist",
+    "Mutable aliases such as `fedora-all`, `fedora-development`, and their architecture-suffixed forms are rejected",
+    "Rawhide is not a Packit staging or production release target",
+    "no alpha may publish to Rawhide",
+    "Rawhide cannot supply lifecycle, artifact, upgrade, rollback, served-version, or availability evidence",
+    "separately reviewed amendment and full Fedora gates",
     "issue #236",
 ):
-    require(phrase in contracts, f"system contracts omit release-channel phrase: {phrase}")
+    require(phrase in normalized_contracts, f"system contracts omit release-channel phrase: {phrase}")
 
 release_skill = (ROOT / ".claude/skills/release/SKILL.md").read_text()
 for phrase in (

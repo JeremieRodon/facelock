@@ -120,18 +120,37 @@ Stable packages are published under the matching codename at
 `dist/release-matrix.json` is the checked-in authority. The release workflow,
 APT configuration, Packit targets, and this table are checked against it.
 
-| Platform | Architecture | Variant/channel | Runtime | Lifecycle depth |
-|----------|--------------|-----------------|---------|-----------------|
-| Debian 13 trixie | amd64 | TPM, staged APT/direct deb | bundled ORT 1.20.1 | full |
-| Debian 12 bookworm LTS | amd64 | legacy, staged APT/direct deb | bundled ORT 1.20.1 | full |
-| Ubuntu 26.04 LTS | amd64 | TPM, staged APT/direct deb | bundled ORT 1.20.1 | full |
-| Ubuntu 24.04 LTS | amd64 | legacy, staged APT/direct deb | bundled ORT 1.20.1 | full |
-| Fedora 43 | x86_64 | staging COPR | system ORT | full through the 2026-12-02 EOL gate |
-| Fedora 44 | x86_64 | staging COPR | system ORT | full |
-| Fedora 45 branched | x86_64 | staging COPR | system ORT | build/runtime smoke |
-| Fedora Rawhide (Fedora 46 development) | x86_64 | development | system ORT | build/runtime smoke |
-| Fedora 44 | x86_64 | direct RPM | bundled ORT 1.20.1 | full |
-| Arch Linux Archive snapshot 2026-08-18 | x86_64 | PKGBUILD and binary recipe | system ORT | full |
+| Platform | Architecture | Variant/channel | Runtime | Support tier | Release target | Lifecycle depth |
+|----------|--------------|-----------------|---------|--------------|----------------|-----------------|
+| Debian 13 trixie | amd64 | TPM, staged APT/direct deb | bundled ORT 1.20.1 | supported | yes | full |
+| Debian 12 bookworm LTS | amd64 | legacy, staged APT/direct deb | bundled ORT 1.20.1 | supported | yes | full |
+| Ubuntu 26.04 LTS | amd64 | TPM, staged APT/direct deb | bundled ORT 1.20.1 | supported | yes | full |
+| Ubuntu 24.04 LTS | amd64 | legacy, staged APT/direct deb | bundled ORT 1.20.1 | supported | yes | full |
+| Fedora 43 | x86_64 | staging COPR | system ORT | supported | yes | full through the 2026-12-02 EOL gate |
+| Fedora 44 | x86_64 | staging COPR | system ORT | supported | yes | full |
+| Fedora 45 branched | x86_64 | staging COPR | system ORT | supported | yes | required build/runtime smoke |
+| Fedora Rawhide (Fedora 46 development) | x86_64 | optional experimental production COPR chroot | system ORT | experimental | no | best-effort pinned Track D smoke only |
+| Fedora 44 | x86_64 | direct RPM | bundled ORT 1.20.1 | supported | yes | full |
+| Arch Linux Archive snapshot 2026-08-18 | x86_64 | PKGBUILD and binary recipe | system ORT | supported | yes | full |
+
+Production COPR requires Fedora 43, Fedora 44, and Fedora 45. Rawhide is the
+only optional allowed experimental production chroot, so it may be present or
+absent; missing any required chroot or enabling any unknown extra fails closed.
+Every Packit `copr_build` target must be an explicit member of the checked-in
+allowlist: `fedora-43-x86_64`, `fedora-44-x86_64`, or
+`fedora-45-x86_64`. Mutable aliases such as `fedora-all`,
+`fedora-development`, and their architecture-suffixed forms are rejected, as
+is any other undeclared target. Rawhide is not a release target and is not a
+Packit staging or production release target. Both `fedora-rawhide` and
+`fedora-rawhide-x86_64` fail validation, and no alpha may publish to Rawhide.
+
+Fedora 43 and Fedora 44 carry the full lifecycle. Fedora 45 carries required
+build/runtime smoke. Rawhide remains best-effort pinned Track D smoke only; a
+Rawhide-only failure is not alpha-blocking, and Rawhide cannot supply lifecycle,
+artifact, upgrade, rollback, served-version, or availability evidence.
+Promotion requires a separately reviewed amendment and full Fedora gates.
+Issue #236 owns the pre-tag and post-publication proof that optional Rawhide
+serves no alpha or candidate build.
 
 Container identities are pinned by registry/index digest, with the linux/amd64
 manifest digest retained where the registry exposes both. They were resolved
@@ -194,8 +213,10 @@ just test-rpm-pkg
 `APT_GPG_PASSPHRASE` are configured in GitHub secrets (via `gh`). COPR needs no
 secret — it is driven by Packit. Preflight and CI also read the public
 production COPR API and require its enabled chroots to equal the checked-in
-43/44/45 authority. An extra or missing live chroot is a release-blocking drift;
-the checker never modifies the project. When the Packit CLI is available,
+authority: Fedora 43/44/45 are required and Rawhide is the only optional
+experimental chroot. Rawhide may be present or absent; a missing required
+chroot or any unknown extra is release-blocking drift. The checker never
+modifies the project. When the Packit CLI is available,
 preflight runs `packit config validate --offline`; `just test-copr` always runs
 that real schema gate inside its Fedora Packit container.
 
@@ -274,8 +295,9 @@ Before a stable release, the maintainer deliberately changes that trigger to
 production release job for a prerelease and rejects its absence for a stable.
 The deliberate stable restoration targets `fedora-43-x86_64`,
 `fedora-44-x86_64`, and the separate `fedora-45-x86_64` branched target.
-Rawhide is Fedora 46 development in this matrix and is not an alias for Fedora
-45.
+Rawhide is Fedora 46 development in this matrix, not an alias for Fedora 45,
+and not a staging or production Packit target. A configuration that targets
+Rawhide for release fails the matrix check.
 
 `.packit.yaml` deliberately uses JSON syntax, which is a valid YAML subset.
 Release guards therefore parse its jobs semantically with the Python standard
@@ -295,8 +317,9 @@ Fedora's ONNX Runtime.)
 1. Create a Fedora Account at https://accounts.fedoraproject.org
 2. Log in to COPR at https://copr.fedorainfracloud.org and ensure the
    `tyvsmith/facelock` project exists with the `fedora-43-x86_64`,
-   `fedora-44-x86_64`, and `fedora-45-x86_64` chroots enabled
-   (Settings → Chroots).
+   `fedora-44-x86_64`, and `fedora-45-x86_64` chroots enabled. The optional
+   `fedora-rawhide-x86_64` experimental chroot may be enabled or absent; no
+   other chroot is allowed (Settings → Chroots).
 3. Install the **Packit-as-a-Service** GitHub App on the repository:
    https://github.com/marketplace/packit-as-a-service
 4. In the COPR project → Settings → Permissions, grant the `packit` user

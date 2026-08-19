@@ -284,6 +284,73 @@ assert_matrix_mutation_rejected() {
     fi
 }
 
+append_packit_job() {
+    local config_path="$1"
+    local job_json="$2"
+    python3 - "$config_path" "$job_json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config["jobs"].append(json.loads(sys.argv[2]))
+path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+}
+
+packit_extra_job_index=0
+assert_extra_packit_job_rejected() {
+    local context="$1"
+    local job_json="$2"
+    local mutation_root="$tmp_root/packit-extra-job-$packit_extra_job_index"
+    local checker_output
+    packit_extra_job_index=$((packit_extra_job_index + 1))
+    cp -R "$matrix_root" "$mutation_root"
+    append_packit_job "$mutation_root/.packit.yaml" "$job_json"
+    if checker_output=$(RELEASE_MATRIX_VERSION=0.2.0 python3 "$mutation_root/test/check-release-matrix.py" 2>&1); then
+        printf '%s\n' "$checker_output"
+        fail "release matrix checker accepted an extra Packit job: $context"
+    fi
+    echo "release matrix Packit case: $context rejected"
+}
+
+valid_packit_staging_root="$tmp_root/packit-valid-staging"
+cp -R "$matrix_root" "$valid_packit_staging_root"
+append_packit_job \
+    "$valid_packit_staging_root/.packit.yaml" \
+    '{"job":"copr_build","trigger":"pull_request","owner":"tyvsmith","project":"facelock-testing","targets":["fedora-43-x86_64","fedora-44-x86_64","fedora-45-x86_64"]}'
+RELEASE_MATRIX_VERSION=0.2.0 python3 "$valid_packit_staging_root/test/check-release-matrix.py" >/dev/null
+echo "release matrix Packit case: exact facelock-testing staging targets accepted"
+
+assert_extra_packit_job_rejected \
+    "canonical Rawhide target outside production and staging" \
+    '{"job":"copr_build","trigger":"release","owner":"other-owner","project":"facelock-scratch","targets":["fedora-rawhide"]}'
+assert_extra_packit_job_rejected \
+    "fedora-all mutable alias" \
+    '{"job":"copr_build","trigger":"release","owner":"other-owner","project":"facelock-scratch","targets":["fedora-all"]}'
+assert_extra_packit_job_rejected \
+    "fedora-development mutable alias" \
+    '{"job":"copr_build","trigger":"release","owner":"other-owner","project":"facelock-scratch","targets":["fedora-development"]}'
+assert_extra_packit_job_rejected \
+    "architecture-suffixed mutable alias" \
+    '{"job":"copr_build","trigger":"release","owner":"other-owner","project":"facelock-scratch","targets":["fedora-development-aarch64"]}'
+assert_extra_packit_job_rejected \
+    "facelock-testing Rawhide target" \
+    '{"job":"copr_build","trigger":"pull_request","owner":"tyvsmith","project":"facelock-testing","targets":["fedora-rawhide-x86_64"]}'
+assert_extra_packit_job_rejected \
+    "Rawhide target outside production and staging" \
+    '{"job":"copr_build","trigger":"release","owner":"other-owner","project":"facelock-scratch","targets":["fedora-rawhide-x86_64"]}'
+assert_extra_packit_job_rejected \
+    "facelock-testing incomplete staging targets" \
+    '{"job":"copr_build","trigger":"pull_request","owner":"tyvsmith","project":"facelock-testing","targets":["fedora-43-x86_64","fedora-44-x86_64"]}'
+assert_extra_packit_job_rejected \
+    "duplicate targets outside production and staging" \
+    '{"job":"copr_build","trigger":"pull_request","owner":"tyvsmith","project":"facelock-scratch","targets":["fedora-43-x86_64","fedora-43-x86_64"]}'
+assert_extra_packit_job_rejected \
+    "invalid targets outside production and staging" \
+    '{"job":"copr_build","trigger":"pull_request","owner":"tyvsmith","project":"facelock-scratch","targets":"fedora-43-x86_64"}'
+
 assert_matrix_mutation_rejected \
     "trixie workflow variant tpm to legacy" \
     ".github/workflows/release.yml" \
@@ -304,11 +371,37 @@ assert_matrix_mutation_rejected \
     "stable publication suite input noble to duplicate trixie" \
     ".github/workflows/release.yml" \
     "s/\"noble=\$(ls debs\\/noble/\"trixie=\$(ls debs\\/noble/"
+assert_matrix_mutation_rejected \
+    "production required supported chroot missing" \
+    "dist/release-matrix.json" \
+    '/"required_supported_chroots"/,/]/s/        "fedora-43-x86_64",//'
+assert_matrix_mutation_rejected \
+    "production optional experimental chroot overlaps a supported chroot" \
+    "dist/release-matrix.json" \
+    '/"optional_experimental_chroots"/,/]/s/"fedora-rawhide-x86_64"/"fedora-45-x86_64"/'
+assert_matrix_mutation_rejected \
+    "Rawhide support tier promoted to supported" \
+    "dist/release-matrix.json" \
+    '/"id": "fedora-rawhide"/,/"lifecycle_depth"/s/"support_tier": "experimental"/"support_tier": "supported"/'
+assert_matrix_mutation_rejected \
+    "Rawhide marked as a release target" \
+    "dist/release-matrix.json" \
+    '/"id": "fedora-rawhide"/,/"lifecycle_depth"/s/"release_target": false/"release_target": true/'
+assert_matrix_mutation_rejected \
+    "Rawhide served-version evidence enabled" \
+    "dist/release-matrix.json" \
+    's/"served_version": false/"served_version": true/'
+assert_matrix_mutation_rejected \
+    "Packit release target Fedora 45 to Rawhide" \
+    ".packit.yaml" \
+    's/"fedora-45-x86_64"/"fedora-rawhide-x86_64"/'
 
-live_copr_exact="$tmp_root/live-copr-exact.json"
-live_copr_drift="$tmp_root/live-copr-drift.json"
+live_copr_supported_only="$tmp_root/live-copr-supported-only.json"
+live_copr_supported_with_rawhide="$tmp_root/live-copr-supported-with-rawhide.json"
+live_copr_missing_supported="$tmp_root/live-copr-missing-supported.json"
+live_copr_unknown_extra="$tmp_root/live-copr-unknown-extra.json"
 live_copr_wrong_project="$tmp_root/live-copr-wrong-project.json"
-cat > "$live_copr_exact" <<'JSON'
+cat > "$live_copr_supported_only" <<'JSON'
 {
   "ownername": "tyvsmith",
   "name": "facelock",
@@ -320,7 +413,7 @@ cat > "$live_copr_exact" <<'JSON'
   }
 }
 JSON
-cat > "$live_copr_drift" <<'JSON'
+cat > "$live_copr_supported_with_rawhide" <<'JSON'
 {
   "ownername": "tyvsmith",
   "name": "facelock",
@@ -330,6 +423,32 @@ cat > "$live_copr_drift" <<'JSON'
     "fedora-44-x86_64": "https://example.invalid/44/",
     "fedora-45-x86_64": "https://example.invalid/45/",
     "fedora-rawhide-x86_64": "https://example.invalid/rawhide/"
+  }
+}
+JSON
+cat > "$live_copr_missing_supported" <<'JSON'
+{
+  "ownername": "tyvsmith",
+  "name": "facelock",
+  "full_name": "tyvsmith/facelock",
+  "chroot_repos": {
+    "fedora-43-x86_64": "https://example.invalid/43/",
+    "fedora-44-x86_64": "https://example.invalid/44/",
+    "fedora-rawhide-x86_64": "https://example.invalid/rawhide/"
+  }
+}
+JSON
+cat > "$live_copr_unknown_extra" <<'JSON'
+{
+  "ownername": "tyvsmith",
+  "name": "facelock",
+  "full_name": "tyvsmith/facelock",
+  "chroot_repos": {
+    "fedora-43-x86_64": "https://example.invalid/43/",
+    "fedora-44-x86_64": "https://example.invalid/44/",
+    "fedora-45-x86_64": "https://example.invalid/45/",
+    "fedora-rawhide-x86_64": "https://example.invalid/rawhide/",
+    "fedora-46-x86_64": "https://example.invalid/46/"
   }
 }
 JSON
@@ -345,13 +464,23 @@ cat > "$live_copr_wrong_project" <<'JSON'
   }
 }
 JSON
-python3 "$repo_root/test/check-live-release-channels.py" --response-file "$live_copr_exact"
-if python3 "$repo_root/test/check-live-release-channels.py" --response-file "$live_copr_drift" >/dev/null 2>&1; then
-    fail "live COPR checker accepted an extra production chroot"
+python3 "$repo_root/test/check-live-release-channels.py" --response-file "$live_copr_supported_only"
+echo "release channel case: supported-only accepted"
+python3 "$repo_root/test/check-live-release-channels.py" --response-file "$live_copr_supported_with_rawhide"
+echo "release channel case: supported-plus-optional-Rawhide accepted"
+if python3 "$repo_root/test/check-live-release-channels.py" --response-file "$live_copr_missing_supported" >/dev/null 2>&1; then
+    fail "live COPR checker accepted a missing supported production chroot"
 fi
+echo "release channel case: missing-supported rejected"
+if python3 "$repo_root/test/check-live-release-channels.py" --response-file "$live_copr_unknown_extra" >/dev/null 2>&1; then
+    fail "live COPR checker accepted an unknown extra production chroot"
+fi
+echo "release channel case: unknown-extra rejected"
 if python3 "$repo_root/test/check-live-release-channels.py" --response-file "$live_copr_wrong_project" >/dev/null 2>&1; then
     fail "live COPR checker accepted the wrong project identity"
 fi
+echo "release channel case: wrong-project rejected"
+echo "release channel case: Rawhide-in-Packit-targets rejected"
 
 prerelease_deb="$tmp_root/facelock-prerelease.deb"
 : > "$prerelease_deb"
