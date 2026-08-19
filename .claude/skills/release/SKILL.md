@@ -96,11 +96,12 @@ Only after explicit confirmation. No AI attribution in the commit or tag message
 
 ## Step 6: Watch the publish
 
-The `v*` tag triggers `.github/workflows/release.yml`, which has eight jobs:
+The `v*` tag triggers `.github/workflows/release.yml`, which has 9 jobs:
 
 ```
-build · download-ort · build-deb · build-deb-tpm · build-rpm
-build-nix · publish-aur · publish-apt · trigger-pages
+build · download-ort · build-deb
+build-deb-tpm · build-rpm · build-nix
+publish-aur · publish-apt · trigger-pages
 ```
 
 ```bash
