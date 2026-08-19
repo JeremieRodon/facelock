@@ -4,6 +4,12 @@ paths:
   - "crates/pam-facelock/**/*.rs"
   - "crates/facelock-tpm/**/*.rs"
   - "crates/facelock-cli/src/commands/auth.rs"
+derives-from:
+  - dbus/org.facelock.Daemon.conf
+  - dist/facelock.tmpfiles
+  - systemd/facelock-daemon.service
+  - docs/adr/**
+reviewed: 2026-08-19
 ---
 
 # Security Rules

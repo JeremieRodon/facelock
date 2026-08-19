@@ -171,6 +171,28 @@ jobs:
           TCTI: swtpm:host=localhost,port=2321
         run: cargo test --workspace --features tpm
 
+  agent-docs:
+    name: Agent Docs Consistency
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm \
+            git \
+            just \
+            python
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Trust the workspace checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify agent docs still describe the tree
+        run: just check-agent-docs "${{ github.event.pull_request.base.sha }}"
+
   catalog-check:
     name: Translation Catalog Freshness
     runs-on: ubuntu-latest

@@ -64,8 +64,19 @@ check-pam-standalone:
     fi
     echo "pam-facelock dependency guard passed"
 
-# Run all checks (test + lint + format + audit + PAM standalone surface)
-check: test lint fmt-check audit check-pam-standalone
+# Verify agent-facing docs still describe the tree they describe.
+# Pass a git ref to also run the coupling check against it.
+check-agent-docs base='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{base}}" ]; then
+        python3 test/check-agent-docs.py --base "{{base}}"
+    else
+        python3 test/check-agent-docs.py
+    fi
+
+# Run all checks (test + lint + format + audit + PAM standalone surface + agent docs)
+check: test lint fmt-check audit check-pam-standalone check-agent-docs
 
 # Build the PAM test container image (uses host-built release binaries).
 # Keep in sync with .github/workflows/ci.yml, which builds this same image
