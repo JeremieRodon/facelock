@@ -120,8 +120,14 @@ Only after tiers 3--4 pass. Always keep a root shell open. Start with `sudo` onl
 ### All checks at once
 
 ```bash
-just check  # runs test + clippy + fmt + audit
+just check  # runs test + clippy + fmt + audit + agent-doc consistency
 ```
+
+`check-agent-docs` verifies that `.claude/rules/` and `.claude/skills/` still
+describe the tree: that every `paths:` glob matches something, that referenced
+`just` recipes and file paths exist, and that lists copied out of the justfile or
+a workflow still match their source. A rule scoped to a path that no longer
+exists fails silently otherwise -- it simply never loads.
 
 ## Security considerations
 
