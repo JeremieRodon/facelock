@@ -102,7 +102,6 @@ install -Dm644 LICENSE-APACHE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE-A
 %tmpfiles_create %{_tmpfilesdir}/facelock.conf
 # ADR 010 retired the facelock group: nothing is group-owned any more, so
 # remove a group an older install created. Best-effort.
-[ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
 if getent group facelock >/dev/null 2>&1; then
     groupdel facelock 2>/dev/null || true
 fi

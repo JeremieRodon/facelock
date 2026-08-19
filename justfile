@@ -524,6 +524,7 @@ install-files:
     [ -d /var/log/facelock ] && chown root:root /var/log/facelock && chmod 700 /var/log/facelock || true
     [ -d /var/log/facelock/snapshots ] && chown root:root /var/log/facelock/snapshots && chmod 700 /var/log/facelock/snapshots || true
     [ -f /var/log/facelock/audit.jsonl ] && chown root:root /var/log/facelock/audit.jsonl && chmod 600 /var/log/facelock/audit.jsonl || true
+    [ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
     [ -d /var/lib/facelock/models ] && chmod 644 /var/lib/facelock/models/*.onnx 2>/dev/null || true
     # The database and sidecars are root-only: encrypted biometric templates,
     # read by the daemon. Tighten if present, never create.
@@ -533,7 +534,6 @@ install-files:
 
     # ADR 010 retired the facelock group: nothing is group-owned any more, so
     # remove a group an older install created. Best-effort.
-    [ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
     if getent group facelock >/dev/null 2>&1; then
         groupdel facelock 2>/dev/null || true
     fi

@@ -197,8 +197,9 @@ enough to call repeatedly from a lock screen: it reads one marker file under
 or reads the face database.
 
 No group is involved (ADR 010): the marker sits under two `0711 root:root`
-directories, so any local user can open its own marker by name. A missing or unreadable marker (`ENOENT` or `EACCES`) is reported
-`not-enrolled` rather than as an error.
+directories, so any local user can open its own marker by name. A missing or
+unreadable marker (`ENOENT` or `EACCES`) is reported `not-enrolled` rather than
+as an error.
 
 ```bash
 facelock is-enrolled                    # prints enrolled / not-enrolled

@@ -2464,41 +2464,19 @@ fn setup_encryption_auto(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn chown_path(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("path contains embedded NUL: {}", path.display()))?;
-    let result = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
-    if result != 0 {
-        anyhow::bail!(
-            "failed to chown {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn chown_path(_path: &Path, _uid: u32, _gid: u32) -> anyhow::Result<()> {
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // legacy facelock system group
 // ---------------------------------------------------------------------------
 
 /// Remove a `facelock` group left behind by an older install, best-effort.
 ///
-/// ADR 010 retired the group: the bus policy no longer names it, packaging
-/// no longer creates it, and nothing under `/var/lib/facelock` or
-/// `/run/facelock` is owned by it any more (`ensure_state_layout` and the
-/// scriptlets converge those to `root:root` first). `groupdel` fails only when
-/// the group is some account's primary group, which facelock never did; a
-/// failure is reported, never fatal.
+/// ADR 010 retired the group: the bus policy no longer names it and packaging
+/// no longer creates it. By the time this runs the state layout has been
+/// applied, so nothing under `/var/lib/facelock` is group-owned;
+/// `/run/facelock` converges through tmpfiles at the next boot or through the
+/// package scriptlets. `groupdel` fails only when the group is some account's
+/// primary group, which facelock never did; a failure is reported, never
+/// fatal.
 fn retire_facelock_group() {
     match nix::unistd::Group::from_name("facelock") {
         Ok(Some(_)) => match run_cmd("groupdel", &["facelock"]) {
@@ -2510,7 +2488,9 @@ fn retire_facelock_group() {
     }
 }
 
-fn secure_existing_path(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> {
+/// Tighten an existing file to `mode` and, when running as root, make it
+/// `root:root`. Every path setup secures is root-owned by construction.
+fn secure_existing_path(path: &Path, mode: u32) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -2519,13 +2499,15 @@ fn secure_existing_path(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> 
         .with_context(|| format!("failed to set permissions on {}", path.display()))?;
 
     if nix::unistd::Uid::current().is_root() {
-        chown_path(path, 0, gid)?;
+        crate::state_layout::chown_root(path)?;
     }
 
     Ok(())
 }
 
-fn secure_dir_if_exists(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> {
+/// Tighten an existing directory to `mode` and, when running as root, make it
+/// `root:root`. Every directory setup secures is root-owned by construction.
+fn secure_dir_if_exists(path: &Path, mode: u32) -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -2540,7 +2522,7 @@ fn secure_dir_if_exists(path: &Path, mode: u32, gid: u32) -> anyhow::Result<()> 
     ensure_private_dir(path, mode)
         .with_context(|| format!("failed to secure directory {}", path.display()))?;
     if nix::unistd::Uid::current().is_root() {
-        chown_path(path, 0, gid)?;
+        crate::state_layout::chown_root(path)?;
     }
 
     Ok(())
@@ -2556,9 +2538,9 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     let key_path = Path::new(&config.encryption.key_path);
     let sealed_key_path = Path::new(&config.encryption.sealed_key_path);
 
-    secure_dir_if_exists(config_dir, 0o755, 0)?;
+    secure_dir_if_exists(config_dir, 0o755)?;
     // Snapshots hold raw face images: root-only, no group access.
-    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700, 0)?;
+    secure_dir_if_exists(Path::new(&config.snapshots.dir), 0o700)?;
 
     // The state directory subtree — state dir, models/, enrolled/, and the
     // database file modes — is owned by `state_layout`. Re-applied here so a
@@ -2567,26 +2549,26 @@ fn secure_setup_paths(config: &Config, manifest: Option<&ModelManifest>) -> anyh
     ensure_state_layout_or_bail(config)?;
     if let Some(parent) = audit_path.parent() {
         // Per-user auth history: root-only, like the snapshots.
-        secure_dir_if_exists(parent, 0o700, 0)?;
+        secure_dir_if_exists(parent, 0o700)?;
     }
     if let Some(parent) = key_path.parent() {
-        secure_dir_if_exists(parent, 0o755, 0)?;
+        secure_dir_if_exists(parent, 0o755)?;
     }
     if let Some(parent) = sealed_key_path.parent() {
-        secure_dir_if_exists(parent, 0o755, 0)?;
+        secure_dir_if_exists(parent, 0o755)?;
     }
 
-    secure_existing_path(&config_path, 0o644, 0)?;
-    secure_existing_path(db_path, 0o600, 0)?;
-    secure_existing_path(audit_path, 0o600, 0)?;
-    secure_existing_path(key_path, 0o600, 0)?;
-    secure_existing_path(sealed_key_path, 0o600, 0)?;
-    secure_existing_path(Path::new(SETUP_COMPLETE_MARKER), 0o644, 0)?;
+    secure_existing_path(&config_path, 0o644)?;
+    secure_existing_path(db_path, 0o600)?;
+    secure_existing_path(audit_path, 0o600)?;
+    secure_existing_path(key_path, 0o600)?;
+    secure_existing_path(sealed_key_path, 0o600)?;
+    secure_existing_path(Path::new(SETUP_COMPLETE_MARKER), 0o644)?;
 
     if let Some(manifest) = manifest {
         for entry in &manifest.models {
             let model_path = Path::new(&config.daemon.model_dir).join(&entry.filename);
-            secure_existing_path(&model_path, 0o644, 0)?;
+            secure_existing_path(&model_path, 0o644)?;
         }
     }
 
@@ -4034,15 +4016,20 @@ mod tests {
             .map(|i| root_start + i)
             .expect("root policy closes");
         let root = &policy[root_start..root_end];
-        let signal_allow = r#"<allow receive_sender="org.facelock.Daemon" receive_type="signal"/>"#;
-        assert_eq!(
-            policy.matches(signal_allow).count(),
-            1,
-            "exactly one signal allow in the whole policy"
-        );
+        let signal_allow = root
+            .split("<allow")
+            .skip(1)
+            .map(|rest| &rest[..rest.find("/>").expect("allow element closes")])
+            .find(|allow| allow.contains(r#"receive_type="signal""#))
+            .expect("root may receive the daemon's signals");
         assert!(
-            root.contains(signal_allow),
-            "the only signal allow is inside the root block (signals are root-only)"
+            signal_allow.contains(r#"receive_sender="org.facelock.Daemon""#),
+            "root signal allow lacks receive_sender: {signal_allow}"
+        );
+        assert_eq!(
+            policy.matches(r#"receive_type="signal""#).count(),
+            2,
+            "signal rules: the root allow and the default-context deny, nothing else"
         );
     }
 }

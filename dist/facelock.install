@@ -24,6 +24,8 @@ _facelock_secure_paths() {
     chown root:root /var/log/facelock/snapshots 2>/dev/null || true
     chmod 700 /var/log/facelock/snapshots 2>/dev/null || true
     [ -f /var/log/facelock/audit.jsonl ] && chown root:root /var/log/facelock/audit.jsonl 2>/dev/null && chmod 600 /var/log/facelock/audit.jsonl 2>/dev/null
+    # Runtime dir: tmpfiles recreates it root:root at boot; converge a live one.
+    [ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
     return 0
 }
 
@@ -32,7 +34,6 @@ _facelock_secure_paths() {
 # refuses (a member still logged in, another package's group of the same name)
 # is not an install failure.
 _facelock_retire_group() {
-    [ -d /run/facelock ] && chown root:root /run/facelock 2>/dev/null || true
     if getent group facelock >/dev/null 2>&1; then
         groupdel facelock 2>/dev/null || true
     fi

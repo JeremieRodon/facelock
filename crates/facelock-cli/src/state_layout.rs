@@ -159,8 +159,8 @@ struct DirSpec<'a> {
 // Applying one path
 // ---------------------------------------------------------------------------
 
-/// `chown(2)` to `root:root`.
-fn chown_root(path: &Path) -> anyhow::Result<()> {
+/// `chown(2)` to `root:root`; shared with setup, which secures the same paths.
+pub(crate) fn chown_root(path: &Path) -> anyhow::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 

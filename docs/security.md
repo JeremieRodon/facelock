@@ -523,7 +523,7 @@ install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present,
 but `/usr/share/...` is the canonical install path. Two grants (ADR 010):
 
 - **root**: may own the name, send anything on the interface, and receive the
-  daemon's signals. Signals are root-only.
+  daemon's signals.
 - **every local user** (`default` context): may send exactly one method,
   `org.facelock.Daemon.Authenticate`. Screen lockers and the polkit agent run
   their PAM stack as the user, so this is what lets face unlock work with no
@@ -542,10 +542,9 @@ rather than a second layer:
 What opening `Authenticate` exposes, and why it is acceptable: any local UID
 may ask the daemon to authenticate **itself**. An unenrolled UID is answered by
 `pre_check` from SQLite (`has_models`) before the camera is opened. An enrolled
-UID could already do this before ADR 010 — it was in the group. No UID can
-name another user (`require_user_authorized`), learn another user's
-enrollment, or see a
-similarity score (redacted for non-root). Every attempt is audited when
+UID could already do this before ADR 010 — it was in the group. No UID can name
+another user (`require_user_authorized`), learn another user's enrollment, or
+see a similarity score (redacted for non-root). Every attempt is audited when
 auditing is enabled; an enrolled UID's failed attempts are rate-limited per
 user, while an unenrolled UID's calls are answered before the limiter and are
 not charged. This is the same shape as fprintd, whose bus policy admits every
