@@ -1,7 +1,7 @@
 # E2E package test — builds a real TPM-enabled .deb and installs via dpkg
 # Uses host-built release binaries (from `just build-release`); no Rust compilation in container.
 # Mirrors the CI TPM .deb build which targets Debian trixie.
-FROM debian:trixie
+FROM docker.io/library/debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -49,6 +49,7 @@ COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/
 COPY dist/ /build/dist/
 COPY .github/workflows/scripts/build-deb.sh /build/.github/workflows/scripts/build-deb.sh
+COPY scripts/release-versions.sh /build/scripts/release-versions.sh
 
 # Copy test validation scripts and PAM test config
 COPY test/pkg-validate.sh /pkg-validate.sh
@@ -66,10 +67,10 @@ RUN mkdir -p /build/onnxruntime/lib && \
 
 # Build the TPM .deb from host-built binaries and install it
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
-RUN bash /build/.github/workflows/scripts/build-deb.sh "0.0.0-test" "tpm" && \
-    (dpkg -i facelock_0.0.0-test-1_amd64.deb || true) && \
+RUN bash /build/.github/workflows/scripts/build-deb.sh "0.0.0" "trixie" "1" && \
+    (dpkg -i facelock_0.0.0-1~deb13u1_amd64.deb || true) && \
     apt-get update && apt-get install -f -y && \
-    rm -rf facelock_0.0.0-test-1_amd64 facelock_0.0.0-test-1_amd64.deb
+    rm -rf facelock_0.0.0-1~deb13u1_amd64 facelock_0.0.0-1~deb13u1_amd64.deb
 
 # Run the TPM PCR-binding regression first (needs the installed package + a
 # config file), then the package validation (which removes the package last).

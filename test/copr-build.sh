@@ -12,7 +12,7 @@
 # `packit srpm` rewrites the spec file in place.
 set -uo pipefail
 
-CHROOT="${COPR_CHROOT:-fedora-42-x86_64}"
+CHROOT="${COPR_CHROOT:-fedora-44-x86_64}"
 RESULT=0
 section() { echo; echo "==== $* ===="; }
 
@@ -23,10 +23,19 @@ cd /work || { echo "FAIL: no workdir"; exit 1; }
 git config --global --add safe.directory /work
 echo "Branch: $(git branch --show-current 2>/dev/null)  HEAD: $(git rev-parse --short HEAD 2>/dev/null)"
 
+section "Packit configuration schema"
+packit config validate --offline -c .packit.yaml || { echo "FAIL: invalid Packit configuration"; exit 1; }
+
 section "packit srpm"
 packit srpm 2>&1 | tee /tmp/srpm.log
 SRPM=$(grep -oE '/[^ ]+\.src\.rpm' /tmp/srpm.log | tail -1)
-[ -z "$SRPM" ] && SRPM=$(ls /work/*.src.rpm 2>/dev/null | head -1)
+if [ -z "$SRPM" ]; then
+  for candidate in /work/*.src.rpm; do
+    [ -f "$candidate" ] || continue
+    SRPM="$candidate"
+    break
+  done
+fi
 if [ -z "$SRPM" ] || [ ! -f "$SRPM" ]; then echo "FAIL: packit srpm produced no SRPM"; exit 1; fi
 cp "$SRPM" /tmp/ ; SRPM="/tmp/$(basename "$SRPM")"
 echo "SRPM: $SRPM"
@@ -43,7 +52,13 @@ else
 fi
 
 section "Built RPM checks"
-BIN_RPM=$(ls /tmp/mock/facelock-*.x86_64.rpm 2>/dev/null | grep -v debug | head -1)
+BIN_RPM=""
+for candidate in /tmp/mock/facelock-*.x86_64.rpm; do
+  [ -f "$candidate" ] || continue
+  case "$candidate" in *debug*) continue ;; esac
+  BIN_RPM="$candidate"
+  break
+done
 if [ -z "$BIN_RPM" ]; then echo "FAIL: no binary RPM produced"; exit 1; fi
 echo "RPM: $BIN_RPM"
 if rpm -qp --requires "$BIN_RPM" | grep -qi 'onnxruntime'; then

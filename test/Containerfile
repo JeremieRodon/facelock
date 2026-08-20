@@ -1,5 +1,7 @@
 # Single-stage test image — uses host-built release binaries (from `just build-release`)
-FROM archlinux:latest
+FROM docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
+
+RUN printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
 
 # Install dependencies
 # `sqlite` provides the sqlite3 CLI used by the device-coupling E2E assertions

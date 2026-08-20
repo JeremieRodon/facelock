@@ -19,6 +19,7 @@ follow it.
 - [Operating Modes](#operating-modes)
   - [facelock is-enrolled Exit Codes](#facelock-is-enrolled-exit-codes)
   - [facelock auth Exit Codes](#facelock-auth-exit-codes)
+- [Release Channels and APT Paths](#release-channels-and-apt-paths)
 - [Filesystem Paths](#filesystem-paths)
   - [Audit Log Entries](#audit-log-entries)
 - [Config Schema](#config-schema)
@@ -1278,6 +1279,59 @@ and never a correct one.
 | 0 | Face matched | PAM_SUCCESS |
 | 1 | No match / timeout / dark | PAM_AUTH_ERR |
 | 2 | Error / no enrolled faces | PAM_IGNORE |
+
+## Release Channels and APT Paths
+
+`dist/release-matrix.json` is the checked-in release-target authority. A strict
+prerelease tag has the form `vX.Y.Z-{alpha,beta,rc}.N`; it creates a GitHub
+prerelease and direct artifacts, but it must not publish to stable APT, stable AUR, or production COPR. Staging COPR infrastructure is owned by issue #236
+and is not provisioned or modified by the prerelease identity workflow.
+
+A stable `vX.Y.Z` tag may publish to stable APT and AUR only after validated
+release metadata classifies it as stable. Production COPR additionally
+requires a deliberately restored `trigger: release` job in the stable-tagged
+Packit configuration. Prerelease-capable configurations keep that job inert.
+Preflight and CI compare the public `tyvsmith/facelock` COPR API read-only with
+the production chroot authority; they never change the project. The required
+supported production COPR chroots are exactly Fedora 43, Fedora 44, and Fedora
+45. Rawhide is the only optional allowed experimental production chroot: its
+presence or absence is accepted, while any missing supported chroot or any
+other extra chroot fails closed.
+
+Every Packit `copr_build` target must be an explicit member of the checked-in
+allowlist: `fedora-43-x86_64`, `fedora-44-x86_64`, or
+`fedora-45-x86_64`. Mutable aliases such as `fedora-all`,
+`fedora-development`, and their architecture-suffixed forms are rejected, as
+is any other undeclared target. Rawhide is not a Packit staging or production
+release target; both `fedora-rawhide` and `fedora-rawhide-x86_64` fail
+validation. The prerelease rule is that no alpha may publish to Rawhide.
+Fedora 43 and Fedora 44 supply full lifecycle evidence; Fedora 45 supplies
+required build/runtime smoke. Rawhide cannot supply lifecycle, artifact,
+upgrade, rollback, served-version, or availability evidence; it is limited to
+best-effort pinned Track D smoke only. A Rawhide-only failure is not
+alpha-blocking. Promotion requires a separately reviewed amendment and full
+Fedora gates.
+
+Issue #236 owns pre-tag and post-publication proof that optional Rawhide serves
+no alpha or candidate build. This contract does not provision, publish to, or
+otherwise mutate COPR or Packit infrastructure.
+
+The public APT base is `https://tysmith.me/facelock/apt/`. Its stable suite
+paths and payload identities are:
+
+| Suite | Public Release path | Architecture | Variant |
+|-------|---------------------|--------------|---------|
+| `trixie` | `https://tysmith.me/facelock/apt/dists/trixie/Release` | amd64 | TPM |
+| `bookworm` | `https://tysmith.me/facelock/apt/dists/bookworm/Release` | amd64 | legacy |
+| `resolute` | `https://tysmith.me/facelock/apt/dists/resolute/Release` | amd64 | TPM |
+| `noble` | `https://tysmith.me/facelock/apt/dists/noble/Release` | amd64 | legacy |
+
+The former `main` and `legacy` suite names are retired; they are not aliases or
+redirects. Existing source entries must replace that suite component with the
+host operating-system codename while keeping the `facelock` component. Each
+stable publication consumes exactly one matching package for all four suites,
+and a prerelease or cross-suite version is rejected before signing or repository
+writes.
 
 ## Filesystem Paths
 
