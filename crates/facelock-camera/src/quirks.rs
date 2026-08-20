@@ -830,7 +830,8 @@ notes = "Full test quirk"
     }
 
     /// Every `format_preference` shipped in `config/quirks.d/00-defaults.toml`
-    /// must be a format facelock can actually decode.
+    /// must be both a format facelock can actually decode and an IR-typical
+    /// format that may safely act as node-level IR evidence.
     ///
     /// This is the coupling #90 introduced and nothing else guards: the file
     /// writes the padded V4L2 spelling (`"Y16 "`), `load_file` normalizes it,
@@ -839,7 +840,7 @@ notes = "Full test quirk"
     /// A shipped preference that fails this check does not fail loudly at
     /// runtime — it silently stops selecting the RealSense IR sensor node.
     #[test]
-    fn shipped_quirk_format_preferences_are_decodable() {
+    fn shipped_quirk_format_preferences_are_decodable_and_ir_typical() {
         let Some(quirks) = shipped_default_quirks() else {
             return;
         };
@@ -853,6 +854,12 @@ notes = "Full test quirk"
                 crate::capture::DECODABLE_FORMATS.contains(&pref.trim()),
                 "shipped quirk {:?} prefers {pref:?}, which facelock cannot decode — \
                  it would be dropped at open with a warning",
+                q.notes
+            );
+            assert!(
+                crate::device::is_ir_typical_fourcc(pref),
+                "shipped quirk {:?} prefers {pref:?}, which is not IR-typical — \
+                 it must not act as node-level IR evidence",
                 q.notes
             );
         }

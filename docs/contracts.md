@@ -1535,8 +1535,10 @@ When `device.path` is omitted:
    (GREY/Y8/Y10/Y12/Y16, with no color format mixed in). The device name never
    classifies a node on its own. Node-level disambiguation for multi-node USB
    devices: when several nodes share one quirk-matched VID:PID and at least one
-   has an IR-like format (GREY/Y16 or the quirk's `format_preference`), only the
-   format-bearing node(s) are IR
+   has an IR-typical format (GREY/Y8/Y10/Y12/Y16), only the format-bearing
+   node(s) are IR. A quirk's `format_preference` counts as node-level IR
+   evidence only when it is itself IR-typical and the node actually advertises
+   it
 4. Exclude devices that advertise no decodable pixel format
    (GREY/Y16/YUYV/NV12/MJPG) — e.g. raw Bayer sensor nodes (Intel IPU6/IPU7).
    This filter runs *after* step 3 and never feeds back into it: it changes
@@ -1858,7 +1860,10 @@ evidence or a real USB identity). The free-text device name never classifies a
 device on its own, and a GREY/Y16 format offered *alongside* a color format is
 not treated as IR. A `force_ir` quirk is device-level ("this USB device has an
 IR sensor"): when the device exposes multiple capture nodes and at least one has
-an IR-like format, only the format-bearing node(s) classify IR (see
+an IR-typical format, only the format-bearing node(s) classify IR. A quirk's
+`format_preference` participates in that decision only when the preferred
+format is itself IR-typical and actually advertised; an RGB preference such as
+MJPG cannot exempt an RGB sibling from demotion (see
 `docs/security.md` §A). Frame variance is passive
 anti-photo only (does not stop video replay); it is evaluated over a sliding window
 of the most recent `min_auth_frames` matched frames (see `docs/security.md` §B), with
