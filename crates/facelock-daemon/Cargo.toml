@@ -37,3 +37,4 @@ tpm = ["facelock-tpm/tpm"]
 [dev-dependencies]
 facelock-test-support = { path = "../facelock-test-support" }
 tempfile = "3"
+syn = { version = "2", features = ["full"] }
