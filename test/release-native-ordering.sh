@@ -30,7 +30,16 @@ case "$kind" in
             "$(release_rpm_evr 0.2.0-rc.1 5)"
             "$(release_rpm_evr 0.2.0 1)"
         )
-        compare() { rpmdev-vercmp "$1" "$2" | grep -Fq ' < '; }
+        compare() {
+            local status
+            if rpmdev-vercmp "$1" "$2" >/dev/null; then
+                status=0
+            else
+                status=$?
+            fi
+            # rpmdev-vercmp status 12 means EVR2 is newer than EVR1.
+            [ "$status" -eq 12 ]
+        }
         ;;
     arch)
         versions=(
