@@ -49,6 +49,7 @@ pub enum PamMessage {
         path: String,
     },
     PamInsertBeforeAuthHint,
+    PamInsertAfterHeaderHint,
     PamInsertAtTopHint,
     PamModifyPreview {
         path: String,
@@ -296,6 +297,9 @@ impl Message for PamMessage {
                 &[("path", path.clone())],
             ),
             PamInsertBeforeAuthHint => translate("inserted before the first 'auth' line"),
+            PamInsertAfterHeaderHint => {
+                translate("no 'auth' line found — inserted after the PAM header")
+            }
             PamInsertAtTopHint => {
                 translate("no 'auth' line found — inserted at the top of the file")
             }
@@ -521,7 +525,7 @@ impl Message for PamMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for PamMessage {
-    const VARIANT_COUNT: usize = 47;
+    const VARIANT_COUNT: usize = 48;
 
     fn samples() -> Vec<Self> {
         use PamMessage::*;
@@ -542,6 +546,7 @@ impl super::Samples for PamMessage {
             PamFileNotFound { paths: s("/p") },
             PamLineAlreadyPresent { path: s("/p") },
             PamInsertBeforeAuthHint,
+            PamInsertAfterHeaderHint,
             PamInsertAtTopHint,
             PamModifyPreview {
                 path: s("/p"),

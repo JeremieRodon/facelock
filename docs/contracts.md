@@ -720,12 +720,34 @@ as "not configured".
 process, one root check and one closing hint. Duplicates collapse. No
 `--service` means `sudo`, which is what bare `setup --pam` has always meant.
 
-**The `/etc/pam.d` bytes are unchanged from before the verb existed.** The line
-goes above the first `auth` line, or at the very top of the file when there is
-none (above the `#%PAM-1.0` header, which is where it has always gone); a
-missing trailing newline stays missing; a backup is taken before every edit and
-never before a no-op. Golden fixtures captured from the pre-refactor code pin
-all of it.
+**Service-file edits are byte-preserving.** A backslash followed only by spaces
+or tabs before LF or CRLF continues the same logical PAM rule, so insertion
+never splits that rule. A `#` ends the semantic rule even after a continuation;
+comment and blank physical lines remain untouched. The line goes above the
+first logical rule whose first ASCII-whitespace-delimited type token is `auth`,
+matched ASCII-case-insensitively and with Linux-PAM's optional leading `-`;
+`authtok_type=` is not an auth type. When there is no auth rule, the line goes
+directly after a leading `#%PAM-1.0` header, or at the top when that header is
+absent.
+
+Removal drops the whole genuine logical Facelock rule. For recovery from older
+facelock output that inserted the canonical physical line between an
+administrator's continuation backslash and its following physical line,
+removal deletes only that injected line. This reconnects the administrator's
+logical rule instead of deleting it.
+
+The editor never decodes the service file as UTF-8 and never reconstructs
+unmodified lines. Existing LF or CRLF endings, invalid bytes, and the presence
+or absence of the final newline survive unchanged; the one inserted line uses
+the target rule's line ending, falling back to the document's first ending when
+that target is unterminated. It uses the PAM header's ending when it follows
+that header, or the document's first ending when it goes at the top. A header
+with no final newline gains the separator before the inserted rule while the
+rule itself remains unterminated. A byte-identical no-op writes no file and
+takes no backup; an in-place add backs up before its real edit. Removal takes
+no new backup, and vendor-override creation has no original at the override
+path to preserve, as documented above. Golden fixtures pin insertion, removal,
+invalid-byte, CRLF and no-final-newline behavior.
 
 ### facelock status Semantics
 
