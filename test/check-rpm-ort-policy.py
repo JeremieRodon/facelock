@@ -25,6 +25,7 @@ def before(text: str, first: str, second: str, context: str) -> None:
 
 spec = read("dist/facelock.spec")
 release = read(".github/workflows/release.yml")
+ort_helper = read("scripts/prepare-ort-bundle.sh")
 build_rpm = read(".github/workflows/scripts/build-rpm.sh")
 networkless = read(".github/workflows/scripts/run-networkless.sh")
 validate_rpm = read(".github/workflows/scripts/validate-rpm.sh")
@@ -46,19 +47,30 @@ for needle in (
     require(spec, needle, "RPM spec channel contract")
 
 for needle in (
-    'ORT_VERSION: "1.20.1"',
-    'ORT_SOURCE_URL: "https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz"',
-    'ORT_ARCHIVE_SHA256: "67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105"',
-    'ORT_GIT_COMMIT: "5c1b7ccbff7e5141c1da7a9d963d660e5741c319"',
-    'ORT_LICENSE: "MIT"',
-    "onnxruntime/manifest.json",
-    "onnxruntime/SHA256SUMS",
+    "ORT_VERSION='1.20.1'",
+    "67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105",
+    "a5faaf78a37590d3fe640f887620e74f6022d34550172b91ad2131bf0ad77d64",
+    "5c1b7ccbff7e5141c1da7a9d963d660e5741c319",
+    "ORT_LICENSE='MIT'",
+    "manifest.json",
+    "SHA256SUMS",
+):
+    require(ort_helper, needle, "shared ORT provenance contract")
+
+for needle in (
+    "scripts/prepare-ort-bundle.sh source-url",
+    "scripts/prepare-ort-bundle.sh prepare ort.tgz onnxruntime",
+    "scripts/prepare-ort-bundle.sh component-tar onnxruntime onnxruntime-bundle.tar.xz",
+    "name: onnxruntime-bundle.tar.xz",
+    "skip-decompress: true",
+    "scripts/prepare-ort-bundle.sh extract-component onnxruntime-bundle.tar.xz onnxruntime",
+    "scripts/prepare-ort-bundle.sh verify onnxruntime",
     "test/check-rpm-ort-policy.py",
 ):
-    require(release, needle, "release workflow provenance contract")
+    require(release, needle, "release workflow ORT consumer contract")
 
-before(release, "curl --output ort.tgz", "sha256sum --check", "release workflow download")
-before(release, "sha256sum --check", 'tar -xzf ort.tgz', "release workflow extraction")
+before(release, "curl --output ort.tgz", "scripts/prepare-ort-bundle.sh prepare", "release workflow download")
+before(ort_helper, 'archive_hash="$(sha256sum', 'tar -xzf "$archive"', "shared ORT extraction")
 if "curl -fsSL" in release and "| tar" in release:
     raise SystemExit("release workflow download: streaming an unverified archive into tar is forbidden")
 

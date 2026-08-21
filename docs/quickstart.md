@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.85+ (`rustup update`)
+- Rust 1.88+ (`rustup update`)
 - [just](https://github.com/casey/just) task runner
 - Linux with V4L2 support
 - System dependencies: `libv4l-dev libpam0g-dev clang` (Debian/Ubuntu) or `v4l-utils pam clang` (Arch)

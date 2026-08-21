@@ -33,33 +33,29 @@ except json.JSONDecodeError as error:
     fail(f"invalid release matrix JSON: {error}")
 
 expected_rows = [
-    ("debian-13", "Debian 13 trixie", "amd64", "TPM, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
-    ("debian-12", "Debian 12 bookworm LTS", "amd64", "legacy, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
-    ("ubuntu-26.04", "Ubuntu 26.04 LTS", "amd64", "TPM, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
-    ("ubuntu-24.04", "Ubuntu 24.04 LTS", "amd64", "legacy, staged APT/direct deb", "bundled ORT 1.20.1", "supported", True, False, "full"),
-    ("fedora-43", "Fedora 43", "x86_64", "staging COPR", "system ORT", "supported", True, False, "full"),
-    ("fedora-44-copr", "Fedora 44", "x86_64", "staging COPR", "system ORT", "supported", True, False, "full"),
-    ("fedora-45", "Fedora 45 branched", "x86_64", "staging COPR", "system ORT", "supported", True, False, "build/runtime smoke"),
+    ("debian-13", "Debian 13 trixie", "amd64", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("ubuntu-26.04", "Ubuntu 26.04 LTS", "amd64", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("fedora-43", "Fedora 43", "x86_64", "system ORT", "supported", True, False, "full"),
+    ("fedora-44-copr", "Fedora 44", "x86_64", "system ORT", "supported", True, False, "full"),
+    ("fedora-45", "Fedora 45 branched", "x86_64", "system ORT", "supported", True, False, "build/runtime smoke"),
     (
         "fedora-rawhide",
         "Fedora Rawhide (Fedora 46 development)",
         "x86_64",
-        "optional experimental production COPR chroot",
         "system ORT",
         "experimental",
         False,
         True,
         "best-effort pinned Track D smoke only",
     ),
-    ("fedora-44-direct", "Fedora 44", "x86_64", "direct RPM", "bundled ORT 1.20.1", "supported", True, False, "full"),
-    ("arch-2026-08-18", "Arch Linux Archive snapshot 2026-08-18", "x86_64", "PKGBUILD and binary recipe", "system ORT", "supported", True, False, "full"),
+    ("fedora-44-direct", "Fedora 44", "x86_64", "bundled ORT 1.20.1", "supported", True, False, "full"),
+    ("arch-2026-08-18", "Arch Linux Archive snapshot 2026-08-18", "x86_64", "system ORT", "supported", True, False, "full"),
 ]
 actual_rows = [
     (
         row["id"],
         row["platform"],
         row["architecture"],
-        row["variant"],
         row.get("runtime"),
         row.get("support_tier"),
         row.get("release_target"),
@@ -70,8 +66,31 @@ actual_rows = [
 ]
 require(
     actual_rows == expected_rows,
-    "platform/architecture/variant/runtime/support-tier/release-target/optional/lifecycle rows differ from issue #234",
+    "platform/architecture/runtime/support-tier/release-target/optional/lifecycle rows differ from issue #234",
 )
+expected_debian_packaging = {
+    "debian-13": ("facelock", ["tpm"], "staged APT/direct deb"),
+    "ubuntu-26.04": ("facelock", ["tpm"], "staged APT/direct deb"),
+}
+for platform_id, expected_packaging in expected_debian_packaging.items():
+    row = next((candidate for candidate in matrix.get("platforms", []) if candidate.get("id") == platform_id), {})
+    require("variant" not in row, f"{platform_id} retains a Debian package variant axis")
+    actual_packaging = (row.get("package"), row.get("required_capabilities"), row.get("channel"))
+    require(
+        actual_packaging == expected_packaging,
+        f"{platform_id} package/capability/channel contract drifted: {actual_packaging!r}",
+    )
+expected_non_debian_variants = {
+    "fedora-43": "staging COPR",
+    "fedora-44-copr": "staging COPR",
+    "fedora-45": "staging COPR",
+    "fedora-rawhide": "optional experimental production COPR chroot",
+    "fedora-44-direct": "direct RPM",
+    "arch-2026-08-18": "PKGBUILD and binary recipe",
+}
+for platform_id, expected_variant in expected_non_debian_variants.items():
+    row = next((candidate for candidate in matrix.get("platforms", []) if candidate.get("id") == platform_id), {})
+    require(row.get("variant") == expected_variant, f"{platform_id} non-Debian variant/channel drifted")
 require(matrix.get("reviewed_on") == "2026-08-18", "matrix review date must be 2026-08-18")
 require(matrix.get("fedora", {}).get("43_eol_gate") == "2026-12-02", "Fedora 43 EOL gate drifted")
 today = date.fromisoformat(os.environ.get("RELEASE_MATRIX_TODAY", date.today().isoformat()))
@@ -150,7 +169,7 @@ for row in matrix.get("platforms", []):
             f"{row['id']} image is not digest-pinned: {image!r}",
         )
 
-expected_suites = {"trixie", "bookworm", "resolute", "noble"}
+expected_suites = {"trixie", "resolute"}
 suite_map = matrix.get("apt_suites", {})
 require(set(suite_map) == expected_suites, "canonical APT suite set drifted")
 expected_suite_contracts = {
@@ -158,29 +177,13 @@ expected_suite_contracts = {
         "platform_id": "debian-13",
         "platform": "Debian 13",
         "architecture": "amd64",
-        "variant": "tpm",
         "revision_suffix": "~deb13u1",
-    },
-    "bookworm": {
-        "platform_id": "debian-12",
-        "platform": "Debian 12",
-        "architecture": "amd64",
-        "variant": "legacy",
-        "revision_suffix": "~deb12u1",
     },
     "resolute": {
         "platform_id": "ubuntu-26.04",
         "platform": "Ubuntu 26.04",
         "architecture": "amd64",
-        "variant": "tpm",
         "revision_suffix": "~ubuntu26.04.1",
-    },
-    "noble": {
-        "platform_id": "ubuntu-24.04",
-        "platform": "Ubuntu 24.04",
-        "architecture": "amd64",
-        "variant": "legacy",
-        "revision_suffix": "~ubuntu24.04.1",
     },
 }
 platforms_by_id = {row["id"]: row for row in matrix.get("platforms", [])}
@@ -213,10 +216,10 @@ for suite, expected in expected_suite_contracts.items():
     require(platform_row is not None, f"APT suite {suite} references a missing platform row")
     require(platform_row["architecture"] == expected["architecture"], f"APT suite {suite} architecture disagrees with its platform row")
     require(platform_row["image"] == details.get("image"), f"APT suite {suite} image disagrees with its platform row")
-    require(
-        platform_row["variant"].lower().split(",", 1)[0] == expected["variant"],
-        f"APT suite {suite} variant disagrees with its platform row",
-    )
+    require("variant" not in details, f"APT suite {suite} retains a Debian package variant axis")
+    require("variant" not in platform_row, f"APT suite {suite} platform retains a Debian package variant axis")
+    require(platform_row.get("package") == "facelock", f"APT suite {suite} must map to the facelock package")
+    require(platform_row.get("required_capabilities") == ["tpm"], f"APT suite {suite} must require TPM")
 
 apt_config = (ROOT / "dist/apt/conf/distributions").read_text()
 declared_suites = set(re.findall(r"^Codename:\s*(\S+)\s*$", apt_config, re.MULTILINE))
@@ -298,23 +301,27 @@ workflow = (ROOT / ".github/workflows/release.yml").read_text()
 for suite, details in suite_map.items():
     expected_block = re.compile(
         rf"(?m)^\s+- suite: {re.escape(suite)}\s*$\n"
-        rf"^\s+variant: {re.escape(details['variant'])}\s*$\n"
         rf"^\s+architecture: {re.escape(details['architecture'])}\s*$\n"
         rf"^\s+image: {re.escape(details['image'])}\s*$"
     )
-    require(expected_block.search(workflow) is not None, f"release workflow suite/variant/architecture/image drifted for {suite}")
+    require(expected_block.search(workflow) is not None, f"release workflow suite/architecture/image drifted for {suite}")
+require("matrix.variant" not in workflow, "release workflow retains the Debian package variant axis")
 publication_inputs = re.findall(
-    r'"(trixie|bookworm|resolute|noble)=\$\(ls debs/(trixie|bookworm|resolute|noble)/facelock_\*\.deb\)"',
+    r'"(trixie|resolute)=\$\(exact_deb_from_manifest (trixie|resolute)\)"',
     workflow,
 )
 require(
-    len(publication_inputs) == 4 and set(publication_inputs) == {(suite, suite) for suite in expected_suites},
+    len(publication_inputs) == 2 and set(publication_inputs) == {(suite, suite) for suite in expected_suites},
     f"stable APT publication inputs drifted or duplicated: {publication_inputs}",
+)
+require(
+    workflow.count("exact_deb_from_manifest() {") == 1,
+    "stable APT publication must resolve each suite from one exact-manifest helper",
 )
 deb_builder = (ROOT / ".github/workflows/scripts/build-deb.sh").read_text()
 require(
-    'release_debian_binary_basename "$VERSION" "$REVISION" "$SUITE" amd64' in deb_builder,
-    "Debian artifact architecture no longer matches the amd64 release matrix",
+    'ARCHITECTURE="$(dpkg --print-architecture)"' in deb_builder,
+    "Debian artifact architecture is not derived from the native suite build",
 )
 apt_publisher = (ROOT / ".github/workflows/scripts/publish-apt.sh").read_text()
 require(
@@ -325,7 +332,7 @@ require(
     'EXPECTED_SUFFIX="$(release_debian_suite_suffix "$SUITE")"' in apt_publisher,
     "APT publisher does not derive suite suffixes from the central release version contract",
 )
-for suffix in ("~deb13u1", "~deb12u1", "~ubuntu26.04.1", "~ubuntu24.04.1"):
+for suffix in ("~deb13u1", "~ubuntu26.04.1"):
     require(suffix not in apt_publisher, f"APT publisher duplicates the central suite suffix {suffix}")
 direct_fedora_image = next(row["image"] for row in matrix["platforms"] if row["id"] == "fedora-44-direct")
 require(f"image: {direct_fedora_image}" in workflow, "direct RPM workflow must pin Fedora 44 by digest")
@@ -370,7 +377,7 @@ package_assemblers = (
     "dist/PKGBUILD-bin",
     "dist/PKGBUILD-git",
     "dist/facelock.spec",
-    "dist/debian/rules",
+    "debian/rules",
     ".github/workflows/scripts/build-deb.sh",
     "dist/nix/default.nix",
 )
@@ -475,9 +482,7 @@ normalized_contracts = re.sub(r"\s+", " ", contracts)
 for phrase in (
     "## Release Channels and APT Paths",
     "https://tysmith.me/facelock/apt/dists/trixie/Release",
-    "https://tysmith.me/facelock/apt/dists/bookworm/Release",
     "https://tysmith.me/facelock/apt/dists/resolute/Release",
-    "https://tysmith.me/facelock/apt/dists/noble/Release",
     "`main` and `legacy`",
     "stable APT, stable AUR, or production COPR",
     "required supported production COPR chroots are exactly Fedora 43, Fedora 44, and Fedora 45",
@@ -516,9 +521,7 @@ install_docs = {
 }
 apt_platform_mappings = (
     ("Debian 13", "trixie", "TPM"),
-    ("Debian 12", "bookworm", "legacy"),
     ("Ubuntu 26.04", "resolute", "TPM"),
-    ("Ubuntu 24.04", "noble", "legacy"),
 )
 retired_apt_source = re.compile(
     r"https://tysmith\.me/facelock/apt\s+(?:main|legacy)\s+facelock",
@@ -527,20 +530,92 @@ retired_apt_source = re.compile(
 for relative_path, content in install_docs.items():
     require(retired_apt_source.search(content) is None, f"{relative_path} still configures a retired APT suite")
     require("https://tysmith.me/facelock/apt" in content, f"{relative_path} omits the public APT base")
-    for platform, suite, variant in apt_platform_mappings:
+    for platform, suite, capability in apt_platform_mappings:
         mapping = re.compile(
-            rf"(?im)^.*{re.escape(platform)}.*{re.escape(suite)}.*{re.escape(variant)}.*$"
+            rf"(?im)^.*{re.escape(platform)}.*{re.escape(suite)}.*{re.escape(capability)}.*$"
         )
-        require(mapping.search(content) is not None, f"{relative_path} omits {platform}/{suite}/{variant} mapping")
+        require(mapping.search(content) is not None, f"{relative_path} omits {platform}/{suite}/{capability} capability mapping")
 
 readme = install_docs["README.md"]
-require("four suite-specific `.deb` artifacts" in readme, "README release wording does not name the four Debian artifacts")
+require("two suite-specific `.deb` artifacts" in readme, "README release wording does not name the two Debian artifacts")
 roadmap = (ROOT / "docs/testing-roadmap.md").read_text()
 for phrase in (
-    "four suite-specific `.deb` artifacts",
-    "trixie, bookworm, resolute, and noble",
+    "two suite-specific `.deb` artifacts",
+    "trixie and resolute",
 ):
     require(phrase in roadmap, f"testing roadmap omits release artifact inventory: {phrase}")
 require(retired_apt_source.search(roadmap) is None, "testing roadmap still names retired APT suites")
+
+debian_support_phrase = (
+    "Debian-family release support is exactly Debian 13 (Trixie) and "
+    "Ubuntu 26.04 LTS (Resolute)."
+)
+debian_source_phrases = (
+    "Trixie package builds use the official Trixie Backports `cargo` and `rustc`",
+    "Both suites ship one binary package named `facelock` with TPM support enabled.",
+    "No `rustup` toolchain participates in Debian source builds.",
+    "deterministic Cargo-vendor component",
+    "network denied and empty Cargo/Rustup caches",
+    "exactly two suite manifests",
+    "Bookworm and Noble artifacts may remain in historical releases, but those suites are unsupported and receive no new packages.",
+)
+for relative_path in ("README.md", "docs/releasing.md", "docs/contracts.md", "docs/security.md"):
+    content = re.sub(r"\s+", " ", (ROOT / relative_path).read_text())
+    require(debian_support_phrase in content, f"{relative_path} omits the exact Debian-family support floor")
+normalized_releasing = re.sub(r"\s+", " ", (ROOT / "docs/releasing.md").read_text())
+for phrase in debian_source_phrases:
+    require(phrase in normalized_releasing, f"release documentation omits Debian source policy: {phrase}")
+    require(phrase in normalized_contracts, f"system contracts omit Debian source policy: {phrase}")
+
+compatibility = (ROOT / "docs/compatibility.md").read_text()
+require("Ubuntu 26.04+" in compatibility, "compatibility guide retains an older Ubuntu support floor")
+require("Debian 13+" in compatibility, "compatibility guide retains an older Debian support floor")
+require("Ubuntu 22.04+" not in compatibility, "compatibility guide still claims Ubuntu 22.04 support")
+require("Debian 12+" not in compatibility, "compatibility guide still claims Debian 12 support")
+
+active_support_docs = (
+    "README.md",
+    "CONTRIBUTING.md",
+    "docs/quickstart.md",
+    "docs/compatibility.md",
+    "book/src/quickstart.md",
+    "book/src/contributing.md",
+    "book/src/compatibility.md",
+    ".github/ISSUE_TEMPLATE/bug_report.md",
+    "website/index.html",
+)
+stale_support_claims = (
+    "Rust 1.85+",
+    "(1.85+)",
+    "Ubuntu 22.04+",
+    "Debian 12+",
+    "Ubuntu 24.04",
+)
+for relative_path in active_support_docs:
+    content = (ROOT / relative_path).read_text()
+    for stale_claim in stale_support_claims:
+        require(stale_claim not in content, f"{relative_path} retains stale support claim: {stale_claim}")
+for relative_path in (
+    "CONTRIBUTING.md",
+    "docs/quickstart.md",
+    "book/src/quickstart.md",
+    "book/src/contributing.md",
+    "book/src/compatibility.md",
+    "website/index.html",
+):
+    require("1.88+" in (ROOT / relative_path).read_text(), f"{relative_path} omits the Rust 1.88+ floor")
+book_compatibility = (ROOT / "book/src/compatibility.md").read_text()
+require("Ubuntu 26.04+" in book_compatibility, "book compatibility guide omits Ubuntu 26.04+")
+require("Debian 13+" in book_compatibility, "book compatibility guide omits Debian 13+")
+for relative_path in ("docs/compatibility.md", "book/src/compatibility.md"):
+    require(
+        "download-binaries" not in (ROOT / relative_path).read_text(),
+        f"{relative_path} falsely claims that the disabled ort download-binaries feature supplies the runtime",
+    )
+packaging_skill = (ROOT / ".claude/skills/packaging-test/SKILL.md").read_text()
+for recipe in ("just test-deb-trixie-pkg", "just test-deb-resolute-pkg"):
+    require(recipe in packaging_skill, f"packaging skill omits {recipe}")
+for retired_recipe in ("just test-deb-pkg", "just test-deb-tpm-pkg"):
+    require(retired_recipe not in packaging_skill, f"packaging skill retains {retired_recipe}")
 
 print("release matrix contract: OK")

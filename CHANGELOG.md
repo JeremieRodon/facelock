@@ -220,6 +220,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Debian-family releases now target Debian 13 Trixie and Ubuntu 26.04
+  Resolute only**: both suites ship one TPM-enabled `facelock` package. Debian
+  source packages include deterministic Cargo-vendor and reviewed ONNX Runtime
+  components and rebuild with network access denied from declared distro Rust
+  toolchains. Bookworm and Noble remain historical, unsupported artifacts.
+
 - **Desktop integrations now own their setup and removal wrappers** (#173):
   added `docs/integrating.md` with the stable capability, enrollment, PAM
   placement, arbitrary-service and Hyprlock policies plus a worked Omarchy

@@ -1831,19 +1831,65 @@ otherwise mutate COPR or Packit infrastructure.
 The public APT base is `https://tysmith.me/facelock/apt/`. Its stable suite
 paths and payload identities are:
 
-| Suite | Public Release path | Architecture | Variant |
+| Suite | Public Release path | Architecture | Package |
 |-------|---------------------|--------------|---------|
-| `trixie` | `https://tysmith.me/facelock/apt/dists/trixie/Release` | amd64 | TPM |
-| `bookworm` | `https://tysmith.me/facelock/apt/dists/bookworm/Release` | amd64 | legacy |
-| `resolute` | `https://tysmith.me/facelock/apt/dists/resolute/Release` | amd64 | TPM |
-| `noble` | `https://tysmith.me/facelock/apt/dists/noble/Release` | amd64 | legacy |
+| `trixie` | `https://tysmith.me/facelock/apt/dists/trixie/Release` | amd64 | `facelock`, TPM enabled |
+| `resolute` | `https://tysmith.me/facelock/apt/dists/resolute/Release` | amd64 | `facelock`, TPM enabled |
 
 The former `main` and `legacy` suite names are retired; they are not aliases or
 redirects. Existing source entries must replace that suite component with the
-host operating-system codename while keeping the `facelock` component. Each
-stable publication consumes exactly one matching package for all four suites,
-and a prerelease or cross-suite version is rejected before signing or repository
+host operating-system codename while keeping the `facelock` component.
+Debian-family release support is exactly Debian 13 (Trixie) and Ubuntu 26.04
+LTS (Resolute). Bookworm and Noble artifacts may remain in historical releases,
+but those suites are unsupported and receive no new packages.
+
+Both suites ship one binary package named `facelock` with TPM support enabled.
+There are no legacy/TPM package-name alternatives and the package declares no
+`Provides`, `Conflicts`, or `Replaces` transition identity. Stable publication
+consumes exactly two suite manifests, one matching package per suite, and a
+prerelease or cross-suite version is rejected before signing or repository
 writes.
+
+### Debian source and binary package contract
+
+Trixie package builds use the official Trixie Backports `cargo` and `rustc`;
+Resolute uses its native distro packages. Both must satisfy the workspace and
+`debian/control` minimum of Rust 1.88. No `rustup` toolchain participates in
+Debian source builds.
+
+The Debian source package contains the exact tagged main upstream tarball, the
+reviewed ORT component, the deterministic Cargo-vendor component, and the
+Debian quilt delta. For upstream `U`, Debian version `V`, and architecture `A`,
+the release manifest lists exactly these eight files in canonical order:
+
+```text
+facelock_U.orig.tar.gz
+facelock_U.orig-onnxruntime.tar.gz
+facelock_U.orig-cargo-vendor.tar.xz
+facelock_V.debian.tar.xz
+facelock_V.dsc
+facelock_V_A.buildinfo
+facelock_V_A.deb
+facelock_V_A.changes
+```
+
+The Cargo component is bound to the exact `Cargo.lock`, contains only regular
+normalized files plus its lock hash, bytewise manifest, and generated legal
+inventory, and is used through the package-only Cargo source replacement. The
+inventory covers every exact vendored crate and records its path, name, version,
+declared license or license-file, available authors/upstream metadata, and every
+referenced license material that exists in the component. The ORT component contains the
+reviewed library, license, third-party notices, version, commit, provenance,
+manifest, and checksums. Neither component is added to the tagged main archive.
+
+Complete `.dsc` rebuilds run with network denied and empty Cargo/Rustup caches.
+The build uses only the extracted source components and declared distro build
+dependencies, with Cargo locked and offline. The clean rebuild must produce the
+same package identity, resolved dependencies, installed path set, and installed
+file hashes as the release build. Fresh installation leaves
+`facelock-daemon.service` disabled and inactive; D-Bus activation remains
+available after explicit setup. Package validation requires the installed TPM
+command surface and the suite-native `libtss2` dependency closure.
 
 ## ONNX Runtime Trust and Fedora RPM Modes
 

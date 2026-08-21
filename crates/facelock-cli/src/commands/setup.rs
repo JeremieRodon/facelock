@@ -4100,8 +4100,7 @@ mod tests {
         for rel in [
             "dist/facelock.install",
             "dist/facelock.spec",
-            "dist/debian/prerm",
-            "dist/omarchy/omarchy-remove-security-face",
+            "debian/prerm",
             "justfile",
         ] {
             let path = root.join(rel);

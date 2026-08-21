@@ -284,7 +284,7 @@ done
 
 lifecycle_messages=(
     justfile
-    dist/debian/postrm
+    debian/postrm
     dist/facelock.spec
     dist/facelock.install
 )

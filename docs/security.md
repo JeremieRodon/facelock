@@ -394,6 +394,29 @@ sandbox that denies socket creation, connection/message syscalls, and
 with an `ENOSYS` network probe before invoking `rpmbuild`. Cargo offline mode is
 additional defense; it is not the network boundary.
 
+#### Debian source-build boundary
+
+Debian-family release support is exactly Debian 13 (Trixie) and Ubuntu 26.04
+LTS (Resolute). Both suites ship the single `facelock` package with TPM enabled;
+Bookworm and Noble artifacts may remain in historical releases, but those
+suites are unsupported and receive no new packages.
+
+The Debian source package carries four independently classified inputs: the
+exact tagged main archive, the reviewed ORT component and its legal/provenance
+set, the deterministic Cargo-vendor component bound to `Cargo.lock`, and the
+Debian quilt delta. Trixie uses official Backports Rust/Cargo and Resolute uses
+its native distro toolchain. No rustup toolchain is trusted as a build
+dependency. Package assembly and a clean `.dsc` rebuild both run through the
+same fail-closed syscall sandbox with network denied and empty Cargo/Rustup
+caches. Cargo's locked/offline mode is additional enforcement; it never
+substitutes for the network boundary.
+
+The release and clean rebuild must agree on binary-package identity, resolved
+dependencies, installed paths, and installed file hashes. Stable APT
+publication is all-or-nothing across exactly two suite manifests. This prevents
+an undeclared toolchain/cache fetch, a component omission, or a partial suite
+publication from being mistaken for a reproducible Debian source build.
+
 ### 3. Embedding / Database Security
 
 **Attack**: Read or modify the SQLite database to extract biometric data or inject fake embeddings.
@@ -483,7 +506,7 @@ directories. No group is involved (ADR 010): the answer is
   An indicator that fails to show is the safe way to be wrong.
 
 Several places encode this layout and must stay in sync: `dist/facelock.tmpfiles`,
-`dist/facelock.install`, `dist/debian/postinst`, `dist/nix/module.nix`,
+`dist/facelock.install`, `debian/postinst`, `dist/nix/module.nix`,
 `dist/openrc/facelock-daemon`, the `install-files` recipe in `justfile`,
 `secure_setup_paths()` in `crates/facelock-cli/src/commands/setup.rs`, the
 default path constants in `crates/facelock-core/src/paths.rs`, and the typed
@@ -1105,7 +1128,7 @@ tests cover the mask arithmetic, and
 running both orders against a real tokio runtime.
 
 That walk only happens if the daemon actually starts, which needs `models/*.onnx` in the
-checkout (they are gitignored). `just test-deb-pkg` / `just test-rpm-pkg` refuse to run without
+checkout (they are gitignored). The Debian suite package gates and `just test-rpm-pkg` refuse to run without
 them, and `pkg-validate.sh` fails rather than skipping — set
 `FACELOCK_ALLOW_MISSING_MODELS=1` to accept a partial run, which then reports the missing
 assertions in its `N skipped` count instead of passing silently.
@@ -1199,7 +1222,7 @@ in-process before the first authentication.) Verify with:
 systemd-analyze security facelock-daemon.service
 ```
 
-**Regression coverage:** `just test-deb-pkg` / `just test-rpm-pkg` boot the package container
+**Regression coverage:** both Debian suite package gates and `just test-rpm-pkg` boot the package container
 with systemd as PID 1 (`test/run-pkg-validate-systemd.sh`) and assert via `systemctl show`
 that the installed unit carries the Phase 3 directives, that the daemon starts and answers on
 D-Bus inside the sandbox, and that an `AF_INET` socket cannot be created under the same

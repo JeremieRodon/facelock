@@ -3088,12 +3088,12 @@ fn atomic_state_publish(root: &Path, name: &str, content: &[u8]) -> std::io::Res
         }
         Ok(identity)
     })();
-    if written.is_err() && !published {
-        if let Some(identity) = owned_temp.as_ref() {
-            let _ =
-                unlink_at_if_identity_matches(&directory, &temp_name, identity, MAX_BACKUP_BYTES);
-            let _ = directory.sync_all();
-        }
+    if written.is_err()
+        && !published
+        && let Some(identity) = owned_temp.as_ref()
+    {
+        let _ = unlink_at_if_identity_matches(&directory, &temp_name, identity, MAX_BACKUP_BYTES);
+        let _ = directory.sync_all();
     }
     written
 }
@@ -6786,12 +6786,12 @@ fn apply_add(target: &Target, no_confirm: bool, sink: &Sink, dirs: &PamDirs) -> 
         return Outcome::Failed(format!("failed to write {path}: {error}"));
     }
 
-    if let Some(prepared) = &prepared {
-        if let Err(error) = transaction.commit(prepared) {
-            return Outcome::Failed(format!(
-                "installed {path}, but failed to commit backup provenance: {error}"
-            ));
-        }
+    if let Some(prepared) = &prepared
+        && let Err(error) = transaction.commit(prepared)
+    {
+        return Outcome::Failed(format!(
+            "installed {path}, but failed to commit backup provenance: {error}"
+        ));
     }
 
     // `notice`, not `info`: these are the messages that tell an operator who

@@ -1,11 +1,34 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: facelock
-Upstream-Contact: Facelock Contributors <facelock@example.com>
+Upstream-Contact: Ty Smith <ty@tysmith.me>
 Source: https://github.com/tyvsmith/facelock
+
+Files: onnxruntime/*
+Copyright: Microsoft Corporation
+License: MIT
+Comment: This independently sourced binary component retains its upstream
+ LICENSE, ThirdPartyNotices.txt, version, commit, checksums, manifest, and
+ provenance under /usr/share/doc/facelock/onnxruntime/.
+
+Files: cargo-vendor/*
+Copyright: See the upstream copyright and license materials referenced by
+ cargo-vendor/LEGAL-INVENTORY.json where the exact crate includes them
+License: Cargo-vendor-per-crate
+Comment: The generated, Cargo.lock-bound inventory records each crate path,
+ version, declared license expression or license-file, authors, upstream URLs,
+ and included license materials. Author metadata is reproduced as declared; it
+ is not asserted to identify copyright ownership. This stanza does not
+ relicense those files.
 
 Files: *
 Copyright: 2024-2026 Facelock Contributors
 License: MIT or Apache-2.0
+
+License: Cargo-vendor-per-crate
+ Each file remains under the license declared by its vendored crate. The exact
+ per-crate declarations and paths are recorded in
+ cargo-vendor/LEGAL-INVENTORY.json; applicable license texts and notices remain
+ alongside each crate under cargo-vendor/vendor/.
 
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a

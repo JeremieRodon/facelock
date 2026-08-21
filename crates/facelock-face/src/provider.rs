@@ -168,10 +168,10 @@ fn runtime_candidates(
     privilege: PrivilegeContext,
 ) -> Vec<RuntimeCandidate> {
     let mut candidates = Vec::new();
-    if privilege == PrivilegeContext::Unprivileged {
-        if let Some(path) = override_path.filter(|path| !path.is_empty()) {
-            candidates.push(RuntimeCandidate::override_path(path));
-        }
+    if privilege == PrivilegeContext::Unprivileged
+        && let Some(path) = override_path.filter(|path| !path.is_empty())
+    {
+        candidates.push(RuntimeCandidate::override_path(path));
     }
 
     if provider != "cpu" {

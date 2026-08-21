@@ -12,14 +12,12 @@ yay -S facelock           # or paru -S facelock
 
 ### Debian / Ubuntu (APT)
 
-Use the exact suite and package variant for your platform:
+Use the exact suite for your platform. Both supported packages include TPM support:
 
-| Platform | Suite | Variant |
-|----------|-------|---------|
+| Platform | Suite | Required capability |
+|----------|-------|---------------------|
 | Debian 13 | trixie | TPM |
-| Debian 12 | bookworm | legacy |
 | Ubuntu 26.04 | resolute | TPM |
-| Ubuntu 24.04 | noble | legacy |
 
 ```bash
 # Add signing key
@@ -56,7 +54,7 @@ sudo facelock test        # verify recognition
 
 ## Prerequisites (Building from Source)
 
-- Rust 1.85+ (`rustup update`)
+- Rust 1.88+ (`rustup update`)
 - [just](https://github.com/casey/just) task runner
 - Linux with V4L2 support
 - System dependencies: `libv4l-dev libpam0g-dev clang` (Debian/Ubuntu) or `v4l-utils pam clang` (Arch)
