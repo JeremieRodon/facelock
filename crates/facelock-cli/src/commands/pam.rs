@@ -5089,6 +5089,7 @@ const NON_SERVICE_SUFFIXES: &[&str] = &[
     ".dpkg-old",
     ".dpkg-new",
     ".dpkg-dist",
+    ".pam-old",
     "~",
 ];
 
@@ -16212,6 +16213,16 @@ account required pam_unix.so\n";
     }
 
     #[test]
+    fn remove_all_preserves_pam_auth_update_backup() {
+        let dir = seeded(&[("common-auth.pam-old", SUDO_AFTER)]);
+        let dirs = only(dir.path());
+        let before = snapshot(dir.path());
+
+        assert_eq!(remove_all(&dirs).unwrap(), WRITE_OK);
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[test]
     fn remove_all_cleans_exact_legacy_emission_without_provenance() {
         let dir = seeded(&[("pre-0.2-service", SUDO_AFTER)]);
         let dirs = only(dir.path());
@@ -17255,9 +17266,10 @@ account required pam_unix.so\n";
     }
 
     /// A `.facelock-backup` is a byte copy of a configured file and is not a
-    /// service. Neither is a `.pacsave`, a `~` file, or this module's own
-    /// in-flight temp file. Reporting one as configured would be the report
-    /// being confidently wrong, which is what enumeration is for removing.
+    /// service. Neither is a `.pacsave`, pam-auth-update's `.pam-old`, a `~`
+    /// file, or this module's own in-flight temp file. Reporting one as
+    /// configured would be the report being confidently wrong, which is what
+    /// enumeration is for removing.
     #[test]
     fn backups_and_package_manager_leftovers_are_not_services() {
         let dir = seeded(&[
@@ -17266,9 +17278,17 @@ account required pam_unix.so\n";
             ("polkit-1.pacsave", SUDO_AFTER),
             ("hyprlock.rpmsave", SUDO_AFTER),
             ("login.dpkg-old", SUDO_AFTER),
+            ("common-auth.pam-old", SUDO_AFTER),
             ("swaylock~", SUDO_AFTER),
             (".sudo.facelock-1234-5678", SUDO_AFTER),
         ]);
+
+        assert_eq!(scan_directories(&only(dir.path())).names, ["sudo"]);
+    }
+
+    #[test]
+    fn pam_auth_update_backup_is_not_a_service() {
+        let dir = seeded(&[("sudo", SUDO_AFTER), ("common-auth.pam-old", SUDO_AFTER)]);
 
         assert_eq!(scan_directories(&only(dir.path())).names, ["sudo"]);
     }

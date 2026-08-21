@@ -545,9 +545,9 @@ consequences:
 - a service file that could not be **read** is an `unknown` row too. Omitting it
   would report "not configured" for a machine this could not check.
 - `.facelock-backup`, `.pacnew`, `.pacsave`, `.pacorig`, `.rpmnew`, `.rpmsave`,
-  `.rpmorig`, `.dpkg-old`, `.dpkg-new`, `.dpkg-dist`, names ending in `~`, and
-  dotfiles are not services. Each can carry the line, and none is a name
-  Linux-PAM is ever asked for.
+  `.rpmorig`, `.dpkg-old`, `.dpkg-new`, `.dpkg-dist`, pam-auth-update's
+  `.pam-old`, names ending in `~`, and dotfiles are not services. Each can carry
+  the line, and none is a name Linux-PAM is ever asked for.
 - only a **regular file** is read. A FIFO blocks the read until a writer
   appears, and a diagnostic command that hangs on a malformed `/etc/pam.d` is
   worse than one that omits an entry no PAM stack could use; device nodes,
@@ -884,7 +884,8 @@ as Facelock-owned when every Facelock logical rule uses the exact pre-versioned
 physical bytes `auth      sufficient pam_facelock.so`. Dot-prefixed names and
 the administrator/package artifact suffixes `.facelock-backup`, `.pacnew`,
 `.pacsave`, `.pacorig`, `.rpmnew`, `.rpmsave`, `.rpmorig`, `.dpkg-old`,
-`.dpkg-new`, `.dpkg-dist`, and `~` are not conventional legacy candidates.
+`.dpkg-new`, `.dpkg-dist`, `.pam-old`, and `~` are not conventional legacy
+candidates.
 They are considered only when a strict provenance basename exists for that
 exact confined service and the current complete-file hash equals
 `installed_sha256` in its validated committed pair, or when the regular local

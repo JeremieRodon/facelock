@@ -117,6 +117,80 @@ verify_installed_deb_ort_bundle() {
 
 export -f verify_installed_deb_ort_bundle
 
+pam_facelock_executes() {
+    local output rc service="$1"
+
+    output="$(mktemp /tmp/facelock-pam-output.XXXXXX)" || return 1
+    if LC_ALL=C timeout 30 pamtester "$service" testuser authenticate </dev/null >"$output" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -ne 124 ] && grep -Fq 'Identifying face' "$output"; then
+        rm -f -- "$output"
+        return 0
+    fi
+    cat "$output" >&2
+    rm -f -- "$output"
+    return 1
+}
+
+pam_missing_module_control_is_rejected() {
+    local service=facelock-missing-module-test
+    local service_path="/etc/pam.d/$service"
+
+    sed 's/pam_facelock\.so/pam_definitely_missing.so/' \
+        /etc/pam.d/facelock-test >"$service_path" || return 1
+    if pam_facelock_executes "$service"; then
+        rm -f -- "$service_path"
+        return 1
+    fi
+    rm -f -- "$service_path"
+}
+
+verify_debian_packaged_pam_profile() {
+    local before=/tmp/facelock-common-auth-profile.before
+    local before_metadata=/tmp/facelock-common-auth-profile.metadata.before
+    local good_output=/tmp/facelock-common-auth-profile.good
+    local bad_output=/tmp/facelock-common-auth-profile.bad
+    local failed=0 service_path=/etc/pam.d/facelock-profile-test
+
+    cp -- /etc/pam.d/common-auth "$before" || return 1
+    stat -c '%a %u %g' /etc/pam.d/common-auth >"$before_metadata" || return 1
+    printf '%s\n' \
+        'auth include common-auth' \
+        'account required pam_permit.so' >"$service_path" || return 1
+
+    pam-auth-update --enable facelock --force || failed=1
+    grep -Eq '^[[:space:]]*auth[[:space:]].*pam_facelock\.so([[:space:]]|$)' \
+        /etc/pam.d/common-auth || failed=1
+
+    if ! printf '%s\n' test | LC_ALL=C timeout 30 \
+        pamtester facelock-profile-test testuser authenticate >"$good_output" 2>&1; then
+        failed=1
+    fi
+    grep -Fq 'Identifying face' "$good_output" || failed=1
+    grep -Fq 'successfully authenticated' "$good_output" || failed=1
+
+    if printf '%s\n' wrong | LC_ALL=C timeout 30 \
+        pamtester facelock-profile-test testuser authenticate >"$bad_output" 2>&1; then
+        failed=1
+    fi
+    grep -Fq 'Identifying face' "$bad_output" || failed=1
+    grep -Fq 'Authentication failure' "$bad_output" || failed=1
+
+    pam-auth-update --disable facelock --force || failed=1
+    cmp -s "$before" /etc/pam.d/common-auth || failed=1
+    [ "$(stat -c '%a %u %g' /etc/pam.d/common-auth)" = "$(cat "$before_metadata")" ] || failed=1
+    ! grep -q pam_facelock\.so /etc/pam.d/common-auth || failed=1
+
+    rm -f -- "$before" "$before_metadata" "$good_output" "$bad_output" "$service_path"
+    return "$failed"
+}
+
+export -f pam_facelock_executes pam_missing_module_control_is_rejected
+export -f verify_debian_packaged_pam_profile
+
 echo "=== Facelock Package Validation ==="
 echo ""
 
@@ -164,9 +238,18 @@ fi
 
 # PAM tests (only if pamtester is available)
 if command -v pamtester >/dev/null 2>&1 && [ -f /etc/pam.d/facelock-test ]; then
-    run_test "PAM module loads via pamtester" "pamtester facelock-test testuser authenticate < /dev/null 2>&1 | grep -qiE '(successfully|authentication failure)'"
+    run_test "PAM module executes through the synthetic service" \
+        "pam_facelock_executes facelock-test"
+    run_test "missing PAM module control is rejected" \
+        "pam_missing_module_control_is_rejected"
 else
-    skip_test "PAM module loads via pamtester" "pamtester or /etc/pam.d/facelock-test unavailable"
+    skip_test "PAM execution block (real module and missing-module control)" \
+        "pamtester or /etc/pam.d/facelock-test unavailable"
+fi
+
+if [ "$PACKAGE_FORMAT" = deb ]; then
+    run_test "packaged opt-in PAM profile enables, falls back to password, and restores common-auth" \
+        "verify_debian_packaged_pam_profile"
 fi
 
 # D-Bus tests (only if dbus-daemon is available)

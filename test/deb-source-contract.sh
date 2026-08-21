@@ -190,6 +190,16 @@ grep -Fq '> /etc/dpkg/dpkg.cfg.d/zz-facelock-test-docs' test/Containerfile.deb-r
     fail "Debian runtime fixture's Facelock include must sort after base-image exclusions"
 grep -Fq '/facelock-common-auth-install-invariant' test/Containerfile.deb-runtime ||
     fail "Debian runtime fixture must prove fresh install leaves common-auth unchanged"
+grep -Fq 'PAM module executes through the synthetic service' test/pkg-validate.sh ||
+    fail "package validation must prove pam_facelock executes, not accept a generic PAM failure"
+grep -Fq 'missing PAM module control is rejected' test/pkg-validate.sh ||
+    fail "package validation must prove its PAM execution assertion rejects a missing module"
+grep -Fq 'packaged opt-in PAM profile enables, falls back to password, and restores common-auth' test/pkg-validate.sh ||
+    fail "Debian package validation must exercise the shipped pam-auth-update profile"
+grep -Fq 'pam-auth-update --enable facelock --force' test/pkg-validate.sh ||
+    fail "Debian package validation must enable the packaged profile through pam-auth-update"
+grep -Fq 'pam-auth-update --disable facelock --force' test/pkg-validate.sh ||
+    fail "Debian package validation must disable the packaged profile through pam-auth-update"
 
 # Match literal source text in the runner, not this contract's working tree.
 # shellcheck disable=SC2016

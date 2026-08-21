@@ -926,9 +926,10 @@ Facelock rule has the exact pre-versioned emitted bytes. A dot-prefixed or
 package/administrator artifact name is considered only when an exact strict
 provenance basename exists and its current hash matches committed provenance,
 or when the regular local file is an exact current Facelock vendor copy;
-unowned `.pacsave`, `.rpmsave`, `~` and similar artifacts are preserved and
-ignored. Customized rules, corrupt provenance for a candidate, linked or
-unreadable entries, and references in read-only roots are unmanaged blockers;
+unowned `.pacsave`, `.rpmsave`, pam-auth-update `.pam-old`, `~` and similar
+artifacts are preserved and ignored. Customized rules, corrupt provenance for
+a candidate, linked or unreadable entries, and references in read-only roots
+are unmanaged blockers;
 preflight reports them without following or changing them. Directory contents
 remain detection ground truth, and provenance is never a target path or an
 instruction to mutate.

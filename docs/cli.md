@@ -749,9 +749,9 @@ ground truth; provenance can authenticate an arbitrary service Facelock
 previously changed, but never supplies a target path. An exact pre-0.2
 `auth      sufficient pam_facelock.so` edit is recognized only under a
 conventional service basename. Dot-prefixed and package/administrator artifact
-names such as `.pacsave`, `.rpmsave` and `~` require strict provenance for that
-exact name or an exact current Facelock vendor-copy header; unowned artifacts
-are ignored and preserved. A customized control,
+names such as `.pacsave`, `.rpmsave`, pam-auth-update `.pam-old`, and `~`
+require strict provenance for that exact name or an exact current Facelock
+vendor-copy header; unowned artifacts are ignored and preserved. A customized control,
 options or spacing, corrupt provenance for a candidate, any other linked entry,
 or a reference in a read-only root is an unmanaged blocker. Nothing is changed
 when preflight finds one. The same scan recognizes an exact unchanged
