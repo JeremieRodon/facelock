@@ -5,6 +5,7 @@ Summary:        Face authentication for Linux PAM
 License:        MIT OR Apache-2.0
 URL:            https://github.com/tyvsmith/facelock
 Source0:        %{name}-%{version}.tar.gz
+Source1:        facelock-authselect-retirement-guard
 
 %bcond_with bundled_ort
 
@@ -37,7 +38,7 @@ Requires:       tpm2-tss
 %if %{without bundled_ort}
 Requires:       onnxruntime
 %endif
-Recommends:     authselect
+Requires(pre):  coreutils
 
 %description
 Facelock provides Windows Hello-style face authentication for Linux
@@ -87,13 +88,6 @@ install -Dm644 dist/facelock.tmpfiles %{buildroot}%{_tmpfilesdir}/facelock.conf
 install -Dm644 dbus/org.facelock.Daemon.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.facelock.Daemon.conf
 install -Dm644 dbus/org.facelock.Daemon.service %{buildroot}%{_datadir}/dbus-1/system-services/org.facelock.Daemon.service
 
-# authselect profile
-install -dm755 %{buildroot}%{_datadir}/authselect/vendor/facelock
-install -Dm644 dist/authselect/facelock/system-auth %{buildroot}%{_datadir}/authselect/vendor/facelock/system-auth
-install -Dm644 dist/authselect/facelock/password-auth %{buildroot}%{_datadir}/authselect/vendor/facelock/password-auth
-install -Dm644 dist/authselect/facelock/postlogin %{buildroot}%{_datadir}/authselect/vendor/facelock/postlogin
-install -Dm644 dist/authselect/facelock/README %{buildroot}%{_datadir}/authselect/vendor/facelock/README
-
 # The direct release RPM is built with --with bundled_ort from a separately
 # fetched, checksum-verified artifact. The default Packit/COPR build must not
 # contain this directory and uses Fedora's onnxruntime package instead.
@@ -131,6 +125,11 @@ FACELOCK_ORT_SMOKE_MODEL=%{_builddir}/ort-smoke-model.onnx \
         provider::tests::live_runtime_creates_session_from_checksum_pinned_minimal_model \
         -- --ignored --exact
 %endif
+
+# Numeric argument 1 is a fresh install and greater than 1 is an upgrade. The
+# source-controlled guard makes fresh install a no-op and stops replacement
+# while the retired Facelock authselect profile is still selected.
+%pre -f %{SOURCE1}
 
 %post
 %tmpfiles_create facelock.conf
@@ -211,7 +210,6 @@ fi
 %{_tmpfilesdir}/facelock.conf
 %{_datadir}/dbus-1/system.d/org.facelock.Daemon.conf
 %{_datadir}/dbus-1/system-services/org.facelock.Daemon.service
-%{_datadir}/authselect/vendor/facelock/
 
 %changelog
 * Mon Mar 10 2026 Facelock Contributors <facelock@example.com> - 0.1.0-1

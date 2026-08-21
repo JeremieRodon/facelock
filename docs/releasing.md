@@ -191,6 +191,7 @@ just test-deb            # delegate to both exact supported-suite package gates
 just test-deb-trixie-pkg    # Debian 13 — offline source rebuild, install, TPM, lifecycle
 just test-deb-resolute-pkg  # Ubuntu 26.04 — the same complete package gate
 just test-rpm-pkg        # Fedora — build real .rpm, install via dnf, validate
+just test-rpm-authselect # Fedora — retired-profile upgrade guard lifecycle
 just test-copr           # COPR-equivalent — Packit SRPM + mock from-source rebuild (slow)
 
 # Interactive (requires camera)
@@ -210,6 +211,20 @@ install path.
 The `*-dev-shell` recipes mount host models for fast interactive camera testing.
 The `*-release-shell` recipes start from a clean package install with nothing from the
 host — run `facelock setup` to download models, then enroll and test.
+
+The RPM embeds a read-only retired-profile upgrade guard in `%pre`. The
+model-free `test-rpm-authselect` gate boots Fedora with systemd and exercises
+real authselect and PAM password success/failure across fresh, unselected,
+selected-retired, custom-profile, malformed-state, and authselect-absent
+transactions. It never changes the host PAM stack. The exact retired
+`facelock` selection blocks with manual backup-and-reselection guidance;
+ordinary selections are preserved and the new RPM ships no authselect profile
+or dependency.
+
+An already-installed v0.1.4 RPM cannot be retroactively guarded: direct
+uninstall runs only the scriptlets already installed from v0.1.4. Users must
+install a guarded release before a later uninstall so the guarded upgrade can
+retire the old authselect payload first.
 
 ### Release preflight (recommended)
 

@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   independent `--allow-sensitive` flag, matching `facelock pam add`; the flag
   requires `--pam`, conflicts with `--remove`, and is advertised by capability
   `setup-allow-sensitive`.
+- **Retired the packaged Fedora authselect profile** (#226): RPMs no longer
+  ship, select, or migrate a system-wide Facelock profile and no longer depend
+  on authselect. Fresh installs and ordinary upgrades leave the selected
+  provider and shared generated PAM files unchanged. An incoming upgrade stops
+  if the old exact `facelock` profile is still selected, with instructions to
+  choose an appropriate profile with an authselect backup before retrying;
+  malformed or unsafe selection state also fails closed. Explicit
+  service-scoped `facelock pam` setup remains the supported opt-in. An
+  already-installed v0.1.4 RPM cannot be retroactively guarded; users must
+  install a guarded release before a later uninstall so the guarded upgrade can
+  retire the old authselect payload first.
 - **`facelock pam status --all`** (#203): enumerate every service in the
   resolved pam.d directories that names `pam_facelock.so`, through the same row
   builder, `action` words and JSON document as `pam status --service`, so the

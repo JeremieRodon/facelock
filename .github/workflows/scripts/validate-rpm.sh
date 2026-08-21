@@ -22,7 +22,6 @@ CHECKS=(
   "dbus-1/system.d/org.facelock.Daemon.conf:D-Bus policy"
   "dbus-1/system-services/org.facelock.Daemon.service:D-Bus activation"
   "tmpfiles.d/facelock.conf:tmpfiles"
-  "authselect/vendor/facelock:authselect"
 )
 
 FAILED=0
@@ -87,6 +86,11 @@ else
     echo "FAIL: COPR RPM does not require Fedora onnxruntime"
     FAILED=1
   fi
+fi
+
+if grep -q '/authselect/' <<<"$CONTENTS"; then
+  echo "FAIL: retired authselect payload remains"
+  FAILED=1
 fi
 
 if [ "$FAILED" -ne 0 ]; then

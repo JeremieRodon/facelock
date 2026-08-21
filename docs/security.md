@@ -992,9 +992,13 @@ this transaction, plus retaining the package/module when it fails. Debian's
 separately managed `pam-auth-update` profile lifecycle and byte-exact rollback
 remain #224 scope; the current `prerm` removes that profile before invoking the
 shared direct-edit cleanup.
-Fedora authselect profile selection, regeneration, and rollback remain #226
-scope. This command treats `/etc/authselect` as detection-only and never edits
-generated profile state.
+The RPM retirement guard reads only `/etc/authselect/authselect.conf` before
+payload replacement. It requires fixed root ownership, mode, link count and a
+16 KiB bound, compares the first line's raw bytes before shell interpretation,
+and refuses a selected retired `facelock` profile or any malformed state. It
+never invokes authselect, chooses a replacement profile, or edits generated
+state. Independently, `pam remove --all` treats `/etc/authselect` as a
+detection-only root and never edits it.
 
 This does not implement #166's final emitted-byte freeze.
 

@@ -37,8 +37,11 @@ COPY .github/workflows/scripts/run-networkless.sh /run-networkless.sh
 COPY .github/workflows/scripts/validate-rpm.sh /validate-rpm.sh
 COPY test/pkg-validate.sh /pkg-validate.sh
 COPY test/polkit-agent-validate.sh /polkit-agent-validate.sh
+COPY test/rpm-service-pam-lifecycle.sh /rpm-service-pam-lifecycle.sh
 COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
-RUN chmod +x /build/test/build-rpm-prebuilt.sh /run-networkless.sh /validate-rpm.sh /pkg-validate.sh /polkit-agent-validate.sh
+RUN chmod +x /build/test/build-rpm-prebuilt.sh /run-networkless.sh \
+    /validate-rpm.sh /pkg-validate.sh /polkit-agent-validate.sh \
+    /rpm-service-pam-lifecycle.sh
 
 # Fetch and verify the same reviewed CPU-only archive as release.yml. This is a
 # distinct network stage; test/build-rpm-prebuilt.sh performs no downloads.
@@ -73,8 +76,8 @@ RUN curl --output /tmp/ort.tgz --proto '=https' --tlsv1.2 -fsSL "$ORT_SOURCE_URL
 # Build the .rpm from pre-built binaries and install it
 RUN /run-networkless.sh bash /build/test/build-rpm-prebuilt.sh "0.0.0" && \
     RPM_FILE="$(find . -maxdepth 1 -name '*.rpm' -print -quit)" && \
-    /validate-rpm.sh "$RPM_FILE" direct && \
     cp "$RPM_FILE" /facelock-test-package.rpm && \
+    /validate-rpm.sh /facelock-test-package.rpm direct && \
     dnf install -y ./*.rpm && \
     rm -rf ~/rpmbuild ./*.rpm
 

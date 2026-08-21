@@ -13,6 +13,7 @@ mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
 # Copy and patch the spec: replace cargo build commands with no-ops
 cp dist/facelock.spec ~/rpmbuild/SPECS/facelock.spec
+cp dist/rpm/facelock-authselect-retirement-guard ~/rpmbuild/SOURCES/facelock-authselect-retirement-guard
 sed -i "s|^Version:.*|Version:        ${VERSION}|" ~/rpmbuild/SPECS/facelock.spec
 sed -i "s|^Release:.*|Release:        1%{?dist}|" ~/rpmbuild/SPECS/facelock.spec
 sed -i 's|^cargo build.*|true|g' ~/rpmbuild/SPECS/facelock.spec

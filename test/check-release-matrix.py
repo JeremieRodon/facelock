@@ -25,6 +25,15 @@ def require(condition: bool, message: str) -> None:
         fail(message)
 
 
+def rust_array_body(source: str, name: str) -> str:
+    match = re.search(
+        rf"(?ms)^(?:pub )?const {re.escape(name)}:[^=]+?=\s*&\[(.*?)^\];",
+        source,
+    )
+    require(match is not None, f"Rust source must define parseable {name}")
+    return match.group(1)
+
+
 try:
     matrix = json.loads(MATRIX_PATH.read_text())
 except FileNotFoundError:
@@ -298,6 +307,71 @@ require(len(packit_target_list) == len(packit_targets), "Packit production COPR 
 require(packit_targets == packit_release_targets, f"Packit targets drifted: {sorted(packit_targets)}")
 
 workflow = (ROOT / ".github/workflows/release.yml").read_text()
+rpm_spec = (ROOT / "dist/facelock.spec").read_text()
+rpm_validator = (ROOT / ".github/workflows/scripts/validate-rpm.sh").read_text()
+rpm_package_fixture = (ROOT / "test/Containerfile.rpm-e2e").read_text()
+rpm_package_runner = (ROOT / "test/run-pkg-validate-systemd.sh").read_text()
+pam_source = (ROOT / "crates/facelock-cli/src/commands/pam.rs").read_text()
+setup_source = (ROOT / "crates/facelock-cli/src/commands/setup.rs").read_text()
+default_pam_service = re.search(
+    r'(?m)^pub const DEFAULT_PAM_SERVICE:\s*&str\s*=\s*"([^"]+)";',
+    pam_source,
+)
+require(default_pam_service is not None, "PAM source must define DEFAULT_PAM_SERVICE")
+require(
+    default_pam_service.group(1) == "sudo",
+    f"bare PAM operations must continue to default to sudo, got {default_pam_service.group(1)!r}",
+)
+require(
+    "facelock-authselect-retirement-guard" in rpm_spec,
+    "RPM release spec must install the retired-profile upgrade guard",
+)
+authselect_dependency = re.compile(
+    r"(?mi)^(?:Requires|Recommends)(?:\([^\n)]*\))?:[^\n]*"
+    r"(?<![A-Za-z0-9_.+-])authselect(?![A-Za-z0-9_.+-])"
+)
+require(
+    authselect_dependency.search(rpm_spec) is None,
+    "RPM release spec must not depend on or recommend authselect",
+)
+require(
+    "authselect/vendor/facelock" not in rpm_spec,
+    "RPM release spec must not ship the retired authselect profile",
+)
+require(
+    "authselect/vendor/facelock" not in rpm_validator,
+    "RPM release validator must not require the retired authselect profile",
+)
+require(
+    re.search(
+        r"(?m)^COPY test/rpm-service-pam-lifecycle\.sh /rpm-service-pam-lifecycle\.sh$",
+        rpm_package_fixture,
+    )
+    is not None,
+    "RPM package fixture must include the service-scoped PAM lifecycle",
+)
+require(
+    re.search(
+        r'(?m)^\s*podman exec "\$cid" /rpm-service-pam-lifecycle\.sh$',
+        rpm_package_runner,
+    )
+    is not None,
+    "booted RPM package runner must execute the service-scoped PAM lifecycle",
+)
+sensitive_services = set(
+    re.findall(r'(?m)^\s*"([^"]+)",\s*$', rust_array_body(pam_source, "SENSITIVE_SERVICES"))
+)
+candidate_body = rust_array_body(setup_source, "PAM_CANDIDATES")
+candidate_services = set(re.findall(r'\bservice:\s*"([^"]+)"', candidate_body))
+require(sensitive_services, "PAM sensitive-service authority must not be empty")
+require(
+    len(candidate_services) == candidate_body.count("PamCandidate {"),
+    "every setup PAM candidate must have one parseable service name",
+)
+require(
+    candidate_services.isdisjoint(sensitive_services),
+    f"setup PAM candidates include sensitive services: {sorted(candidate_services & sensitive_services)}",
+)
 for suite, details in suite_map.items():
     expected_block = re.compile(
         rf"(?m)^\s+- suite: {re.escape(suite)}\s*$\n"

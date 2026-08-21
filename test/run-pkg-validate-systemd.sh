@@ -82,4 +82,8 @@ if [ "${#onnx[@]}" -gt 0 ]; then
     '
 fi
 
+if podman exec "$cid" test -x /rpm-service-pam-lifecycle.sh; then
+    podman exec "$cid" /rpm-service-pam-lifecycle.sh
+fi
+
 podman exec "${exec_env[@]}" "$cid" /pkg-validate.sh

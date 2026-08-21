@@ -373,12 +373,13 @@ distribution that ships face auth in its own PAM stack is configured, and
 saying otherwise would send an integrator off to create a copy that adds
 nothing.
 
-**Direct service-file editing is the Arch-family path.** Debian and Ubuntu
-compose their stacks with `pam-auth-update` from profiles in
-`/usr/share/pam-configs/`, and Fedora and RHEL with `authselect` (see
-`dist/authselect/facelock`); on those systems a hand-inserted line is
-overwritten by the tool that owns the file. Being able to resolve a vendor
-directory does not make this command idiomatic there.
+**Managed shared stacks are not leaf services.** Debian and Ubuntu compose
+their shared stacks with `pam-auth-update`; Fedora and RHEL use `authselect`.
+Facelock does not write through either manager's generated shared files.
+Explicit named leaf services remain supported on every package family: the
+writer resolves and edits only that requested service under the fixed PAM
+roots, while the sensitive-service gate and no-follow checks refuse generated
+`system-auth` and `password-auth` links.
 
 **Confinement.** A service name is **one path component**: not empty, no `/`,
 not `.` or `..`, no interior NUL. Rejected before any I/O, on `add`, `remove`
@@ -1015,10 +1016,11 @@ The all-or-nothing guarantee covers direct PAM edits owned and scanned by this
 transaction and retention of the package/module when that cleanup fails. It
 does not cover every package-manager or profile side effect. Debian `prerm`
 currently invokes tolerant `pam-auth-update --remove facelock` before shared
-cleanup; byte-exact profile lifecycle and rollback are #224 scope. Fedora
-authselect profile selection, regeneration and rollback are #226 scope;
-`remove --all` only scans `/etc/authselect` as a detection-only root and never
-edits generated state.
+cleanup; byte-exact profile lifecycle and rollback are #224 scope. Fedora is
+separate: #226 owns only RPM payload retirement and the read-only upgrade guard.
+Shared-stack migration, regeneration, editing and rollback are explicitly rejected.
+Automatic profile selection is also rejected. `remove --all` only scans
+`/etc/authselect` as a detection-only root and never edits generated state.
 
 **`--json`** emits exactly one document on stdout and no human text; `--quiet`
 suppresses even that, leaving the exit code as the whole answer, as it does for
@@ -2110,6 +2112,51 @@ RPM and Arch have no Debian-style second `purge` phase. Their ordinary erase
 therefore removes static integration and safely cleaned PAM provenance, while
 preserving biometric state and whatever administrator-configuration artifact
 their package manager retained.
+
+### Fedora authselect retirement boundary
+
+The RPM does not ship or select an authselect profile, does not edit
+`system-auth` or `password-auth`, and has no runtime or scriptlet dependency on
+authselect. Fresh installation is PAM-inert. The supported opt-in is an
+explicit, named leaf service through `facelock pam add --service <name>` or its
+`setup --pam --service <name>` alias. That operation edits only the resolved
+leaf service plus Facelock's fixed backup state; the selected authselect profile
+and shared generated files remain byte-for-byte unchanged.
+
+An incoming RPM upgrade runs the source-controlled
+`facelock-authselect-retirement-guard` from `%pre`, while the old payload is
+still installed. A fresh transaction is an immediate no-op. An upgrade also
+succeeds without authselect installed or when the fixed selection-state file
+`/etc/authselect/authselect.conf` is absent.
+
+An already-installed v0.1.4 RPM cannot be retroactively guarded: direct
+uninstall runs only that installed release's unguarded scriptlets.
+Administrators must install a guarded release before a later uninstall so the
+upgrade guard can first retire the old authselect payload safely.
+
+When that file exists, the guard reads no other authselect path and invokes no
+authselect command. It requires a root-owned, root-group, regular, single-link
+0644 file of at most 16 KiB, compares the first line's original bytes with its
+shell-decoded value so no NUL or other control byte can be discarded, and then
+accepts only the profile grammar used by authselect: one confined profile
+identifier, `custom/<identifier>`, or `@system-default`. A malformed, linked,
+oversized, control-bearing, or wrong-metadata file is untrusted and blocks the
+package transaction without changing it.
+
+The exact retired profile identifier `facelock` also blocks upgrade. The
+diagnostic requires the administrator to inspect the active identity provider
+and features, select an appropriate supported profile while asking authselect
+to create a backup, and retry the RPM transaction. Facelock does not guess a
+replacement or migrate generated PAM state. A different valid identifier,
+including the separately administrator-owned `custom/facelock`, is preserved
+unchanged and does not block the upgrade.
+
+The booted Fedora lifecycle test uses the released 0.1.4 RPM to prove fresh,
+unselected, selected-retired, custom-profile, malformed-state, and
+authselect-absent upgrade cases. It also proves correct and wrong password
+fallback through the real selected profile, and the real RPM package test
+proves that service-scoped setup and removal leave the selection and shared
+generated files unchanged. Neither test mutates the host PAM stack.
 
 ### Fixed-root purge boundary
 

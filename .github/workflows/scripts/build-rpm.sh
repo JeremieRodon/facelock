@@ -26,6 +26,8 @@ raise SystemExit("networkless sandbox is not enforced")
 PKG_VERSION_RAW="${1:?Usage: build-rpm.sh <VERSION_RAW> <PRERELEASE_COUNTER>}"
 PRERELEASE_COUNTER="${2:?Usage: build-rpm.sh <VERSION_RAW> <PRERELEASE_COUNTER>}"
 # shellcheck source=../../../scripts/release-versions.sh
+# Resolved from SCRIPT_DIR at runtime.
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/../../../scripts/release-versions.sh"
 PKG_VERSION="$(release_rpm_version "$PKG_VERSION_RAW")"
 PKG_RELEASE="$(release_rpm_release "$PKG_VERSION_RAW" "$PRERELEASE_COUNTER")%{?dist}"
@@ -55,6 +57,7 @@ mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
 # Copy spec file and set version/release
 cp dist/facelock.spec ~/rpmbuild/SPECS/facelock.spec
+cp dist/rpm/facelock-authselect-retirement-guard ~/rpmbuild/SOURCES/facelock-authselect-retirement-guard
 sed -i "s|^Version:.*|Version:        ${PKG_VERSION}|" ~/rpmbuild/SPECS/facelock.spec
 sed -i "s|^Release:.*|Release:        ${PKG_RELEASE}|" ~/rpmbuild/SPECS/facelock.spec
 

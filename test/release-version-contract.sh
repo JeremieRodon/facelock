@@ -214,8 +214,46 @@ export XDG_RUNTIME_DIR="$tmp_root/runtime"
 release_repo="$tmp_root/release-repo"
 matrix_root="$tmp_root/matrix-root"
 mkdir -p "$release_repo/debian" "$release_repo/dist" "$release_repo/scripts" "$tmp_root/bin" "$XDG_RUNTIME_DIR"
-mkdir -p "$matrix_root/.claude/skills/packaging-test" "$matrix_root/.claude/skills/release" "$matrix_root/.github/ISSUE_TEMPLATE" "$matrix_root/.github/workflows/scripts" "$matrix_root/book/src" "$matrix_root/dist/apt/conf" "$matrix_root/debian" "$matrix_root/dist/nix" "$matrix_root/docs/adr" "$matrix_root/test" "$matrix_root/website"
+mkdir -p "$matrix_root/.claude/skills/packaging-test" "$matrix_root/.claude/skills/release" "$matrix_root/.github/ISSUE_TEMPLATE" "$matrix_root/.github/workflows/scripts" "$matrix_root/book/src" "$matrix_root/crates/facelock-cli/src/commands" "$matrix_root/dist/apt/conf" "$matrix_root/debian" "$matrix_root/dist/nix" "$matrix_root/docs/adr" "$matrix_root/test" "$matrix_root/website"
 cp "$repo_root/.claude/skills/packaging-test/SKILL.md" "$matrix_root/.claude/skills/packaging-test/"
+
+rpm_query_failure_output=
+if rpm_query_failure_output=$(
+    FACELOCK_TEST_RPM="$tmp_root/missing.rpm" \
+        bash "$repo_root/test/rpm-authselect-contract.sh" 2>&1
+); then
+    fail "RPM authselect contract accepted an unreadable artifact"
+fi
+case "$rpm_query_failure_output" in
+    *"cannot query RPM payload inventory"*) ;;
+    *) fail "RPM authselect contract omitted the explicit payload query failure: $rpm_query_failure_output" ;;
+esac
+
+rpm_query_bin="$tmp_root/rpm-query-bin"
+mkdir -p "$rpm_query_bin"
+cat > "$rpm_query_bin/rpm" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-qpl" ]; then
+    printf '%s\n' /usr/bin/facelock
+    exit 0
+fi
+if [ "${1:-}" = "-qp" ] && [ "${2:-}" = "--requires" ]; then
+    exit 42
+fi
+exit 43
+SH
+chmod +x "$rpm_query_bin/rpm"
+rpm_dependency_failure_output=
+if rpm_dependency_failure_output=$(
+    PATH="$rpm_query_bin:$PATH" FACELOCK_TEST_RPM="$tmp_root/queryable.rpm" \
+        bash "$repo_root/test/rpm-authselect-artifact-contract.sh" 2>&1
+); then
+    fail "RPM artifact contract accepted a failed dependency query"
+fi
+case "$rpm_dependency_failure_output" in
+    *"cannot query RPM dependency inventory"*) ;;
+    *) fail "RPM artifact contract omitted the explicit dependency query failure: $rpm_dependency_failure_output" ;;
+esac
 cp "$repo_root/.claude/skills/release/SKILL.md" "$matrix_root/.claude/skills/release/"
 cp "$repo_root/.packit.yaml" "$matrix_root/"
 cp "$repo_root/justfile" "$matrix_root/"
@@ -224,6 +262,7 @@ cp "$repo_root/.github/workflows/release.yml" "$matrix_root/.github/workflows/"
 cp "$repo_root/.github/workflows/scripts/build-deb.sh" "$matrix_root/.github/workflows/scripts/"
 cp "$repo_root/.github/workflows/scripts/publish-apt.sh" "$matrix_root/.github/workflows/scripts/"
 cp "$repo_root/.github/workflows/scripts/publish-aur.sh" "$matrix_root/.github/workflows/scripts/"
+cp "$repo_root/.github/workflows/scripts/validate-rpm.sh" "$matrix_root/.github/workflows/scripts/"
 cp "$repo_root/dist/PKGBUILD" "$repo_root/dist/PKGBUILD-bin" "$repo_root/dist/PKGBUILD-git" "$repo_root/dist/facelock.spec" "$repo_root/dist/release-matrix.json" "$matrix_root/dist/"
 cp "$repo_root/dist/apt/conf/distributions" "$matrix_root/dist/apt/conf/"
 cp "$repo_root/debian/rules" "$matrix_root/debian/"
@@ -234,10 +273,14 @@ cp "$repo_root/docs/testing-roadmap.md" "$matrix_root/docs/"
 cp "$repo_root/README.md" "$repo_root/CONTRIBUTING.md" "$matrix_root/"
 cp "$repo_root/book/src/quickstart.md" "$repo_root/book/src/contributing.md" "$repo_root/book/src/compatibility.md" "$matrix_root/book/src/"
 cp "$repo_root/.github/ISSUE_TEMPLATE/bug_report.md" "$matrix_root/.github/ISSUE_TEMPLATE/"
+cp "$repo_root/crates/facelock-cli/src/commands/pam.rs" "$matrix_root/crates/facelock-cli/src/commands/"
+cp "$repo_root/crates/facelock-cli/src/commands/setup.rs" "$matrix_root/crates/facelock-cli/src/commands/"
 cp "$repo_root/website/index.html" "$matrix_root/website/"
 cp "$repo_root/test/check-release-matrix.py" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile" "$matrix_root/test/"
+cp "$repo_root/test/Containerfile.rpm-e2e" "$matrix_root/test/"
 cp "$repo_root/test/copr-build.sh" "$matrix_root/test/"
+cp "$repo_root/test/run-pkg-validate-systemd.sh" "$matrix_root/test/"
 
 apt_publisher_root="$tmp_root/apt-publisher-root"
 mkdir -p "$apt_publisher_root/.github/workflows/scripts" "$apt_publisher_root/scripts" "$apt_publisher_root/debs"
@@ -292,6 +335,7 @@ assert_matrix_mutation_rejected() {
     if RELEASE_MATRIX_VERSION=0.2.0 python3 "$mutation_root/test/check-release-matrix.py" >/dev/null 2>&1; then
         fail "release matrix checker accepted drift: $context"
     fi
+    echo "release matrix mutation case: $context rejected"
 }
 
 assert_matrix_payload_mutation_rejected_with_diagnostic() {
@@ -498,6 +542,28 @@ assert_extra_packit_job_rejected \
     "invalid targets outside production and staging" \
     '{"job":"copr_build","trigger":"pull_request","owner":"tyvsmith","project":"facelock-scratch","targets":"fedora-43-x86_64"}'
 
+assert_matrix_mutation_rejected \
+    "RPM authselect scriptlet dependency" \
+    "dist/facelock.spec" \
+    's/Requires(pre):  coreutils/Requires(pre):  authselect/'
+assert_matrix_mutation_rejected \
+    "RPM service-scoped PAM lifecycle omitted from package fixture" \
+    "test/Containerfile.rpm-e2e" \
+    's@COPY test/rpm-service-pam-lifecycle.sh /rpm-service-pam-lifecycle.sh@COPY test/rpm-service-pam-lifecycle.sh /rpm-service-pam-lifecycle-disabled.sh@'
+# The variable is literal fixture text inside the sed expression.
+# shellcheck disable=SC2016
+assert_matrix_mutation_rejected \
+    "RPM service-scoped PAM lifecycle omitted from booted runner" \
+    "test/run-pkg-validate-systemd.sh" \
+    's@podman exec "$cid" /rpm-service-pam-lifecycle.sh@podman exec "$cid" /rpm-service-pam-lifecycle-disabled.sh@'
+assert_matrix_mutation_rejected \
+    "sensitive shared stack offered as a setup candidate" \
+    "crates/facelock-cli/src/commands/setup.rs" \
+    '/const PAM_CANDIDATES/,/^];/s/service: "sudo"/service: "system-auth"/'
+assert_matrix_mutation_rejected \
+    "bare PAM service default drifted from sudo" \
+    "crates/facelock-cli/src/commands/pam.rs" \
+    '/pub const DEFAULT_PAM_SERVICE/s/"sudo"/"doas"/'
 assert_matrix_mutation_rejected \
     "trixie workflow variant axis reintroduced" \
     ".github/workflows/release.yml" \

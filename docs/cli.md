@@ -650,6 +650,12 @@ Machine-wide `pam remove --all` deliberately ignores that setting, scans the
 compiled system roots `/etc/pam.d` and `/usr/lib/pam.d`, and separately scans
 the fixed detection-only generated root `/etc/authselect`.
 
+Fedora RPMs support the same service-scoped leaf-file setup. They do not ship
+or select an authselect profile, and Facelock never writes the generated
+`system-auth` or `password-auth` files. Choose an application-owned leaf such
+as `sudo`, `polkit-1`, or another explicit service; generated authselect symlinks
+are refused by the writer's no-follow checks.
+
 ### facelock pam add
 
 ```bash

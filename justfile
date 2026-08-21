@@ -79,6 +79,7 @@ check-agent-docs base='':
         python3 test/check-agent-docs.py
     fi
     bash test/lifecycle-ownership-contract.sh
+    bash test/rpm-authselect-contract.sh
 
 # Run all checks (test + lint + format + audit + PAM standalone surface + agent docs)
 check: test lint fmt-check audit check-pam-standalone check-agent-docs test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test
@@ -915,6 +916,12 @@ test-rpm: build-release
     set -euo pipefail
     podman build -t facelock-rpm-test -f test/Containerfile.fedora .
     podman run --rm facelock-rpm-test
+
+# Static and booted, model-free Fedora authselect retirement lifecycle.
+test-rpm-authselect:
+    bash test/rpm-authselect-contract.sh
+    podman build -t facelock-rpm-authselect-test -f test/Containerfile.rpm-authselect .
+    bash test/run-rpm-authselect-systemd.sh facelock-rpm-authselect-test
 
 # Run both exact supported-suite Debian package gates.
 test-deb: test-deb-trixie-pkg test-deb-resolute-pkg
