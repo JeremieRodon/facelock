@@ -193,6 +193,7 @@ require_text "$repo_root/test/build-rpm-authselect-fixtures.sh" \
     '"$repo_root/.github/workflows/scripts/validate-rpm.sh" "$new_rpm" copr'
 require_text "$repo_root/test/Containerfile.rpm-authselect" \
     'COPY .github/workflows/scripts/run-networkless.sh /run-networkless.sh'
+require_text "$repo_root/test/Containerfile.rpm-authselect" "python3"
 require_text "$repo_root/test/Containerfile.rpm-authselect" \
     '/run-networkless.sh /build/test/build-rpm-authselect-fixtures.sh'
 
