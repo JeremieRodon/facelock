@@ -125,7 +125,7 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use dialoguer::Confirm;
@@ -506,6 +506,12 @@ fn secure_state_directory(directory: &fs::File, expected_owner: (u32, u32)) -> s
     directory.sync_all()
 }
 
+fn create_state_directory(root: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(PAM_BACKUPS_DIR_MODE);
+    builder.create(root)
+}
+
 /// One complete mutation of PAM configuration and its rollback state.
 /// Holding the state-directory flock in this guard prevents recovery or a
 /// competing writer from observing a prepared pair between publication and
@@ -684,7 +690,7 @@ impl BackupStore {
                     format!("{} is not a directory", root.display()),
                 ));
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir(root)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => create_state_directory(root)?,
             Err(error) => return Err(error),
         }
 
@@ -6929,6 +6935,20 @@ mod tests {
             fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o7777,
             0o700
         );
+    }
+
+    #[test]
+    fn new_state_directory_is_never_group_or_world_accessible() {
+        let root = tempfile::tempdir().unwrap();
+        let backup_dir = root.path().join("pam-backups");
+
+        create_state_directory(&backup_dir).unwrap();
+
+        let mode = fs::symlink_metadata(&backup_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
     }
 
     #[test]
