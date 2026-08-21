@@ -235,7 +235,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Resolute only**: both suites ship one TPM-enabled `facelock` package. Debian
   source packages include deterministic Cargo-vendor and reviewed ONNX Runtime
   components and rebuild with network access denied from declared distro Rust
-  toolchains. Bookworm and Noble remain historical, unsupported artifacts.
+  toolchains. The packaged `pam-auth-update` profile is opt-in, so a fresh
+  install leaves `common-auth` unchanged. Bookworm and Noble remain historical,
+  unsupported artifacts.
 
 - **Desktop integrations now own their setup and removal wrappers** (#173):
   added `docs/integrating.md` with the stable capability, enrollment, PAM

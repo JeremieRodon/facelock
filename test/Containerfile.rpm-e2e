@@ -4,7 +4,7 @@ FROM registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e9
 
 # dbus-daemon (Fedora ships dbus-broker by default) is needed for the runtime
 # D-Bus tests in pkg-validate.sh, including the polkit agent boundary check.
-RUN dnf -y install pam dbus dbus-daemon rpm-build systemd binutils glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 util-linux && dnf clean all
+RUN dnf -y install pam authselect dbus dbus-daemon rpm-build systemd binutils glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 util-linux && dnf clean all
 
 # Build pamtester from source (not in Fedora repos)
 COPY test/install-pamtester.sh /tmp/install-pamtester.sh
@@ -76,8 +76,8 @@ RUN curl --output /tmp/ort.tgz --proto '=https' --tlsv1.2 -fsSL "$ORT_SOURCE_URL
 # Build the .rpm from pre-built binaries and install it
 RUN /run-networkless.sh bash /build/test/build-rpm-prebuilt.sh "0.0.0" && \
     RPM_FILE="$(find . -maxdepth 1 -name '*.rpm' -print -quit)" && \
+    /validate-rpm.sh "$RPM_FILE" direct && \
     cp "$RPM_FILE" /facelock-test-package.rpm && \
-    /validate-rpm.sh /facelock-test-package.rpm direct && \
     dnf install -y ./*.rpm && \
     rm -rf ~/rpmbuild ./*.rpm
 

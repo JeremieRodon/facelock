@@ -27,6 +27,18 @@ for path in "${required_metadata[@]}"; do
     [ -f "$path" ] || fail "missing canonical metadata: $path"
 done
 
+grep -Eq '^Default:[[:space:]]*no[[:space:]]*$' debian/pam-auth-update ||
+    fail "Debian pam-auth-update profile must be opt-in"
+grep -Fq 'pam-auth-update --package' debian/postinst ||
+    fail "Debian postinst must register/update the opt-in PAM profile"
+grep -Fq 'pam-auth-update --remove facelock' debian/prerm ||
+    fail "Debian prerm must retire the packaged PAM profile"
+grep -Fq 'facelock pam remove --all' debian/prerm ||
+    fail "Debian prerm must delegate direct-edit cleanup to pam remove --all"
+if grep -Eq 'FACELOCK_PAM_SERVICES=|sed -i .pam_facelock' debian/prerm; then
+    fail "Debian prerm must not carry a fixed PAM service list or raw sed cleanup"
+fi
+
 [ ! -e dist/debian ] || fail "retired dist/debian metadata still exists"
 [ ! -e debian/compat ] || fail "debhelper compat must be declared once, in Build-Depends"
 if rg -n 'dist/debian' justfile scripts test .github .claude crates docs/security.md docs/releasing.md \
@@ -176,6 +188,8 @@ grep -Fq 'path-include=/usr/share/doc/facelock/**' test/Containerfile.deb-runtim
     fail "Debian runtime fixture must preserve Facelock legal/provenance documents"
 grep -Fq '> /etc/dpkg/dpkg.cfg.d/zz-facelock-test-docs' test/Containerfile.deb-runtime ||
     fail "Debian runtime fixture's Facelock include must sort after base-image exclusions"
+grep -Fq '/facelock-common-auth-install-invariant' test/Containerfile.deb-runtime ||
+    fail "Debian runtime fixture must prove fresh install leaves common-auth unchanged"
 
 # Match literal source text in the runner, not this contract's working tree.
 # shellcheck disable=SC2016

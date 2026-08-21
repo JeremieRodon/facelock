@@ -1206,11 +1206,12 @@ for cleanup; custom control, spacing, or options block the whole-machine run
 for administrator review rather than being rewritten.
 
 This emitted-byte contract applies only to direct CLI service-file writes.
-The Debian `pam-auth-update` profile intentionally emits
-`[success=end default=ignore] pam_facelock.so`, and the Fedora authselect
-profiles use authselect's generated layout. Both remain visible to the same
-broad `add`/`status` active-reference recognition, but neither is required to
-match the canonical direct-writer bytes.
+The packaged Debian `pam-auth-update` profile is opt-in (`Default: no`) and
+intentionally emits `[success=end default=ignore] pam_facelock.so`. Legacy or
+administrator-managed Fedora authselect profiles use authselect's generated
+layout; Facelock RPMs no longer ship or select one. Both shapes remain visible
+to the same broad `add`/`status` active-reference recognition, but neither is
+required to match the canonical direct-writer bytes.
 
 **Service-file edits are byte-preserving.** A backslash followed only by spaces
 or tabs before LF or CRLF continues the same logical PAM rule, so insertion

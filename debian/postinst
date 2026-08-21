@@ -61,7 +61,7 @@ case "$1" in
         dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
             /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
 
-        # Configure PAM via pam-auth-update (Debian/Ubuntu)
+        # Register/update the packaged opt-in profile without selecting it.
         if [ -x /usr/sbin/pam-auth-update ]; then
             pam-auth-update --package 2>/dev/null || true
         fi

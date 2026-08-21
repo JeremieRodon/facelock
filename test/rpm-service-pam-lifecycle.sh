@@ -165,17 +165,12 @@ authselect_is_unchanged || fail "vendor-only setup changed authselect state"
 pass "vendor-only leaf setup leaves the vendor service unchanged"
 
 /usr/bin/facelock pam remove --service "$vendor_service" --no-confirm >/dev/null
-[ -f "$vendor_override" ] && [ ! -L "$vendor_override" ] || \
-    fail "vendor-only removal lost the current lane's local override"
-if grep -qF 'pam_facelock.so' "$vendor_override"; then
-    fail "vendor-only removal retained the Facelock rule"
-fi
-grep -qxF 'auth      required pam_unix.so' "$vendor_override" || \
-    fail "vendor-only removal lost the password fallback"
+[ ! -e "$vendor_override" ] && [ ! -L "$vendor_override" ] || \
+    fail "vendor-only removal retained the unchanged Facelock-created override"
 snapshot_file "$vendor_path" | cmp -s - "$snapshot_dir/vendor.before" || \
     fail "vendor-only removal changed the vendor service"
 authselect_is_unchanged || fail "vendor-only removal changed authselect state"
-pass "vendor-only leaf removal removes only the Facelock rule"
+pass "vendor-only leaf removal retires the unchanged Facelock override"
 
 printf '%s\n' '# administrator-owned PAM sentinel' >"$outside_path"
 outside_hash="$(sha256sum "$outside_path" | awk '{print $1}')"

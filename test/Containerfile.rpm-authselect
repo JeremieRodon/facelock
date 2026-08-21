@@ -26,11 +26,15 @@ COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/
 COPY dist/ /build/dist/
 COPY test/build-rpm-prebuilt.sh /build/test/build-rpm-prebuilt.sh
+COPY .github/workflows/scripts/run-networkless.sh /run-networkless.sh
+COPY .github/workflows/scripts/validate-rpm.sh /build/.github/workflows/scripts/validate-rpm.sh
 COPY test/rpm-authselect-artifact-contract.sh /build/test/rpm-authselect-artifact-contract.sh
 COPY test/build-rpm-authselect-fixtures.sh /build/test/build-rpm-authselect-fixtures.sh
 RUN chmod +x /build/test/build-rpm-prebuilt.sh \
+        /run-networkless.sh \
+        /build/.github/workflows/scripts/validate-rpm.sh \
         /build/test/build-rpm-authselect-fixtures.sh \
-    && /build/test/build-rpm-authselect-fixtures.sh
+    && /run-networkless.sh /build/test/build-rpm-authselect-fixtures.sh
 
 RUN useradd -m facelock-password-user \
     && echo 'facelock-password-user:correct-password' | chpasswd

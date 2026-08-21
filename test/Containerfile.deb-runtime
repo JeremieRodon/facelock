@@ -22,8 +22,15 @@ RUN printf '%s\n' \
         > /etc/dpkg/dpkg.cfg.d/zz-facelock-test-docs
 
 COPY facelock-test-package.deb /facelock-test-package.deb
-RUN apt-get update && \
+RUN cp /etc/pam.d/common-auth /tmp/common-auth.before && \
+    stat -c '%a %u %g' /etc/pam.d/common-auth > /tmp/common-auth.metadata.before && \
+    apt-get update && \
     apt-get install -y /facelock-test-package.deb && \
+    cmp -s /etc/pam.d/common-auth /tmp/common-auth.before && \
+    test "$(stat -c '%a %u %g' /etc/pam.d/common-auth)" = "$(cat /tmp/common-auth.metadata.before)" && \
+    ! grep -q pam_facelock.so /etc/pam.d/common-auth && \
+    touch /facelock-common-auth-install-invariant && \
+    rm -f /tmp/common-auth.before /tmp/common-auth.metadata.before && \
     rm -rf /var/lib/apt/lists/*
 
 COPY test/pkg-validate.sh /pkg-validate.sh

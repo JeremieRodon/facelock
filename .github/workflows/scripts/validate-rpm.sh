@@ -92,6 +92,10 @@ if grep -q '/authselect/' <<<"$CONTENTS"; then
   echo "FAIL: retired authselect payload remains"
   FAILED=1
 fi
+if grep -Eq '(^|[[:space:]])authselect([[:space:]]|$)' <<<"$REQUIRES"; then
+  echo "FAIL: RPM depends on retired authselect"
+  FAILED=1
+fi
 
 if [ "$FAILED" -ne 0 ]; then
   echo "=== .rpm validation FAILED ==="

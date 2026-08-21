@@ -1,5 +1,5 @@
 Name: Facelock face authentication
-Default: yes
+Default: no
 Priority: 900
 Auth-Type: Primary
 Auth:

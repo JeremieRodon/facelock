@@ -1499,10 +1499,9 @@ impl BackupStore {
         }
         if result.as_ref().is_err_and(|error| {
             error.kind() == ErrorKind::Interrupted || is_ambiguous_publication(error)
-        }) {
-            if let Err(error) = result {
-                return Err(error);
-            }
+        }) && let Err(error) = result
+        {
+            return Err(error);
         }
         let cleanup = self.finish_publication_state(
             &intent_name,
@@ -2232,17 +2231,15 @@ impl BackupStore {
                     &publication.binding.backup,
                     &expected,
                     |_| Ok(()),
-                ) {
-                    if is_ambiguous_publication(&error)
-                        || error.kind() == std::io::ErrorKind::Interrupted
-                    {
-                        return Err(error);
-                    }
-                    // A deterministic vendor mismatch restores the exact
-                    // quarantined inode to the canonical name. The removal
-                    // publication is complete even though retirement was
-                    // declined, so its state evidence may now be finalized.
+                ) && (is_ambiguous_publication(&error)
+                    || error.kind() == std::io::ErrorKind::Interrupted)
+                {
+                    return Err(error);
                 }
+                // A deterministic vendor mismatch restores the exact
+                // quarantined inode to the canonical name. The removal
+                // publication is complete even though retirement was
+                // declined, so its state evidence may now be finalized.
             }
         }
         self.finish_recovered_publication(intent, publication)

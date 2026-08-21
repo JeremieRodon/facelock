@@ -22,11 +22,13 @@ cp /usr/bin/true "$repo_root/target/release/facelock-polkit-agent"
 cp /usr/bin/true "$repo_root/target/release/libpam_facelock.so"
 (
     cd "$repo_root"
-    bash test/build-rpm-prebuilt.sh 0.2.0
+    bash test/build-rpm-prebuilt.sh 0.2.0 copr
 )
 new_rpm="$(find "$repo_root" -maxdepth 1 -type f -name 'facelock-0.2.0-1*.rpm' -print -quit)"
 [ -n "$new_rpm" ]
 cp "$new_rpm" "$artifacts/facelock-new.rpm"
+
+"$repo_root/.github/workflows/scripts/validate-rpm.sh" "$new_rpm" copr
 
 FACELOCK_TEST_RPM="$artifacts/facelock-new.rpm" \
     bash "$repo_root/test/rpm-authselect-artifact-contract.sh"

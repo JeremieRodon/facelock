@@ -86,7 +86,7 @@ require_text "$service_lifecycle" \
 require_text "$service_lifecycle" \
     "vendor-only leaf setup leaves the vendor service unchanged"
 require_text "$service_lifecycle" \
-    "vendor-only leaf removal removes only the Facelock rule"
+    "vendor-only leaf removal retires the unchanged Facelock override"
 require_text "$service_lifecycle" \
     "outbound PAM service symlink is refused"
 require_text "$service_lifecycle" \
@@ -107,10 +107,14 @@ require_text "$package_fixture" \
     "COPY test/rpm-service-pam-lifecycle.sh /rpm-service-pam-lifecycle.sh"
 require_text "$package_fixture" \
     "COPY .github/workflows/scripts/validate-rpm.sh /validate-rpm.sh"
-require_text "$package_fixture" "/validate-rpm.sh /facelock-test-package.rpm"
+# The variable is literal Containerfile source text.
+# shellcheck disable=SC2016
+require_text "$package_fixture" '/validate-rpm.sh "$RPM_FILE" direct'
+require_text "$package_fixture" "authselect"
 require_text "$package_runner" "/rpm-service-pam-lifecycle.sh"
 reject_text "$package_validator" "facelock-rpm-service"
 reject_text "$rpm_validator" "authselect/vendor/facelock"
+require_text "$rpm_validator" "RPM depends on retired authselect"
 require_text "$contracts" \
     "The RPM does not ship or select an authselect profile"
 require_text "$contracts" \
@@ -178,6 +182,19 @@ for builder in \
     reject_text "$builder" "facelock-authselect-migrate"
     reject_text "$builder" "facelock-authselect-known-profiles"
 done
+# The parameter expansion is literal builder source text.
+# shellcheck disable=SC2016
+require_text "$repo_root/test/build-rpm-prebuilt.sh" 'CHANNEL="${2:-direct}"'
+require_text "$repo_root/test/build-rpm-authselect-fixtures.sh" \
+    'bash test/build-rpm-prebuilt.sh 0.2.0 copr'
+# The variables are literal fixture source text.
+# shellcheck disable=SC2016
+require_text "$repo_root/test/build-rpm-authselect-fixtures.sh" \
+    '"$repo_root/.github/workflows/scripts/validate-rpm.sh" "$new_rpm" copr'
+require_text "$repo_root/test/Containerfile.rpm-authselect" \
+    'COPY .github/workflows/scripts/run-networkless.sh /run-networkless.sh'
+require_text "$repo_root/test/Containerfile.rpm-authselect" \
+    '/run-networkless.sh /build/test/build-rpm-authselect-fixtures.sh'
 
 if [ -f "$guard" ]; then
     require_text "$guard" "state=/etc/authselect/authselect.conf"

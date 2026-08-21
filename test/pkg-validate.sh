@@ -408,18 +408,13 @@ rm -rf /var/lib/facelock/models
 export ORT_DYLIB_PATH=/facelock-test-missing-onnxruntime.so
 
 if [ "$PACKAGE_FORMAT" = deb ]; then
-    # #224 owns Debian profile lifecycle and rollback. Keep this case visible:
-    # today's prerm asks pam-auth-update to remove the active package profile
-    # before the #227 direct-edit transaction runs. A later direct blocker
-    # aborts dpkg and retains the package/module, but does not promise to roll
-    # that separately managed common-auth change back.
-    run_test "dpkg abort coverage starts with the pam-auth-update profile active" \
-        "grep -q pam_facelock.so /etc/pam.d/common-auth"
+    run_test "fresh Debian install leaves common-auth unchanged and Facelock-free" \
+        "[ -f /facelock-common-auth-install-invariant ] && ! grep -q pam_facelock.so /etc/pam.d/common-auth"
     sha256sum /etc/pam.d/common-auth > /tmp/facelock-common-auth.before
     run_test "dpkg removal aborts on an unmanaged PAM reference" \
         "! dpkg -r facelock"
-    run_test "#224-deferred profile mutation is visible after aborted dpkg removal" \
-        "! sha256sum -c --status /tmp/facelock-common-auth.before && ! grep -q pam_facelock.so /etc/pam.d/common-auth"
+    run_test "aborted dpkg removal leaves inactive common-auth bytes unchanged" \
+        "sha256sum -c --status /tmp/facelock-common-auth.before && ! grep -q pam_facelock.so /etc/pam.d/common-auth"
     run_test "dpkg keeps the package installed after aborted removal" \
         "dpkg-query -W -f='\${binary:Package}\n' facelock | grep -qx facelock"
     run_test "PAM module remains after aborted package removal" \

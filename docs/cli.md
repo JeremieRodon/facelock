@@ -797,12 +797,13 @@ and `dnf` frontends through abort retention and blocker-free success. Arch
 packages also ship a Remove-only libalpm `PreTransaction` hook with
 `AbortOnFail`, so pacman stops before removing either file.
 This all-or-nothing promise covers direct PAM edits owned by this command.
-Debian's separately managed `pam-auth-update` profile lifecycle and byte-exact
-profile rollback are tracked in #224; the current `prerm` removes that profile
-before calling the shared direct-edit cleanup.
-Fedora's authselect profile lifecycle is tracked separately in #226; this
-command only detects references in generated `/etc/authselect` state and never
-changes that state.
+The packaged Debian `pam-auth-update` profile is opt-in (`Default: no`), so
+fresh installation leaves `common-auth` unchanged. Its separately managed
+profile lifecycle and byte-exact rollback are tracked in #224; the current
+`prerm` removes that profile before calling the shared direct-edit cleanup.
+Fedora #226 retired the packaged authselect profile and added a read-only
+upgrade guard. This command only detects references in generated
+`/etc/authselect` state and never changes that state.
 
 ### facelock pam status
 
