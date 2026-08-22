@@ -482,8 +482,8 @@ validation phase, before any prompt exists to skip, so an unattended
 | `pam status --all` | 1 | nothing on the machine carries it, or an enumerated service has no line in the file Linux-PAM reads |
 | `pam status --all` | 2 | a directory could not be listed, or an enumerated service could not be answered for |
 | `pam status --all --if-present` | 0/1/2 | unchanged from `--all`: an enumerated name was found, so there is no absent case to forgive |
-| `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `overridden` (`add` created the `/etc/pam.d` copy), `vendor-only` (`remove` had nothing of its own to take out of a package-owned file), `absent` under `--if-present`, and `declined` |
-| `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure |
+| `pam add`, `pam remove` | 0 | every service reached its requested state and required default rollback-state cleanup completed — including `unchanged`, `overridden` (`add` created the `/etc/pam.d` copy), `vendor-only` (`remove` had nothing of its own to take out of a package-owned file), `absent` under `--if-present`, and `declined` |
+| `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure, including `cleanup-failed` after the requested PAM state was reached |
 | `pam remove --all` | 0 | every recognized writable direct reference was removed, the final compiled-root scan was clear, and the whole-set transaction committed and cleaned; an empty scan is an idempotent success |
 | `pam remove --all` | non-zero | preflight, journal, identity, write, final-rescan or recovery failure; direct PAM mutations are rolled back where their exact identities prove that safe, otherwise transaction evidence is retained |
 
@@ -806,7 +806,7 @@ conflicting entry, a symlink/hard link, or any other ambiguity is preserved for
 manual inspection.
 
 `pam remove` takes no new rollback copy. After every successful or no-op
-removal it deletes validated Facelock-owned pairs for that service and the
+removal it deletes validated committed Facelock-owned pairs for that service and the
 exact legacy `<service>.facelock-backup` entry by default. Pair deletion first
 moves the record and backup to no-replace quarantine names, then rechecks the
 identities before unlinking. Legacy cleanup is confined to the override root
@@ -1087,14 +1087,17 @@ unchanged by it.
 **This shape is a stability contract.** An object rather than a bare array so a
 new top-level field is additive. Field names do not change and are not removed;
 `service`, `path`, `action` and `backup` are always present on every service
-object; `error` is present when `action` is `failed` or `unknown`, and
-`shadows` when the file the row names hides a vendor one. **`error` is a
+object; `error` is present when `action` is `failed`, `cleanup-failed` or
+`unknown`, and `shadows` when the file the row names hides a vendor one.
+**`error` is a
 diagnostic, not a contract** — branch on `action`, never on `error`'s text. A
 rejected service name reports the fixed C-locale string `invalid service name`,
 a symlinked service entry reports `symlinked outside /etc/pam.d` — the retained
 fixed name for the class, whichever directory it was in — and a
-hard-linked one `hard-linked service file`, but the OS-level failures (`failed` on a write, `unknown` on an unreadable
-file) interpolate a `strerror` string, which follows the operator's
+hard-linked one `hard-linked service file`, but the OS-level failures
+(`failed` on a write, `cleanup-failed` after the requested PAM state was
+reached, or `unknown` on an unreadable file) interpolate a `strerror` string,
+which follows the operator's
 `LC_MESSAGES` like any other C library message. Nothing else in a `--json`
 document is locale-dependent. `backup` is the newest committed backup path the
 calling process can validate for the service, falling back only to the exact
