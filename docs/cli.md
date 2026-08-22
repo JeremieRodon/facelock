@@ -700,9 +700,12 @@ sudo facelock pam remove --service sudo --dry-run --json
 Takes the same flags as `add` except `--allow-sensitive`, which it does not
 offer: removal can only take away a way to authenticate, so there is nothing to
 gate. It never prompts either. Named removal uses the configured lookup path.
-By default it removes Facelock-owned provenance
-and backups for the requested service, including the legacy adjacent
-`<service>.facelock-backup` name. `--keep-backup` opts out of that cleanup.
+By default it removes committed Facelock-owned provenance and backups for the
+requested service, including the legacy adjacent `<service>.facelock-backup`
+name. Unresolved prepared state is preserved for recovery. `--keep-backup`
+opts out of cleanup. A cleanup error remains non-zero, but the JSON action is
+`cleanup-failed` and the human diagnostic says that the PAM state change
+already completed.
 
 `remove --all` is the package-safe, config-independent form. It opens the
 compiled `/etc/pam.d`, `/usr/lib/pam.d`, and detection-only `/etc/authselect`

@@ -744,9 +744,10 @@ likewise removed only when their exact destination role, owner, mode, link
 count, and contents validate. Thus a crash at any prepare, PAM-directory temp,
 exchange, no-replace publication, quarantine, or unlink boundary has a
 deterministic next action, while an ambiguous lookalike is retained.
-Default removal deletes only validated Facelock pairs and the exact legacy
-`<service>.facelock-backup` name; malformed records, symlinks, hard links, and
-unrelated administrator backups are never followed or removed.
+Default removal deletes only validated committed Facelock pairs and the exact
+legacy `<service>.facelock-backup` name; unresolved prepared pairs, malformed
+records, symlinks, hard links, and unrelated administrator backups are never
+followed or removed.
 
 Intent filenames use
 `.facelock-intent-<hyphenated-role>-<transaction>.json`; the JSON `role`

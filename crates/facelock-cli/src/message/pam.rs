@@ -37,6 +37,10 @@ pub enum PamMessage {
         service: String,
         error: String,
     },
+    PamBackupCleanupFailed {
+        service: String,
+        error: String,
+    },
     NoPamServicesSelected,
     /// Every path the resolver tried, comma-separated. Not one path: a
     /// service can be absent from `/etc/pam.d` and present in a vendor
@@ -285,6 +289,12 @@ impl Message for PamMessage {
                 translate("  Failed to configure {service}: {error}"),
                 &[("service", service.clone()), ("error", error.clone())],
             ),
+            PamBackupCleanupFailed { service, error } => fill(
+                translate(
+                    "  PAM service {service} reached the requested state, but rollback-state cleanup failed: {error}",
+                ),
+                &[("service", service.clone()), ("error", error.clone())],
+            ),
             NoPamServicesSelected => translate("  No PAM services selected."),
             PamFileNotFound { paths } => fill(
                 translate("PAM service file not found: {paths}"),
@@ -523,7 +533,7 @@ impl Message for PamMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for PamMessage {
-    const VARIANT_COUNT: usize = 48;
+    const VARIANT_COUNT: usize = 49;
 
     fn samples() -> Vec<Self> {
         use PamMessage::*;
@@ -537,6 +547,10 @@ impl super::Samples for PamMessage {
             },
             PromptSelectPamServices,
             PamConfigureFailed {
+                service: s("sudo"),
+                error: s("e"),
+            },
+            PamBackupCleanupFailed {
                 service: s("sudo"),
                 error: s("e"),
             },
