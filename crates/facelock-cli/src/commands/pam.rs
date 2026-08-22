@@ -109,8 +109,8 @@
 //!
 //! # Limits
 //!
-//! `remove` takes no backup of its own. It removes validated Facelock-owned
-//! state and the exact legacy adjacent backup name by default;
+//! `remove` takes no backup of its own. It removes validated committed
+//! Facelock-owned state and the exact legacy adjacent backup name by default;
 //! `--keep-backup` preserves both.
 //!
 //! A replace writes a new inode, so it carries what it is told to carry: mode,
@@ -1829,10 +1829,18 @@ impl BackupStore {
 
     fn latest_committed(&self, service: &str) -> std::io::Result<Option<PathBuf>> {
         Ok(self
+            .validated_committed_records(service)?
+            .into_iter()
+            .next()
+            .map(|record| record.backup_path()))
+    }
+
+    fn validated_committed_records(&self, service: &str) -> std::io::Result<Vec<PreparedBackup>> {
+        Ok(self
             .validated_records(service)?
             .into_iter()
-            .find(|record| record.provenance.state == ProvenanceState::Committed)
-            .map(|record| record.backup_path()))
+            .filter(|record| record.provenance.state == ProvenanceState::Committed)
+            .collect())
     }
 
     fn cleanup(&self, service: &str) -> std::io::Result<()> {
@@ -1846,7 +1854,7 @@ impl BackupStore {
     ) -> std::io::Result<()> {
         let _lock = self.lock_exclusive()?;
         let directory = open_directory_nofollow(&self.root)?;
-        for prepared in self.validated_records(service)? {
+        for prepared in self.validated_committed_records(service)? {
             before_recheck(&prepared);
             self.cleanup_one_at(&directory, &prepared, |_| Ok(()))?;
         }
@@ -1861,7 +1869,7 @@ impl BackupStore {
     ) -> std::io::Result<()> {
         let _lock = self.lock_exclusive()?;
         let directory = open_directory_nofollow(&self.root)?;
-        for prepared in self.validated_records(service)? {
+        for prepared in self.validated_committed_records(service)? {
             self.cleanup_one_at(&directory, &prepared, &mut after_boundary)?;
         }
         directory.sync_all()
@@ -4446,11 +4454,16 @@ enum Outcome {
     Declined,
     /// The write failed. Carries the error for the `"error"` field.
     ///
-    /// That field is a diagnostic, not a contract: `Failed` and `Unknown` both
-    /// interpolate an `io::Error`, whose text comes from the C library's
-    /// `strerror` and therefore follows `LC_MESSAGES` like any other OS
-    /// string. A consumer branches on `action`; it must not match on `error`.
+    /// That field is a diagnostic, not a contract: `Failed`, `CleanupFailed`
+    /// and `Unknown` interpolate an `io::Error`, whose text comes from the C
+    /// library's `strerror` and therefore follows `LC_MESSAGES` like any other
+    /// OS string. A consumer branches on `action`; it must not match on
+    /// `error`.
     Failed(String),
+    /// `remove`: the PAM service reached its requested state, but the default
+    /// cleanup of Facelock-owned rollback state did not complete. This remains
+    /// a write failure: callers must retry or use `--keep-backup` explicitly.
+    CleanupFailed(String),
     /// `status`: the file exists and carries a facelock line.
     Present,
     /// `status`: the file exists and carries no facelock line.
@@ -4470,6 +4483,7 @@ impl Outcome {
             Outcome::Absent => "absent",
             Outcome::Declined => "declined",
             Outcome::Failed(_) => "failed",
+            Outcome::CleanupFailed(_) => "cleanup-failed",
             Outcome::Present => "present",
             Outcome::Missing => "missing",
             Outcome::Unknown(_) => "unknown",
@@ -4479,7 +4493,9 @@ impl Outcome {
     /// The `"error"` field, when this outcome carries one.
     fn error(&self) -> Option<&str> {
         match self {
-            Outcome::Failed(error) | Outcome::Unknown(error) => Some(error),
+            Outcome::Failed(error) | Outcome::CleanupFailed(error) | Outcome::Unknown(error) => {
+                Some(error)
+            }
             _ => None,
         }
     }
@@ -7086,7 +7102,8 @@ fn report_plan(target: &Target, action: WriteAction, sink: &Sink) -> Outcome {
 // ---------------------------------------------------------------------------
 
 /// `{"command", "dry_run", "services": [{"service", "path", "action",
-/// "backup"}]}`, with `"error"` present on a `failed` or `unknown` service.
+/// "backup"}]}`, with `"error"` present on a `failed`, `cleanup-failed` or
+/// `unknown` service.
 ///
 /// An object rather than a bare array so a later top-level field is an
 /// additive change instead of a document-type change. Built through
@@ -7349,17 +7366,26 @@ fn apply_all(
                 && !matches!(outcome, Outcome::Failed(_))
                 && let Err(error) = cleanup_backups(dirs, &target.service)
             {
-                outcome = Outcome::Failed(format!(
+                outcome = Outcome::CleanupFailed(format!(
                     "failed to clean backups for {}: {error}",
                     target.service
                 ));
             }
 
-            if let (Outcome::Failed(error), true) = (&outcome, sink.report_failures) {
-                sink.error(&PamMessage::PamConfigureFailed {
-                    service: target.service.clone(),
-                    error: error.clone(),
-                });
+            if sink.report_failures {
+                match &outcome {
+                    Outcome::Failed(error) => sink.error(&PamMessage::PamConfigureFailed {
+                        service: target.service.clone(),
+                        error: error.clone(),
+                    }),
+                    Outcome::CleanupFailed(error) => {
+                        sink.error(&PamMessage::PamBackupCleanupFailed {
+                            service: target.service.clone(),
+                            error: error.clone(),
+                        });
+                    }
+                    _ => {}
+                }
             }
 
             ServiceReport {
@@ -7409,8 +7435,11 @@ fn emit_extension_hint(sink: &Sink) {
 /// rather than an exit code. Every service has already been attempted.
 fn first_failure(reports: &[ServiceReport]) -> anyhow::Result<()> {
     for report in reports {
-        if let Outcome::Failed(error) = &report.outcome {
-            return Err(anyhow::anyhow!(error.clone()));
+        match &report.outcome {
+            Outcome::Failed(error) | Outcome::CleanupFailed(error) => {
+                return Err(anyhow::anyhow!(error.clone()));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -9079,7 +9108,8 @@ fn status_code(outcome: &Outcome, if_present: bool) -> i32 {
         | Outcome::Removed
         | Outcome::Unchanged
         | Outcome::Declined
-        | Outcome::Failed(_) => STATUS_ERROR,
+        | Outcome::Failed(_)
+        | Outcome::CleanupFailed(_) => STATUS_ERROR,
     }
 }
 
@@ -9185,6 +9215,7 @@ fn add_left_the_line(outcome: &Outcome) -> bool {
         | Outcome::Removed
         | Outcome::VendorOnly
         | Outcome::Failed(_)
+        | Outcome::CleanupFailed(_)
         | Outcome::Present
         | Outcome::Missing
         | Outcome::Unknown(_) => false,
@@ -10166,6 +10197,59 @@ mod tests {
                 keep_backup
             );
         }
+    }
+
+    #[test]
+    fn cleanup_failure_reports_the_partial_result_and_remains_fatal() {
+        let dir = seeded(&[("sudo", SUDO_AFTER)]);
+        let dirs = only(dir.path());
+        let sentinel = dir.path().join("administrator-sentinel");
+        fs::write(&sentinel, b"administrator state\n").unwrap();
+        let legacy = backup_path(&dir.path().join("sudo"));
+        std::os::unix::fs::symlink(&sentinel, &legacy).unwrap();
+        let request = remove(&["sudo"]);
+        let write = WriteRequest {
+            action: WriteAction::Remove,
+            request: &request,
+            remedy: "--allow-sensitive",
+        };
+        let targets = plan_writes(&dirs, &write).unwrap();
+
+        let reports = apply_all(&dirs, &targets, &write, &Sink::verb(true));
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("sudo")).unwrap(),
+            SUDO_BEFORE
+        );
+        assert!(legacy.is_symlink());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"administrator state\n");
+        assert!(matches!(reports[0].outcome, Outcome::CleanupFailed(_)));
+        assert!(first_failure(&reports).is_err());
+        let json: serde_json::Value =
+            serde_json::from_str(&report_json(PamAction::Remove, false, &reports, &[])).unwrap();
+        assert_eq!(json["services"][0]["action"], "cleanup-failed");
+        assert!(
+            json["services"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("failed to clean backups")
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_an_unresolved_prepared_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BackupStore::open(root.path()).unwrap();
+        let prepared = store
+            .prepare("sudo", SUDO_BEFORE.as_bytes(), SUDO_AFTER.as_bytes())
+            .unwrap();
+        let backup_before = fs::read(prepared.backup_path()).unwrap();
+        let record_before = fs::read(prepared.record_path()).unwrap();
+
+        store.cleanup("sudo").unwrap();
+
+        assert_eq!(fs::read(prepared.backup_path()).unwrap(), backup_before);
+        assert_eq!(fs::read(prepared.record_path()).unwrap(), record_before);
     }
 
     #[test]
@@ -13232,6 +13316,7 @@ mod tests {
             Outcome::Absent,
             Outcome::Declined,
             Outcome::Failed(String::new()),
+            Outcome::CleanupFailed(String::new()),
             Outcome::Present,
             Outcome::Missing,
             Outcome::Unknown(String::new()),
@@ -13251,6 +13336,7 @@ mod tests {
                 "absent",
                 "declined",
                 "failed",
+                "cleanup-failed",
                 "present",
                 "missing",
                 "unknown",
@@ -13812,6 +13898,7 @@ mod tests {
             Outcome::Removed,
             Outcome::VendorOnly,
             Outcome::Failed("e".to_string()),
+            Outcome::CleanupFailed("e".to_string()),
             Outcome::Present,
             Outcome::Missing,
             Outcome::Unknown("e".to_string()),
