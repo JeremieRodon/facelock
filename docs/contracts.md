@@ -1769,6 +1769,15 @@ holds the unresolved load so a broken config renders as a finding in its
 report, and its own root check still runs before its first line of output —
 the read alone has no user-visible effect ahead of the refusal.
 
+The rows in `crates/facelock-cli/tests/cli_smoke.rs` pin this ordering per
+gated command. They run the binary unprivileged even under a root test
+runner: both CI test jobs are root in a container, and a row that skipped
+there reported as a pass while asserting nothing (issue #189). They close
+stdin, so what they witness is that the refusal preceded the output, not
+which of DEC-6's two escalation classes produced it; `require_root` and
+`require_root_scripted` share one non-interactive branch and are
+indistinguishable to them.
+
 **AccessDenied hint.** A D-Bus `AccessDenied` reply carries one actionable
 hint (`ipc_client::add_access_denied_hint`): root is required. Since almost
 every D-Bus method is root-only (see IPC Protocol below) and, under ADR 010,
