@@ -1,0 +1,14 @@
+# Container for `just test-packit-config` — the Packit configuration schema gate.
+# Pins the Fedora that supplies `packit`, so validation does not depend on the
+# host's Python, RPM bindings, or a host `packit` install.
+#
+# A toolchain image with no CMD: test/packit-config-validate.sh mounts the repo
+# read-only at /repo and passes the validator command on the run line, so the
+# command this gate actually runs is visible in one place. Offline schema
+# validation reads only the checked-in config, so neither git history nor the
+# network is needed — the repo may be a git worktree whose .git pointer is
+# unreachable in here.
+FROM registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e90866c488d5d04fc6612284169e20a1bdb
+RUN dnf install -y --setopt=install_weak_deps=False packit \
+    && dnf clean all
+WORKDIR /repo

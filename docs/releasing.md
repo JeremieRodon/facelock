@@ -199,6 +199,7 @@ just test-deb-trixie-pkg    # Debian 13 — offline source rebuild, install, TPM
 just test-deb-resolute-pkg  # Ubuntu 26.04 — the same complete package gate
 just test-rpm-pkg        # Fedora — build real .rpm, install via dnf, validate
 just test-rpm-authselect # Fedora — retired-profile upgrade guard lifecycle
+just test-packit-config  # Packit config schema — real `packit` in a pinned Fedora container
 just test-copr           # COPR-equivalent — Packit SRPM + mock from-source rebuild (slow)
 
 # Interactive (requires camera)
@@ -258,9 +259,12 @@ production COPR API and require its enabled chroots to equal the checked-in
 authority: Fedora 43/44/45 are required and Rawhide is the only optional
 experimental chroot. Rawhide may be present or absent; a missing required
 chroot or any unknown extra is release-blocking drift. The checker never
-modifies the project. When the Packit CLI is available,
-preflight runs `packit config validate --offline`; `just test-copr` always runs
-that real schema gate inside its Fedora Packit container.
+modifies the project. Preflight always runs `packit config validate --offline`
+against `.packit.yaml`, in the digest-pinned Fedora container built from
+`test/Containerfile.packit` — the same real schema gate `just test-copr` runs,
+reachable without a host `packit` install. It has no skip path: podman is a
+preflight prerequisite, and without it the gate fails rather than passing
+unrun. `just test-packit-config` runs the same gate on its own.
 
 ### Package repository setup (one-time)
 
