@@ -6,16 +6,21 @@
 |-----------|-----------|
 | OS | Linux (kernel 4.14+ for V4L2) |
 | Architecture | x86_64 (ONNX Runtime binaries) |
-| Rust | 1.85+ (edition 2024) |
+| Rust | 1.88+ (edition 2024) |
 | Camera | V4L2-compatible (USB webcam, built-in IR) |
 | PAM | Linux-PAM (pam 1.5+) |
 
 ## Tested Distributions
 
+Debian-family release support is exactly Debian 13 (Trixie) and Ubuntu 26.04
+LTS (Resolute). Other Debian and Ubuntu releases are unsupported.
+
 | Distribution | Init System | Mode | Status |
 |-------------|-------------|------|--------|
 | Arch Linux | systemd | daemon + D-Bus activation | Primary target |
 | Arch Linux | systemd | oneshot | Tested |
+| Debian 13 (Trixie) | systemd | daemon + D-Bus activation | Booted package gate |
+| Ubuntu 26.04 LTS (Resolute) | systemd | daemon + D-Bus activation | Booted package gate |
 | Container (Arch) | none | daemon (manual) | CI-tested |
 | Container (Arch) | none | oneshot | CI-tested |
 
@@ -24,8 +29,6 @@
 | Distribution | Init System | Mode |
 |-------------|-------------|------|
 | Fedora 38+ | systemd | daemon + D-Bus activation |
-| Ubuntu 22.04+ | systemd | daemon + D-Bus activation |
-| Debian 12+ | systemd | daemon + D-Bus activation |
 | Any Linux | any / none | oneshot |
 | Void Linux | runit | oneshot or manual daemon |
 | Alpine Linux | OpenRC | oneshot or manual daemon |
@@ -55,13 +58,20 @@ RGB cameras work with `security.require_ir = false` but provide no anti-spoofing
 | NV12 | Full | Semi-planar 4:2:0; common on Intel IPU processed cameras |
 | GREY | Full | IR cameras, replicated to RGB |
 | Y16 | Full | 16-bit IR grayscale, bit-depth-aware conversion to 8-bit |
+| Y8, Y10, Y12 | Not supported | IR-typical classification evidence, but not decodable; excluded from the setup wizard and automatic selection with a path/format warning |
 | Raw Bayer (SGRBG10, ...) | Not supported | Raw sensor nodes are skipped by auto-detection |
 | Other | Not supported | Device is rejected at open with an error listing its formats |
 
 Negotiation priority: `GREY > Y16 > YUYV > NV12 > MJPG` (a hardware quirk's
 `format_preference` is tried first). Devices that advertise none of these are
-excluded from auto-detection, and opening one explicitly fails with an error
-naming the advertised formats.
+excluded from auto-detection and setup selection, and opening one explicitly
+fails with an error naming the advertised formats. This includes an IR node
+whose only formats are Y8, Y10, or Y12: it still classifies as IR, but Facelock
+does not persist it as an automatic setup choice. If `security.require_ir` is
+enabled and every detected IR node is excluded this way, the setup wizard
+stops with all excluded IR paths and formats instead of offering an RGB node.
+When `require_ir` is disabled, a decodable RGB node remains a valid explicit
+wizard choice.
 
 ### Intel IPU6/IPU7 MIPI cameras (v4l2-relayd)
 
@@ -198,7 +208,7 @@ auth  sufficient  pam_facelock.so
 - `gcc-libs` (C runtime)
 
 ### Build
-- `rust` + `cargo` (1.85+)
+- `rust` + `cargo` (1.88+)
 - `clang` (for ONNX Runtime bindings)
 - System headers: `libv4l-dev`, `libxkbcommon-dev`, `libpam0g-dev` (names vary by distro)
 
@@ -208,7 +218,10 @@ auth  sufficient  pam_facelock.so
 
 ## ONNX Runtime
 
-Facelock uses the `ort` crate (Rust bindings for ONNX Runtime). The runtime binary is downloaded at build time via the `download-binaries` feature.
+Facelock uses the `ort` crate (Rust bindings for ONNX Runtime) and loads the
+compatible shared library dynamically. Native packages either include the
+reviewed CPU runtime or depend on the distribution runtime; source builds use
+a compatible ONNX Runtime installed on the build host.
 
 ### Execution Providers
 

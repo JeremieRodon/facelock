@@ -109,6 +109,8 @@ EOF
 rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
       /etc/pam.d/facelock-scratch.facelock-backup \
       /etc/pam.d/facelock-scratch2.facelock-backup
+find /var/lib/facelock/pam-backups -maxdepth 1 \
+    \( -name 'facelock-scratch.*' -o -name 'facelock-scratch2.*' \) -delete
 cat > /etc/pam.d/facelock-scratch <<'EOF'
 #%PAM-1.0
 auth       include        system-auth
@@ -134,8 +136,8 @@ run_test "pam status --if-present: an absent service file is exit 0" \
     "facelock pam status --service facelock-does-not-exist --if-present" \
     0
 
-run_test "pam add: 'installed', backup written, line is the first auth line" \
-    "facelock pam add --service facelock-scratch --json > /tmp/pam-add.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-add.json | grep -qx installed && test -f /etc/pam.d/facelock-scratch.facelock-backup && python3 /tmp/pam-first-auth.py /etc/pam.d/facelock-scratch" \
+run_test "pam add: committed root-only state backup, line is the first auth line" \
+    "facelock pam add --service facelock-scratch --json > /tmp/pam-add.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-add.json | grep -qx installed && backup=\$(python3 -c 'import json; print(json.load(open(\"/tmp/pam-add.json\"))[\"services\"][0][\"backup\"])') && case \"\$backup\" in /var/lib/facelock/pam-backups/facelock-scratch.*) ;; *) exit 1;; esac && test -f \"\$backup\" && test -f \"\$backup.json\" && test \"\$(stat -c '%a:%U:%G' \"\$backup\")\" = 600:root:root && test \"\$(stat -c '%a:%U:%G' \"\$backup.json\")\" = 600:root:root && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d[\"version\"] == 1 and d[\"sequence\"] > 0 and d[\"state\"] == \"committed\" and d[\"service\"] == \"facelock-scratch\" and \"path\" not in d and \"target\" not in d' \"\$backup.json\" && ! test -e /etc/pam.d/facelock-scratch.facelock-backup && python3 /tmp/pam-first-auth.py /etc/pam.d/facelock-scratch" \
     0
 
 sha256sum /etc/pam.d/facelock-scratch > /tmp/pam-scratch.sha
@@ -188,16 +190,19 @@ if [ -n "$PAM_SENSITIVE" ]; then
     run_test "pam add refuses sensitive service $PAM_SENSITIVE under --no-confirm" \
         "facelock pam add --service $PAM_SENSITIVE --no-confirm > /tmp/pam-sensitive.out 2>&1; test \$? -ne 0 && grep -q 'sensitive PAM service' /tmp/pam-sensitive.out && sha256sum -c --status /tmp/pam-sensitive.sha" \
         0
-    # The alias has its own refusal, naming its own flag: `setup --yes` is the
-    # documented exception that means both "do not ask" and "unlock the gate",
-    # so the message has to say --yes and not --allow-sensitive. Without this
-    # row the alias could lose the gate entirely and only the verb would notice.
-    run_test "setup --pam refuses sensitive service $PAM_SENSITIVE without --yes" \
-        "facelock setup --pam --service $PAM_SENSITIVE > /tmp/pam-sensitive-alias.out 2>&1; test \$? -ne 0 && grep -q 'sensitive PAM service' /tmp/pam-sensitive-alias.out && grep -q -- '--yes' /tmp/pam-sensitive-alias.out && sha256sum -c --status /tmp/pam-sensitive.sha" \
+    # The alias must preserve the verb's two independent decisions: --yes
+    # suppresses the ordinary prompt, but only --allow-sensitive authorizes
+    # this write. The hash proves the refusal happened before mutation.
+    run_test "setup --pam --yes refuses sensitive service $PAM_SENSITIVE without --allow-sensitive" \
+        "facelock setup --pam --service $PAM_SENSITIVE --yes > /tmp/pam-sensitive-alias.out 2>&1; test \$? -ne 0 && grep -q 'sensitive PAM service' /tmp/pam-sensitive-alias.out && grep -q -- '--allow-sensitive' /tmp/pam-sensitive-alias.out && sha256sum -c --status /tmp/pam-sensitive.sha" \
+        0
+    run_test "setup --pam explicit authorization configures sensitive service $PAM_SENSITIVE" \
+        "facelock setup --pam --service $PAM_SENSITIVE --yes --allow-sensitive >/tmp/pam-sensitive-authorized.out 2>&1; test \$? -eq 0 && grep -qxF '$PAM_LINE_TEXT' /etc/pam.d/$PAM_SENSITIVE && facelock setup --pam --service $PAM_SENSITIVE --remove --yes >/tmp/pam-sensitive-remove.out 2>&1 && sha256sum -c --status /tmp/pam-sensitive.sha" \
         0
     cp -p /tmp/pam-sensitive.orig "/etc/pam.d/$PAM_SENSITIVE"
     rm -f "/etc/pam.d/$PAM_SENSITIVE.facelock-backup" /tmp/pam-sensitive.orig \
-          /tmp/pam-sensitive-alias.out
+          /tmp/pam-sensitive-alias.out /tmp/pam-sensitive-authorized.out \
+          /tmp/pam-sensitive-remove.out
 else
     echo "SKIP: no sensitive service file in the image to test the gate"
 fi
@@ -238,8 +243,9 @@ run_test "pam add refuses a service file symlinked out of /etc/pam.d" \
 rm -f /etc/pam.d/facelock-scratch-link /tmp/facelock-outside \
       /tmp/facelock-outside.sha /tmp/pam-symlink.out
 
-run_test "pam remove: 'removed' and no facelock line left" \
-    "facelock pam remove --service facelock-scratch --json > /tmp/pam-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-remove.json | grep -qx removed && ! grep -q pam_facelock.so /etc/pam.d/facelock-scratch" \
+cp /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch.facelock-backup
+run_test "pam remove: line, owned state, and legacy backup are removed" \
+    "facelock pam remove --service facelock-scratch --json > /tmp/pam-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-remove.json | grep -qx removed && ! grep -q pam_facelock.so /etc/pam.d/facelock-scratch && ! test -e /etc/pam.d/facelock-scratch.facelock-backup && ! find /var/lib/facelock/pam-backups -maxdepth 1 -name 'facelock-scratch.*' | grep -q ." \
     0
 
 # The `setup --pam` alias must reach the same writer and the same bytes.
@@ -324,11 +330,16 @@ run_test "pam add again edits the override, writes no second header" \
     "facelock pam add --service facelock-vendor-scratch --json > /tmp/pam-vendor-add2.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-add2.json | grep -qx unchanged && test \$(grep -c '^# Copied from ' /etc/pam.d/facelock-vendor-scratch) -eq 1 && sha256sum -c --status /tmp/pam-vendor.sha" \
     0
 
-run_test "pam remove takes the line out of the override, not the vendor file" \
-    "facelock pam remove --service facelock-vendor-scratch --json > /tmp/pam-vendor-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-remove.json | grep -qx removed && test -f /etc/pam.d/facelock-vendor-scratch && ! grep -q pam_facelock.so /etc/pam.d/facelock-vendor-scratch && sha256sum -c --status /tmp/pam-vendor.sha" \
+run_test "pam remove deletes the unchanged Facelock-created override" \
+    "facelock pam remove --service facelock-vendor-scratch --json > /tmp/pam-vendor-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-remove.json | grep -qx removed && ! test -e /etc/pam.d/facelock-vendor-scratch && sha256sum -c --status /tmp/pam-vendor.sha" \
     0
 
-rm -f /etc/pam.d/facelock-vendor-scratch /etc/pam.d/facelock-vendor-scratch.facelock-backup
+run_test "pam remove keeps a drifted vendor override after removing its line" \
+    "facelock pam add --service facelock-vendor-scratch --json > /dev/null 2>/dev/null && printf '%s\n' '# local customization' >> /etc/pam.d/facelock-vendor-scratch && facelock pam remove --service facelock-vendor-scratch --json > /tmp/pam-vendor-drift-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-drift-remove.json | grep -qx removed && test -f /etc/pam.d/facelock-vendor-scratch && ! grep -q pam_facelock.so /etc/pam.d/facelock-vendor-scratch && grep -qxF '# local customization' /etc/pam.d/facelock-vendor-scratch && sha256sum -c --status /tmp/pam-vendor.sha" \
+    0
+
+rm -f /etc/pam.d/facelock-vendor-scratch \
+      /etc/pam.d/facelock-vendor-scratch.facelock-backup
 
 run_test "pam remove on a vendor-only service is a no-op, exit 0" \
     "facelock pam remove --service facelock-vendor-scratch --json > /tmp/pam-vendor-remove2.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-vendor-remove2.json | grep -qx vendor-only && ! test -e /etc/pam.d/facelock-vendor-scratch && sha256sum -c --status /tmp/pam-vendor.sha" \
@@ -349,7 +360,8 @@ rm -f "$VENDOR_PAM_DIR/facelock-vendor-scratch" /tmp/pam-vendor.sha \
       /tmp/pam-vendor-dir.before /tmp/pam-vendor-dir.after \
       /tmp/pam-vendor-status.json /tmp/pam-vendor-add.json \
       /tmp/pam-vendor-add2.json /tmp/pam-vendor-remove.json \
-      /tmp/pam-vendor-remove2.json /tmp/pam-nowhere.out
+      /tmp/pam-vendor-drift-remove.json /tmp/pam-vendor-remove2.json \
+      /tmp/pam-nowhere.out
 
 # The real thing, on the stock image: `sudo facelock setup --pam --service
 # polkit-1` is the invocation omarchy#7040 runs under `set -e`, and it exited 1
@@ -364,8 +376,11 @@ if [ -f /usr/lib/pam.d/polkit-1 ] && [ ! -e /etc/pam.d/polkit-1 ]; then
     run_test "pam status now answers 0 for polkit-1" \
         "facelock pam status --service polkit-1" \
         0
+    run_test "pam remove retires the unchanged polkit-1 override" \
+        "facelock pam remove --service polkit-1 --json > /tmp/pam-polkit-remove.json 2>/dev/null; test \$? -eq 0 && python3 /tmp/pam-action.py /tmp/pam-polkit-remove.json | grep -qx removed && ! test -e /etc/pam.d/polkit-1 && sha256sum -c --status /tmp/pam-polkit.sha" \
+        0
     rm -f /etc/pam.d/polkit-1 /etc/pam.d/polkit-1.facelock-backup \
-          /tmp/pam-polkit.sha /tmp/pam-polkit.out
+          /tmp/pam-polkit.sha /tmp/pam-polkit.out /tmp/pam-polkit-remove.json
 else
     # Not a skip. This is the only end-to-end row for the bug the whole gap
     # exists to fix, so an image that stops presenting the layout must cost a
@@ -614,6 +629,8 @@ rm -f /etc/pam.d/facelock-scratch /etc/pam.d/facelock-scratch2 \
       /etc/pam.d/facelock-vendor-scratch.facelock-backup \
       /usr/lib/pam.d/facelock-vendor-scratch \
       /tmp/pam-action.py /tmp/pam-first-auth.py
+find /var/lib/facelock/pam-backups -maxdepth 1 \
+    \( -name 'facelock-scratch.*' -o -name 'facelock-scratch2.*' \) -delete
 
 # --- Spec 29: Smart PAM skip (no enrolled faces) ---
 

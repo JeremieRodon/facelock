@@ -37,6 +37,10 @@ pub enum PamMessage {
         service: String,
         error: String,
     },
+    PamBackupCleanupFailed {
+        service: String,
+        error: String,
+    },
     NoPamServicesSelected,
     /// Every path the resolver tried, comma-separated. Not one path: a
     /// service can be absent from `/etc/pam.d` and present in a vendor
@@ -110,6 +114,34 @@ pub enum PamMessage {
         vendor: String,
         service: String,
     },
+    /// Removal retired an unchanged Facelock-created local vendor copy.
+    PamVendorOverrideRemoved {
+        path: String,
+        vendor: String,
+    },
+    /// The module line was removed, but drift means the local copy remains.
+    PamVendorOverrideRetained {
+        path: String,
+        vendor: String,
+    },
+    /// The generated header names a configured vendor candidate, but no
+    /// current source exists. Removal may take out the module line, but the
+    /// local override remains because its origin cannot be revalidated.
+    PamVendorOverrideSourceAbsent {
+        path: String,
+        vendor: String,
+    },
+    /// The restart shape already has no module line; the absent configured
+    /// vendor source is the explicit reason the local override remains.
+    PamVendorOverrideSourceAbsentNoLine {
+        path: String,
+        vendor: String,
+    },
+    /// `--dry-run`: an unchanged local copy would be deleted after removal.
+    PamPlanDeleteOverride {
+        path: String,
+        vendor: String,
+    },
     /// A service whose only copy is package-owned, on a verb that does not
     /// write there.
     PamVendorOnly {
@@ -144,10 +176,8 @@ pub enum PamMessage {
     PamInvalidServiceName {
         service: String,
     },
-    /// A service file that is a symlink out of `/etc/pam.d`. Names the target
-    /// because that is the file the operator has to go and edit — on an
-    /// authselect system it is a generated one, and editing it is not the fix
-    /// either.
+    /// A symlinked service file. Names the link text for diagnosis, but the
+    /// writer never follows it, even when it appears to remain in-directory.
     PamServiceSymlinkedOutside {
         path: String,
         target: String,
@@ -160,10 +190,9 @@ pub enum PamMessage {
         path: String,
         links: String,
     },
-    /// `remedy` is the flag that unlocks this surface: `--allow-sensitive` on
-    /// `pam add`, `--yes` on the `setup --pam` alias, which keeps its
-    /// combined meaning. Carrying it as data is what lets one message be
-    /// truthful on both.
+    /// `remedy` is the explicit flag that unlocks the sensitive gate on the
+    /// current surface. It is `--allow-sensitive` for both `pam add` and the
+    /// `setup --pam` alias.
     PamSensitiveRefused {
         service: String,
         remedy: String,
@@ -176,6 +205,10 @@ pub enum PamMessage {
         paths: String,
         path: String,
     },
+    /// Debian's shared profile is already selected and live. A direct rule
+    /// would create two Facelock auth paths, so the refusal gives the exact
+    /// opt-in migration command and verification sequence.
+    PamAuthUpdateProfileActive,
     PamServiceAbsentSkipped {
         path: String,
     },
@@ -276,7 +309,7 @@ impl Message for PamMessage {
             ),
             PamLinePreview { line } => fill(
                 translate(
-                    "  The following line will be added to each selected /etc/pam.d/<service>:\n\n      {line}\n\n  It is inserted above the first existing 'auth' line. A backup\n  (.facelock-backup) is saved before any change, and you'll be asked\n  to confirm each file individually.\n",
+                    "  The following line will be added to each selected /etc/pam.d/<service>:\n\n      {line}\n\n  It is inserted above the first existing 'auth' line. A root-only backup\n  is saved under /var/lib/facelock/pam-backups before any change, and you'll\n  be asked to confirm each file individually.\n",
                 ),
                 &[("line", line.clone())],
             ),
@@ -285,6 +318,12 @@ impl Message for PamMessage {
             }
             PamConfigureFailed { service, error } => fill(
                 translate("  Failed to configure {service}: {error}"),
+                &[("service", service.clone()), ("error", error.clone())],
+            ),
+            PamBackupCleanupFailed { service, error } => fill(
+                translate(
+                    "  PAM service {service} reached the requested state, but rollback-state cleanup failed: {error}",
+                ),
                 &[("service", service.clone()), ("error", error.clone())],
             ),
             NoPamServicesSelected => translate("  No PAM services selected."),
@@ -379,13 +418,43 @@ impl Message for PamMessage {
                 service,
             } => fill(
                 translate(
-                    "Created {path} from {vendor} with the facelock PAM line.\nThis local override shadows the vendor file and will not track vendor updates.\n\nTo rollback:\n  sudo rm {path}\n  # or, to keep the override and drop the line: sudo facelock pam remove --service {service}",
+                    "Created {path} from {vendor} with the facelock PAM line.\nThis local override shadows the vendor file and will not track vendor updates.\n\nTo rollback:\n  sudo facelock pam remove --service {service}\nAn unchanged Facelock-created override is deleted; a modified override is kept after its facelock line is removed.",
                 ),
                 &[
                     ("path", path.clone()),
                     ("vendor", vendor.clone()),
                     ("service", service.clone()),
                 ],
+            ),
+            PamVendorOverrideRemoved { path, vendor } => fill(
+                translate(
+                    "Removed facelock PAM line from {path}.\nDeleted unchanged local override; {vendor} is authoritative again.",
+                ),
+                &[("path", path.clone()), ("vendor", vendor.clone())],
+            ),
+            PamVendorOverrideRetained { path, vendor } => fill(
+                translate(
+                    "Removed facelock PAM line from {path}.\nKept local override because administrator or vendor drift no longer matches {vendor}.",
+                ),
+                &[("path", path.clone()), ("vendor", vendor.clone())],
+            ),
+            PamVendorOverrideSourceAbsent { path, vendor } => fill(
+                translate(
+                    "Removed facelock PAM line from {path}.\nKept local override because the vendor source is absent: {vendor}.",
+                ),
+                &[("path", path.clone()), ("vendor", vendor.clone())],
+            ),
+            PamVendorOverrideSourceAbsentNoLine { path, vendor } => fill(
+                translate(
+                    "No facelock PAM line found in {path}.\nKept local override because the vendor source is absent: {vendor}.",
+                ),
+                &[("path", path.clone()), ("vendor", vendor.clone())],
+            ),
+            PamPlanDeleteOverride { path, vendor } => fill(
+                translate(
+                    "Would remove the facelock PAM line from {path}, delete the unchanged local override, and make {vendor} authoritative again.",
+                ),
+                &[("path", path.clone()), ("vendor", vendor.clone())],
             ),
             PamVendorOnly { path } => fill(
                 translate(
@@ -429,7 +498,7 @@ impl Message for PamMessage {
             ),
             PamServiceSymlinkedOutside { path, target, dir } => fill(
                 translate(
-                    "Refusing to touch {path}: it is a symlink to {target}, which is not inside {dir}.\nEdit that file directly, or the tool that generates it — authselect regenerates system-auth and password-auth from /etc/authselect.",
+                    "Refusing to touch {path}: it is a symlink to {target}. PAM service links are never followed beneath {dir}.\nEdit the real service file directly, or the tool that generates it — authselect regenerates system-auth and password-auth from /etc/authselect.",
                 ),
                 &[
                     ("path", path.clone()),
@@ -454,6 +523,9 @@ impl Message for PamMessage {
                     "PAM module not found. Tried: {paths}\nInstall it first: cargo build --release -p pam-facelock && sudo cp target/release/libpam_facelock.so {path}",
                 ),
                 &[("paths", paths.clone()), ("path", path.clone())],
+            ),
+            PamAuthUpdateProfileActive => translate(
+                "Facelock's pam-auth-update profile is active; direct PAM edits would configure Facelock twice. To migrate, run `sudo pam-auth-update --disable facelock`, verify that a real correct password succeeds and a wrong password fails, then retry the original Facelock command with all of its services and flags.",
             ),
             PamServiceAbsentSkipped { path } => fill(
                 translate("PAM service file absent: {path}. Nothing to add."),
@@ -525,7 +597,7 @@ impl Message for PamMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for PamMessage {
-    const VARIANT_COUNT: usize = 48;
+    const VARIANT_COUNT: usize = 55;
 
     fn samples() -> Vec<Self> {
         use PamMessage::*;
@@ -539,6 +611,10 @@ impl super::Samples for PamMessage {
             },
             PromptSelectPamServices,
             PamConfigureFailed {
+                service: s("sudo"),
+                error: s("e"),
+            },
+            PamBackupCleanupFailed {
                 service: s("sudo"),
                 error: s("e"),
             },
@@ -583,6 +659,26 @@ impl super::Samples for PamMessage {
                 vendor: s("/usr/lib/pam.d/polkit-1"),
                 service: s("polkit-1"),
             },
+            PamVendorOverrideRemoved {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+            },
+            PamVendorOverrideRetained {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+            },
+            PamVendorOverrideSourceAbsent {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+            },
+            PamVendorOverrideSourceAbsentNoLine {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+            },
+            PamPlanDeleteOverride {
+                path: s("/etc/pam.d/polkit-1"),
+                vendor: s("/usr/lib/pam.d/polkit-1"),
+            },
             PamVendorOnly {
                 path: s("/usr/lib/pam.d/polkit-1"),
             },
@@ -620,6 +716,7 @@ impl super::Samples for PamMessage {
                 paths: s("/lib/security/pam_facelock.so, /usr/lib64/security/pam_facelock.so"),
                 path: s("/lib/security/pam_facelock.so"),
             },
+            PamAuthUpdateProfileActive,
             PamServiceAbsentSkipped { path: s("/p") },
             PamPlanAdd {
                 path: s("/p"),

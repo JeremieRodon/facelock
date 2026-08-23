@@ -25,12 +25,13 @@ pub enum SystemMessage {
     // -- the legacy facelock system group (ADR 010) --
     RetiredFacelockGroup,
 
-    // -- installing and removing the unit files --
+    // -- validating installed assets and controlling the unit --
     DisablingSystemdUnits,
     SystemdUnitsDisabled,
-    InstallingSystemdUnits,
-    WroteFile { path: String },
-    RefreshedLegacyFile { path: String },
+    ValidatingSystemAssets,
+    RemovedLegacySystemAsset { path: String },
+    PreservedLocalDbusPolicy { path: String },
+    SystemAssetsValidated,
     SystemctlDaemonReloadDone,
     SystemctlEnableDone { unit: String },
     DbusActivationEnabled,
@@ -66,14 +67,20 @@ impl Message for SystemMessage {
             }
             DisablingSystemdUnits => translate("Disabling facelock-daemon systemd units..."),
             SystemdUnitsDisabled => translate("facelock-daemon service disabled and stopped."),
-            InstallingSystemdUnits => {
-                translate("Installing facelock-daemon systemd and D-Bus units...")
+            ValidatingSystemAssets => {
+                translate("Validating installed facelock-daemon systemd and D-Bus assets...")
             }
-            WroteFile { path } => fill(translate("  Wrote {path}"), &[("path", path.clone())]),
-            RefreshedLegacyFile { path } => fill(
-                translate("  Refreshed legacy {path}"),
+            RemovedLegacySystemAsset { path } => fill(
+                translate("  Removed exact known legacy {path}"),
                 &[("path", path.clone())],
             ),
+            PreservedLocalDbusPolicy { path } => fill(
+                translate(
+                    "  Preserved merged local D-Bus policy {path}; review it if Facelock bus authorization is unexpected.",
+                ),
+                &[("path", path.clone())],
+            ),
+            SystemAssetsValidated => translate("  Installed systemd and D-Bus assets validated."),
             SystemctlDaemonReloadDone => translate("  systemctl daemon-reload done."),
             SystemctlEnableDone { unit } => fill(
                 translate("  systemctl enable {unit} done."),
@@ -94,7 +101,7 @@ impl Message for SystemMessage {
 /// above: no wildcard arm, so a variant that renders nothing does not build.
 #[cfg(test)]
 impl super::Samples for SystemMessage {
-    const VARIANT_COUNT: usize = 17;
+    const VARIANT_COUNT: usize = 18;
 
     fn samples() -> Vec<Self> {
         use SystemMessage::*;
@@ -110,9 +117,10 @@ impl super::Samples for SystemMessage {
             RetiredFacelockGroup,
             DisablingSystemdUnits,
             SystemdUnitsDisabled,
-            InstallingSystemdUnits,
-            WroteFile { path: s("/p") },
-            RefreshedLegacyFile { path: s("/p") },
+            ValidatingSystemAssets,
+            RemovedLegacySystemAsset { path: s("/p") },
+            PreservedLocalDbusPolicy { path: s("/p") },
+            SystemAssetsValidated,
             SystemctlDaemonReloadDone,
             SystemctlEnableDone {
                 unit: s("u.service"),
@@ -142,22 +150,26 @@ mod tests {
             "facelock-daemon service disabled and stopped."
         );
         assert_eq!(
-            InstallingSystemdUnits.localized(),
-            "Installing facelock-daemon systemd and D-Bus units..."
+            ValidatingSystemAssets.localized(),
+            "Validating installed facelock-daemon systemd and D-Bus assets..."
         );
         assert_eq!(
-            WroteFile {
+            RemovedLegacySystemAsset {
                 path: "/etc/systemd/system/facelock-daemon.service".into()
             }
             .localized(),
-            "  Wrote /etc/systemd/system/facelock-daemon.service"
+            "  Removed exact known legacy /etc/systemd/system/facelock-daemon.service"
         );
         assert_eq!(
-            RefreshedLegacyFile {
-                path: "/usr/lib/systemd/system/facelock-daemon.service".into()
+            PreservedLocalDbusPolicy {
+                path: "/etc/dbus-1/system.d/90-facelock-admin.conf".into()
             }
             .localized(),
-            "  Refreshed legacy /usr/lib/systemd/system/facelock-daemon.service"
+            "  Preserved merged local D-Bus policy /etc/dbus-1/system.d/90-facelock-admin.conf; review it if Facelock bus authorization is unexpected."
+        );
+        assert_eq!(
+            SystemAssetsValidated.localized(),
+            "  Installed systemd and D-Bus assets validated."
         );
         assert_eq!(
             SystemctlDaemonReloadDone.localized(),

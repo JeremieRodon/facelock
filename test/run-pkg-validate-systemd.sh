@@ -7,10 +7,28 @@
 # the daemon inside the sandbox, and probe the seccomp/address-family
 # restrictions with transient units.
 #
-# Usage: test/run-pkg-validate-systemd.sh <image>
+# Usage: test/run-pkg-validate-systemd.sh <image> [exact-package.deb]
 set -euo pipefail
 
-IMAGE="${1:?usage: run-pkg-validate-systemd.sh <image>}"
+IMAGE="${1:?usage: run-pkg-validate-systemd.sh <image> [exact-package.deb]}"
+PACKAGE="${2:-}"
+[ "$#" -le 2 ] || {
+    echo "usage: run-pkg-validate-systemd.sh <image> [exact-package.deb]" >&2
+    exit 2
+}
+package_mount=()
+if [ -n "$PACKAGE" ]; then
+    [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || {
+        echo "exact Debian package is not a regular file: $PACKAGE" >&2
+        exit 1
+    }
+    PACKAGE="$(cd "$(dirname "$PACKAGE")" && pwd)/$(basename "$PACKAGE")"
+    [ "$(stat -c %a "$PACKAGE")" = 444 ] || {
+        echo "exact Debian package must have mode 0444: $PACKAGE" >&2
+        exit 1
+    }
+    package_mount=(-v "$PACKAGE:/facelock-test-package.deb:ro,Z")
+fi
 
 # Bind-mount repo ONNX models so the daemon-start test can run: `facelock
 # daemon` loads models at startup. Models are large and gitignored, so a fresh
@@ -24,7 +42,10 @@ shopt -s nullglob
 onnx=(models/*.onnx)
 shopt -u nullglob
 if [ "${#onnx[@]}" -gt 0 ]; then
-    mounts=(-v "$PWD/models:/var/lib/facelock/models")
+    # Stage read-only rather than mounting over the runtime model directory.
+    # pkg-validate removes its disposable runtime copy before the uninstall
+    # assertions to prove package cleanup has no model dependency.
+    mounts=(-v "$PWD/models:/facelock-test-models:ro")
 elif [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = "1" ]; then
     echo "WARNING: no models/*.onnx in repo — the daemon-start assertions will be" >&2
     echo "         reported as skipped (FACELOCK_ALLOW_MISSING_MODELS=1)." >&2
@@ -47,7 +68,7 @@ fi
 #   ProtectProc=/ProcSubset= (they need a fresh procfs mount, which the
 #   kernel refuses when parts of /proc are overmounted).
 cid=$(podman run -d --rm --systemd=always --security-opt unmask=ALL \
-    "${mounts[@]}" "$IMAGE" /lib/systemd/systemd)
+    "${mounts[@]}" "${package_mount[@]}" "$IMAGE" /lib/systemd/systemd)
 trap 'podman rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
 # Wait for systemd to finish booting (degraded is fine — minimal containers
@@ -66,4 +87,44 @@ if [ -z "$booted" ]; then
     exit 1
 fi
 
+# Never expose checkout files at Facelock's mutable runtime path. Copy only
+# model payloads from the read-only mount into this disposable container after
+# systemd has booted. The genuine active-service upgrade cases need the daemon
+# to load them before the shared package validator begins.
+if [ "${#onnx[@]}" -gt 0 ]; then
+    podman exec "$cid" sh -eu -c '
+        install -d -m 0755 /var/lib/facelock/models
+        for model in /facelock-test-models/*.onnx; do
+            [ -f "$model" ]
+            install -m 0644 "$model" /var/lib/facelock/models/
+        done
+    '
+fi
+
+if podman exec "$cid" test -x /deb-package-lifecycle.sh; then
+    [ -n "$PACKAGE" ] || {
+        echo "ERROR: Debian lifecycle image requires an exact package argument" >&2
+        exit 1
+    }
+    podman exec "$cid" /deb-package-lifecycle.sh install-remove-reinstall
+    podman exec "$cid" /deb-package-lifecycle.sh versioned-upgrade-inactive
+    if [ "${#onnx[@]}" -gt 0 ]; then
+        podman exec "$cid" /deb-package-lifecycle.sh versioned-upgrade-active
+    elif [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = 1 ]; then
+        echo "SKIP: Debian active-service versioned upgrades (no ONNX models, FACELOCK_ALLOW_MISSING_MODELS=1)" >&2
+    else
+        echo "ERROR: Debian active-service versioned upgrades require the reviewed ONNX models" >&2
+        exit 1
+    fi
+    podman exec "$cid" install -m 0644 /facelock-test.pam /etc/pam.d/facelock-test
+fi
+
+if podman exec "$cid" test -x /rpm-service-pam-lifecycle.sh; then
+    podman exec "$cid" /rpm-service-pam-lifecycle.sh
+fi
+
 podman exec "${exec_env[@]}" "$cid" /pkg-validate.sh
+
+if podman exec "$cid" test -x /deb-package-lifecycle.sh; then
+    podman exec "$cid" /deb-package-lifecycle.sh purge
+fi

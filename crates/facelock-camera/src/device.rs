@@ -115,10 +115,10 @@ pub(crate) fn is_ir_typical_fourcc(fourcc: &str) -> bool {
 /// overlap on GREY and Y16 but neither contains the other: Y8/Y10/Y12 are
 /// IR-typical yet undecodable, and YUYV/NV12/MJPG are decodable yet not IR
 /// evidence. A device classified IR purely on Y8/Y10/Y12 evidence is
-/// therefore excluded from auto-detection — see [`pick_auto_device`], which
-/// says so in syslog rather than leaving the operator with only the
-/// downstream "not an IR camera" error.
-fn has_decodable_format(device: &DeviceInfo) -> bool {
+/// therefore excluded from automatic selection. See [`pick_auto_device`],
+/// which says so in syslog; setup uses this same predicate and reports its own
+/// exclusion at camera-selection time.
+pub fn has_decodable_format(device: &DeviceInfo) -> bool {
     device
         .formats
         .iter()
@@ -236,33 +236,33 @@ fn ir_source_with_quirks_and_ids(
     quirks: Option<&crate::quirks::QuirksDb>,
     usb_ids: Option<&(String, String)>,
 ) -> IrSource {
-    if let Some(db) = quirks {
-        if let Some((quirk, kind)) = db.find_match_with_kind(device, usb_ids) {
-            match quirk.force_ir {
-                Some(false) => return IrSource::None,
-                Some(true) => {
-                    let corroborated = match kind {
-                        // A real hardware identity match — authoritative on
-                        // its own.
-                        crate::quirks::QuirkMatchKind::UsbId => true,
-                        // A name-only match needs corroboration: either a
-                        // real (if DB-unlisted) USB identity, or the
-                        // device's own queried evidence. A virtual
-                        // v4l2loopback node has neither, so a crafted name
-                        // alone can no longer win force_ir through the
-                        // quirks path (#98 Task 3).
-                        crate::quirks::QuirkMatchKind::NameOnly => {
-                            usb_ids.is_some() || has_queried_ir_evidence(device)
-                        }
-                    };
-                    if corroborated {
-                        return IrSource::Quirk;
+    if let Some(db) = quirks
+        && let Some((quirk, kind)) = db.find_match_with_kind(device, usb_ids)
+    {
+        match quirk.force_ir {
+            Some(false) => return IrSource::None,
+            Some(true) => {
+                let corroborated = match kind {
+                    // A real hardware identity match — authoritative on
+                    // its own.
+                    crate::quirks::QuirkMatchKind::UsbId => true,
+                    // A name-only match needs corroboration: either a
+                    // real (if DB-unlisted) USB identity, or the
+                    // device's own queried evidence. A virtual
+                    // v4l2loopback node has neither, so a crafted name
+                    // alone can no longer win force_ir through the
+                    // quirks path (#98 Task 3).
+                    crate::quirks::QuirkMatchKind::NameOnly => {
+                        usb_ids.is_some() || has_queried_ir_evidence(device)
                     }
-                    // Uncorroborated name-only force_ir: fall through to the
-                    // evidence-only heuristic below.
+                };
+                if corroborated {
+                    return IrSource::Quirk;
                 }
-                None => {}
+                // Uncorroborated name-only force_ir: fall through to the
+                // evidence-only heuristic below.
             }
+            None => {}
         }
     }
     heuristic_ir_source(device)
@@ -1084,6 +1084,22 @@ mod tests {
         let y16_only = device_at("/dev/video0", "Depth Camera", &["Y16"]);
         assert!(has_decodable_format(&y16_only));
         assert_eq!(heuristic_ir_source(&y16_only), IrSource::Format);
+    }
+
+    #[test]
+    fn decodable_format_predicate_keeps_grey_and_y16_but_rejects_y8_y10_y12() {
+        for format in ["GREY", "Y16", "Y16 "] {
+            assert!(
+                has_decodable_format(&device_at("/dev/video0", "IR", &[format])),
+                "{format} must remain decodable"
+            );
+        }
+        for format in ["Y8", "Y10", "Y12"] {
+            assert!(
+                !has_decodable_format(&device_at("/dev/video0", "IR", &[format])),
+                "{format} is IR evidence but is not decodable"
+            );
+        }
     }
 
     #[test]

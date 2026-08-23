@@ -186,9 +186,14 @@ Every management command is root-only; the CLI offers to re-run itself under
 `sudo` on a terminal. Face unlock itself (hyprlock, swaylock, the polkit
 agent, `facelock is-enrolled`) needs no group and no re-login: the bus admits
 any local user's `Authenticate` for their own account (ADR 010). If a lock
-screen still reports `AccessDenied` right after an upgrade, the bus has not
-re-read the policy yet — `sudo facelock setup --systemd` rewrites it and asks
-for a reload, or reboot.
+screen still reports `AccessDenied` right after an upgrade, the bus may not
+have re-read the policy yet. `sudo facelock setup --systemd` validates the
+package-owned policy, transactionally retires only the byte-exact historical
+duplicate, and asks for a reload; it never rewrites a package file or an
+administrator-modified `/etc` copy. D-Bus merges all policy fragments, so setup
+reports other local fragments for review instead of calling them ineffective.
+Resolve a preserved-path or rollback error, review any reported local policy,
+or reboot.
 
 The `facelock` group is no longer used (ADR 010). `sudo facelock setup`, `just
 install-files` and the package scriptlets remove a leftover group; if it

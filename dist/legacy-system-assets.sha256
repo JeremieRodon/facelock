@@ -1,0 +1,37 @@
+# Exact Facelock system assets that repository setup/install code has shipped.
+#
+# Format: <asset-id> <sha256>.  setup.rs embeds this file and the source-install
+# migration reads it directly.  Add a digest only after reviewing the exact
+# historical bytes; marker, substring, and filename matches are intentionally
+# insufficient authority to delete an administrator-owned /etc override.
+
+# source 096931a45a5354970230ae4676ff06ecfe3671a7:systemd/facelock-daemon.service
+systemd-unit a5ea88523bd5dd952a620da43f5552c656d69544301db6f5eda892458ea2ea12
+# source 1470beb178a7bb983633a17905b95456b1b7e01f:systemd/facelock-daemon.service
+systemd-unit 92bd0768e83dff6975a3cd694a38c6cc16b4f2b3c17db433d20821cff6458e58
+# source dab45cdebe66919469f2d5cf81dc101ad617a561:systemd/facelock-daemon.service
+systemd-unit da291c66f41eebb33bd283b3ba832644a9ec2461275f1dda9cac46bf85c15c3f
+# source debc603cde6d870b69a3272623d4e9f0187cb4d7:systemd/facelock-daemon.service
+systemd-unit afb4fa589d2c26f06c7d6d11a67056198e8ff9eb1f9427ff35f48b9dd146e69a
+# source e006edc2d694a10e0b23d3f55bd78d02b9b5defc:systemd/facelock-daemon.service
+systemd-unit 5ae6a063fcefe9654078b8fc413291efea22980a82cea08a489c1c26405ec295
+# source c64b10f3b85683c12c7c12c5849f311402e6ce61:systemd/facelock-daemon.service
+systemd-unit 7544af14679278e404d54858fc84ba7616f20c6f1266e4e2d45eef8cd0c2c4b6
+# source 610c201a8cf21afe488eb6faaf14b77effa4a606:systemd/facelock-daemon.service
+systemd-unit dffe34d055857fd69150ced81f0d7fccad87060ae2318ee9f3ddcafcf48cf5a1
+# source 1d684ca528820c4da429f67862943330ccf13194:systemd/facelock-daemon.service
+systemd-unit 39438bae0d97852faeb95964006b8efc3ed658648e4a7ab9a4fdb33a175a5bfe
+# source 04ec3efe2decf6f7c2dd7a20d20d6f5d4aa5e190:systemd/facelock-daemon.service
+systemd-unit d66167d09f8ff8303e583566970dfb4202e8c781082702191ecf2dbf336971ce
+
+# source a0102318ff8a19aef8cad529e1b937ce69520186:dbus/org.facelock.Daemon.conf
+dbus-policy 39b42dabbadb3e22de4d0edc7614dfb91bc901819b9871423f45d8c3aae2f223
+# source f293b3e0a31fe5eb4ed7503ec4b5fcc74d31912d:dbus/org.facelock.Daemon.conf
+dbus-policy 6c44d14b1d7ba3e02021b101712ce0050a42347dbb1556ac63492916bd24c0a7
+# source 39ecc15b7718b181c85d6f490f5ea4f97d68ec39:dbus/org.facelock.Daemon.conf
+dbus-policy 31f6792628375aeb69d631de75e997574b480ca0610f4169c3db23865be34e5f
+# source 04ec3efe2decf6f7c2dd7a20d20d6f5d4aa5e190:dbus/org.facelock.Daemon.conf
+dbus-policy f046a97378b006122b71069fa831b983e293e3fdfec2d44edbdfa67ec0211e7c
+
+# source 04ec3efe2decf6f7c2dd7a20d20d6f5d4aa5e190:dbus/org.facelock.Daemon.service
+dbus-activation ed5ab678c401a4fe61c06fda3f31246a61fd4ce30b7add75bee671977260b9ee

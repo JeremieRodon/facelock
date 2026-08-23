@@ -60,6 +60,7 @@ fn matrix_row_bare_setup_is_the_full_wizard() {
     assert_eq!(p.execution_provider, None);
     assert_eq!(p.encryption, None);
     assert!(!p.yes);
+    assert!(!p.allow_sensitive);
 }
 
 #[test]
@@ -844,6 +845,7 @@ fn legacy_invocations_still_parse() {
         ],
         &["facelock", "pam", "add", "--service", "x", "--if-present"],
         &["facelock", "pam", "remove"],
+        &["facelock", "pam", "remove", "--all"],
         &[
             "facelock",
             "pam",
@@ -1003,7 +1005,7 @@ fn pam_service_is_repeatable_and_ordered() {
 
 /// **`--no-confirm` must never imply `--allow-sensitive`.** They are
 /// separate authorizations: "do not ask me" and "yes, edit system-auth".
-/// `setup --yes` keeps the combined meaning and is the sole exception.
+/// The primary PAM verb and the setup alias both enforce that separation.
 #[test]
 fn no_confirm_and_allow_sensitive_are_independent() {
     for skip_prompts in [
@@ -1026,8 +1028,52 @@ fn no_confirm_and_allow_sensitive_are_independent() {
         "--allow-sensitive accepts a risk; it does not skip the question"
     );
 
-    // `setup --yes` is the documented exception, unchanged.
-    assert!(plan(&["--pam", "--yes"]).yes);
+    // The setup alias must keep the same separation.
+    let setup = plan(&["--pam", "--yes"]);
+    assert!(setup.yes);
+    assert!(!setup.allow_sensitive);
+}
+
+/// `setup --pam` exposes the same explicit sensitive authorization as the
+/// primary `pam add` surface, and the modifier is meaningless without PAM.
+#[test]
+fn setup_accepts_explicit_sensitive_authorization_only_with_pam() {
+    let authorized = [
+        "facelock",
+        "setup",
+        "--pam",
+        "--service",
+        "system-auth",
+        "--yes",
+        "--allow-sensitive",
+    ];
+    assert!(
+        Cli::try_parse_from(authorized).is_ok(),
+        "`{}` must parse",
+        authorized.join(" ")
+    );
+    assert!(
+        Cli::try_parse_from(["facelock", "setup", "--allow-sensitive"]).is_err(),
+        "--allow-sensitive without --pam must be rejected"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "facelock",
+            "setup",
+            "--pam",
+            "--remove",
+            "--allow-sensitive",
+        ])
+        .is_err(),
+        "removal is never sensitive-gated, so it must not accept a meaningless authorization"
+    );
+
+    let resolved = plan(&["--pam", "--allow-sensitive"]);
+    assert!(resolved.allow_sensitive);
+    assert!(
+        !resolved.yes,
+        "sensitive authorization must not suppress the prompt"
+    );
 }
 
 /// `--allow-sensitive` is an `add`-only flag: removal can only take away a
@@ -1047,8 +1093,56 @@ fn remove_and_status_do_not_offer_allow_sensitive() {
     }
 }
 
-/// `--all` is `status`-only, takes no `--service`, and leaves the bare form
-/// alone.
+#[test]
+fn pam_remove_keep_backup_is_an_explicit_opt_out() {
+    let default = pam_request(&["remove"]);
+    assert!(!default.keep_backup);
+
+    let kept = pam_request(&["remove", "--keep-backup"]);
+    assert!(kept.keep_backup);
+
+    for argv in [
+        &["facelock", "pam", "add", "--keep-backup"][..],
+        &["facelock", "pam", "status", "--keep-backup"],
+    ] {
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "--keep-backup is remove-only: {argv:?}"
+        );
+    }
+}
+
+/// Package removal gets one fixed-root, read-only probe instead of parsing
+/// pam-auth-update state in a maintainer script. It is deliberately a hidden
+/// internal surface and carries no file-selection or mutation flags.
+#[test]
+fn pam_shared_profile_status_is_a_read_only_internal_probe() {
+    let request = pam_request(&["shared-profile-status"]);
+    assert!(request.shared_profile_status);
+    assert_eq!(
+        request.action,
+        facelock_cli::commands::pam::PamAction::Status
+    );
+    assert!(request.services.is_empty());
+    assert!(!request.all);
+
+    for argv in [
+        &["facelock", "pam", "shared-profile-status", "--all"][..],
+        &[
+            "facelock",
+            "pam",
+            "shared-profile-status",
+            "--service",
+            "sudo",
+        ],
+        &["facelock", "pam", "shared-profile-status", "--dry-run"],
+    ] {
+        assert!(Cli::try_parse_from(argv).is_err(), "must reject {argv:?}");
+    }
+}
+
+/// `--all` is an enumerating flag for status and removal, takes no
+/// `--service`, and leaves both bare forms alone.
 ///
 /// The last clause is the compatibility one: `pam status` with no flags has
 /// meant `sudo` since the verb shipped, and its exit code is 0/1/2 about that
@@ -1056,9 +1150,15 @@ fn remove_and_status_do_not_offer_allow_sensitive() {
 /// without changing their command line, which is why `--all` is a flag rather
 /// than a new default (docs/contracts.md, "facelock pam Semantics").
 #[test]
-fn all_is_a_status_only_flag_and_leaves_the_bare_form_alone() {
+fn all_enumerates_status_or_removal_and_leaves_bare_forms_alone() {
     assert!(pam_request(&["status", "--all"]).all);
     assert!(pam_request(&["status", "--all", "--json"]).json);
+    let removal = pam_request(&["remove", "--all"]);
+    assert!(removal.all);
+    assert_eq!(
+        removal.action,
+        facelock_cli::commands::pam::PamAction::Remove
+    );
 
     let bare = pam_request(&["status"]);
     assert!(!bare.all, "bare `pam status` must still mean one service");
@@ -1066,6 +1166,9 @@ fn all_is_a_status_only_flag_and_leaves_the_bare_form_alone() {
         bare.services.is_empty(),
         "...resolved to sudo in the command"
     );
+    let bare_remove = pam_request(&["remove"]);
+    assert!(!bare_remove.all, "bare `pam remove` must still mean sudo");
+    assert!(bare_remove.services.is_empty());
 
     // `--if-present` composes: the pair is documented as answering
     // "everything configured, and absence is not an error".
@@ -1075,10 +1178,10 @@ fn all_is_a_status_only_flag_and_leaves_the_bare_form_alone() {
         // Enumerating and naming are two questions; a request that did both
         // would have to drop one silently.
         &["facelock", "pam", "status", "--all", "--service", "sudo"][..],
-        // A write verb has nothing to enumerate: `add --all` would have to
-        // mean "edit every service file on the machine".
+        &["facelock", "pam", "remove", "--all", "--service", "sudo"],
+        // Addition is deliberately named: `add --all` would edit every PAM
+        // service file on the machine rather than clean Facelock-owned work.
         &["facelock", "pam", "add", "--all"],
-        &["facelock", "pam", "remove", "--all"],
     ] {
         assert!(
             Cli::try_parse_from(argv).is_err(),

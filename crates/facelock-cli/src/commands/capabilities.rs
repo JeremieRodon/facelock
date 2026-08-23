@@ -67,9 +67,11 @@ pub const CAPABILITIES: &[&str] = &[
     "pam-if-present",
     "pam-json",
     "pam-multi-service",
+    "pam-remove-all",
     "pam-status",
     "pam-status-all",
     "quiet",
+    "setup-allow-sensitive",
     "setup-if-present",
     "setup-no-pam",
     "setup-systemd",
@@ -148,6 +150,7 @@ mod tests {
         "pam-status",
         "pam-status-all",
         "quiet",
+        "setup-allow-sensitive",
         "setup-if-present",
         "setup-no-pam",
         "setup-systemd",
@@ -168,6 +171,15 @@ mod tests {
                  names are added, never removed"
             );
         }
+    }
+
+    #[test]
+    fn setup_sensitive_authorization_is_probeable() {
+        assert!(
+            CAPABILITIES.contains(&"setup-allow-sensitive"),
+            "wrappers need to distinguish prompt-only setup --yes from builds \
+             where that flag also authorized sensitive PAM writes"
+        );
     }
 
     /// Strict `<` proves sorted and deduplicated in one pass — the contract

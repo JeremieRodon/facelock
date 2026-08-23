@@ -27,9 +27,8 @@ pub struct UserArg {
     pub user: Option<String>,
 }
 
-/// Confirmation bypass for the commands whose only prompt is "are you sure?" —
-/// `remove` and `clear`. `setup` deliberately declares its own `yes` instead,
-/// because there the flag also unlocks a gate; see [`SetupCli`].
+/// Confirmation bypass for commands whose prompt is an ordinary confirmation.
+/// It never grants a separate authorization such as `--allow-sensitive`.
 ///
 /// `--no-confirm` shipped on `setup` only; it is carried as a hidden alias on
 /// every site so a wrapper written against either spelling keeps working.
@@ -62,7 +61,7 @@ pub struct DryRunArg {
 
 /// `facelock setup`'s command line.
 ///
-/// Its only job is to become a [`SetupArgs`]. Naming the 16 fields once means
+/// Its only job is to become a [`SetupArgs`]. Naming the 17 fields once means
 /// `main` and the tests reach the resolver through the same conversion; when
 /// they were two hand-written destructures, a field added to one could be
 /// silently missing from the other.
@@ -71,16 +70,8 @@ pub struct SetupCli {
     /// Run in non-interactive mode (skip wizard)
     #[arg(long)]
     pub non_interactive: bool,
-    // Not a shared `ConfirmArg`: on `setup` the flag means more than it does
-    // elsewhere. It skips the per-file "Proceed?" prompt *and* unlocks the
-    // gate that otherwise refuses to write into a sensitive PAM service
-    // (`SENSITIVE_SERVICES` in commands/pam.rs). Rendering that as plain
-    // prompt suppression would understate what the user is authorizing.
-    // Spelling still cannot drift: `cli_flag_conformance` pins `-y` and the
-    // `no-confirm` alias on every arg named `yes`, wherever it is declared.
-    /// Skip confirmation prompts, and unlock the sensitive-service gate (also: --no-confirm)
-    #[arg(short = 'y', long, alias = "no-confirm")]
-    pub yes: bool,
+    #[command(flatten)]
+    pub confirm: ConfirmArg,
 
     // -- Action pairs. A later flag wins over an earlier one, so a wrapper
     //    script can append an override to a command it did not construct.
@@ -90,10 +81,10 @@ pub struct SetupCli {
     /// Do not touch PAM configuration at all (no prompt, no write)
     #[arg(long = "no-pam", overrides_with = "pam")]
     pub no_pam: bool,
-    /// Install and enable systemd units
+    /// Validate installed systemd/D-Bus assets, reload, and enable the daemon
     #[arg(long, overrides_with = "no_systemd")]
     pub systemd: bool,
-    /// Do not install or enable systemd units
+    /// Do not validate, reload, or enable systemd/D-Bus assets
     #[arg(long = "no-systemd", overrides_with = "systemd")]
     pub no_systemd: bool,
     /// Enroll a face during setup
@@ -116,6 +107,9 @@ pub struct SetupCli {
     /// Used with --pam: treat an absent service file as success
     #[arg(long = "if-present", requires = "pam")]
     pub if_present: bool,
+    /// Used with --pam: permit sensitive PAM services
+    #[arg(long = "allow-sensitive", requires = "pam", conflicts_with = "remove")]
+    pub allow_sensitive: bool,
 
     // -- Choice flags. Supplying a value answers the question, and so skips
     //    the matching wizard step.
@@ -137,7 +131,7 @@ impl From<SetupCli> for SetupArgs {
     fn from(cli: SetupCli) -> Self {
         let SetupCli {
             non_interactive,
-            yes,
+            confirm,
             pam,
             no_pam,
             systemd,
@@ -148,6 +142,7 @@ impl From<SetupCli> for SetupArgs {
             service,
             remove,
             if_present,
+            allow_sensitive,
             camera,
             models,
             execution_provider,
@@ -155,7 +150,7 @@ impl From<SetupCli> for SetupArgs {
         } = cli;
         SetupArgs {
             non_interactive,
-            yes,
+            yes: confirm.yes,
             pam,
             no_pam,
             systemd,
@@ -166,6 +161,7 @@ impl From<SetupCli> for SetupArgs {
             service,
             remove,
             if_present,
+            allow_sensitive,
             camera,
             models,
             execution_provider,
@@ -194,6 +190,9 @@ pub struct PamServiceArg {
 /// construct in a test.
 #[derive(Subcommand)]
 pub enum PamCli {
+    /// Inspect Debian's packaged shared profile for package lifecycle guards
+    #[command(hide = true)]
+    SharedProfileStatus,
     /// Add the facelock line to one or more /etc/pam.d service files
     #[command(after_help = "\
 --yes/--no-confirm only skips the per-file confirmation. Editing one of the \
@@ -225,16 +224,26 @@ modified.")]
     /// Remove the facelock line from one or more /etc/pam.d service files
     #[command(after_help = "\
 Removal is never gated by the sensitive-service list and never prompts — it can \
-only take away a way to authenticate, and the .facelock-backup file written by \
-`add` is left in place. --yes/--no-confirm is accepted for symmetry with `add`.")]
+only take away a way to authenticate. Facelock-owned backups and legacy \
+.facelock-backup files are cleaned by default; --keep-backup preserves them. \
+--all ignores configured PAM directories, scans the compiled system roots, \
+preflights and journals the complete recognized set, and rolls every earlier \
+file back if a later replacement or final active-reference scan fails. \
+--yes/--no-confirm is accepted for symmetry with `add`.")]
     Remove {
         #[command(flatten)]
         service: PamServiceArg,
+        /// Remove every recognized Facelock-owned PAM edit under the system PAM roots
+        #[arg(long, conflicts_with = "service")]
+        all: bool,
         #[command(flatten)]
         confirm: ConfirmArg,
         /// Treat a missing service file as success instead of an error
         #[arg(long = "if-present")]
         if_present: bool,
+        /// Preserve Facelock PAM backups instead of cleaning them up
+        #[arg(long = "keep-backup")]
+        keep_backup: bool,
         #[command(flatten)]
         dry_run: DryRunArg,
         #[command(flatten)]
@@ -268,6 +277,11 @@ read, so 'not configured' and 'not checked' are never the same answer.")]
 impl From<PamCli> for PamRequest {
     fn from(cli: PamCli) -> Self {
         match cli {
+            PamCli::SharedProfileStatus => PamRequest {
+                action: PamAction::Status,
+                shared_profile_status: true,
+                ..PamRequest::default()
+            },
             PamCli::Add {
                 service,
                 confirm,
@@ -277,6 +291,7 @@ impl From<PamCli> for PamRequest {
                 json,
             } => PamRequest {
                 action: PamAction::Add,
+                shared_profile_status: false,
                 services: service.service,
                 all: false,
                 // `--json` implies `--no-confirm` and never `--allow-sensitive`:
@@ -287,23 +302,28 @@ impl From<PamCli> for PamRequest {
                 allow_sensitive,
                 if_present,
                 dry_run: dry_run.dry_run,
+                keep_backup: false,
                 json: json.json,
             },
             PamCli::Remove {
                 service,
+                all,
                 confirm,
                 if_present,
+                keep_backup,
                 dry_run,
                 json,
             } => PamRequest {
                 action: PamAction::Remove,
+                shared_profile_status: false,
                 services: service.service,
-                all: false,
+                all,
                 // Symmetry with `add`; `remove` has nothing to suppress today.
                 no_confirm: confirm.yes || json.json,
                 allow_sensitive: false,
                 if_present,
                 dry_run: dry_run.dry_run,
+                keep_backup,
                 json: json.json,
             },
             PamCli::Status {

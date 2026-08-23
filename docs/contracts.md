@@ -20,6 +20,8 @@ follow it.
   - [facelock is-enrolled Exit Codes](#facelock-is-enrolled-exit-codes)
   - [facelock auth Exit Codes](#facelock-auth-exit-codes)
 - [Release Channels and APT Paths](#release-channels-and-apt-paths)
+- [ONNX Runtime Trust and Fedora RPM Modes](#onnx-runtime-trust-and-fedora-rpm-modes)
+- [Package Lifecycle Ownership](#package-lifecycle-ownership)
 - [Filesystem Paths](#filesystem-paths)
   - [Audit Log Entries](#audit-log-entries)
 - [Config Schema](#config-schema)
@@ -52,10 +54,12 @@ follow it.
 | Command | Purpose |
 |---------|---------|
 | `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, daemon, enrollment, PAM — the daemon before enrollment, so enrollment and the recognition test run on the transport later authentications use); removes a leftover `facelock` group from an older install, best-effort (ADR 010) |
-| `facelock setup --systemd` | Install/enable systemd units |
+| `facelock setup --systemd` | Validate installed systemd/D-Bus assets, retire exact known legacy copies, reload, verify resolution, and enable the daemon unit |
 | `facelock setup --pam` | Alias onto `facelock pam add\|remove` (see "facelock pam" below). Kept, and kept parsing, for every wrapper written against it |
+| `facelock setup --pam --allow-sensitive` | Explicitly authorize an add to a sensitive PAM service. Does not suppress confirmation and conflicts with `--remove` |
 | `facelock pam add` | Add the facelock line to one or more `/etc/pam.d/<service>` files. Root |
-| `facelock pam remove` | Remove it. Root |
+| `facelock pam remove` | Remove it. Root. Cleans validated Facelock-owned rollback state by default; `--keep-backup` preserves it |
+| `facelock pam remove --all` | Config-independent, whole-machine removal of recognized Facelock-owned direct PAM edits beneath compiled roots. Root. Conflicts with `--service` |
 | `facelock pam status` | Report whether services carry the line. Reads only, **no root** — the probe to branch on instead of grepping `/etc/pam.d` |
 | `facelock setup` choice flags | `--camera <PATH\|auto>`, `--models <standard\|balanced\|high>`, `--execution-provider <cpu\|cuda\|rocm\|openvino\|auto>`, `--encryption <tpm\|keyfile\|none\|auto>`. Precedence: CLI flag > config file > built-in default |
 | `facelock setup` action opt-outs | `--no-pam`, `--no-systemd`, `--no-enroll` decline an action outright (and their `--pam`/`--systemd`/`--enroll` counterparts force it). Later flag wins |
@@ -95,8 +99,7 @@ commands and never earn a group. Inside a group the second word is spelled the
 way its domain spells it, verb or noun: `tpm seal-key` and `tpm pcr-baseline`
 follow tpm2-tools, `bench cold-auth` names a measurement. A new command must
 fit an existing domain before it may claim a top-level name. Commands named by
-`pam_facelock.so`, the service units, or the Omarchy scripts never move. See
-ADR 009.
+`pam_facelock.so` or the service units never move. See ADR 009.
 
 The top-level set is pinned by the `TOP_LEVEL_COMMANDS` registry in
 `crates/facelock-cli/src/conformance/flags.rs`, checked in both directions against
@@ -270,17 +273,102 @@ path took in the vendor directories, `--service polkit-1` finds
 `--if-present` for services a machine may genuinely not have. The default stays
 a hard error, which is what catches `--service polkti-1`.
 
+### facelock setup System Asset Ownership
+
+`facelock setup --systemd` is not an installer for immutable service assets.
+The Debian/RPM/Arch packages and `just install-files` own these canonical
+files:
+
+- `/usr/lib/systemd/system/facelock-daemon.service`
+- `/usr/share/dbus-1/system.d/org.facelock.Daemon.conf`
+- `/usr/share/dbus-1/system-services/org.facelock.Daemon.service`
+
+Setup requires each path to be a single-link `0644 root:root` regular file
+whose bytes match the running build. It never creates, overwrites, changes the
+mode or changes the owner of one. After `daemon-reload`, setup requires
+systemd's `FragmentPath` to name the canonical unit and refuses drop-ins. D-Bus
+activation is also winner-selected: setup refuses exact-name definitions in
+the higher-priority `/etc`, `/run`, and `/usr/local` service directories. D-Bus
+policy is different: every policy fragment is merged. Setup proves the
+canonical policy bytes are present and the exact historical `/etc` duplicate
+is retired; it preserves and reports every other local policy fragment and
+never claims those administrator rules are ineffective.
+
+The only static-file mutation setup may perform is retiring these historical
+legacy copies:
+
+- `/etc/systemd/system/facelock-daemon.service`
+- `/etc/dbus-1/system.d/org.facelock.Daemon.conf`
+- `/etc/dbus-1/system-services/org.facelock.Daemon.service`
+
+The complete canonical, legacy, and fixed quarantine set is preflighted before
+the first mutation.
+A legacy path is removable only when it is a single-link `0644 root:root`
+regular file whose SHA-256 is in `dist/legacy-system-assets.sha256`, the
+reviewed inventory of exact historical Facelock bytes. Missing paths are
+healthy and repeated migration is a no-op. Modified, unknown, symlinked,
+hardlinked, non-regular, wrongly owned or wrongly moded paths are preserved and
+make the action fail with the exact path and recovery direction; an ambiguous
+peer or quarantine collision prevents removal of every otherwise exact peer in
+that run. The sole recoverable pre-existing quarantine state is an absent
+public legacy name paired with its exact known, trusted fixed quarantine.
+Before restoring any such pair, setup preflights the complete canonical and
+three-pair set. It restores every recoverable pair in reverse order with
+no-replace semantics, revalidates the result, then restarts the complete
+migration preflight. A dual-name pair, changed quarantine, ambiguous peer, or
+recovery collision is preserved and reported without overwrite.
+
+Migration first moves every candidate with no-replace semantics to its fixed,
+same-parent `.facelock-migrate-*` quarantine. A later staging or revalidation
+failure rolls earlier candidates back in reverse order before any quarantine
+is deleted. Rollback never overwrites a replacement: a collision preserves
+both fixed names and reports incomplete recovery. Only after every legacy name
+is absent and the complete canonical and quarantine set has been revalidated
+does deletion of the quarantines publish the migration. Cleanup failure after
+that boundary can leave a reported fixed quarantine, but cannot leave a mix of
+active historical names; the next run authenticates, restores, and remigrates
+that exact pair through the same bounded protocol. Rust uses Linux
+`renameat2(RENAME_NOREPLACE)` without a replacing-rename fallback; the source
+helper uses same-parent GNU `mv -Tn` and verifies both names so a no-clobber
+skip is an error.
+
+Production pins the trusted identity to UID/GID `0:0` and requires the layout
+root, every existing parent, and every asset to have the documented trusted
+ownership and modes. The source helper's explicit alternate-layout test mode
+treats that real, non-linked layout directory's owner as the root-equivalent
+identity and also rejects a group/world-writable root. That identity can change
+the fixture just as root can change the production filesystem; it is not an
+isolation boundary.
+
+`setup --systemd --disable` stops and disables the unit without writing any
+service asset. A concurrent privileged writer can always replace root-owned
+names between filesystem operations; setup detects stable-path changes by
+revalidating immediately before removal, but does not claim isolation from a
+second root process. Administrators must not edit these paths concurrently.
+`just uninstall` removes only canonical `/usr` assets. It never inspects or
+removes any of the three historical `/etc` names, even when one is an exact
+known regular copy; linked and parent-linked forms are preserved as well. It
+preflights the complete canonical set before deletion: every existing parent
+component must be a non-linked directory owned by the trusted root-equivalent
+identity and not writable by group/other, while each existing direct target
+must be a single-link `0644` regular file with that identity. A linked,
+multiply linked, wrongly owned, wrongly moded or non-regular canonical target,
+or any untrusted canonical parent, preserves every canonical peer and fails the
+uninstall-files action. This path-based shell preflight does not claim
+isolation from another process with the same root-equivalent authority.
+
 **`--pam` is an alias onto `facelock pam add` / `facelock pam remove`.** The
 plan resolution above stays on `setup` — `--pam`, `--no-pam`, `--service`,
 `--remove`, `--if-present` and their precedence rules are unchanged — and only
 the execution moved. The alias is exact, including the two things that make it
 not a plain forward:
 
-- **`setup --yes` keeps its combined meaning** and is the one documented
-  exception to the flag split below. It maps onto *both* of the writer's knobs:
-  `--no-confirm` (skip the per-file question) **and** `--allow-sensitive`
-  (accept the sensitive services listed below). `--non-interactive` maps onto
-  `--no-confirm` alone, as it always has.
+- **`setup --yes` maps onto `--no-confirm` only.** It suppresses the ordinary
+  per-file question and does not authorize a sensitive PAM mutation.
+  `--non-interactive` has the same prompt-only effect, as it always has.
+  `setup --pam --allow-sensitive` maps onto the writer's separate
+  authorization and does not suppress the question. The flag conflicts with
+  `--remove`, whose safe direction is never sensitive-gated.
 - **The root refusal is a hard error, not a `sudo` re-exec.** Standalone
   `--pam` never offered the interactive escalation (`needs_root_precheck`), and
   `facelock pam add|remove` does not either.
@@ -290,9 +378,27 @@ Supplying a choice flag suppresses the corresponding wizard step. `auto` means
 gives the default. Under `--non-interactive`, an unresolvable choice is an error,
 never a prompt.
 
+Setup's automatic camera choices apply the same post-classification decodability
+predicate as device.path-unset auto-detection. The interactive wizard excludes
+nodes that advertise none of GREY/Y16/YUYV/NV12/MJPG before it auto-selects or
+presents candidates, and `--camera auto` considers only the remaining
+IR-classified nodes. Exclusion never reclassifies a node: an IR node whose only
+formats are Y8/Y10/Y12 remains IR, but setup reports its path and advertised
+formats and does not select it. GREY and Y16 remain eligible. If
+`security.require_ir = true` and IR-classified nodes were detected but none has
+a decodable format, the wizard aborts setup before constructing its menu,
+reports every excluded IR path and format, and never presents, recommends, or
+persists an RGB fallback; unrelated camera-enumeration and prompt failures
+retain the wizard's recoverable camera-step behavior. With `require_ir = false`,
+decodable RGB nodes remain explicit wizard choices. `--camera auto` likewise
+errors instead of falling back to RGB when no usable IR candidate remains. An
+explicit `--camera /dev/videoN` remains an operator override and is still
+subject to the auth/open fail-closed checks.
+
 ### facelock pam Semantics
 
-`facelock pam add | remove | status` owns every write to `/etc/pam.d`.
+`facelock pam add | remove | status` and the machine-wide
+`facelock pam remove --all` cleanup own every direct write to `/etc/pam.d`.
 `setup --pam` is an alias onto it (above), and the wizard's step 9 calls the
 same writer, so there is one implementation of the edit and one set of rules.
 
@@ -303,8 +409,10 @@ does not exist, so a writer that looked only in `/etc/pam.d` could not
 configure the service at all. The list is `[pam] config_dirs` (Config Schema
 below) for a distribution whose vendor directory is somewhere else; there is no
 way to ask Linux-PAM at run time which one it was compiled with, so the default
-is the pair above and configuration is never required. A hit that is *refused* —
-a hard link, a symlink out of its directory — is still a hit: the search does
+for named add, remove and status is the pair above and configuration is never
+required. Machine-wide `remove --all` uses its own fixed roots described below.
+A hit that is *refused* —
+a hard link or any symlink — is still a hit: the search does
 not fall through to the next directory, because that would let a vendor file
 silently take over from an `/etc` entry facelock declined to follow.
 
@@ -318,9 +426,15 @@ it shadows it and will not track vendor updates. The copy reports `overridden`
 rather than `installed`, and the operator is told at the time, on the
 unsuppressible `notice` stream, because a new shadowing file in `/etc` is a
 durable change with a maintenance consequence. Deleting the override restores
-the vendor file; `pam remove` takes the line out and leaves the override in
-place. The vendor file is never read-modified-written, never backed up, and
-never renamed over.
+the vendor file. Named `pam remove` deletes an unchanged Facelock-created
+override after taking out its line; header, payload, metadata, identity or
+current-vendor drift keeps the no-rule local override and reports why. If no
+current vendor source exists, an exact header path derived from a normalized
+configured later-root candidate is recognition only: removal retains the
+local override and reports that the source is absent. An arbitrary path in a
+header is never authority. The
+vendor file is never read-modified-written, never backed up, and never renamed
+over.
 
 **The module is probed too, and that is a different list.** The service-file
 order above says where a *service file* is looked up; the module
@@ -343,12 +457,25 @@ distribution that ships face auth in its own PAM stack is configured, and
 saying otherwise would send an integrator off to create a copy that adds
 nothing.
 
-**Direct service-file editing is the Arch-family path.** Debian and Ubuntu
-compose their stacks with `pam-auth-update` from profiles in
-`/usr/share/pam-configs/`, and Fedora and RHEL with `authselect` (see
-`dist/authselect/facelock`); on those systems a hand-inserted line is
-overwritten by the tool that owns the file. Being able to resolve a vendor
-directory does not make this command idiomatic there.
+**Managed shared stacks are not leaf services.** Debian and Ubuntu compose
+their shared stacks with `pam-auth-update`; Fedora and RHEL use `authselect`.
+Facelock does not write through either manager's generated shared files.
+Before any direct `pam add` or `setup --pam` plan, Debian's detector reads only
+the compiled `/usr/share/pam-configs/facelock`, `/var/lib/pam/auth`, and
+`/etc/pam.d/common-auth` locations. It requires root-owned, non-writable,
+regular single-link files opened beneath no-follow directory descriptors, the
+exact packaged profile bytes, an exact `Module: facelock` selection, and a live
+Facelock rule inside pam-auth-update's Primary block. An active profile refuses
+the direct edit before backup state is created and says exactly how to run
+`sudo pam-auth-update --disable facelock`, verify password authentication, and
+retry the original Facelock command with all services and flags intact.
+Selected-but-inconsistent or untrusted state fails closed rather than being
+treated as inactive. A live managed rule whose saved selection is absent fails
+closed as well. The roots are not configurable and the environment cannot
+redirect them. Explicit named leaf services remain supported on every package
+family: the writer resolves and edits only that requested service under the PAM
+roots, while the sensitive-service gate and no-follow checks refuse generated
+`system-auth` and `password-auth` links.
 
 **Confinement.** A service name is **one path component**: not empty, no `/`,
 not `.` or `..`, no interior NUL. Rejected before any I/O, on `add`, `remove`
@@ -357,34 +484,25 @@ absolute name *replaces* the base — so this is the check, not the join.
 Anything else is accepted: `PAM_CANDIDATES` is the wizard's menu, **not** an
 allowlist, and a service that is not on it must keep working.
 
-**Symlinks are followed only inside the directory the entry was found in.** A
-well-formed name still has to survive the filesystem: on an authselect system
-`/etc/pam.d/system-auth` and `/etc/pam.d/password-auth` are symlinks into
-`/etc/authselect`, and read, copy and write all follow a link without being
-asked to. So the entry is `lstat`ed, and a link is canonicalized: a target
-**under that same directory** is followed — the real file is what gets read, rewritten and backed up, so the
-`.facelock-backup` lands beside the file that changed rather than beside the
-link — and a target anywhere else is a validation failure — **including a target in a
-directory later on the search path.** `/etc/pam.d/polkit-1 ->
-/usr/lib/pam.d/polkit-1`, wired up by hand, is therefore refused rather than
-treated as a vendor hit: it is a link out of `/etc`, and following it would put
-the edit in the package's own file, which is the one thing this must never do.
-The fix is to delete the link and let `pam add` create a real override. So is a
-link that cannot be resolved at all; the rule is "prove it stays inside", and a
-dangling link proves nothing. Being a validation failure, it writes nothing for the
-whole run, and `pam status` reports the service as `unknown` with the fixed
-reason `symlinked outside /etc/pam.d` (the human message on stderr names the
-target). That reason is a fixed name for the class, not a rendering of the
-directory that was violated: an entry in a vendor directory pointing out of
-*that* directory reports the same string, and the human message is what names
-the real one. Editing through such a link would edit a file authselect regenerates,
-so the change would disappear on the next `authselect apply-changes` with
-nothing to say it had.
+**Every symlinked service entry is refused by named add, remove and status.**
+The writer `lstat`s the entry for diagnostics, but read, mutation and recovery
+all reopen the confined service basename relative to an already-open PAM root
+with `O_NOFOLLOW`; neither a resolved absolute target nor a target recorded in
+provenance is ever opened.
+This applies even when the link text appears to remain in the same directory.
+It also prevents Facelock from editing generated authselect state through
+`/etc/pam.d/system-auth` or `/etc/pam.d/password-auth`, and prevents a hand-made
+`/etc/pam.d/polkit-1 -> /usr/lib/pam.d/polkit-1` link from turning a vendor file
+into a write target. A symlink is a validation failure for the whole write run,
+and `pam status` reports it as `unknown` with the retained fixed reason
+`symlinked outside /etc/pam.d`; that token names the compatibility class, not a
+claim that an in-directory link would be followed. The human diagnostic names
+the link text and the directory whose entry was refused.
 
-**A file with more than one hard link is refused.** A symlink can be followed
-to somewhere and checked; a second hard link cannot — a link count says another
-name for the inode exists and says nothing about where it is, so the edit
-cannot be shown to stay inside the directory. `pam status` reports it as
+**A file with more than one hard link is refused.** A symlink is a visible
+indirection this can reject by name; a second hard link says another name for
+the inode exists but not where, so the edit cannot be shown to stay inside the
+directory. `pam status` reports it as
 `unknown` with the fixed reason `hard-linked service file`. This is
 conservative rather than adversarial: a `/etc` that has been through a
 deduplicating backup or `jdupes -L` can trip it with nobody attacking anything,
@@ -400,23 +518,26 @@ unresolvable link is the absence of an *answer* about where a write would land.
 Both are phase-one failures on `add` and `remove` under `--if-present`, and
 exit 2 on `status --if-present`.
 
-**The sensitive gate is applied to the resolved file, not only to the typed
-name.** A symlink `alias -> system-auth` *inside* `/etc/pam.d` is followed, so
-without the second check `pam add --service alias` would be an ungated name for
-a gated file — which is the shape RHEL's older `authconfig` leaves behind, and
-why `system-auth-ac` and `password-auth-ac` are on the list as well.
+**The sensitive gate is applied before any write.** It checks the typed service
+and the confined basename returned by resolution. Symlinks cannot provide an
+alternate ungated name because every symlink is refused; the `system-auth-ac`
+and `password-auth-ac` spellings remain explicit members because older
+`authconfig` installations can use those names as real service files.
 
-**Two-phase.** Every requested service is validated — name, existence
-(subject to `--if-present`), the sensitive gate, and what the edit would be —
-before **any** file is written. A validation failure writes nothing at all,
+**Two-phase across services.** Every requested service is validated — name,
+existence (subject to `--if-present`), the sensitive gate, and what the edit
+would be — before **any** file is written. A validation failure writes nothing at all,
 which is what makes a caller's loop all-or-nothing for the failure that
 actually happens: a typo'd or gated service name. It is **not** a transaction:
 a write-phase I/O error on service N leaves 1..N-1 written. Those are reported
 per service and the exit code is non-zero; the remaining services are still
-attempted. The rollback is the `.facelock-backup` file written before each
-edit, which nothing in this command deletes.
+attempted. Each individual local mutation has its own serialized,
+crash-recoverable transaction and rollback pair, described below. Named
+`pam add` and `pam remove` do not use a whole-set journal; the compiled-root
+`pam remove --all` transaction is specified separately below.
 
-**`--no-confirm` never implies `--allow-sensitive`.** They are separate
+**`--no-confirm` never implies `--allow-sensitive`, including through
+`setup --pam`.** They are separate
 authorizations: "do not ask me" and "yes, edit the shared auth stack". The
 gated services are `common-auth`, `login`, `password-auth`,
 `password-auth-ac`, `sshd`, `system-auth`, `system-auth-ac` and
@@ -430,9 +551,10 @@ spelling made the gate depend on the operator's distribution. `login` and
 `sshd` are the two that are not: each locks one specific door — the TTY, the
 network — rather than every one at once. `--yes` and
 `--no-confirm` are the same flag (the shared `ConfirmArg` spelling, so "skip
-prompts" reads the same on `pam add` as on `remove` and `clear`) and neither
-unlocks the gate. `setup --yes` keeps the combined meaning and is the sole
-exception. `remove` is never gated **on sensitivity** — removal can only take
+prompts" reads the same on `setup`, `pam add`, `remove` and `clear`) and neither
+unlocks the gate. Both `pam add` and its `setup --pam` alias expose the same
+explicit `--allow-sensitive` authorization. `remove` is never gated **on
+sensitivity** — removal can only take
 away a way to authenticate — and never prompts, which is what
 `setup --pam --remove` has always done; the confinement rules below apply to
 every verb, `remove` and `status` included. `--yes`/`--no-confirm` is accepted there for symmetry and has
@@ -454,7 +576,7 @@ validation phase, before any prompt exists to skip, so an unattended
 |---------|------|---------|
 | `pam status` | 0 | every requested service carries the line |
 | `pam status` | 1 | at least one requested service exists without it, in `/etc/pam.d` (`missing`) or only in a vendor directory (`vendor-only`) |
-| `pam status` | 2 | at least one is absent, unreadable, misnamed, symlinked out of the directory, or hard-linked |
+| `pam status` | 2 | at least one is absent, unreadable, misnamed, symlinked, or hard-linked |
 | `pam status --if-present` | 0 | every requested service **that exists** carries the line |
 | `pam status --if-present` | 1 | at least one existing service carries no line |
 | `pam status --if-present` | 2 | as above, minus the absent case, which no longer forces 2 |
@@ -462,8 +584,10 @@ validation phase, before any prompt exists to skip, so an unattended
 | `pam status --all` | 1 | nothing on the machine carries it, or an enumerated service has no line in the file Linux-PAM reads |
 | `pam status --all` | 2 | a directory could not be listed, or an enumerated service could not be answered for |
 | `pam status --all --if-present` | 0/1/2 | unchanged from `--all`: an enumerated name was found, so there is no absent case to forgive |
-| `pam add`, `pam remove` | 0 | every service reached its requested state — including `unchanged`, `overridden` (`add` created the `/etc/pam.d` copy), `vendor-only` (`remove` had nothing of its own to take out of a package-owned file), `absent` under `--if-present`, and `declined` |
-| `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure |
+| `pam add`, `pam remove` | 0 | every service reached its requested state and required default rollback-state cleanup completed — including `unchanged`, `overridden` (`add` created the `/etc/pam.d` copy), `vendor-only` (`remove` had nothing of its own to take out of a package-owned file), `absent` under `--if-present`, and `declined` |
+| `pam add`, `pam remove` | non-zero | a validation failure (nothing written) or a write failure, including `cleanup-failed` after the requested PAM state was reached |
+| `pam remove --all` | 0 | every recognized writable direct reference was removed, the final compiled-root scan was clear, and the whole-set transaction committed and cleaned; an empty scan is an idempotent success |
+| `pam remove --all` | non-zero | preflight, journal, identity, write, final-rescan or recovery failure; direct PAM mutations are rolled back where their exact identities prove that safe, otherwise transaction evidence is retained |
 
 `pam status` is on `grep`'s scale and `is-enrolled`'s: a boolean query whose
 exit code is the answer. Across several services the worst outcome wins. A
@@ -471,7 +595,8 @@ exit code is the answer. Across several services the worst outcome wins. A
 asked, and `--json` is how a script tells it from an install.
 
 **`--dry-run`** prints the resolved plan, writes nothing, and exits 0. It is
-honoured *after* the root check (see DEC-6 above).
+honoured *after* the root check (see DEC-6 above). On `remove --all` it performs
+no transaction recovery and creates no state.
 
 **A service that exists in no directory names them all.** The refusal `add`
 and `remove` raise, and the line `status` prints, both list every path tried:
@@ -511,14 +636,14 @@ consequences:
   one** is reported `missing`. The file Linux-PAM reads has no line in it, and
   dropping the name would hide the one machine an operator cannot otherwise
   explain.
-- an entry the resolver refuses (symlinked out of its directory, hard-linked)
+- an entry the resolver refuses (symlinked or hard-linked)
   is an `unknown` row with its usual reason: never followed, never dropped.
 - a service file that could not be **read** is an `unknown` row too. Omitting it
   would report "not configured" for a machine this could not check.
 - `.facelock-backup`, `.pacnew`, `.pacsave`, `.pacorig`, `.rpmnew`, `.rpmsave`,
-  `.rpmorig`, `.dpkg-old`, `.dpkg-new`, `.dpkg-dist`, names ending in `~`, and
-  dotfiles are not services. Each can carry the line, and none is a name
-  Linux-PAM is ever asked for.
+  `.rpmorig`, `.dpkg-old`, `.dpkg-new`, `.dpkg-dist`, pam-auth-update's
+  `.pam-old`, names ending in `~`, and dotfiles are not services. Each can carry
+  the line, and none is a name Linux-PAM is ever asked for.
 - only a **regular file** is read. A FIFO blocks the read until a writer
   appears, and a diagnostic command that hangs on a malformed `/etc/pam.d` is
   worse than one that omits an entry no PAM stack could use; device nodes,
@@ -572,29 +697,448 @@ it reads `none configured` only when every directory was read, `not checked`
 when nothing was found and something could not be, and it names each unread
 place on a `not checked:` line of its own.
 
-**Every write is atomic.** A temp file in the destination's own directory,
-`fsync`, then a rename — so a reader sees the old file or the new one and never
-a short one, which matters because a truncated `/etc/pam.d/polkit-1` breaks
-polkit auth machine-wide and a truncated `system-auth` breaks the machine. The
-new file carries the mode and owner of the file it replaces (of the vendor
-original, for a copy) and the SELinux context of the file being replaced; a
-copy has no context to inherit and takes the destination directory's, which is
-what SELinux's own type transition would have given it. **POSIX ACLs and every
-xattr other than the SELinux label are not carried across** — a `setfacl`'d
-service file loses its ACL on the first `pam add`, which is written down rather
-than guessed at. A failed write removes its temp file, so a refusal leaves no
-debris in `/etc/pam.d`.
+**PAM publication is complete-file atomic and identity-checked.** Planning
+captures the regular, single-link service file's device, inode, link count,
+SHA-256 hash, exact mode, UID and GID. Stable identity comparisons bind all
+seven values; timestamps and other unstable metadata are deliberately
+excluded. Immediately before publication the writer reopens the confined
+basename beneath its configured PAM write root and checks that same identity.
+An existing local file is replaced with `RENAME_EXCHANGE`, leaving the exact
+displaced inode named and open for a final check. There is an unavoidable
+bounded interval after the exchange in which the complete replacement is the
+canonical service file before that displaced-original check completes. If an
+administrator or package replaced the file at the boundary, a second exchange
+restores that complete intervening file; only a verified displaced inode is
+unlinked. Neither side is ever partially written, and PAM's password fallback
+is unchanged.
 
-**The `.facelock-backup` is written the same way**, and that is what makes it
-safe: a rename replaces the *name*, so a symlink standing at
-`<service>.facelock-backup` is replaced rather than followed — the confinement
-rules cover the service file, and nothing covered its backup while the backup
-was a `copy`. It also means the file `add` tells the operator to restore from
-cannot be a short one.
+The replacement file preserves the existing file's owner, exact mode and
+SELinux context. Ownership is applied before the final mode because `fchown`
+can clear setuid/setgid bits. POSIX ACLs and xattrs other than the SELinux label
+are not carried across. A vendor-only service is rechecked by identity and hash
+immediately before a complete local override is published with
+`RENAME_NOREPLACE`; an override that appeared after planning is preserved. The
+new override takes the vendor file's owner and exact mode, but deliberately
+does **not** copy the vendor file's SELinux xattr: the destination directory's
+type transition supplies the local label. Each new file and its parent
+directory are fsynced at the committed boundary.
 
-**Limit.** One, deliberate and not hidden: `remove` takes no backup of its own.
-It relies on the one `add` wrote, which is why nothing in this command ever
-deletes a backup.
+**Rollback state has a fixed root.** An in-place `pam add` writes the original
+service bytes under `/var/lib/facelock/pam-backups`, a `0700 root:root`
+directory independent of both `[pam].config_dirs` and `storage.db_path`. The
+production store opens that fixed directory without following the final path
+component, applies root ownership before the final mode, and verifies exact
+directory type, `0700` mode and `root:root` ownership before accepting it. It
+reopens, locks and verifies the descriptor again before trusting state in a
+transaction. State-entry authority is the fixed expected root owner, never the
+owner observed on the directory. Only explicitly injected setup/test roots use
+the process EUID and EGID as their expected state owner.
+
+The published backup and its adjacent JSON record are regular, single-link
+`0600 root:root` files. Their exact basenames are
+`<service>.<seconds>-<nine-digit-nanoseconds>` and that basename plus `.json`;
+seconds are decimal and in range for `u64`, and nanoseconds are decimal,
+exactly nine digits and below one billion. Collision probing is bounded,
+advances the nanoseconds and publishes with no-clobber semantics. A failed
+publication cleans only an identity created and validated by that transaction,
+never a pre-existing name.
+
+Version 1 provenance JSON is strict and rejects unknown fields. It contains
+exactly `version`, positive `sequence`, `state` (`prepared` or `committed`), a
+confined `service`, the exact `backup` basename, `original_sha256` and
+`installed_sha256`; both hashes are 64 hexadecimal characters, and no target
+path is stored. A record can participate in sequence allocation, duplicate
+detection, newest-backup reporting or cleanup only as part of a complete
+record/backup pair whose names and schema agree, whose backup hash validates,
+whose entries have the fixed expected state owner, mode `0600` and one link,
+and whose record and backup can be read within 16 KiB and 1 MiB respectively.
+Duplicate sequences make every pair at that sequence ambiguous for service
+selection and cleanup. Sequence allocation checks overflow, and the newest
+committed backup is selected by validated sequence rather than wall-clock
+filename order.
+
+**Every multi-name mutation has a strict durable intent.** Version 1 intent
+JSON rejects unknown fields and always carries `version`, `role`, positive
+`sequence`, confined `service`, strict transaction basename in `backup`,
+`original_sha256`, `installed_sha256`, nullable `record_sha256` and
+`replacement_record_sha256`, and nullable `original_device`, `original_inode`,
+`original_links`, `original_mode`, `original_uid` and `original_gid`. Option
+fields are serialized as JSON `null`. Each intent must be a regular,
+single-link, state-owner `0600` file no larger than 16 KiB, every present hash
+must be 64 hexadecimal characters, and every present mode must identify a
+regular file. Fields that are irrelevant to the selected role must be `null`;
+any other combination invalidates the intent. For mutation-only roles the
+`backup` value is a collision-resistant operation identifier, not a claim that
+a rollback pair exists.
+
+| JSON `role` | Required role-specific fields |
+|-------------|-------------------------------|
+| `prepare`, `cleanup` | `record_sha256` present; replacement-record hash and all six original identity/metadata fields null |
+| `commit` | record and replacement-record hashes present; all six original identity/metadata fields null |
+| `pam_replace` | record hash present; replacement-record hash null; exact original device/inode, `original_links = 1`, mode, UID and GID |
+| `pam_remove` | record hashes null; exact original device/inode, `original_links = 1`, mode, UID and GID |
+| `vendor_create` | record hashes and original device/inode/links null; original mode/UID/GID present as the expected newly-created destination metadata |
+
+**A strict publication binding authenticates every created inode.** Version 1
+binding JSON rejects unknown fields and contains exactly `version`, `role`, a
+positive `u64` `sequence`, confined `service`, strict transaction basename in
+`backup`, `intent_sha256`, `device`, `inode`, `links`, `sha256`, `mode`, `uid`
+and `gid`. JSON `role` is one of `commit`, `pam_replace`, `pam_remove` or
+`vendor_create`. Both hashes are 64 hexadecimal characters, `links` is exactly
+one, and `mode` identifies a regular file. The binding itself must be a
+regular, single-link, fixed-state-owner `0600` file no larger than 16 KiB.
+
+While the base intent exists, its exact bytes must hash to `intent_sha256`, and
+its role, sequence, service and operation basename must agree with the binding.
+The bound replacement hash must also equal the commit intent's replacement
+record hash or, for a PAM/vendor mutation, its installed hash. After the named
+replacement temp exists, Facelock publishes the binding atomically with
+no-clobber semantics before the `RENAME_EXCHANGE` or `RENAME_NOREPLACE` that
+makes the replacement canonical. The full identity is captured from the
+still-open created temp only after its bytes and requested metadata/context are
+applied, the file is synced, and its desired hash, mode, UID, GID and
+single-link count are validated. Facelock then reopens the exact reserved temp
+basename and full-compares it before publishing any binding. A failure at this
+boundary uses identity-checked cleanup; any reopen, comparison or cleanup
+uncertainty is ambiguous and preserves the base intent and filesystem evidence.
+A crash in the gap before the binding is published leaves the base intent and
+unbound temp conservatively preserved.
+A synchronous no-clobber binding-publication failure is distinct from that
+crash: it preserves the colliding administrator state entry and reopens and
+full-compares the unpublished replacement temp. Facelock may remove the base
+intent only after the exact temp unlink and parent-directory fsync succeed.
+Any reopen, full-identity, unlink or fsync ambiguity returns
+`AmbiguousPublication` and retains the base intent and colliding administrator
+evidence. The temp is also retained unless its exact identity-checked unlink
+succeeded and only the subsequent parent-directory durability sync failed; in
+that case the temp name may already be absent. Commit, PAM replacement/removal
+and vendor creation all use this same checked cleanup primitive.
+The same full-identity cleanup applies after the binding is durable if source
+drift or an exchange/no-replace failure prevents PAM or vendor publication.
+Any uncertainty returns `AmbiguousPublication` and preserves the base intent,
+binding and all remaining evidence, subject to the same post-unlink fsync
+boundary above.
+
+The reserved name grammar is exact:
+
+- intents: `.facelock-intent-{prepare|commit|cleanup|pam-replace|pam-remove|vendor-create}-<transaction>.json`
+- publication bindings: `.facelock-publication-{commit|pam-replace|pam-remove|vendor-create}-<transaction>.json`
+- state quarantine: `.facelock-quarantine-backup-<backup>`, `.facelock-quarantine-record-<backup>.json`, `.facelock-quarantine-commit-<backup>.json`
+- PAM-directory temps: `.facelock-pam-replace-<transaction>`, `.facelock-pam-remove-<transaction>`, `.facelock-vendor-create-<transaction>`
+- PAM-directory vendor-retirement quarantine: `.facelock-vendor-retire-<transaction>`
+- atomic state temps: `.facelock-tmp-<destination>-<64hex-content-hash>-<pid-digits>-<nanos-digits>`
+
+The strict atomic-state-temp destination grammar includes publication-binding
+destinations; a binding temp is not authenticated by its prefix alone.
+Backup and record temp destinations additionally require a confined service
+component, so empty, `.` and `..` services are never owned.
+
+A reserved-looking name alone never establishes ownership. The applicable
+intent or pair schema and derived names, the owner/mode/link requirements for
+that role, the bounded content hash and, where applicable, the captured PAM
+identity and metadata must all agree before Facelock resumes or removes it.
+Every state match, committed-record transition, quarantine move and unlink
+rechecks that the entry is single-link, state-owner and mode `0600` in addition
+to its content and identity. Same-inode, same-content mode or ownership drift
+is ambiguous and is preserved. State publication, vendor publication, state
+quarantine and vendor-retirement quarantine moves use `RENAME_NOREPLACE`;
+committed-record and existing-PAM transitions use `RENAME_EXCHANGE`.
+
+If an atomic state temp-to-final `RENAME_NOREPLACE` succeeds but syncing the
+parent directory fails, the result is `AmbiguousPublication`, not an ordinary
+create failure, and every caller propagates it before cleanup. Prepare retains
+its durable intent plus the visible final backup or record. Commit-replacement
+publication retains the commit intent plus its named replacement. If the
+destination is a publication binding, each of `commit`, `pam_replace`,
+`pam_remove` and `vendor_create` retains its base intent, exact replacement temp
+and visible binding. Checked cleanup is limited to definite failures before the
+rename; strict identity binding lets recovery classify and complete each
+retained evidence set.
+
+After exchange or publication, the canonical file is reopened and compared
+against the binding's full device, inode, link count, hash, mode, UID and GID.
+This happens immediately after publication, immediately before a displaced
+inode is unlinked where that boundary exists, and immediately before the base
+intent is cleaned; commit checks once more after unlinking its displaced
+prepared record. A canonical mismatch preserves the canonical name, any
+remaining temp or displaced name, the base intent and the binding for manual
+inspection. These checks do not weaken complete-file atomicity or PAM password
+fallback.
+
+**One state-directory flock spans a local mutation.** For an in-place add it
+covers recovery, bounded timestamp and sequence allocation, durable prepare
+intent and rollback-pair publication, PAM intent/temp/exchange, and committed
+record intent/exchange. Local remove and vendor-create planning, publication
+and recovery run under the same guard; unchanged vendor-override quarantine,
+validation, deletion or restoration completes before the local-remove guard is
+released. A competing writer or recovery cannot
+discard an add's prepared pair between persistence and commit. Backup cleanup
+after a successful or no-op remove is a separate locked quarantine phase; this
+does not make named mutations multi-service atomic. The `pam remove --all`
+transaction below keeps its whole-set lock through batch cleanup.
+
+Recovery treats state as an untrusted hint and re-resolves only the recorded
+confined service under the current PAM write root. It recovers publication
+bindings before base intents. A bound commit, PAM or vendor canonical candidate
+must match the exact full created identity in its binding; an original PAM
+candidate must match the exact original identity captured in its base intent.
+While both state files exist they must bind to one another as described above.
+Without a valid binding, a named or published replacement is ambiguous and is
+preserved; only a clearly pre-temp base-intent shape is cleaned.
+
+The base intent is removed first and the self-contained binding last. Recovery
+considers a binding orphaned only when the exact derived base-intent name is
+definitely absent. An invalid-mode, invalid-owner, malformed, mismatching,
+symlinked, or hard-linked exact entry blocks destructive binding recovery. If
+a crash truly leaves an orphan after the base unlink, recovery removes it only
+when the canonical file still matches the full bound identity and the temp is
+absent. A mismatch preserves the binding and every ambiguous name. A crash
+after the binding unlink leaves no publication-state debris.
+
+Prepare recovery handles an intent alone, a backup alone, a record alone or a
+complete pair. Bound commit recovery distinguishes pre-exchange, exchanged and
+displaced-record-unlinked boundaries. Cleanup resumes the no-replace
+backup/record quarantines and identity-rechecked unlinks. Bound PAM
+replacement/removal recovery distinguishes an intent alone, a ready temp and
+the exchanged canonical/displaced pair. A remaining ambiguous `pam_replace`
+intent also blocks generic prepared-pair recovery, preserving the rollback
+pair. Bound vendor-create recovery handles absent/temp and published/absent
+boundaries. A wrong owner, mode, link count, schema, hash or identity, an extra
+conflicting entry, a symlink/hard link, or any other ambiguity is preserved for
+manual inspection.
+
+`pam remove` takes no new rollback copy. After every successful or no-op
+removal it deletes validated committed Facelock-owned pairs for that service and the
+exact legacy `<service>.facelock-backup` entry by default. Pair deletion first
+moves the record and backup to no-replace quarantine names, then rechecks the
+identities before unlinking. Legacy cleanup is confined to the override root
+and rechecks the exact regular, single-link entry immediately before unlink.
+Malformed provenance, lookalike names, symlinks, hard links, changed entries
+and unrelated administrator files are retained. `--keep-backup` opts out of
+both versioned and legacy cleanup.
+
+For a local copy created from a vendor-only service, named `pam remove` first
+publishes the complete document without the Facelock rule through the existing
+`pam_remove` exchange protocol. It then deletes the local override only when
+the exact two-line Facelock header names the current vendor service. Current
+vendor resolution reopens the configured later roots in order and stops at the
+first existing entry; a malformed, linked, unreadable or oversized first entry
+is a blocker rather than permission to accept a matching lower-priority file.
+The remaining payload and mode/UID/GID must equal that bounded, regular,
+single-link vendor file, the vendor file must contain no active Facelock rule,
+and the complete local bytes must be either the exact header plus the one
+document emitted by Facelock's insertion or the exact header-plus-vendor
+no-rule restart shape. The journal backup used by batch cleanup is likewise
+reopened within its size bound and must retain its full prepared identity
+before its header is parsed.
+
+The canonical local inode must still have the full identity captured by the
+removal publication. Facelock moves that exact basename to the derived
+`.facelock-vendor-retire-<transaction>` quarantine with a no-replace rename,
+syncs the directory, and rechecks the quarantined identity, canonical absence,
+exact emitted shape and ordered current vendor before identity-checked unlink.
+If the local or vendor check fails while the canonical name remains absent,
+Facelock restores the exact quarantine with a no-replace rename. A concurrent
+canonical entry, quarantine collision, reopen failure, identity mismatch or
+durability uncertainty preserves all available names and durable publication
+evidence as ambiguous. Every quarantine, restore and unlink boundary is
+restartable. Both service names are re-resolved beneath already selected PAM
+roots; the header is a recognition hint, never a path to open. Header, payload,
+metadata, vendor-source or identity drift preserves the local override after
+removing its Facelock rule and reports that decision. When no current vendor
+entry resolves, only a header naming a normalized path derived from a
+configured later root is recognized, and it causes explicit retention rather
+than deletion; the header path is not opened or followed. A restart may finish the
+same exact deletion when the rule-removal exchange completed but the
+header-bearing local override is still present.
+
+**`pam remove --all` is the config-independent whole-machine cleanup.** It
+ignores `[pam].config_dirs` and opens the compiled roots `/etc/pam.d`
+(writable override), `/usr/lib/pam.d` (detection-only vendor state), and
+`/etc/authselect` (detection-only generated state). Missing or corrupt config,
+database, model, camera, daemon and ONNX Runtime state cannot redirect or block
+it. It enumerates already-open directory descriptors and re-resolves each
+confined basename with directory-relative, no-follow operations. A candidate
+must remain a regular, single-link file whose bounded bytes and complete
+identity can be rechecked. Directory contents are detection ground truth;
+provenance is untrusted ownership evidence, never a target path.
+
+No symlink is followed. A symlink is skipped only when its text is the exact
+absolute path of the same service basename beneath a later compiled root that
+this run scans independently. This accounts for stock links such as
+`/etc/pam.d/system-auth -> /etc/authselect/system-auth` without trusting the
+link's contents. Every other symlink, hard-linked, nonregular or unreadable PAM
+entry that contains or could hide a Facelock reference is an unmanaged blocker.
+A reference found in the independently scanned `/usr/lib/pam.d` or
+`/etc/authselect` root is likewise an unmanaged read-only or external-root
+blocker. Structural directories, including authselect profile directories, are
+not PAM service files and are skipped. Nothing outside the fixed roots is
+followed or deleted.
+
+A writable direct file with a conventional PAM service basename is recognized
+as Facelock-owned when every Facelock logical rule uses the exact pre-versioned
+physical bytes `auth      sufficient pam_facelock.so`. Dot-prefixed names and
+the administrator/package artifact suffixes `.facelock-backup`, `.pacnew`,
+`.pacsave`, `.pacorig`, `.rpmnew`, `.rpmsave`, `.rpmorig`, `.dpkg-old`,
+`.dpkg-new`, `.dpkg-dist`, `.pam-old`, and `~` are not conventional legacy
+candidates.
+They are considered only when a strict provenance basename exists for that
+exact confined service and the current complete-file hash equals
+`installed_sha256` in its validated committed pair, or when the regular local
+file carries the exact Facelock vendor-copy header and matches its current
+fixed-root vendor source as specified above. This lets `remove --all` find
+every arbitrary name accepted by either named writer path without treating an
+unowned administrator artifact as an active PAM service. Customized controls,
+options or spacing, corrupt or ambiguous provenance for a candidate, invalid
+bytes, path escapes, link swaps, identity drift and concurrent edits block the
+whole run during preflight. Nothing is changed when preflight finds a blocker.
+An empty scan is an idempotent success.
+The initial cleanup scan also recognizes that exact unchanged header-bearing
+vendor override after its Facelock rule is already absent. This is the bounded
+restart shape of the named removal above; other no-rule files are ignored and
+preserved. The final active-reference scan excludes this cleanup-only shape.
+
+**The whole set is journaled before the first PAM mutation.** Version 2 state
+is strict JSON with unknown fields rejected, regular single-link fixed-state
+owner and mode `0600`, no-clobber publication, a 4 MiB encoded limit and at
+most 1,024 unique confined services. Its reserved names and exact fields are:
+
+- `.facelock-remove-all-<operation>.json` contains exactly `version`,
+  `operation`, `keep_backup`, and `targets`. Each target contains exactly
+  `service`, strict `backup`, `original`, `installed_sha256`, and the required
+  boolean `delete_override`; `original` contains exactly `device`, `inode`,
+  `links`, `sha256`, `mode`, `uid`, and `gid` and must describe a regular
+  single-link file.
+- `.facelock-remove-all-commit-<operation>.json` contains exactly `version`,
+  `operation`, `journal_sha256`, `keep_backup`, and `targets`. Each target
+  contains exactly `service`, strict `backup`, `installed`, and the required
+  boolean `delete_override`, where `installed` uses the same complete-identity
+  fields and validation.
+
+Version 1 journal and commit files remain recoverable only when every target
+omits `delete_override`; version 2 requires it on every target. JSON `null` is
+not an absent field. The corresponding journal and commit flags must match.
+
+`operation` is `<seconds>-<exactly-nine-digit-nanoseconds>`: seconds parse as
+`u64`, nanoseconds are below one billion, and collision allocation is bounded.
+Only a prefix plus that valid operation grammar is reserved batch state; a
+prefix-shaped strict provenance basename with another suffix remains ordinary
+per-service provenance. Both state files and every hash are bounded and
+validated, and duplicate services invalidate either target list before
+recovery. A commit pairs with a journal only when operation, keep flag, ordered
+service/backup set, exact journal hash and planned/committed installed hashes
+and `delete_override` flags agree. Multiple, malformed or conflicting reserved
+entries require manual review.
+
+`pam remove --all --dry-run` opens an existing backup directory for read-only
+inspection and requires its owner and mode to be trusted already. It performs
+no owner/mode repair, directory sync, recovery or write locking; an untrusted
+directory makes the preview fail closed with its metadata and entries intact.
+
+One fixed-state-directory flock spans recovery of any earlier journal, the
+authoritative root scan and complete preflight, bounded operation and rollback
+pair allocation, publication of every #171 backup/provenance pair, journal
+publication, every PAM exchange, the final fixed-root active-reference scan,
+commit publication and evidence cleanup. Every per-service rollback pair is
+durable before the journal, and the complete journal is durable before the
+first PAM mutation. Each service then uses the #171 intent, publication
+binding, exact created-identity and `RENAME_EXCHANGE` protocol while retaining
+the displaced original inode.
+
+A later failure or a non-empty or unanswerable final scan reverse-exchanges
+every earlier file in reverse order after complete identity checks. Recovery
+does the same for a prepared journal without a valid commit. The strict,
+self-contained commit authenticates the journal bytes and every installed
+complete identity; once it is durable, recovery finishes per-file publication
+cleanup and validated backup cleanup instead of rolling the PAM files back.
+Any mismatch or ambiguity preserves the journal and per-file intent, binding,
+temp or displaced evidence, including administrator bytes, for review. Files
+are always published as complete byte sequences and PAM password fallback is
+unchanged.
+
+Prepared-journal recovery also recognizes the one provably unstarted
+per-service publication shape: the canonical service still has the journal's
+full original identity, the exact valid `pam_replace` intent agrees with the
+prepared pair's sequence and record hash, and the exact replacement temp and
+publication binding are both absent. It identity-checks and removes only that
+intent before continuing rollback. Any mismatch or extra name remains
+ambiguous. After reverse exchange and identity-checked replacement-temp
+cleanup, rollback removes the exact publication binding before delegating the
+remaining base intent to that intent-only recovery. Every boundary is
+restartable; normal forward publication retains its existing intent-first
+cleanup order. Rollback-pair cleanup is restart-idempotent across cleanup intent,
+both quarantine moves and both unlinks. An exact matching cleanup intent is
+resumed; a target whose canonical pair, quarantine pair and exact cleanup
+intent are all absent is already clean. Partial, substituted or conflicting
+pair state is preserved and blocks journal cleanup.
+
+After the batch commit marker is durable and per-file publication evidence is
+finalized, each target with `delete_override = true` is unlinked through the
+writable-root directory descriptor only if its full committed identity still
+matches. The corresponding journaled original backup must retain the full
+identity captured by the prepared pair and parse as an exact Facelock-emitted
+one-rule copy or exact no-rule restart shape. Its line-removed SHA-256 must
+equal the journal target's installed hash. The header must name the first
+existing service in the ordered later roots, whose bounded, re-opened regular
+single-link entry must still match the payload and mode/UID/GID and contain no
+active Facelock rule. Facelock never opens an arbitrary path from the header.
+The same no-replace vendor-retirement quarantine protocol above performs the
+committed deletion. Any mismatch preserves the override and the batch
+journal/commit evidence. A crash after a checked unlink is restartable: absence
+is accepted only for a committed `delete_override` target, while any partial,
+substituted or unflagged absence remains ambiguous.
+
+On success, default cleanup removes only validated Facelock-owned versioned
+pairs and exact validated legacy `<service>.facelock-backup` state for every
+committed target. `--keep-backup` instead commits and preserves the new pairs
+and opts out of legacy cleanup. `--json` uses the standard single remove
+document with one committed `removed` row per target (and a backup path only
+under `--keep-backup`); an idempotent no-op has an empty `services` array.
+`--quiet` suppresses that document.
+
+**Every shipped uninstall surface delegates to this cleanup before deleting
+the binary or PAM module.** This includes the Arch source and binary packages,
+Debian `prerm`, RPM `%preun`, the Omarchy remover and `just uninstall`. Booted
+package coverage exercises direct `dpkg`/`rpm` and their `apt-get`, `apt`, and
+`dnf` frontends for abort retention and blocker-free success. Arch
+also ships `/usr/share/libalpm/hooks/facelock-pam-remove.hook`, a package
+Remove-only `PreTransaction` hook for target `facelock`; `AbortOnFail`
+runs `/usr/bin/facelock pam remove --all` before pacman changes the package,
+and the package scriptlet retains an idempotent second call. Debian and RPM
+propagate cleanup failure so the package, binary and module remain. Source and
+Omarchy removal stop before their deletes. The module can be removed only
+after the cleanup's final compiled-root scan succeeds.
+
+The all-or-nothing guarantee covers direct PAM edits owned and scanned by this
+transaction and retention of the package/module when that cleanup fails.
+Debian removal adds a read-only boundary before it: the exact shared-profile
+probe runs first, followed by `pam remove --all --dry-run`, then the journaled
+real cleanup, and only then the generated ordinary-removal service stop.
+Ordinary removal preserves the unit's enabled state for reinstall; the
+generated purge path alone retires that state. A selected Facelock
+`pam-auth-update` profile blocks removal without changing `common-auth`, its
+selection state, direct edits, the service, the binary, or the PAM module. The
+diagnostic tells the administrator to run
+`sudo pam-auth-update --disable facelock`, verify that a real correct password
+succeeds and a wrong password fails, and retry removal. Unsafe or inconsistent
+shared-profile state also blocks.
+
+This release deliberately supports no automatic legacy/shared-profile
+migration or deselection. Older packages persisted no durable fact that can
+distinguish a package-auto-enabled profile from a later administrator choice;
+therefore every selected state is administrator-owned and preserved. This is
+the intentionally deferred legacy ambiguity: a future automatic transition
+requires exact package provenance recorded before the choice, a byte-and-
+metadata snapshot of the managed PAM graph, mutation while the old profile and
+binary still exist, `pam-auth-update`, reapplication of only provenance-owned
+direct edits, and real correct/wrong-password validation, with provable restore
+or retained evidence on failure. An unselected profile needs no graph
+transition: its `Default: no` metadata leaves with the package payload after
+the fixed-root direct cleanup succeeds. Fedora is separate:
+#226 owns only RPM payload retirement and the read-only upgrade guard.
+Shared-stack migration, regeneration, editing and rollback are explicitly rejected.
+`remove --all` scans `/etc/authselect` as a detection-only root and never edits
+generated state.
 
 **`--json`** emits exactly one document on stdout and no human text; `--quiet`
 suppresses even that, leaving the exit code as the whole answer, as it does for
@@ -625,7 +1169,7 @@ the refusal is *also* written to stderr for a human. Exit 2 either way.
       "service": "sudo",
       "path": "/etc/pam.d/sudo",
       "action": "installed",
-      "backup": "/etc/pam.d/sudo.facelock-backup"
+      "backup": "/var/lib/facelock/pam-backups/sudo.1770000000-123456789"
     }
   ]
 }
@@ -667,32 +1211,41 @@ unchanged by it.
 **This shape is a stability contract.** An object rather than a bare array so a
 new top-level field is additive. Field names do not change and are not removed;
 `service`, `path`, `action` and `backup` are always present on every service
-object; `error` is present when `action` is `failed` or `unknown`, and
-`shadows` when the file the row names hides a vendor one. **`error` is a
+object; `error` is present when `action` is `failed`, `cleanup-failed` or
+`unknown`, and `shadows` when the file the row names hides a vendor one.
+**`error` is a
 diagnostic, not a contract** — branch on `action`, never on `error`'s text. A
 rejected service name reports the fixed C-locale string `invalid service name`,
-a service symlinked out of the directory it was found in
-`symlinked outside /etc/pam.d` — a fixed name for the class, whichever
-directory it was — and a
-hard-linked one `hard-linked service file`, but the OS-level failures (`failed` on a write, `unknown` on an unreadable
-file) interpolate a `strerror` string, which follows the operator's
+a symlinked service entry reports `symlinked outside /etc/pam.d` — the retained
+fixed name for the class, whichever directory it was in — and a
+hard-linked one `hard-linked service file`, but the OS-level failures
+(`failed` on a write, `cleanup-failed` after the requested PAM state was
+reached, or `unknown` on an unreadable file) interpolate a `strerror` string,
+which follows the operator's
 `LC_MESSAGES` like any other C library message. Nothing else in a `--json`
-document is locale-dependent. `backup`
-is the `.facelock-backup` path when one exists on disk after the operation and
-`null` otherwise — always `null` under `--dry-run`, which writes none, and
-always `null` for an `overridden` service: the copy preserved nothing, so it
-took no backup, and a `.facelock-backup` left at the override path by an
-earlier run is not this run's rollback and is not reported as one. Deleting the
-override is its undo, and the vendor original is untouched.
+document is locale-dependent. `backup` is the newest committed backup path the
+calling process can validate for the service, falling back only to the exact
+legacy adjacent `<service>.facelock-backup` path; it is `null` otherwise. The
+root write verbs can inspect the `0700` state directory; an unprivileged
+`pam status` normally cannot and may therefore report `null` even while such a
+versioned backup exists. This is the documented location change from the pre-0.2
+adjacent path, so consumers treat the value as an opaque absolute rollback
+path. It is always `null` under `--dry-run`, which writes none, and normally
+`null` after a default `remove`, which cleans owned state; `--keep-backup`
+retains it. It is always `null` for an `overridden` service: the copy preserved
+nothing, so legacy state at the override path is not this run's rollback and
+is not reported as one. Deleting the override is its undo, and the vendor
+original is untouched.
 `path` on an `overridden` row is the **override that was created**, not the
 vendor file it was read from; on a `vendor-only` row it is the vendor file,
 which is the one that exists. `path`
 is itself `null` when `action` is `unknown` because the *name* was rejected: no
 path was ever resolved, and reporting `/etc/pam.d/../escape` named a path
 nothing went near, which reads as one that was acted on. A service rejected for
-being a symlink out of the directory does carry a `path` — the link, which is a
-real entry this did `lstat` — and its `backup` field is probed, since a
-facelock version that wrote through the link left one there.
+being a symlink does carry a `path` — the link, which is a real entry this did
+`lstat` — and its `backup` field probes only the exact legacy adjacent name,
+since a pre-0.2 version may have written through the link. It does not use an
+untrusted link to select versioned state.
 
 The `action` vocabulary — **new words may be added, so a consumer must tolerate
 one it does not know rather than treat it as an error**:
@@ -709,7 +1262,7 @@ one it does not know rather than treat it as an error**:
 | `failed` | `add`, `remove` | the write failed; see `error` |
 | `present` | `status` | the file exists and carries a facelock line |
 | `missing` | `status` | the file exists and carries none |
-| `unknown` | `status` | the file could not be read, the name was rejected, or the entry is a symlink out of the directory or a hard link; see `error` |
+| `unknown` | `status` | the file could not be read, the name was rejected, or the entry is a symlink or a hard link; see `error` |
 
 `pam status --json` is what replaces `grep -q pam_facelock.so
 /etc/pam.d/<service>` in an integration script: it answers from the same file,
@@ -720,15 +1273,71 @@ as "not configured".
 process, one root check and one closing hint. Duplicates collapse. No
 `--service` means `sudo`, which is what bare `setup --pam` has always meant.
 
+**PAM line placement.** The direct CLI writer emits exactly this 36-byte
+literal; the literal itself has no trailing newline:
+
+```pam
+auth      sufficient pam_facelock.so
+```
+
+The control is frozen to `sufficient`: a successful face can satisfy the
+stack, while a non-match or unavailable face path continues under the
+service-owned rules that follow. Ordinary login and privilege stacks commonly
+reach their password modules there. Omarchy's face-only context instead
+continues to `pam_deny.so`; its password attempt uses a separate PAM context.
+There is intentionally no `--control` option. A caller cannot silently
+substitute `required`, an extended control, or another stack policy for the
+line whose behavior downstream consumers and Facelock cleanup rely on.
+
+The line is inserted immediately before the first *logical* rule whose first
+ASCII-whitespace-delimited type token is `auth`, matched
+ASCII-case-insensitively and with Linux-PAM's optional leading `-`;
+`authtok_type=` is not an auth type. If no auth rule exists and the first
+physical line is exactly `#%PAM-1.0`, the line follows that header. Without
+that exact leading header it starts at byte 0. This header-aware fallback is
+the post-#192 contract; it supersedes #166's original top-of-file wording.
+
+Omarchy owns this exact backend-neutral `omarchy-lock-face` skeleton:
+
+```pam
+#%PAM-1.0
+auth       required                    pam_deny.so
+account    include                     system-local-login
+```
+
+The direct writer produces this exact stack, leaving Omarchy's face-only lane
+to reach its plain denial when Facelock does not succeed:
+
+```pam
+#%PAM-1.0
+auth      sufficient pam_facelock.so
+auth       required                    pam_deny.so
+account    include                     system-local-login
+```
+
+Add idempotency and named `pam status` recognition are deliberately broader
+than the emitted bytes. Any uncommented logical rule whose semantic bytes
+contain the exact, case-sensitive byte sequence `pam_facelock.so` is an active
+reference: `add` does not emit a duplicate, and `status` reports it present.
+This is substring recognition, not a PAM module-token-boundary promise.
+`pam remove --all` is stricter: a broad active reference is not automatically
+Facelock-owned. Without validated provenance or the exact vendor-copy shape,
+only the exact canonical physical line in a conventional service is eligible
+for cleanup; custom control, spacing, or options block the whole-machine run
+for administrator review rather than being rewritten.
+
+This emitted-byte contract applies only to direct CLI service-file writes.
+The packaged Debian `pam-auth-update` profile is opt-in (`Default: no`) and
+intentionally emits `[success=end default=ignore] pam_facelock.so`. Legacy or
+administrator-managed Fedora authselect profiles use authselect's generated
+layout; Facelock RPMs no longer ship or select one. Both shapes remain visible
+to the same broad `add`/`status` active-reference recognition, but neither is
+required to match the canonical direct-writer bytes.
+
 **Service-file edits are byte-preserving.** A backslash followed only by spaces
 or tabs before LF or CRLF continues the same logical PAM rule, so insertion
 never splits that rule. A `#` ends the semantic rule even after a continuation;
-comment and blank physical lines remain untouched. The line goes above the
-first logical rule whose first ASCII-whitespace-delimited type token is `auth`,
-matched ASCII-case-insensitively and with Linux-PAM's optional leading `-`;
-`authtok_type=` is not an auth type. When there is no auth rule, the line goes
-directly after a leading `#%PAM-1.0` header, or at the top when that header is
-absent.
+comment and blank physical lines remain untouched.
 
 Removal drops the whole genuine logical Facelock rule. For recovery from older
 facelock output that inserted the canonical physical line between an
@@ -745,8 +1354,9 @@ that header, or the document's first ending when it goes at the top. A header
 with no final newline gains the separator before the inserted rule while the
 rule itself remains unterminated. A byte-identical no-op writes no file and
 takes no backup; an in-place add backs up before its real edit. Removal takes
-no new backup, and vendor-override creation has no original at the override
-path to preserve, as documented above. Golden fixtures pin insertion, removal,
+no new backup and cleans validated rollback state by default; `--keep-backup`
+preserves it. Vendor-override creation has no original at the override path to
+preserve, as documented above. Golden fixtures pin insertion, removal,
 invalid-byte, CRLF and no-final-newline behavior.
 
 ### facelock status Semantics
@@ -1071,9 +1681,11 @@ that is not on this list is not being denied, only not yet promised.
 | `pam-if-present` | `pam add`/`pam remove`/`pam status` accept `--if-present` |
 | `pam-json` | `pam add`/`pam remove`/`pam status` accept `--json` |
 | `pam-multi-service` | `pam add`/`pam remove`/`pam status` take a repeatable `--service` — several services in one process, one root check |
+| `pam-remove-all` | `pam remove --all` exists, conflicts with `--service`, and uses compiled-root whole-set cleanup |
 | `pam-status` | `pam status` exists — the unprivileged `/etc/pam.d` read (DEC-6 below) |
 | `pam-status-all` | `pam status --all` exists, and conflicts with `--service` — the enumerating form, which answers "what is configured on this machine?" rather than "is this name configured?" |
 | `quiet` | the global `--quiet` |
+| `setup-allow-sensitive` | `setup --pam` accepts `--allow-sensitive` as the explicit sensitive-service authorization; `--yes` remains prompt suppression only |
 | `setup-if-present` | `setup --pam --if-present`, on add and on `--remove` alike |
 | `setup-no-pam` | `setup --no-pam` |
 | `setup-systemd` | `setup --systemd` |
@@ -1327,12 +1939,14 @@ allowlist: `fedora-43-x86_64`, `fedora-44-x86_64`, or
 is any other undeclared target. Rawhide is not a Packit staging or production
 release target; both `fedora-rawhide` and `fedora-rawhide-x86_64` fail
 validation. The prerelease rule is that no alpha may publish to Rawhide.
-Fedora 43 and Fedora 44 supply full lifecycle evidence; Fedora 45 supplies
-required build/runtime smoke. Rawhide cannot supply lifecycle, artifact,
-upgrade, rollback, served-version, or availability evidence; it is limited to
-best-effort pinned Track D smoke only. A Rawhide-only failure is not
-alpha-blocking. Promotion requires a separately reviewed amendment and full
-Fedora gates.
+Fedora 43 and Fedora 44 are the required full-lifecycle targets; Fedora 45 is a
+required build/runtime-smoke target. Issue #230 owns the actual lifecycle
+evidence. Rawhide cannot supply lifecycle, artifact, upgrade, rollback,
+served-version, or availability evidence; it is limited to best-effort pinned
+Track D smoke only. It is non-release and non-gating: its absence or a
+Rawhide-only failure is not alpha-blocking, and its smoke result is not alpha
+acceptance or release evidence. Promotion requires a separately reviewed
+amendment and full Fedora gates.
 
 Issue #236 owns pre-tag and post-publication proof that optional Rawhide serves
 no alpha or candidate build. This contract does not provision, publish to, or
@@ -1341,19 +1955,556 @@ otherwise mutate COPR or Packit infrastructure.
 The public APT base is `https://tysmith.me/facelock/apt/`. Its stable suite
 paths and payload identities are:
 
-| Suite | Public Release path | Architecture | Variant |
+| Suite | Public Release path | Architecture | Package |
 |-------|---------------------|--------------|---------|
-| `trixie` | `https://tysmith.me/facelock/apt/dists/trixie/Release` | amd64 | TPM |
-| `bookworm` | `https://tysmith.me/facelock/apt/dists/bookworm/Release` | amd64 | legacy |
-| `resolute` | `https://tysmith.me/facelock/apt/dists/resolute/Release` | amd64 | TPM |
-| `noble` | `https://tysmith.me/facelock/apt/dists/noble/Release` | amd64 | legacy |
+| `trixie` | `https://tysmith.me/facelock/apt/dists/trixie/Release` | amd64 | `facelock`, TPM enabled |
+| `resolute` | `https://tysmith.me/facelock/apt/dists/resolute/Release` | amd64 | `facelock`, TPM enabled |
 
 The former `main` and `legacy` suite names are retired; they are not aliases or
 redirects. Existing source entries must replace that suite component with the
-host operating-system codename while keeping the `facelock` component. Each
-stable publication consumes exactly one matching package for all four suites,
-and a prerelease or cross-suite version is rejected before signing or repository
+host operating-system codename while keeping the `facelock` component.
+Debian-family release support is exactly Debian 13 (Trixie) and Ubuntu 26.04
+LTS (Resolute). Bookworm and Noble artifacts may remain in historical releases,
+but those suites are unsupported and receive no new packages.
+
+Both suites ship one binary package named `facelock` with TPM support enabled.
+There are no legacy/TPM package-name alternatives and the package declares no
+`Provides`, `Conflicts`, or `Replaces` transition identity. Stable publication
+consumes exactly two suite manifests, one matching package per suite, and a
+prerelease or cross-suite version is rejected before signing or repository
 writes.
+
+### Debian source and binary package contract
+
+Trixie package builds use the official Trixie Backports `cargo` and `rustc`;
+Resolute uses its native distro packages. Both must satisfy the workspace and
+`debian/control` minimum of Rust 1.88. No `rustup` toolchain participates in
+Debian source builds.
+
+The Debian source package contains the exact tagged main upstream tarball, the
+reviewed ORT component, the deterministic Cargo-vendor component, and the
+Debian quilt delta. For upstream `U`, Debian version `V`, and architecture `A`,
+the release manifest lists exactly these eight files in canonical order:
+
+```text
+facelock_U.orig.tar.gz
+facelock_U.orig-onnxruntime.tar.gz
+facelock_U.orig-cargo-vendor.tar.xz
+facelock_V.debian.tar.xz
+facelock_V.dsc
+facelock_V_A.buildinfo
+facelock_V_A.deb
+facelock_V_A.changes
+```
+
+The Cargo component is bound to the exact `Cargo.lock`, contains only regular
+normalized files plus its lock hash, bytewise manifest, and generated legal
+inventory, and is used through the package-only Cargo source replacement. The
+inventory covers every exact vendored crate and records its path, name, version,
+declared license or license-file, available authors/upstream metadata, and every
+referenced license material that exists in the component. The ORT component contains the
+reviewed library, license, third-party notices, version, commit, provenance,
+manifest, and checksums. Neither component is added to the tagged main archive.
+
+Complete `.dsc` rebuilds run with network denied and empty Cargo/Rustup caches.
+The build uses only the extracted source components and declared distro build
+dependencies, with Cargo locked and offline. The clean rebuild must produce the
+same package identity, resolved dependencies, installed path set, and installed
+file hashes as the release build. Fresh installation leaves
+`facelock-daemon.service` disabled and inactive; D-Bus activation remains
+available after explicit setup. Reinstall and upgrade restart the daemon only
+when it was already active, including an active D-Bus-activated instance; they
+preserve both enabled and disabled state and leave every inactive instance
+inactive. The post-install convergence still removes the retired `facelock`
+group, fixes ADR 010 ownership, leaves every legacy `/etc` systemd/D-Bus copy
+untouched, asks the bus to reload policy, and registers the opt-in PAM profile
+without selecting it. Exact known legacy-copy migration belongs to
+`facelock setup --systemd`; package configuration never overwrites an
+administrator-owned shadow. Package validation requires the installed TPM
+command surface and the suite-native `libtss2` dependency closure.
+
+Compat 13's generated `dh_installtmpfiles` post-install snippet is the sole
+install-time tmpfiles activation and invokes `systemd-tmpfiles` for
+`facelock.conf` only. The source `postinst` never runs a global tmpfiles create,
+so another package's configuration cannot be activated by a Facelock
+transaction.
+
+Trixie's debhelper 13.24 omits its remove-only service stop when
+`dh_installsystemd --no-start` is used, while Resolute's debhelper 13.31 emits
+it. The package build therefore appends debhelper's canonical
+`prerm-systemd-restart` template for the exact Facelock unit only when that stop
+is absent. This compatibility path is idempotent: both suites produce exactly
+one stop after successful PAM cleanup, neither starts or enables the daemon on
+installation, and only the generated purge path retires enabled state.
+
+## ONNX Runtime Trust and Fedora RPM Modes
+
+ONNX Runtime (ORT) is executable code loaded into the daemon, the
+PAM-spawned oneshot helper, and other privileged Facelock processes. A runtime
+must therefore be selected deterministically and validated **before** it is
+mapped. Loading a bare `libonnxruntime.so.1` through the dynamic linker's
+ambient search path and inspecting it afterward is forbidden: ELF constructors
+may already have executed before any post-map rejection.
+
+### Deterministic candidate order
+
+The resolver considers candidates in this order and stops at the first one
+that passes the applicable trust checks and initializes ORT:
+
+1. A non-empty `ORT_DYLIB_PATH`, **only in an unprivileged process**.
+2. Trusted system locations for the configured GPU provider. ROCm first checks
+   `libonnxruntime.so.1` beneath `/usr/lib64/rocm/lib`, then
+   `/usr/lib/rocm/lib`; any non-CPU provider then checks the configured-GPU
+   compatibility name `libonnxruntime.so` beneath `/usr/lib64`, then
+   `/usr/lib`.
+3. Package-manager stable-SONAME candidates
+   `/usr/lib64/libonnxruntime.so.1`, then
+   `/usr/lib/libonnxruntime.so.1`.
+4. Facelock package-owned stable-SONAME candidates beneath
+   `/usr/lib64/facelock`, then `/usr/lib/facelock`, followed by the existing
+   package-owned unversioned Debian compatibility names in those same roots.
+
+The CPU provider skips step 2. A system runtime therefore precedes a bundled
+CPU fallback even in a direct package. A missing or rejected candidate advances
+to the next fixed candidate; no other directory is searched.
+
+A process is privileged when its real or effective UID or GID is 0, its
+real/effective UID or GID differs, the kernel marks it `AT_SECURE`, or the
+calling thread has any inheritable, permitted, effective, or ambient Linux
+capability. Capability inspection reads `/proc/thread-self/status`, never the
+thread-group leader's status; an unreadable file or a missing, duplicate,
+empty, or malformed capability field fails closed as privileged. Every such
+process ignores `ORT_DYLIB_PATH` entirely and has no `/usr/local` candidate.
+The explicit override is an unprivileged caller choice: it is still opened and
+checked as a bounded ELF with the required architecture and SONAME before
+mapping, but it does not claim package-manager root ownership.
+
+### Privileged pre-map validation
+
+Every privileged system or bundle candidate has a fixed approved trust root
+and a normal relative path beneath it. One descriptor-held component walker is
+used on every kernel, with no alternate or weaker kernel-version path. The
+loader:
+
+- requires the trust root, each ancestor, and every traversed directory to be
+  root-owned and not group- or world-writable; a linked trust root is rejected,
+  and the fixed root is opened and retained with
+  `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK`
+- inspects every relative component and link through a held parent descriptor
+  using `O_PATH|O_NOFOLLOW|O_NONBLOCK`; directory links, absolute targets,
+  non-normal targets such as `.` or `..`, and paths that escape and later
+  return beneath the root are rejected
+- follows only a root-owned, single-link, relative package SONAME chain beneath
+  the held root; every link target is decomposed and walked again from held
+  descriptors rather than resolved by an ambient pathname lookup
+- opens the final object through its held parent with
+  `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, then requires a bounded regular file with
+  exactly one hard link, root ownership, no group/world write bits, no
+  setuid/setgid bits, and no `security.capability` xattr
+- requires device, inode, link count, size, UID/GID, mode, modification time,
+  and change time to remain stable across component inspection, the final
+  open, the bounded read, and the last pre-map check
+- requires a 64-bit ELF for the running architecture, SONAME exactly
+  `libonnxruntime.so.1`, and no RPATH/RUNPATH entry except exactly `$ORIGIN` or
+  `${ORIGIN}`
+
+Only after every check passes is the same held read descriptor mapped (for
+example through `/proc/self/fd/<fd>`). No pathname is reopened after validation.
+
+If every candidate is missing, rejected, or fails ORT initialization, model
+loading fails and authentication degrades through its existing password
+fallback. Authentication never downloads a runtime or model.
+
+### Fedora package modes
+
+`dist/facelock.spec` has two mutually exclusive ORT modes:
+
+| RPM channel | Spec mode | Runtime payload and dependency contract |
+|-------------|-----------|-----------------------------------------|
+| GitHub direct RPM (Fedora 44) | `--with bundled_ort` | Installs the pinned CPU runtime as `%{_libdir}/facelock/libonnxruntime.so.1.20.1` with a package-owned `libonnxruntime.so.1` symlink; carries no `BuildRequires` or `Requires` on Fedora `onnxruntime` |
+| Packit/COPR (Fedora 43/44/45) | default `%bcond_with bundled_ort` disabled | Contains no bundled ORT library or bundle metadata; `BuildRequires` and `Requires` Fedora's runtime-only `onnxruntime` package, with `onnxruntime-devel` absent |
+
+The COPR `%check` constructs a real ORT session from the checksum-pinned
+minimal model in `test/fixtures/`; finding a library or running
+`facelock --version` is not a substitute. The two RPM validators independently
+reject a direct RPM with a system-ORT dependency and a COPR RPM with bundled
+payload, and reject the inverse missing dependency/payload.
+
+Track D validates only direct/COPR build success, real ORT runtime
+initialization, and the intended payload and dependency policy. It supplies no
+clean-install, upgrade, erase, rollback, served-repository, availability,
+alpha-acceptance, or release evidence. Issue #230 owns exact-artifact package
+lifecycle proof; issue #236 owns staging and production repository publication
+and served-version proof.
+
+Optional experimental Rawhide may attempt only the separately digest-pinned,
+best-effort system-ORT build/session smoke. It is non-release and non-gating,
+must not publish or modify a COPR channel, and cannot substitute for any
+supported Fedora result or any lifecycle, artifact, served-version,
+availability, alpha-acceptance, or release evidence.
+
+### Reviewed direct-bundle identity
+
+The direct RPM bundle is exactly:
+
+| Field | Reviewed value |
+|-------|----------------|
+| Version | `1.20.1` |
+| Upstream archive | `https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz` |
+| Archive SHA-256 | `67db4dc1561f1e3fd42e619575c82c601ef89849afc7ea85a003abbac1a1a105` |
+| Upstream commit | `5c1b7ccbff7e5141c1da7a9d963d660e5741c319` |
+| Library SHA-256 | `a5faaf78a37590d3fe640f887620e74f6022d34550172b91ad2131bf0ad77d64` |
+| License identity | MIT |
+
+The release network stage downloads the archive to a file and verifies the
+archive digest **before extraction**. It then verifies `VERSION_NUMBER`,
+`GIT_COMMIT_ID`, and the library digest against the reviewed values. Streaming
+an unverified response into `tar` is forbidden.
+
+The prepared bundle contains the exact library plus upstream `LICENSE`,
+`ThirdPartyNotices.txt`, `VERSION_NUMBER`, and `GIT_COMMIT_ID`, and generated
+`PROVENANCE.md`, `manifest.json`, and `SHA256SUMS`. The checksum file covers
+the library and every listed metadata/provenance file except itself. Direct RPM
+assembly requires and re-verifies the complete prepared bundle.
+
+Before creating the source archive or any rpmbuild tree, the whole assembly
+enters `.github/workflows/scripts/run-networkless.sh`. That wrapper uses
+util-linux `enosys` as a fail-closed seccomp boundary: it denies socket
+creation/connection and message syscalls plus `io_uring_setup`, closes every
+inherited non-stdio file descriptor, and requires a socket probe to fail with
+`ENOSYS` before it invokes the assembly command. Cargo offline mode remains
+defense in depth; it is not the network-isolation boundary.
+
+The installed `libonnxruntime.so.1.20.1` bytes must retain the exact reviewed
+library digest above. Fedora strip/debug/post-processing must not rewrite the
+pinned runtime; bundled mode disables the modifying strip hook, and validation
+extracts the final RPM member and checks its digest. The RPM also ships the
+license, notices, version, commit, checksums, provenance, and component manifest
+under its documentation/license directories.
+
+Those metadata files are inputs for later SBOM, release-manifest, attestation,
+and signing work. Their presence does **not** claim that Track D generated or
+signed a final SBOM/manifest, signed the RPM, or published a release. Issue
+#235 owns native signing and final immutable direct-artifact publication.
+
+### RPM tmpfiles transaction
+
+The RPM transaction creates Facelock's runtime directories through the
+package-scoped `%tmpfiles_create facelock.conf` invocation. It must not run a
+global `systemd-tmpfiles --create` or otherwise process unrelated packages'
+tmpfiles configuration. Package validation observes the directories created by
+the actual install transaction and does not manufacture them with a later
+global tmpfiles command.
+
+## Package Lifecycle Ownership
+
+This is the Wave 0 ownership freeze for issue #232. It defines what package
+lifecycle work is allowed to remove, and the Debian post-removal script
+implements the bounded purge described below. **Ordinary removal is not data
+deletion.** Ordinary `remove` remains preservation-only: removing the package
+must leave a machine reinstallable without losing its biometric or operational
+state.
+
+The ownership classes are deliberately separate:
+
+| Class | Examples | Ordinary removal |
+|-------|----------|------------------|
+| Package-owned static integration | binaries and shared libraries, systemd/OpenRC/runit/s6 units, D-Bus policy and activation, tmpfiles configuration, shipped quirks, PAM/authselect profiles, translations, bundled runtime libraries | Remove through the package manager. These files can be recreated byte-for-byte by reinstalling the package |
+| Administrator configuration | `/etc/facelock/config.toml` and the package manager's saved replacement for an administrator-modified copy | Apply the native package-family rules below. Do not treat administrator configuration as biometric state or as disposable static integration |
+| Biometric and operational state | the database and its WAL/SHM sidecars, encryption keys and sealed keys, downloaded models, enrollment markers, setup state, audit logs, and snapshots under the compiled roots | Preserve all of it. A reinstall reuses it; ordinary removal never interprets absence of the package as consent to discard it |
+| PAM integration and provenance | a `pam_facelock.so` rule, a Facelock-created local override and its provenance header, legacy `<service>.facelock-backup` files, and rollback state under `/var/lib/facelock/pam-backups` | Attempt safe cleanup while the binary is still present. Delete provenance only after the corresponding PAM cleanup is proven complete |
+| Externally configured state | any database, model directory, key, sealed key, audit log, or snapshot path configured outside the compiled Facelock roots | Never package-owned. Leave it untouched and report it as an external remnant |
+
+PAM provenance and rollback files are not biometric state. They exist to
+explain or reverse an authentication-stack edit, so retaining all of them
+forever makes an otherwise successful uninstall look incomplete. Conversely,
+deleting them before the PAM edit is known to be gone destroys the evidence and
+rollback path for a service that still references a removed module.
+
+**Preserve PAM provenance when cleanup is incomplete; remove it only after
+successful cleanup.** Successful cleanup means the service file was safely
+resolved inside `/etc/pam.d`, its Facelock rule was removed (or was already
+absent), and any candidate override or backup was proven to be Facelock-created
+and no longer needed. A Facelock-created override may be deleted to reveal its
+vendor file only when it has no administrator changes. Never restore a backup
+over a newer service file merely because the backup exists. An unreadable,
+unwritable, wrong-owner, non-regular, changed, linked, or mount-separated
+service file makes cleanup incomplete: preserve its override, provenance
+header, and `.facelock-backup`, and report the exact remnant. Cleanup of one
+service does not authorize deleting provenance for a different service.
+The final Debian `postrm` never interprets rollback schemas. If
+`/var/lib/facelock/pam-backups` is nonempty after the earlier binary-backed
+cleanup, it retains and reports the entire opaque subtree; only a trusted empty
+directory is eligible for ordinary fixed-root removal.
+
+### Native configuration lifecycles
+
+The package families reach the same ownership result through different native
+mechanisms:
+
+| Family and operation | Administrator-configuration contract |
+|----------------------|--------------------------------------|
+| Debian `remove` | `/etc/facelock/config.toml` is a Debian conffile and remains at its installed path. Biometric and operational state also remains |
+| Debian `purge` | `dpkg` removes the conffile, and the post-removal purge may then remove only safe remnants inside the compiled roots. Unsafe and external remnants are retained and reported |
+| RPM erase | `/etc/facelock/config.toml` is RPM `%config(noreplace)`. RPM removes an unmodified copy and retains an administrator-modified copy according to RPM semantics, commonly as `config.toml.rpmsave`. A `.rpmsave` is retained state, not evidence of a failed erase and not something a Facelock script deletes |
+| Arch package removal | the `backup` entry follows pacman's native saved-configuration behavior (including `.pacsave` when applicable). Facelock lifecycle code does not bypass it |
+| `just uninstall` | no package manager owns the config, so the source-install uninstall preserves `/etc/facelock` with the biometric and operational state |
+
+### Source-install daemon lifecycle
+
+The privileged `install` and `uninstall` entrypoints invoke absolute
+`/usr/bin/sudo`, `/usr/bin/env`, and `/usr/bin/just` paths with
+`PATH=/usr/bin:/bin`. The `install-files` and `uninstall-files` recipes use the
+exact `#!/usr/bin/bash -p` interpreter, set that fixed path before their first
+operation, and reject caller-supplied Bash startup hooks through the structural
+gate. Directly executed production helpers also use `/usr/bin/bash -p` and pin
+their production path. The root-owned checkout and another actor with root or
+equivalent filesystem authority remain trusted inputs.
+
+`just install-files` serializes its protected interval with
+`/run/facelock/lifecycle.lock`. It safely creates or validates
+`/run/facelock` as `root:root` mode `0755` (the fixture-root identity in
+offline tests), then captures the never-unlinked lock as a `root:root` mode
+`0600`, zero-byte, single-link regular file without following the public path.
+The lock stays held through manager/D-Bus restoration, migration publication,
+signal cleanup, and descriptor release. This is the canonical cross-entrypoint
+lifecycle lock path; other lifecycle entrypoints join it in their owning work.
+
+Before its first replacement write, the installer records exactly one service
+load, active, unit-file, fragment, effective command, and drop-in state. It
+admits only loaded active/inactive service state or a genuine first install.
+Probe failures, transitional/failed states, inconsistent manager/disk state,
+untrusted effective assets, a concurrent lifecycle holder, and malformed or
+duplicate properties abort before mutation. Persistent and runtime ordinary
+unit paths are snapshotted independently. An admitted path is absent, an exact
+administrator `/dev/null` or empty-file mask, or a bounded trusted regular
+override retained by descriptor, metadata, and digest. Systemd precedence is
+preserved; linked, multiply linked, writable, or changing state fails closed.
+
+Every admitted online state receives an owned activation barrier at
+`/run/systemd/system.control/facelock-daemon.service`. The no-clobber-created,
+descriptor-held `root:root` mode `0600` empty regular file is manager-proved as
+the effective mask before the daemon is stopped and before any install write.
+The helper also proves the active system bus, its standard service-directory
+topology, selected Facelock activation definition, policy-only includes, bus
+owner state, and systemd delegation. Custom or unreadable activation topology,
+direct D-Bus execution, or a higher-priority control conflict aborts. The
+source installer never changes enablement and restores only the active/inactive
+state captured at entry.
+
+The source recipe writes service assets only to the canonical `/usr` paths. It
+plans all three historical `/etc` public/quarantine pairs before the protected
+writes, including exact known copies, interrupted exact quarantines,
+administrator files, and systemd masks. After the canonical writes, it moves
+only reviewed exact historical copies to fixed same-parent quarantines with
+no-replace semantics. Trusted modified administrator files and masks remain at
+their exact recorded identities; a selected administrator D-Bus activation
+definition must still delegate to systemd. Unknown, linked, wrongly owned,
+wrongly moded, changing, or ambiguous state fails closed.
+
+Staging is not publication. Quarantines remain rollback-capable while later
+source writes and permission fixes run. A recipe failure or `HUP`, `INT`, or
+`TERM` restores every newly staged public name in reverse order before manager
+and D-Bus restoration; a pair that was already an interrupted quarantine is
+restored to that same pre-run state. The lifecycle treats the staging child
+and its exact parent-side identity record as one signal-critical operation.
+The child also traps exit and caught signals to reverse its locally known
+prefix; parent cleanup independently reconciles unchanged or staged names
+against the complete preplan even when the record was interrupted. Any mixed
+pair that cannot be restored without replacement remains preserved and keeps
+activation barred. Normal completion reloads and proves the
+canonical winners while the activation barrier is still effective, then
+revalidates and deletes the exact quarantines. Only after that commit and
+another topology proof may cleanup quarantine/remove the barrier and restart
+an initially active daemon. A pre-publication commit failure rolls back,
+reloads, and proves the original winners while still barred. A collision,
+partial publication, incomplete rollback, or unprovable manager/D-Bus state
+retains the safest provable barrier and suppresses restart.
+
+Barrier cleanup itself uses held descriptors, fixed same-parent quarantine
+names, no-replace recovery, bounded retries, and repeated disk/manager/D-Bus
+proof. An inactive or first-install daemon remains inactive. The initiating
+failure or signal remains the process result, and signal cleanup is
+non-reentrant until restoration and lock/descriptor release finish.
+
+Ordinary source install fails closed without systemd. The sole exception is
+the checked-in `test/Containerfile` offline image step, selected by its exact
+mode and marker. It authenticates the copied lifecycle/migration helpers and
+digest manifest, takes the same canonical lock inside the image, and proves no
+manager, bus, activation asset, installed Facelock indicator, or unreadable
+process identity exists before allowing writes. Distro maintainer scripts own
+their separate native lifecycle. The mocked/static gate is
+`just test-source-install-daemon-lifecycle`; the mount-free PID-1 gate is
+`just test-source-install-daemon-lifecycle-systemd`.
+
+Debian `postrm purge` is self-contained. It never invokes the already-removed
+`facelock` binary. By the time `postrm` runs, package payloads cannot be treated
+as available cleanup tools. The bounded purge makes its decisions from fixed
+constants and the remaining filesystem state and uses the Essential
+`perl-base` interpreter available throughout the package lifecycle; it cannot
+delegate safety checks or deletion to the CLI it is purging.
+The supported Debian-family artifacts are explicitly `Architecture: amd64`.
+For quarantine and recovery, the helper therefore invokes x86-64
+`renameat2(RENAME_NOREPLACE)` directly through Perl's `syscall`; an unsupported
+architecture, kernel, or filesystem fails closed and retains the entry. It
+never falls back to an absence check followed by a replacing rename.
+
+The post-removal script classifies the six supported configured path fields
+while the conffile is still available during `remove`, and repeats that report
+at `purge` when a configuration file remains. Its bounded TOML classifier
+recognizes canonical section assignments plus dotted and quoted key or table
+components with their TOML table scope intact. If a valid representation is
+outside that bounded grammar, including a multiline string, the script emits a
+controlled warning that the configuration could not be fully classified. An
+external value is reported but never opened, removed, or used as a traversal
+root. A configuration object that cannot be safely inspected and is reported
+as retained is protected from the later generic walk. The report therefore
+survives dpkg's normal ordering, in which it can remove the conffile before the
+final `postrm purge` call, without turning configuration into deletion
+authority.
+
+RPM and Arch have no Debian-style second `purge` phase. Their ordinary erase
+therefore removes static integration and safely cleaned PAM provenance, while
+preserving biometric state and whatever administrator-configuration artifact
+their package manager retained.
+
+### Fedora authselect retirement boundary
+
+The RPM does not ship or select an authselect profile, does not edit
+`system-auth` or `password-auth`, and has no runtime or scriptlet dependency on
+authselect. Fresh installation is PAM-inert. The supported opt-in is an
+explicit, named leaf service through `facelock pam add --service <name>` or its
+`setup --pam --service <name>` alias. That operation edits only the resolved
+leaf service plus Facelock's fixed backup state; the selected authselect profile
+and shared generated files remain byte-for-byte unchanged.
+
+An incoming RPM upgrade runs the source-controlled
+`facelock-authselect-retirement-guard` from `%pre`, while the old payload is
+still installed. A fresh transaction is an immediate no-op. An upgrade also
+succeeds without authselect installed or when the fixed selection-state file
+`/etc/authselect/authselect.conf` is absent.
+
+An already-installed v0.1.4 RPM cannot be retroactively guarded: direct
+uninstall runs only that installed release's unguarded scriptlets.
+Administrators must install a guarded release before a later uninstall so the
+upgrade guard can first retire the old authselect payload safely.
+
+When that file exists, the guard reads no other authselect path and invokes no
+authselect command. It requires a root-owned, root-group, regular, single-link
+0644 file of at most 16 KiB, compares the first line's original bytes with its
+shell-decoded value so no NUL or other control byte can be discarded, and then
+accepts only the profile grammar used by authselect: one confined profile
+identifier, `custom/<identifier>`, or `@system-default`. A malformed, linked,
+oversized, control-bearing, or wrong-metadata file is untrusted and blocks the
+package transaction without changing it.
+
+The exact retired profile identifier `facelock` also blocks upgrade. The
+diagnostic requires the administrator to inspect the active identity provider
+and features, select an appropriate supported profile while asking authselect
+to create a backup, and retry the RPM transaction. Facelock does not guess a
+replacement or migrate generated PAM state. A different valid identifier,
+including the separately administrator-owned `custom/facelock`, is preserved
+unchanged and does not block the upgrade.
+
+The booted Fedora lifecycle test uses the released 0.1.4 RPM to prove fresh,
+unselected, selected-retired, custom-profile, malformed-state, and
+authselect-absent upgrade cases. It also proves correct and wrong password
+fallback through the real selected profile, and the real RPM package test
+proves that service-scoped setup and removal leave the selection and shared
+generated files unchanged. Neither test mutates the host PAM stack.
+
+### Fixed-root purge boundary
+
+The only purge roots are the compiled Facelock roots:
+`/etc/facelock`, `/var/lib/facelock`, and `/var/log/facelock`. `/etc/pam.d` is
+a separate, fixed root for the narrow PAM cleanup above; it is never a recursive
+purge root. The nonempty `/var/lib/facelock/pam-backups` subtree is an opaque
+exception inside the state root because any remaining entry is unresolved PAM
+cleanup evidence. A configured path that remains within a compiled Facelock
+root is eligible for a later Debian purge only under the same safety checks as
+every other descendant.
+
+Configured paths outside those roots are external remnants. This includes
+external values of `daemon.model_dir`, `storage.db_path`, `encryption.key_path`,
+`encryption.sealed_key_path`, `audit.path`, and `snapshots.dir`. Removal and
+purge must leave them untouched, report that they were refused as external, and
+must not claim that all Facelock data is gone. A path becoming external through
+configuration does not expand package ownership.
+
+The purge operates from fixed path constants and examines each entry without
+trusting path traversal. A root and every traversed directory must be a
+root-owned, non-group/world-writable directory on the root's device. Deletable
+leaves are single-link regular files with the same ownership and write-mode
+constraint. The only ownership exception is an owner-only regular file that is
+one of the direct children of `/var/lib/facelock/enrolled`; those enrollment
+markers are deliberately owned by the enrolled user. Other wrong-owner,
+non-regular, or multiply-linked objects remain in place.
+
+The helper pins every component from the fixed prefix through each purge root
+with `O_DIRECTORY|O_NOFOLLOW` descriptors, opens regular candidates with
+`O_NONBLOCK|O_NOFOLLOW`, and operates through `/proc/self/fd/<fd>` rather than
+reopening public pathnames. It revalidates the complete fixed chain and every
+opened descendant immediately before and after a removal quarantine. Mount IDs
+from `/proc/self/fdinfo` are combined with `/proc/self/mountinfo` to detect bind
+mounts even when their device number is unchanged; every descendant's `st_dev`
+must also equal the opened root's device.
+
+A safe regular file or empty descendant directory is first moved within its
+trusted, non-writable parent by a descriptor-anchored, atomic no-replace
+quarantine operation. A colliding quarantine name is preserved and reported;
+the helper may try a later bounded candidate but never replaces the collision.
+The helper reopens the admitted quarantine name and proves the original device,
+inode, type, link count, ownership, mode, mount, and fixed-chain identity before
+unlink or `rmdir`. Recovery uses the same atomic no-replace operation, so a
+replacement at the public name preserves both public and quarantine remnants.
+A failed unlink or directory removal restores the proven quarantine identity
+with no-replace recovery when possible instead of stranding it under a hidden
+name. After regular-file unlink, the still-open inode must reach link count
+zero; otherwise an external hard-link remnant is reported without claiming the
+data was fully removed.
+A directory with any refused child is never moved. The helper never removes
+the three compiled root directories because their parents are outside the
+recursive purge boundary; safely admitted contents and empty descendant
+directories are removed, while a root may still contain reported refused or
+opaque remnants. After the helper returns, dpkg may remove an empty
+`/etc/facelock` directory as part of native conffile purge. The helper must
+never cross a mount point.
+It must never follow a symbolic link, act through a hard-linked object, or
+recurse through an object whose ownership cannot be proven safe.
+
+The trusted-parent mode is also the purge concurrency boundary. Linux has no
+inode-conditional `unlinkat` or `rmdirat`: after the quarantine identity's final
+proof, deletion assumes no concurrent process with root or equivalent mutation
+authority is changing names in that root-owned, non-group/world-writable
+parent. The package transaction stops the service and owns this interval;
+ordinary unprivileged users cannot enter it. A separate same-authority process
+that deliberately mutates those parents is outside the package-purge contract,
+because no maintainer script can both delete a pathname and preserve an object
+that such a process substitutes at the deletion syscall itself.
+
+Traversal is iterative and bounded independently for each compiled root: at
+most 64 descendant-directory levels and 10,000 inspected entries. A directory
+beyond the depth limit remains as a reported subtree while safe siblings may
+still be cleaned. Reaching the node limit stops further cleanup of that root
+and reports the whole root subtree as retained rather than implying that only
+the first unseen entry is unsafe. A root or descendant that fails any other
+check remains in place and is reported. A safe root may still be cleaned around
+an unsafe child, but the final report must name every remnant rather than
+describe the root as removed. `/etc/pam.d` is not among these recursive roots,
+so purge cannot erase an incomplete PAM edit or its rollback provenance.
+
+Safety refusals and external remnants must not strand package-manager state.
+In particular, Debian purge reports and preserves an unsafe object but returns
+success after reporting safety refusals, so a link, mount, wrong-owner object,
+or partial unlink failure cannot leave the package permanently half-purged.
+This is not a broad recursive-delete contract: the script enumerates the
+bounded roots and rejects anything it cannot prove is inside them.
+
+Finally, filesystem removal does not promise secure erasure. Unlinking files
+does not guarantee that data is absent from SSD flash translation layers,
+snapshots, backups, journal history, or remapped blocks. Lifecycle messages may
+say which names were removed and which remnants remain; they must not describe
+purge as forensic destruction of biometric data.
 
 ## Filesystem Paths
 
@@ -1365,13 +2516,25 @@ writes.
 | `/var/lib/facelock/models/` | root:root | 755 | ONNX models — public, SHA256-verified downloads |
 | `/var/lib/facelock/enrolled/` | root:root | 711 | Enrollment markers; traversable by all, listable by none |
 | `/var/lib/facelock/enrolled/<user>` | \<user\>:\<user\> | 600 | `{"models": N, "updated": "<ISO8601>"}` — a hint for `is-enrolled`, never authoritative |
+| `/var/lib/facelock/pam-backups/` | root:root | 700 | Fixed-root PAM rollback state; not affected by `[pam].config_dirs` or `storage.db_path` |
+| `/var/lib/facelock/pam-backups/<service>.<seconds>-<nanoseconds>` | root:root | 600 | Original PAM service bytes; nanoseconds are exactly nine digits |
+| `/var/lib/facelock/pam-backups/<service>.<seconds>-<nanoseconds>.json` | root:root | 600 | Strict versioned provenance for the adjacent rollback bytes |
+| `/var/lib/facelock/pam-backups/.facelock-remove-all-<operation>.json` | root:root | 600 | Strict prepared whole-set PAM removal journal |
+| `/var/lib/facelock/pam-backups/.facelock-remove-all-commit-<operation>.json` | root:root | 600 | Strict self-contained whole-set commit and recovery marker |
 | `/var/log/facelock/` | root:root | 700 | Log dir — per-user auth history and raw face snapshots are root-only |
 | `/var/log/facelock/audit.jsonl` | root:root | 600 | Structured audit log |
 | `/var/log/facelock/snapshots/` | root:root | 700 | Auth snapshots (raw face images) |
 | `/usr/bin/facelock` | root:root | 755 | CLI binary |
 | `/lib/security/pam_facelock.so` | root:root | 755 | PAM module |
 
-All paths overridable via config. `FACELOCK_CONFIG` is honored for unprivileged processes, but privileged PAM/root auth flows ignore the environment and use either an explicit `--config` path or `/etc/facelock/config.toml`.
+Config-described data and model paths are overridable as documented by their
+schema fields. `/var/lib/facelock/pam-backups` is deliberately fixed for the
+PAM writer and shared state layout. Neither `[pam].config_dirs` nor
+`storage.db_path` redirects it: the former selects PAM service roots and the
+latter relocates biometric database state only. `FACELOCK_CONFIG` is honored
+for unprivileged processes, but privileged PAM/root auth flows ignore the
+environment and use either an explicit `--config` path or
+`/etc/facelock/config.toml`.
 Runtime-created DB sidecars (`-wal`, `-shm`), audit logs, and snapshots are created with explicit restrictive modes. The packaged systemd unit also sets `UMask=0027`.
 
 #### Traversal for everyone, listing for nobody (ADR 010)
@@ -1379,10 +2542,11 @@ Runtime-created DB sidecars (`-wal`, `-shm`), audit logs, and snapshots are crea
 The state directory and `enrolled/` are `0711 root:root`: any local user may
 *enter* them, nobody but root may *list* them. That is the whole grant. Every
 entry below is locked down in its own right — `0600 root:root` database and
-sidecars, `0600 <user>:<user>` markers — and `models/` is the one subtree that
-carries "other" read bits of its own, because its contents are public,
-SHA256-verified downloads. There is no group in the file contract: nothing
-under `/var/lib/facelock` is group-owned or group-readable (ADR 010).
+sidecars, `0600 <user>:<user>` markers, and a `0700 root:root` PAM-backup
+directory containing `0600 root:root` state files — and `models/` is the one
+subtree that carries "other" read bits of its own, because its contents are
+public, SHA256-verified downloads. There is no group in the file contract:
+nothing under `/var/lib/facelock` is group-owned or group-readable (ADR 010).
 
 D-Bus is required for user-run screen lockers (hyprlock/swaylock) and the
 polkit agent — their PAM stack runs as the user, and nothing makes the `0600
@@ -1489,8 +2653,11 @@ handled by the desktop's normal password agent) is unverified pending
 live-desktop testing and may require a design change. Behavior here is
 fail-closed: a non-eligible action is never face-authorized.
 
-`[pam].config_dirs` is where `facelock pam add | remove | status` looks for PAM
-service files, in search order — Linux-PAM's own precedence, earliest wins.
+`[pam].config_dirs` is where named `facelock pam add | remove | status` looks
+for PAM service files, in search order — Linux-PAM's own precedence, earliest
+wins. `facelock pam remove --all` always uses the compiled `/etc/pam.d`,
+`/usr/lib/pam.d`, and detection-only `/etc/authselect` roots and cannot be
+redirected by configuration.
 Default: `["/etc/pam.d", "/usr/lib/pam.d"]`. **The first entry is the override
 directory: every write lands there and every later entry is read-only**, so a
 service that resolves only in a later one is copied into the first before the

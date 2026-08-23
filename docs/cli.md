@@ -79,14 +79,14 @@ that once.
 ```bash
 facelock setup                          # interactive wizard
 facelock setup --non-interactive        # base setup, no prompts, no PAM/systemd/enroll
-facelock setup --systemd                # install systemd units
+facelock setup --systemd                # validate installed assets, reload and enable
 facelock setup --systemd --disable      # disable systemd units
 facelock setup --pam                    # install to /etc/pam.d/sudo
 facelock setup --pam --service polkit-1 # install to a specific service
 facelock setup --pam --remove           # remove the PAM line
 facelock setup --pam --service hyprlock --if-present  # a missing service file is success
 facelock setup --pam --remove --if-present  # ...on removal too
-facelock setup --pam --service sshd -y  # a sensitive service: -y is what unlocks it
+facelock setup --pam --service sshd -y --allow-sensitive  # suppress the prompt and authorize the sensitive write
 facelock setup --no-pam                 # wizard, but never touch /etc/pam.d
 facelock setup --camera /dev/video2     # answer step 1 from the command line
 ```
@@ -103,12 +103,15 @@ since omitting a flag already gives the default.
 |------|---------|
 | *(none)* | Full interactive wizard. Falls back to the non-interactive flow when stdin is not a terminal. |
 | `--non-interactive` | No prompts. Choices resolve to config-or-default. Runs the base setup only: directories, model download and verification, encryption, path permissions. No PAM, no systemd, no enrollment unless asked for explicitly. |
-| `-y`, `--yes` (alias `--no-confirm`) | Suppress confirmation prompts, and unlock the sensitive-service gate. |
+| `-y`, `--yes` (alias `--no-confirm`) | Suppress ordinary confirmation prompts. Does not authorize a sensitive PAM edit. |
 
-`--non-interactive` suppresses the per-file "Proceed?" confirmation on its own,
-since it promises no prompts. It does **not** unlock the sensitive-service
-gate, so `facelock setup --non-interactive --pam --service sshd` refuses until
-`-y` is added. Locking yourself out of a machine takes two decisions.
+`--yes` and `--non-interactive` suppress the per-file "Proceed?" confirmation;
+neither unlocks the sensitive-service gate. The shared auth stacks
+`common-auth`, `password-auth`, `password-auth-ac`, `system-auth`,
+`system-auth-ac` and `system-login`, plus `login` and `sshd`, require
+`--allow-sensitive`. Thus even `facelock setup --pam --service sshd --yes`
+refuses. Locking yourself out of a machine takes two independent decisions:
+whether to skip the prompt, and whether to authorize the sensitive write.
 
 ### Choice flags
 
@@ -121,10 +124,16 @@ quietly writing a software keyfile.
 
 | Flag | Values | What `auto` does | Wizard step |
 |------|--------|------------------|-------------|
-| `--camera <PATH\|auto>` | a `/dev/video*` path, or `auto` | Re-classifies the attached devices and picks the single IR-capable one. Zero IR devices and more than one are both errors that list what was found. | 1 |
+| `--camera <PATH\|auto>` | a `/dev/video*` path, or `auto` | Re-classifies the attached devices and picks the single IR-capable node that advertises a format Facelock can decode. Zero usable IR devices and more than one are both errors that list what was found; an IR node excluded for formats such as Y8/Y10/Y12 is reported with its path and formats. | 1 |
 | `--models <standard\|balanced\|high>` | three presets | *no `auto`*: quality is a preference, not something the machine can report | 2 |
 | `--execution-provider <cpu\|cuda\|rocm\|openvino\|auto>` | provider name | Asks the installed ONNX Runtime which providers it was built with and takes the best, in the order cuda > rocm > openvino > cpu. Availability is a property of the runtime build, not of the hardware, and the choice is always printed. | 3 |
 | `--encryption <tpm\|keyfile\|none\|auto>` | method | Uses the TPM when a working TPM 2.0 is present, otherwise a software keyfile. | 5 |
+
+When `security.require_ir = true` and the wizard detects IR-classified nodes but
+all of them advertise only unsupported formats, camera selection is a fatal
+refusal. It lists every excluded IR path and format and does not present or
+default to an attached RGB camera. With `require_ir = false`, decodable RGB
+cameras remain available as explicit wizard choices.
 
 Model presets:
 
@@ -160,7 +169,8 @@ forcing the step, so it runs unattended.
 | `--service <NAME>` | `--pam` | Target PAM service. Default `sudo`. |
 | `--remove` | `--pam` | Remove the facelock PAM line instead of adding it. |
 | `--if-present` | `--pam` | Treat an absent service file as success rather than an error, on the add side as well as `--remove`. Read, parse and write failures stay fatal. Without it, a service that is not there is a hard error. |
-| `--disable` | `--systemd` | Disable and stop the units instead of installing them. |
+| `--allow-sensitive` | `--pam` add | Explicitly authorize adding Facelock to `common-auth`, `login`, `password-auth`, `password-auth-ac`, `sshd`, `system-auth`, `system-auth-ac`, or `system-login`. Does not suppress the confirmation prompt and conflicts with `--remove`. |
+| `--disable` | `--systemd` | Disable and stop the units without changing installed assets. |
 
 The parser enforces these, so `facelock setup --remove` is an error naming the
 missing `--pam` rather than a silently ignored flag.
@@ -177,13 +187,15 @@ then PAM.
 
 `--pam` is an alias onto [`facelock pam add | remove`](#facelock-pam), which is
 the primary spelling and the one that takes several services in one process.
-Every `setup --pam` invocation keeps parsing and keeps its behaviour.
+Existing `setup --pam` invocations keep parsing. Sensitive additions now use
+the same explicit `--allow-sensitive` authorization as `facelock pam add`,
+while `-y` only suppresses the prompt.
 
 Eight services are gated: the shared auth stacks `common-auth`,
 `password-auth`, `password-auth-ac`, `system-auth`, `system-auth-ac` and
 `system-login`, plus `login` and `sshd`.
-`facelock setup --pam --service login` refuses until `-y` is added, and on
-`facelock pam add` the same gate is `--allow-sensitive`.
+`facelock setup --pam --service login` refuses until `--allow-sensitive` is
+added, even when `-y` is present.
 
 Every `setup` run reconciles the per-user enrollment markers behind
 [`facelock is-enrolled`](#facelock-is-enrolled) against the database, which is
@@ -625,8 +637,24 @@ the facelock line already in it and a two-line header saying what it was forked
 from; the package's own file is left byte for byte. That copy reports
 `overridden` rather than `installed`, and `pam status` reports a service with no
 local copy as `vendor-only` rather than as `missing`. Deleting the override
-restores the vendor file. Set `[pam] config_dirs` if your distribution's vendor
-directory is somewhere else.
+restores the vendor file. Named `pam remove` does that automatically only while
+the two-line Facelock header, the bytes below it after removing the module rule,
+and the file owner/mode still match the first existing vendor service in the
+configured search order. If either copy
+has drifted, it removes the module rule but keeps the local override and says
+why. If no current vendor source exists, an exact header naming a normalized
+configured candidate is reported as absent and the local override is retained;
+an arbitrary header path is not trusted or opened. Set `[pam] config_dirs` if your distribution's vendor directory is
+somewhere else for explicit `add`, named `remove`, and test resolution.
+Machine-wide `pam remove --all` deliberately ignores that setting, scans the
+compiled system roots `/etc/pam.d` and `/usr/lib/pam.d`, and separately scans
+the fixed detection-only generated root `/etc/authselect`.
+
+Fedora RPMs support the same service-scoped leaf-file setup. They do not ship
+or select an authselect profile, and Facelock never writes the generated
+`system-auth` or `password-auth` files. Choose an application-owned leaf such
+as `sudo`, `polkit-1`, or another explicit service; generated authselect symlinks
+are refused by the writer's no-follow checks.
 
 ### facelock pam add
 
@@ -656,14 +684,38 @@ answered — no TTY on stdin, no TTY on stderr (where the prompt is drawn, so
 `2>install.log` counts), or `--json` — and the gate is decided before any
 prompt exists, so an unattended `pam add --service system-auth` still refuses.
 
-A service file that is a symlink out of `/etc/pam.d` is refused rather than
-written through: on an authselect system `system-auth` and `password-auth` link
-into `/etc/authselect`, and an edit there is regenerated away. A link that
-stays inside the directory is followed — and gated on the file it reaches, so
-`--service alias` where `alias -> system-auth` still needs
-`--allow-sensitive` — with the backup landing beside the real file. A file with
-more than one hard link is refused too: a link count says another name exists
-and not where, so the edit cannot be shown to stay in the directory.
+On Debian and Ubuntu, a selected packaged `pam-auth-update` profile is already
+one Facelock auth path. Before planning any direct add (including
+`setup --pam`), Facelock verifies the exact fixed-root profile, saved selection
+and live Primary block without following links. It refuses a duplicate with:
+`sudo pam-auth-update --disable facelock`, verify a real correct password
+succeeds and a wrong password fails, then retry the original Facelock command
+with all of its services and flags.
+Any disagreement between the saved selection and live graph, or untrusted
+state, also refuses without writing PAM or backup state.
+
+`facelock pam shared-profile-status` is an internal, read-only Debian package
+maintainer probe. It exits 0 only for that exact active profile, 1 when the
+profile is cleanly unselected, and 2 for untrusted or inconsistent state; it
+never changes PAM or backup state.
+
+Any symlinked service file is refused rather than written through: on an
+authselect system `system-auth` and `password-auth` link into generated state,
+and even an in-directory link would make a recorded service name resolve to a
+different file. A file with more than one hard link is refused too: a link
+count says another name exists and not where, so the edit cannot be shown to
+stay in the directory.
+
+Before an in-place edit, `add` writes a `0600 root:root` backup under
+`/var/lib/facelock/pam-backups/<service>.<timestamp>` and an adjacent versioned
+JSON provenance record. The record stores a confined service name, backup
+basename, positive monotonic sequence, hashes, and prepared/committed state;
+it never stores a target path. Only the exact
+`<service>.<seconds>-<nine-digit-nanoseconds>` basename grammar is recognized.
+This also moves the human and JSON `backup` value from the former adjacent
+`/etc/pam.d/<service>.facelock-backup` location to the dedicated state path.
+Legacy adjacent files remain visible as rollback hints and are removed by a
+default `pam remove`, but they are not rewritten into versioned provenance.
 
 `--dry-run` is honoured after the root check, so it still needs root.
 `pam status` is the unprivileged read to reach for instead.
@@ -673,14 +725,112 @@ and not where, so the edit cannot be shown to stay in the directory.
 ```bash
 sudo facelock pam remove                                     # /etc/pam.d/sudo
 sudo facelock pam remove --service login                     # removal is never gated
+sudo facelock pam remove --all                               # every recognized owned edit
 sudo facelock pam remove --service hyprlock --if-present     # a missing file is success
+sudo facelock pam remove --service sudo --keep-backup        # retain rollback state
 sudo facelock pam remove --service sudo --dry-run --json
 ```
 
 Takes the same flags as `add` except `--allow-sensitive`, which it does not
 offer: removal can only take away a way to authenticate, so there is nothing to
-gate. It never prompts either, and the `.facelock-backup` file written by `add`
-is left in place.
+gate. It never prompts either. Named removal uses the configured lookup path.
+By default it removes committed Facelock-owned provenance and backups for the
+requested service, including the legacy adjacent `<service>.facelock-backup`
+name. Unresolved prepared state is preserved for recovery. `--keep-backup`
+opts out of cleanup. A cleanup error remains non-zero, but the JSON action is
+`cleanup-failed` and the human diagnostic says that the PAM state change
+already completed.
+For a Facelock-created local vendor copy, named removal first uses the normal
+crash-safe complete-file replacement to remove the module rule, then deletes
+the override only after moving its exact published inode to a no-replace
+transaction quarantine and rechecking that inode, canonical-name absence, and
+the current vendor bytes and metadata. The first existing later-root service
+wins; Facelock does not accept a matching lower-priority copy. The pre-removal
+document must contain exactly the
+one Facelock-emitted rule; extra or customized rules are drift. A restart also
+recognizes the exact header-bearing copy after the line is already absent.
+Header, payload, owner/mode, or vendor drift keeps the override; Facelock never
+deletes a merely similar local file. If the current vendor source is absent,
+only a header path derived from a normalized configured later-root candidate is
+recognized, solely to report why the local override is retained; header paths
+are never opened.
+
+`remove --all` is the package-safe, config-independent form. It opens the
+compiled `/etc/pam.d`, `/usr/lib/pam.d`, and detection-only `/etc/authselect`
+roots without following links, enumerates the opened directory descriptors,
+and uses directory-relative regular/single-link reads. A symlink is skipped
+only when its exact absolute target is the same service in a later compiled
+root that is scanned independently; every other linked entry is an unmanaged
+blocker. This lets Fedora's unrelated generated PAM links be checked at their
+fixed root without traversing the links. Directory contents are detection
+ground truth; provenance can authenticate an arbitrary service Facelock
+previously changed, but never supplies a target path. An exact pre-0.2
+`auth      sufficient pam_facelock.so` edit is recognized only under a
+conventional service basename. Dot-prefixed and package/administrator artifact
+names such as `.pacsave`, `.rpmsave`, pam-auth-update `.pam-old`, and `~`
+require strict provenance for that exact name or an exact current Facelock
+vendor-copy header; unowned artifacts are ignored and preserved. A customized control,
+options or spacing, corrupt provenance for a candidate, any other linked entry,
+or a reference in a read-only root is an unmanaged blocker. Nothing is changed
+when preflight finds one. The same scan recognizes an exact unchanged
+Facelock-created vendor override even if a previous run already removed its
+module rule, so package cleanup can finish that bounded intermediate.
+
+With `--dry-run`, an existing PAM backup directory is inspected read-only and
+must already have its trusted owner and mode. The preview does not repair or
+sync that directory, acquire its write lock, or run recovery; it refuses the
+preview if the directory is not already trusted.
+
+Before the first PAM file changes, the command persists rollback state for the
+complete target set and one bounded, root-owned whole-set journal. Each
+replacement re-resolves and rechecks the planned identity. A later failure or
+the final compiled-root rescan finding any active reference exchanges every
+earlier original inode back in reverse order. Only after the rescan is clear is
+a self-contained commit marker published and cleanup finalized. Version 2
+journal and commit targets carry a required `delete_override` boolean; version
+1 state remains recoverable and must omit it. Once committed, a flagged target
+is deleted only while the exact installed inode still matches and the
+journaled header payload, owner/mode, and first existing fixed-root vendor
+service still agree. The journal backup's full prepared identity and the
+line-removed installed hash are checked before parsing that shape. An already
+absent flagged target is an idempotent completed
+unlink. Recovery rolls back a prepared journal and completes a durable commit
+marker. It recognizes
+an exact intent-only, pre-publication service as unstarted only while the
+canonical full identity still matches and both temp and binding are absent.
+After a reverse exchange, rollback removes the identity-checked replacement
+temp, then its publication binding, then delegates the remaining base intent
+to that exact intent-only recovery. Each boundary is restartable; ordinary
+forward publication keeps its existing cleanup order.
+Cleanup recovery resumes exact pair quarantine/unlink state; a fully absent
+pair is already clean, but partial or conflicting state blocks. `--keep-backup`
+preserves versioned and legacy rollback state for every target; the default
+cleans only validated Facelock-owned state.
+
+The command reads no Facelock config, database, model, camera, daemon, or ONNX
+Runtime state. Package uninstallers invoke it while the CLI and PAM module are
+still installed. Debian and RPM removal abort if cleanup cannot prove a clear
+final scan. Booted coverage runs direct `dpkg`/`rpm` and the `apt-get`, `apt`,
+and `dnf` frontends through abort retention and blocker-free success. Arch
+packages also ship a Remove-only libalpm `PreTransaction` hook with
+`AbortOnFail`, so pacman stops before removing either file.
+This all-or-nothing promise covers direct PAM edits owned by this command.
+The packaged Debian `pam-auth-update` profile is opt-in (`Default: no`), so
+fresh installation leaves `common-auth` unchanged. Package removal never
+silently disables a selected profile: it probes first and aborts with the
+package, module, PAM graph, direct edits and daemon state retained. Run
+`sudo pam-auth-update --disable facelock`, prove a real correct password
+succeeds and a wrong password fails, then retry removal. No older package
+persisted evidence distinguishing auto-enable from a later administrator
+choice, so every existing selection is preserved; automatic legacy migration
+is intentionally deferred. With the profile unselected, removal performs a
+read-only direct-cleanup preflight and the journaled cleanup before generated
+service lifecycle handling. Ordinary removal stops the daemon but preserves
+its enabled state for reinstall; only purge retires that state. The inert
+profile metadata leaves with the package without a generated-graph transition.
+Fedora #226 retired the packaged authselect profile and added a read-only
+upgrade guard. This command only detects references in generated
+`/etc/authselect` state and never changes that state.
 
 ### facelock pam status
 
