@@ -1283,3 +1283,146 @@ fn a_success_hold_is_what_lets_the_next_authentication_skip_the_reopen() {
         cleanup_db(&db_path);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Preview embedding cache (#141): the decrypted compare set is loaded once
+// per preview session — not once per PreviewDetectFrame — and is dropped
+// (zeroized, see facelock-core's `Wiped` tests) when the session ends.
+// The probes below flip the store *behind the handler's back* between
+// frames: a face that stays recognized proves the set was NOT reloaded,
+// and a face that stops being recognized proves the cached set is gone.
+// ---------------------------------------------------------------------------
+
+/// A handler with one enrolled `previewuser` template whose engine sees that
+/// exact face in every frame.
+fn preview_handler() -> facelock_daemon::handler::Handler<MockCamera, MockFaceEngine> {
+    use facelock_daemon::handler::Handler;
+    use facelock_daemon::rate_limit::RateLimiter;
+
+    let config = test_config();
+    let emb = fixtures::known_embedding(7);
+    let store = FaceStore::open_memory().unwrap();
+    store.add_model("previewuser", "front", &emb, "").unwrap();
+    let rate_limiter = RateLimiter::new(
+        config.security.rate_limit.max_attempts,
+        config.security.rate_limit.window_secs,
+    );
+    let factory: MockCameraFactory = Box::new(|_cfg| Ok(MockCamera::bright(64, 64, 20)));
+
+    Handler::new(
+        config,
+        MockFaceEngine::one_face(emb),
+        store,
+        rate_limiter,
+        CameraCaps::default(),
+        Some(factory),
+        None,
+    )
+    .unwrap()
+}
+
+/// One `PreviewDetectFrame` for `user`; returns whether its single face was
+/// recognized against whatever compare set the handler used.
+fn preview_frame_recognized(
+    handler: &mut facelock_daemon::handler::Handler<MockCamera, MockFaceEngine>,
+    user: &str,
+) -> bool {
+    let resp = handler.handle(DaemonRequest::PreviewDetectFrame { user: user.into() });
+    match resp {
+        DaemonResponse::DetectFrame { faces, .. } => {
+            assert_eq!(faces.len(), 1, "the mock engine reports exactly one face");
+            faces[0].recognized
+        }
+        other => panic!("expected a detect frame, got: {other:?}"),
+    }
+}
+
+#[test]
+fn preview_detect_loads_the_compare_set_once_per_session() {
+    let mut handler = preview_handler();
+
+    assert!(
+        preview_frame_recognized(&mut handler, "previewuser"),
+        "sanity: the enrolled face must be recognized on the first frame"
+    );
+
+    // Clear the store directly, bypassing the handler. A per-frame reload
+    // (the old behavior — a decrypt, and on a TPM-sealed store a TPM
+    // round-trip, per frame) would now come back empty.
+    handler.store.clear_user("previewuser").unwrap();
+
+    assert!(
+        preview_frame_recognized(&mut handler, "previewuser"),
+        "the second frame must compare against the session's cached set, not a per-frame reload"
+    );
+}
+
+#[test]
+fn release_camera_ends_the_preview_session() {
+    let mut handler = preview_handler();
+
+    assert!(preview_frame_recognized(&mut handler, "previewuser"));
+    handler.store.clear_user("previewuser").unwrap();
+
+    // The CLI sends this when a preview exits; the cached set must not
+    // survive it.
+    let resp = handler.handle(DaemonRequest::ReleaseCamera);
+    assert!(matches!(resp, DaemonResponse::Ok));
+
+    assert!(
+        !preview_frame_recognized(&mut handler, "previewuser"),
+        "after ReleaseCamera the next session must reload from the (now empty) store"
+    );
+}
+
+#[test]
+fn camera_hold_expiry_ends_the_preview_session() {
+    let mut handler = preview_handler();
+
+    assert!(preview_frame_recognized(&mut handler, "previewuser"));
+    handler.store.clear_user("previewuser").unwrap();
+
+    // The poll tick that finds the warm hold expired is the backstop that
+    // bounds a crashed preview client: the camera closes and the decrypted
+    // compare set goes with it.
+    handler.expire_camera(std::time::Instant::now() + std::time::Duration::from_secs(600));
+
+    assert!(
+        !preview_frame_recognized(&mut handler, "previewuser"),
+        "an expired warm hold must drop the cached compare set with the camera"
+    );
+}
+
+#[test]
+fn clearing_models_through_the_handler_ends_the_preview_session() {
+    let mut handler = preview_handler();
+
+    assert!(preview_frame_recognized(&mut handler, "previewuser"));
+
+    // Deleting templates through the handler must not leave a matchable
+    // cached copy resident.
+    let resp = handler.handle(DaemonRequest::ClearModels {
+        user: "previewuser".into(),
+    });
+    assert!(matches!(resp, DaemonResponse::Removed));
+
+    assert!(
+        !preview_frame_recognized(&mut handler, "previewuser"),
+        "a cleared user's templates must not keep matching from the preview cache"
+    );
+}
+
+#[test]
+fn preview_for_a_different_user_swaps_the_compare_set() {
+    let mut handler = preview_handler();
+
+    assert!(preview_frame_recognized(&mut handler, "previewuser"));
+    assert!(
+        !preview_frame_recognized(&mut handler, "otheruser"),
+        "a user with no templates must not inherit the previous user's set"
+    );
+    assert!(
+        preview_frame_recognized(&mut handler, "previewuser"),
+        "switching back must reload the first user's set"
+    );
+}

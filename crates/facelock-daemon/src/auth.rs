@@ -7,8 +7,8 @@ use facelock_core::config::{Config, SnapshotConfig};
 use facelock_core::fs_security::{ensure_dir, ensure_private_dir, write_file};
 use facelock_core::traits::{CameraSource, FaceProcessor};
 use facelock_core::types::{
-    AuthFailureReason, CameraCaps, FaceEmbedding, Frame, FrameVarianceWindow, MatchResult,
-    best_match, device_allowed_model_ids, zeroize_stored_embeddings,
+    AuthFailureReason, CameraCaps, FaceEmbedding, Frame, FrameVarianceWindow, MatchResult, Wiped,
+    best_match, device_allowed_model_ids,
 };
 use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
@@ -463,38 +463,6 @@ fn save_snapshot(snapshot_config: &SnapshotConfig, user: &str, similarity: f32, 
     debug!(path = %path.display(), "saved auth snapshot");
 }
 
-/// Plaintext embeddings wiped when the guard leaves scope — on every return
-/// path *and* on an unwind, which the hand-written per-return-site wipes this
-/// replaces could not cover (D11).
-///
-/// Generic over how the plaintext is held so the same guard covers both sets
-/// this module handles: the caller's buffer (`&mut [_]`, borrowed) and the
-/// device-filtered compare set (`Vec<_>`, owned). `zeroize`'s own `Zeroizing`
-/// cannot: it needs `T: Zeroize`, which `(u32, FaceEmbedding)` is not.
-struct Wiped<T>(T)
-where
-    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>;
-
-impl<T> std::ops::Deref for Wiped<T>
-where
-    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
-{
-    type Target = [(u32, FaceEmbedding)];
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-impl<T> Drop for Wiped<T>
-where
-    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
-{
-    fn drop(&mut self) {
-        zeroize_stored_embeddings(self.0.as_mut());
-    }
-}
-
 /// Run the camera-based authentication loop with pre-loaded (decrypted) embeddings.
 ///
 /// This is the only entry point: callers MUST load embeddings through their
@@ -533,7 +501,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     source: AuditSource,
     cancel: &CancelToken,
 ) -> AuthOutcome {
-    let stored = Wiped(stored);
+    let stored = Wiped::new(stored);
     let device_is_ir = camera.capabilities().is_ir;
     let ir_texture_scale = camera.capabilities().ir_texture_scale;
     let live_fingerprint = camera.capabilities().fingerprint.clone();
@@ -583,7 +551,7 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     // a lockout. Fail SOFT by construction.
     let policy = config.security.device_binding_policy();
     let allowed = device_allowed_model_ids(models, &live_fingerprint, &policy);
-    let compare_set = Wiped(
+    let compare_set = Wiped::new(
         stored
             .iter()
             .filter(|(id, _)| allowed.contains(id))

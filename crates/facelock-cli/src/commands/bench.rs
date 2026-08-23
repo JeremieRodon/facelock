@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use facelock_camera::Camera;
 use facelock_core::Config;
-use facelock_core::types::{FaceEmbedding, cosine_similarity};
+use facelock_core::types::{FaceEmbedding, Wiped, cosine_similarity};
 use facelock_face::FaceEngine;
 use facelock_store::FaceStore;
 
@@ -116,7 +116,9 @@ fn cmd_cold_auth(config: &Config) -> Result<()> {
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
 
-    let embeddings = direct::load_user_embeddings(&store, config, &user)?;
+    // Decrypted templates (the CLI's decryption-aware load), zeroized when
+    // the guard drops — early bails and panics included (#141).
+    let embeddings = Wiped::new(direct::load_user_embeddings(&store, config, &user)?);
     if embeddings.is_empty() {
         bail!(
             "No enrolled faces for user '{}'. Enroll first with `facelock enroll`.",
@@ -178,7 +180,9 @@ fn cmd_warm_auth(config: &Config) -> Result<()> {
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
 
-    let embeddings = direct::load_user_embeddings(&store, config, &user)?;
+    // Decrypted templates (the CLI's decryption-aware load), zeroized when
+    // the guard drops — early bails and panics included (#141).
+    let embeddings = Wiped::new(direct::load_user_embeddings(&store, config, &user)?);
     if embeddings.is_empty() {
         bail!(
             "No enrolled faces for user '{}'. Enroll first with `facelock enroll`.",
@@ -363,7 +367,9 @@ fn cmd_calibrate(config: &Config) -> Result<()> {
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
 
-    let enrolled = direct::load_user_embeddings(&store, config, &user)?;
+    // Decrypted templates (the CLI's decryption-aware load), zeroized when
+    // the guard drops — early bails and panics included (#141).
+    let enrolled = Wiped::new(direct::load_user_embeddings(&store, config, &user)?);
     if enrolled.is_empty() {
         bail!(
             "No enrolled faces for user '{}'. Enroll first with `facelock enroll`.",
@@ -397,7 +403,7 @@ fn cmd_calibrate(config: &Config) -> Result<()> {
     // Compute all similarities between live and enrolled embeddings
     let mut similarities: Vec<f32> = Vec::new();
     for live_emb in &live_embeddings {
-        for (_, enrolled_emb) in &enrolled {
+        for (_, enrolled_emb) in enrolled.iter() {
             similarities.push(cosine_similarity(live_emb, enrolled_emb));
         }
     }
@@ -696,7 +702,9 @@ fn cmd_report(config: &Config) -> Result<()> {
     // Warm auth benchmark
     let store = FaceStore::open_existing(Path::new(&config.storage.db_path))
         .context("Failed to open face store")?;
-    let embeddings = direct::load_user_embeddings(&store, config, &user)?;
+    // Decrypted templates (the CLI's decryption-aware load), zeroized when
+    // the guard drops — early bails and panics included (#141).
+    let embeddings = Wiped::new(direct::load_user_embeddings(&store, config, &user)?);
     let has_enrolled = !embeddings.is_empty();
 
     let warm_auth_ms = if has_enrolled {

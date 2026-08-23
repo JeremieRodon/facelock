@@ -128,18 +128,22 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
     // a store of biometric templates that `open_existing` exists to prevent.
     // An absent database is simply "nothing enrolled yet", which preview can
     // still render: every face just comes back unrecognized.
-    let stored = match crate::direct::open_store_existing(config) {
-        Ok(store) => crate::direct::load_user_embeddings(&store, config, user)?,
-        Err(facelock_store::StoreError::Absent { .. }) => {
-            // stderr, not stdout: this is the notice that used to corrupt
-            // the frame stream (see the module docs).
-            warn(&FaceMessage::NoModelsEnrolled {
-                user: user.to_string(),
-            });
-            Vec::new()
-        }
-        Err(e) => return Err(e.into()),
-    };
+    // Decrypted templates, zeroized when the guard drops — Ctrl+C return and
+    // unwind alike. The set outlives the whole preview loop (loaded once, not
+    // per frame), which is exactly why it must not outlive the function too.
+    let stored =
+        facelock_core::types::Wiped::new(match crate::direct::open_store_existing(config) {
+            Ok(store) => crate::direct::load_user_embeddings(&store, config, user)?,
+            Err(facelock_store::StoreError::Absent { .. }) => {
+                // stderr, not stdout: this is the notice that used to corrupt
+                // the frame stream (see the module docs).
+                warn(&FaceMessage::NoModelsEnrolled {
+                    user: user.to_string(),
+                });
+                Vec::new()
+            }
+            Err(e) => return Err(e.into()),
+        });
     let threshold = config.recognition.threshold;
 
     let mut frame_count: u64 = 0;
@@ -172,7 +176,7 @@ pub fn run_direct(config: &facelock_core::Config, user: &str) -> anyhow::Result<
             .iter()
             .map(|(det, embedding)| {
                 let mut best_sim: f32 = 0.0;
-                for (_, stored_emb) in &stored {
+                for (_, stored_emb) in stored.iter() {
                     let sim = cosine_similarity(embedding, stored_emb);
                     if sim > best_sim {
                         best_sim = sim;
