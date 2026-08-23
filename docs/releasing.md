@@ -273,17 +273,33 @@ retire the old authselect payload first.
 Run this before creating/pushing a release tag:
 
 ```bash
+just test-arch-camera-required      # camera + a person in frame; records the commit
 just release-preflight              # stable release checks
 just release-preflight v0.2.0-rc.1 # prerelease checks; no stable secret access
 just test-release-matrix            # converters, matrix drift, native ordering
 just check
 just test-arch-pam
+just test-arch-camera-free
 just test-rpm
 just test-deb
 just test-deb-trixie-pkg
 just test-deb-resolute-pkg
 just test-rpm-pkg
 ```
+
+`just test-arch-camera-required` comes first because it is the only step a
+human has to perform. It runs `test-arch-integration` and `test-arch-oneshot`,
+the two tiers that need `/dev/video*` and a live face, and writes the commit
+they passed at to `.hardware-tiers-verified`. Preflight fails while that record
+is absent or names an older commit, so run it after the last commit that will
+ship, not before.
+
+Those two tiers are the only automated evidence that face authentication works
+end to end: real D-Bus activation, the real PAM stack, real capture, and the
+one-shot path PAM falls back to. Nothing else ran them, and three of their
+assertions rotted undetected as a result (#139). If they were already run by
+hand at this exact commit, acknowledge that by naming it:
+`FACELOCK_HARDWARE_TIERS_ACK=<sha> just release-preflight`.
 
 `just release-preflight` checks local tools, required packaging files (including
 `.packit.yaml`), and whether `AUR_SSH_KEY`, `APT_GPG_PRIVATE_KEY`, and
@@ -567,7 +583,10 @@ Since facelock is a PAM module, broken releases can lock users out. Every releas
 
 1. Pass `just check` (tests + clippy + fmt)
 2. Pass `just test-arch-pam` (Arch container PAM smoke tests)
-3. Pass `just test-rpm` and `just test-deb` (multi-distro package validation)
-4. Not change PAM auth semantics without explicit changelog entry
+3. Pass `just test-arch-camera-free` (camera-free daemon and one-shot E2E)
+4. Pass `just test-arch-camera-required` against the final release commit, with
+   a camera and a person in frame; `just release-preflight` fails until it has
+5. Pass `just test-rpm` and `just test-deb` (multi-distro package validation)
+6. Not change PAM auth semantics without explicit changelog entry
 5. Preserve `/etc/pam.d/sudo` backup on install (`/var/lib/facelock/pam-backups/sudo.<timestamp>`)
 6. Default to `PAM_IGNORE` on internal errors (fall through to password)

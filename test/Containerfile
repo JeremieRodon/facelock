@@ -120,9 +120,11 @@ RUN chmod +x /build/test/build-arch-test-package.sh && \
 COPY test/run-container-tests.sh /run-tests.sh
 COPY test/run-integration-tests.sh /run-integration-tests.sh
 COPY test/run-oneshot-tests.sh /run-oneshot-tests.sh
+COPY test/run-camera-free-tests.sh /run-camera-free-tests.sh
 COPY test/run-layout-tests.sh /run-layout-tests.sh
 COPY test/arch-package-validate.sh /arch-package-validate.sh
 RUN chmod +x /run-tests.sh /run-integration-tests.sh /run-oneshot-tests.sh \
+    /run-camera-free-tests.sh \
     /run-layout-tests.sh /arch-package-validate.sh \
     /source-install-lifecycle/test/source-install-daemon-lifecycle-systemd.sh \
     /source-install-lifecycle/test/source-install-daemon-stub.sh \

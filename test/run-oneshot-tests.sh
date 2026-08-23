@@ -99,6 +99,11 @@ run_test_or_skip() {
 
 echo "=== Oneshot Mode Tests (fully daemonless, with camera) ==="
 echo ""
+# Camera-bound half of the daemonless E2E suite. `facelock auth` opens the
+# store and runs every pre-flight gate before it loads the ONNX engine or
+# touches the camera, so the schema migrations and the pre-flight exit codes
+# moved to test/run-camera-free-tests.sh (#139), which CI runs on every pull
+# request. Add a row here only when it needs a real frame.
 
 # Use installed config, set oneshot mode and writable paths
 sed -i 's|db_path.*|db_path = "/tmp/facelock-test.db"|' /etc/facelock/config.toml 2>/dev/null || true
@@ -177,9 +182,10 @@ run_test_contains "facelock test (oneshot)" \
 
 # --- Device coupling (Plan 02, oneshot/direct path) ---
 # The template enrolled above records the live camera's fingerprint in
-# face_models.device_id (schema V6). These assertions prove: the migration
-# applied, enroll records a device_id, a forged/mismatched id falls through to
-# no-match (never a success), and a legacy NULL id still authenticates.
+# face_models.device_id (schema V6). These assertions prove: enroll records a
+# device_id, a forged/mismatched id falls through to no-match (never a
+# success), and a legacy NULL id still authenticates. The V6 migration that
+# makes the column exist is asserted in run-camera-free-tests.sh.
 # Resolve the DB path facelock actually uses (config db_path if uncommented,
 # else the compiled default). container-config.toml sets no db_path, so this
 # yields /var/lib/facelock/facelock.db — the path enroll above wrote to.
@@ -187,17 +193,6 @@ db_path_from_config() {
     local p
     p="$(grep -E '^[[:space:]]*db_path[[:space:]]*=' "$1" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
     [ -n "$p" ] && echo "$p" || echo "/var/lib/facelock/facelock.db"
-}
-# Force db_path in a config file (uncomment/replace, or append [storage] if absent).
-set_db_path() {
-    local cfg="$1" path="$2"
-    if grep -qE '^[[:space:]]*#?[[:space:]]*db_path' "$cfg"; then
-        sed -i -E "s|^[[:space:]]*#?[[:space:]]*db_path.*|db_path = \"$path\"|" "$cfg"
-    elif grep -qE '^\[storage\]' "$cfg"; then
-        sed -i "/^\[storage\]/a db_path = \"$path\"" "$cfg"
-    else
-        printf '\n[storage]\ndb_path = "%s"\n' "$path" >> "$cfg"
-    fi
 }
 
 DB="$(db_path_from_config /etc/facelock/config.toml)"
@@ -220,10 +215,9 @@ KEYMODE="$(stat -c '%a' "$KEYF" 2>/dev/null || echo '?')"
 run_test "encryption key auto-generated at 0600 ($KEYF mode=$KEYMODE)" \
     "[ -f \"$KEYF\" ] && [ \"$KEYMODE\" = 600 ]" 0
 
-# Migration applied on first store open (enroll).
-SCHEMA_VER="$(sqlite3 "$DB" 'SELECT MAX(version) FROM schema_version' 2>/dev/null || echo 0)"
-run_test "V6 schema migration applied (oneshot; db=$DB)" \
-    "[ \"$SCHEMA_VER\" -ge 6 ]" 0
+# The V6 migration itself runs on first store open, before the camera is
+# touched, and is asserted against a fresh database in
+# run-camera-free-tests.sh.
 
 # (a) After enroll, the model row carries a device_id. Whether it is NON-NULL
 #     depends on the live camera exposing a USB identity via sysfs in-container;
@@ -251,31 +245,8 @@ run_test "facelock auth succeeds on legacy NULL device_id (allow-with-warn)" \
     "timeout --foreground $LIVE_TIMEOUT facelock auth --user testuser --config /etc/facelock/config.toml" \
     0
 
-# (d) A pre-V6 database migrates cleanly on open: seed schema V5, open it via a
-#     store-opening command, then confirm the column was added, the version
-#     bumped to >=6, and the legacy row survived with a NULL device_id.
-PREV6="/tmp/facelock-prev6.db"
-rm -f "$PREV6" "$PREV6-wal" "$PREV6-shm"
-sqlite3 "$PREV6" "
-CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
-CREATE TABLE face_models (id INTEGER PRIMARY KEY AUTOINCREMENT, user TEXT NOT NULL, label TEXT NOT NULL, created_at INTEGER NOT NULL, embedder_model TEXT NOT NULL DEFAULT '', UNIQUE(user,label));
-CREATE TABLE face_embeddings (id INTEGER PRIMARY KEY AUTOINCREMENT, model_id INTEGER NOT NULL REFERENCES face_models(id) ON DELETE CASCADE, embedding BLOB NOT NULL, sealed INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE rate_limit (user TEXT NOT NULL, attempt_time INTEGER NOT NULL);
-INSERT INTO schema_version (version) VALUES (5);
-INSERT INTO face_models (user,label,created_at,embedder_model) VALUES ('legacyuser','legacy-face',1700000000,'w600k_r50.onnx');
-" || true
-cp /etc/facelock/config.toml /tmp/facelock-prev6.toml
-set_db_path /tmp/facelock-prev6.toml "$PREV6"
-# Opening the store (via any command) runs migrations; auth on a user with no
-# embeddings exits non-zero after migrating — we only care about the migration.
-timeout --foreground 20s facelock auth --user legacyuser --config /tmp/facelock-prev6.toml >/dev/null 2>&1 || true
-PREV6_VER="$(sqlite3 "$PREV6" 'SELECT MAX(version) FROM schema_version' 2>/dev/null || echo 0)"
-PREV6_COL="$(sqlite3 "$PREV6" "SELECT COUNT(*) FROM pragma_table_info('face_models') WHERE name='device_id'" 2>/dev/null || echo 0)"
-PREV6_ROW="$(sqlite3 "$PREV6" "SELECT label FROM face_models WHERE user='legacyuser'" 2>/dev/null || echo '')"
-PREV6_DID="$(sqlite3 "$PREV6" "SELECT COALESCE(device_id,'NULL') FROM face_models WHERE user='legacyuser'" 2>/dev/null || echo '?')"
-run_test "pre-V6 DB migrates cleanly, preserves row, device_id NULL (v=$PREV6_VER col=$PREV6_COL row=$PREV6_ROW did=$PREV6_DID)" \
-    "[ \"$PREV6_VER\" -ge 6 ] && [ \"$PREV6_COL\" = 1 ] && [ \"$PREV6_ROW\" = legacy-face ] && [ \"$PREV6_DID\" = NULL ]" 0
-rm -f "$PREV6" "$PREV6-wal" "$PREV6-shm" /tmp/facelock-prev6.toml
+# (d) Pre-V6 migration on open needs no camera and is asserted in
+#     run-camera-free-tests.sh, alongside the fresh-database case.
 
 # facelock auth binary (used by PAM module)
 run_test "facelock auth authenticates (oneshot)" \
@@ -637,10 +608,9 @@ sqlite3 "$DB" "UPDATE face_models SET device_id=$ADR008_DEVID WHERE user='testus
 
 # --- End ADR 008 one-shot lifecycle ---
 
-# facelock auth rejects unknown user
-run_test "facelock auth rejects unknown user" \
-    "facelock auth --user nobody --config /etc/facelock/config.toml" \
-    2
+# The unknown-user pre-flight rejection (exit 2) short-circuits before the
+# engine loads and before the camera opens, so it is asserted in
+# run-camera-free-tests.sh.
 
 # Clear models (direct DB access)
 run_test "facelock clear (oneshot)" \

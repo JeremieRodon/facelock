@@ -5,10 +5,11 @@ description: Pick and run the right facelock packaging or container test for a c
 
 # Packaging and container tests
 
-CI runs exactly one container job — `container-pam-test` in `ci.yml`. Every
-`.deb`, `.rpm`, COPR and APT-repo path is **local only**. If you changed
-packaging and did not run one of these yourself, it is untested until a release
-tag fires `release.yml`, which is the worst place to find out.
+CI runs exactly one container job, `container-pam-test` in `ci.yml`. It runs
+the PAM smoke tier and the camera-free E2E tier. Every `.deb`, `.rpm`, COPR and
+APT-repo path is **local only**. If you changed packaging and did not run one of
+these yourself, it is untested until a release tag fires `release.yml`, which is
+the worst place to find out.
 
 All recipes need `podman`. None of the ones in the routing table need a camera.
 
@@ -27,6 +28,7 @@ All recipes need `podman`. None of the ones in the routing table need a camera.
 | `systemd/`, `dbus/`, `polkit/`, install paths | both Debian suite recipes or `just test-rpm-pkg` — all validate under booted systemd |
 | `crates/pam-facelock/**`, `/etc/pam.d` handling | `just test-arch-pam` and `just check-pam-standalone` |
 | File layout, installed paths | `just test-arch-layout` |
+| D-Bus policy, daemon authorization, pre-flight exit codes, schema migrations | `just test-arch-camera-free` |
 
 `just test-deb` delegates to both exact supported-suite package gates. The
 remaining quick syntax-level check is `just test-rpm` (Fedora container), which
@@ -63,11 +65,17 @@ run them:
 
 - `just test-arch-integration` — daemon-mode end to end
 - `just test-arch-oneshot` — daemonless end to end
+- `just test-arch-camera-required` — both of the above, recorded against HEAD for `just release-preflight`
 - `just test-arch-dev-shell`, `test-arch-release-shell`, `test-deb-dev-shell`, `test-rpm-dev-shell`, `test-deb-release-shell`, `test-rpm-release-shell`
 
 **Do not attempt these.** When a change needs one, say so plainly and name the
 recipe so a human can run it. Never report a change as validated on the strength
 of tests that were skipped.
+
+`just test-arch-camera-free` is the half of the first two that never opens a
+camera, and an agent can and should run it. It needs `podman` and the ONNX
+models baked into the image (`just link-models` once per checkout); the daemon
+half of it refuses to run without them rather than skipping quietly.
 
 Dev shells mount host models for fast iteration; release shells are clean-room
 and reproduce the real first-run user experience. Reach for a release shell when

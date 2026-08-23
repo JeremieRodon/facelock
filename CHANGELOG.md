@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clears on its own. Enablement
   is never changed, and acquisition fails closed without systemd, without the
   lock, or without a confirmed-stopped daemon.
+- **Camera-free end-to-end test tier** (#139): the assertions in the two
+  camera-required E2E suites that never open a camera now live in
+  `just test-arch-camera-free`, which CI runs on every pull request. That
+  covers D-Bus authorization, the `AuthAttempted` broadcast's audience and
+  payload, the rate-limit reply encoding and its no-fallback guarantee, schema
+  migrations, and the one-shot pre-flight exit codes. The two hardware tiers
+  keep what needs a live frame and are now gated at release time:
+  `just test-arch-camera-required` runs both and records the commit they
+  passed at, and `just release-preflight` fails until that record names HEAD.
 - **Explicit authorization for sensitive `setup --pam` writes** (#207):
   `--yes` and its `--no-confirm` alias now suppress only the ordinary per-file
   confirmation. Adding Facelock to a shared or login PAM stack requires the
