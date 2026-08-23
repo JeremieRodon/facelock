@@ -35,6 +35,9 @@ COPY target/release/libpam_facelock.so /build/target/release/libpam_facelock.so
 COPY justfile /build/justfile
 COPY scripts/source-install-daemon-lifecycle.sh /build/scripts/source-install-daemon-lifecycle.sh
 COPY scripts/migrate-legacy-system-assets.sh /build/scripts/migrate-legacy-system-assets.sh
+# base-devel supplies msgfmt, so install-files takes its translation path here
+COPY scripts/install-locale-catalogs.sh /build/scripts/install-locale-catalogs.sh
+COPY po/ /build/po/
 COPY config/ /build/config/
 COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/

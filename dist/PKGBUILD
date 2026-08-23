@@ -8,7 +8,7 @@ arch=('x86_64')
 url="https://github.com/tyvsmith/facelock"
 license=('MIT OR Apache-2.0')
 depends=('glibc' 'dbus' 'pam' 'gcc-libs' 'tpm2-tss' 'libxkbcommon' 'onnxruntime')
-makedepends=('rust' 'cargo' 'clang' 'wayland' 'libxkbcommon')
+makedepends=('rust' 'cargo' 'clang' 'gettext' 'wayland' 'libxkbcommon')
 optdepends=(
     'onnxruntime-opt-cuda: NVIDIA GPU acceleration (replaces onnxruntime)'
     'onnxruntime-opt-rocm: AMD GPU acceleration (replaces onnxruntime)'
@@ -53,6 +53,10 @@ package() {
 
     # Quirks database
     install -Dm644 -t "$pkgdir/usr/share/facelock/quirks.d/" config/quirks.d/*.toml
+
+    # Compiled translation catalogs, both gettext domains. Installs nothing
+    # while po/ holds only .pot templates, and creates no empty locale root.
+    scripts/install-locale-catalogs.sh "$pkgdir/usr/share/locale"
 
     # systemd units
     install -Dm644 systemd/facelock-daemon.service "$pkgdir/usr/lib/systemd/system/facelock-daemon.service"

@@ -98,7 +98,13 @@ check-package-names-live:
     python3 test/check-package-names-live.py
 
 # Run all checks (test + lint + format + audit + PAM standalone surface + agent docs)
-check: test lint fmt-check audit check-pam-standalone check-agent-docs test-source-install-daemon-lifecycle test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test test-legacy-system-assets
+check: test lint fmt-check audit check-pam-standalone check-agent-docs test-source-install-daemon-lifecycle test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test test-legacy-system-assets test-locale-install-contract
+
+# Prove every install path ships compiled gettext catalogs. Static checks run
+# everywhere; the compile check needs gettext and skips without it, so that
+# `just check` keeps working on a machine that has none.
+test-locale-install-contract:
+    bash test/locale-install-contract.sh
 
 # Preserve the daemon's pre-install runtime state across source file replacement.
 test-source-install-daemon-lifecycle:
@@ -537,11 +543,17 @@ install-files:
     install -dm755 /usr/share/facelock/quirks.d
     install -Dm644 config/quirks.d/*.toml /usr/share/facelock/quirks.d/
 
-    # Compiled translations (optional; produced by `just mo`, absent otherwise)
-    if [ -d target/locale ]; then
-        (cd target/locale && find . -name '*.mo' | while read -r mo; do
-            install -Dm644 "$mo" "/usr/share/locale/${mo#./}"
-        done)
+    # Compiled translations, both gettext domains. Compiled straight from po/
+    # rather than from a target/locale a previous `just mo` may or may not have
+    # produced. gettext stays optional for a source install (see the
+    # localization section below), so a machine without msgfmt gets the
+    # compiled-in English rather than a failed install.
+    # `bash -p` because this recipe's own `-p` does not reach a child started
+    # from its shebang: that child would read an inherited BASH_ENV as root.
+    if command -v msgfmt >/dev/null; then
+        bash -p scripts/install-locale-catalogs.sh /usr/share/locale
+    else
+        echo "note: msgfmt not found; skipping translation catalogs (English is compiled in)"
     fi
 
     # systemd unit
@@ -807,11 +819,15 @@ pot:
     echo "Regenerated po/facelock.pot and po/pam_facelock.pot"
 
 # Compile translations po/<lang>/{facelock,pam_facelock}.po into
-# target/locale/<lang>/LC_MESSAGES/<domain>.mo. `just install` installs
-# target/locale/ under /usr/share/locale if present. To start a new
-# translation: mkdir -p po/de && msginit -i po/facelock.pot -o po/de/facelock.po -l de
-# To verify a translation manually without installing system-wide:
-#   FACELOCK_LOCALEDIR=$PWD/target/locale LANGUAGE=de facelock list
+# target/locale/<lang>/LC_MESSAGES/<domain>.mo, for verifying a translation
+# before it is installed anywhere. To start a new translation:
+#   mkdir -p po/de && msginit -i po/facelock.pot -o po/de/facelock.po -l de
+# To verify it manually without installing system-wide:
+#   just mo && FACELOCK_LOCALEDIR=$PWD/target/locale LANGUAGE=de facelock list
+#
+# Installing no longer depends on this: every install path — the packages and
+# `just install-files` alike — compiles po/ itself through
+# scripts/install-locale-catalogs.sh, which is also what this recipe runs.
 #
 # `msgfmt --check` is what enforces the `{placeholder}` contract: paired with the
 # python-brace-format flags `just pot` writes, it rejects a translation that
@@ -826,20 +842,10 @@ mo:
         echo "       (Translations are optional; building facelock does not need this.)" >&2
         exit 1
     fi
-    found=0
-    for po in po/*/*.po; do
-        [ -e "$po" ] || continue
-        found=1
-        lang=$(basename "$(dirname "$po")")
-        domain=$(basename "$po" .po)
-        out="target/locale/$lang/LC_MESSAGES/$domain.mo"
-        mkdir -p "$(dirname "$out")"
-        msgfmt --check -o "$out" "$po"
-        echo "  $po -> $out"
-    done
-    if [ "$found" = 0 ]; then
-        echo "no .po files under po/<lang>/ — nothing to compile"
-    fi
+    # Always present, so FACELOCK_LOCALEDIR=$PWD/target/locale is a valid
+    # override even before the first translation lands.
+    mkdir -p target/locale
+    scripts/install-locale-catalogs.sh target/locale
 
 # Bump version and prepare a release commit + tag
 

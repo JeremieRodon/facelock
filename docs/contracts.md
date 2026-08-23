@@ -2564,6 +2564,8 @@ purge as forensic destruction of biometric data.
 | `/var/log/facelock/snapshots/` | root:root | 700 | Auth snapshots (raw face images) |
 | `/usr/bin/facelock` | root:root | 755 | CLI binary |
 | `/lib/security/pam_facelock.so` | root:root | 755 | PAM module |
+| `/usr/share/locale/<lang>/LC_MESSAGES/facelock.mo` | root:root | 644 | Compiled CLI catalog. Present only for languages `po/` carries, which today is none |
+| `/usr/share/locale/<lang>/LC_MESSAGES/pam_facelock.mo` | root:root | 644 | Compiled PAM module catalog. A separate gettext domain from the CLI's, never merged with it |
 
 Config-described data and model paths are overridable as documented by their
 schema fields. `/var/lib/facelock/pam-backups` is deliberately fixed for the

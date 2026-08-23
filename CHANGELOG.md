@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installs consume the same reviewed digest inventory, and source uninstall
   leaves every historical `/etc` copy untouched without changing daemon-state
   restoration policy.
+- **Every install path ships compiled translation catalogs** (#140): deb, rpm,
+  the three PKGBUILDs, Nix and the source install now all compile `po/` through
+  `scripts/install-locale-catalogs.sh`, for both the `facelock` and
+  `pam_facelock` gettext domains. Previously only `just install-files` did, and
+  only when the operator had run `just mo` first. gettext is a build dependency
+  of the packages and stays optional for source installs. Nothing is translated
+  yet (`po/` holds only templates), which is why the wiring landed first.
 
 ### Added
 

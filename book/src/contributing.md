@@ -91,6 +91,43 @@ Only after tiers 3--4 pass. Always keep a root shell open. Start with `sudo` onl
 just check  # runs test + clippy + fmt
 ```
 
+## Translations
+
+Facelock is wired for gettext but not yet translated. `po/` holds only the two
+`.pot` templates, and that is the intended state -- there are no `.po` files to
+review, and no language is shipped.
+
+Two catalogs, deliberately separate and never merged: `facelock` for the CLI
+(extracted from the message seam in `crates/facelock-cli/src/message/`) and
+`pam_facelock` for the PAM module, which has its own hard dependency ceiling.
+
+```bash
+just pot   # regenerate po/*.pot from source (translators and CI only)
+just mo    # compile po/<lang>/*.po into target/locale for local verification
+```
+
+gettext is a build dependency of every package but stays optional for a source
+install: English is compiled in as the fallback, so `just install-files` on a
+machine without `msgfmt` installs untranslated rather than failing.
+
+Installing a catalog is `scripts/install-locale-catalogs.sh`, and **every**
+install path calls it -- deb, rpm, the three PKGBUILDs, Nix, and the source
+install that OpenRC, runit and s6 systems use. `just test-locale-install-contract`
+is what holds that together; it builds a throwaway pseudo-locale, because with
+no `.po` in the tree nothing else would notice a broken install path until the
+first translation landed. Add a packaging path, wire it there too.
+
+Two things are still missing, both tracked in
+[#140](https://github.com/tyvsmith/facelock/issues/140):
+
+- a long tail of CLI print sites (counted per domain in #140) still writes
+  English directly instead of going through the message seam, so a translation
+  would cover the converted subset only. The conversion pattern is documented
+  in `crates/facelock-cli/src/message/mod.rs` and is best done one domain at a
+  time.
+- no translation has been accepted yet. Start one with
+  `mkdir -p po/de && msginit -i po/facelock.pot -o po/de/facelock.po -l de`.
+
 ## Security considerations
 
 Read the [Security](security.md) chapter before implementing any auth-related code. Key rules:

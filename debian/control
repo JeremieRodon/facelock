@@ -8,6 +8,7 @@ Build-Depends:
  cargo (>= 1.88),
  rustc (>= 1.88),
  clang,
+ gettext,
  pkg-config,
  python3,
  libpam0g-dev,

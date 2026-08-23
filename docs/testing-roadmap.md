@@ -184,6 +184,15 @@ production-ready in the justfile install recipe.
 | runit | `dist/runit/run`, `dist/runit/log/run` | Service scripts exist. |
 | s6 | `dist/s6/facelock-daemon/run` | Service script exists. |
 
+Every format above that installs files (`.deb`, `.rpm`, the three PKGBUILDs,
+and the Nix derivation) also installs compiled gettext catalogs, via
+`scripts/install-locale-catalogs.sh`. openrc, runit and s6 have no packaging
+path of their own; those systems install from source through
+`just install-files`, which calls the same installer.
+`just test-locale-install-contract` is the gate. `po/` holds only `.pot`
+templates, so nothing else would exercise these paths until the first
+translation landed.
+
 ### Model hosting
 - Default: upstream URLs (visomaster GitHub releases, HuggingFace)
 - Self-hosted mirror: GitHub release tag `v0.1.0-models` (documented in `models/manifest.toml`)

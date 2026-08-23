@@ -32,6 +32,10 @@ override_dh_auto_install:
 	install -dm755 debian/facelock/usr/share/facelock/quirks.d
 	install -Dm644 -t debian/facelock/usr/share/facelock/quirks.d/ config/quirks.d/*.toml
 
+	# Compiled translation catalogs, both gettext domains. Installs nothing
+	# while po/ holds only .pot templates, and creates no empty locale root.
+	scripts/install-locale-catalogs.sh debian/facelock/usr/share/locale
+
 	# systemd units
 	install -Dm644 systemd/facelock-daemon.service debian/facelock/usr/lib/systemd/system/facelock-daemon.service
 

@@ -44,6 +44,11 @@ in
     # Polkit authority, for the facelock-polkit-agent binary the package ships
     security.polkit.enable = true;
 
+    # facelock's compiled-in catalog root is /usr/share/locale, which does not
+    # exist on NixOS. The CLI honours this override; the PAM module has no
+    # equivalent, so its two-entry catalog stays English here.
+    environment.sessionVariables.FACELOCK_LOCALEDIR = "${facelockPackage}/share/locale";
+
     # PAM module
     security.pam.services = {
       sudo.rules.auth.facelock = {
