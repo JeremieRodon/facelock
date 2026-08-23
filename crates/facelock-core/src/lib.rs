@@ -5,6 +5,7 @@ pub mod fs_security;
 pub mod ipc;
 pub mod notify;
 pub mod paths;
+pub mod purge;
 pub mod traits;
 pub mod types;
 

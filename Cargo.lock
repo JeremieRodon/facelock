@@ -1072,8 +1072,10 @@ dependencies = [
 name = "facelock-core"
 version = "0.1.4"
 dependencies = [
+ "libc",
  "serde",
  "subtle",
+ "tempfile",
  "thiserror",
  "toml",
  "tracing",
