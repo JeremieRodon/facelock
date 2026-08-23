@@ -32,8 +32,9 @@ use crate::rate_limit::RateLimiter;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthIntent {
     /// A real authentication — every PAM stack (sudo, login, screen
-    /// lockers), the polkit agent, `facelock auth`. Fully enforced, and a
-    /// failed attempt charges the shared rate-limit budget.
+    /// lockers), the polkit agent, `facelock auth`. Fully enforced (the D-Bus
+    /// server owns caller-session provenance), and a failed attempt charges
+    /// the shared rate-limit budget.
     Authenticate,
     /// A diagnostic run of root-only `facelock test` (N11, issue #96).
     /// Skips only the SSH/lid physical-presence gates, and never charges the
@@ -928,18 +929,59 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
         intent: AuthIntent,
         cancel: &CancelToken,
     ) -> DaemonResponse {
-        if let Some(resp) = auth::pre_check_audited_with_context(
+        if let Some(response) = self.preflight_authenticate(&user, intent) {
+            return response;
+        }
+
+        self.handle_authenticate_prechecked(user, intent, cancel)
+    }
+
+    /// Run the camera-independent authentication gates and their established
+    /// rejection audit before the D-Bus server admits the request to the
+    /// global capture slot.
+    ///
+    /// The caller must keep this handler locked until either returning the
+    /// rejection or calling [`Self::handle_authenticate_prechecked`]. That
+    /// keeps one config/store generation across the decision and capture;
+    /// a concurrent live reload cannot turn the split into a fail-open race.
+    pub(crate) fn preflight_authenticate(
+        &mut self,
+        user: &str,
+        intent: AuthIntent,
+    ) -> Option<DaemonResponse> {
+        self.preflight_authenticate_with_context(user, intent, intent.pre_check_context())
+    }
+
+    /// Run preflight with a transport-selected environment context. The D-Bus
+    /// server uses this only after its caller ProcessFD/session check; direct
+    /// handler callers keep [`Self::preflight_authenticate`]'s enforced
+    /// real-authentication context.
+    pub(crate) fn preflight_authenticate_with_context(
+        &mut self,
+        user: &str,
+        intent: AuthIntent,
+        context: PreCheckContext,
+    ) -> Option<DaemonResponse> {
+        auth::pre_check_audited_with_context(
             &self.config,
             &self.store,
-            &user,
+            user,
             &self.rate_limiter,
             &self.device_caps,
             intent.audit_source(),
-            intent.pre_check_context(),
-        ) {
-            return resp.into();
-        }
+            context,
+        )
+        .map(Into::into)
+    }
 
+    /// Continue an authentication whose camera-independent gates have
+    /// already passed on this same locked handler generation.
+    pub(crate) fn handle_authenticate_prechecked(
+        &mut self,
+        user: String,
+        intent: AuthIntent,
+        cancel: &CancelToken,
+    ) -> DaemonResponse {
         // A storage failure here must surface as an error, never fold into an
         // empty model list (C3, issue #105): empty `models` means an empty
         // device-allowed set, a guaranteed "no match", and a rate-limit charge
@@ -1089,13 +1131,19 @@ mod tests {
         assert!(!AuthIntent::Test.charges_rate_limit());
     }
 
-    /// The SSH/lid physical-presence gates are skippable for the diagnostic
-    /// intent only (N11); every other gate applies to both.
+    /// The generic real-authentication intent remains fully enforced for
+    /// direct handler callers. The D-Bus server explicitly supplies its
+    /// caller-ProcessFD context at its preflight boundary. The diagnostic
+    /// intent skips both physical-presence gates (N11).
     #[test]
-    fn only_the_test_intent_skips_the_ssh_and_lid_gates() {
+    fn daemon_authenticate_skips_only_the_environment_ssh_gate() {
         let real = AuthIntent::Authenticate.pre_check_context();
         assert!(!real.skip_ssh_gate);
         assert!(!real.skip_lid_gate);
+
+        let daemon = PreCheckContext::daemon_authenticate();
+        assert!(daemon.skip_ssh_gate);
+        assert!(!daemon.skip_lid_gate);
 
         let test = AuthIntent::Test.pre_check_context();
         assert!(test.skip_ssh_gate);

@@ -1672,6 +1672,7 @@ that is not on this list is not being denied, only not yet promised.
 |------|---------|
 | `capabilities` | this command exists, so a consumer's membership test is uniform across every name |
 | `config-edit` | `config edit` exists — the verb ADR 009 split out of the old `--edit` flag |
+| `daemon-processfd-session-gate` | daemon `Authenticate` supports the ProcessFD-backed logind remote-session gate documented under IPC Protocol |
 | `daemon-restart` | `daemon restart` exists — the verb ADR 009 moved under `daemon` from the top-level `restart` |
 | `devices-json` | `devices --json` |
 | `is-enrolled` | `is-enrolled` exists — the unprivileged enrollment probe whose exit code is the contract |
@@ -2833,7 +2834,9 @@ hill-climbing oracle by construction rather than by redacting fields):
 - `Authenticate`: root or the matching Unix user. The one user-scoped method
   — screen lockers run their PAM stack as the user, so this is architecture,
   not policy. It is **real authentication**: a failed attempt always
-  consumes rate-limit budget, whatever the caller's UID.
+  consumes rate-limit budget, whatever the caller's UID. When
+  `security.abort_if_ssh = true`, an authorized non-root caller must also
+  prove a live local process/session identity as described below.
 - `TestAuthenticate`: **root only.** Same arguments and same `AuthResult`
   reply as `Authenticate`, and the same gates except that it skips the
   SSH/lid physical-presence aborts and charges no rate-limit budget on
@@ -2851,6 +2854,71 @@ hill-climbing oracle by construction rather than by redacting fields):
   the caller UID from `GetConnectionUnixUser`, keyed by a table-driven scope
   (`authorize_method` in `facelock_daemon::server`) so a new method is
   root-only by default until deliberately opened up.
+
+Daemon ingress ordering is part of the authorization contract. The server
+resolves and authorizes the caller/target pair before refreshing daemon
+activity or touching handler reload, SQLite, audit, or capture state. Every
+authorized non-root `Authenticate` then spends one token from a daemon-local,
+per-caller-UID availability bucket before any of that shared work: capacity
+10, one token restored per monotonic second. Saturation is an in-band
+recoverable `AuthResult` (`model_id = -2`, `label = "rate limited"`), so PAM
+continues to the password. The charge applies even when the request later
+finds no model, fails another preflight gate, or meets a busy capture. UID 0
+is trusted and exempt from this ingress bucket; `TestAuthenticate` remains
+root-only and ingress-budget-free. This availability budget is distinct from
+`security.rate_limit`: the latter remains the persistent, per-target-user
+biometric-guess limiter and still charges root `Authenticate` failures under
+the rules in "facelock test Semantics".
+
+The remote-session gate is bound to the D-Bus caller rather than the daemon's
+environment. For an authorized non-root `Authenticate` with
+`security.abort_if_ssh = true`, the daemon asks
+`org.freedesktop.DBus.GetConnectionCredentials` for the message sender's
+unique bus name and requires the returned `ProcessFD`. It derives the PID from
+that pidfd's kernel metadata, checks that the pidfd is live both before and
+after `org.freedesktop.login1.Manager.GetSessionByPID`, and reads the selected
+session's `Remote` property. It never trusts the credentials' numeric
+`ProcessID`, never classifies the caller from a security label, and rejects a
+PID-reuse race because a dead original pidfd invalidates the intervening
+logind answer.
+
+A remote session, omitted or invalid ProcessFD, dead caller, unavailable or
+inconsistent logind answer, cancellation, or expiry of the four-second
+provenance deadline (covering credentials, ProcessFD validation, and logind)
+all fail closed as the same out-of-band
+`org.freedesktop.DBus.Error.AccessDenied` message: `Authenticate requires a
+live local caller process`. The privileged daemon journal keeps the detailed
+cause; the unprivileged wire does not distinguish remote from unverifiable
+provenance. Credentials and login1 are queried asynchronously without
+retaining the handler mutex. Caller departure, `ReleaseCamera`, suspend, and
+shutdown cancel a pending query, so a stalled system-bus reply cannot delay
+later handler operations or daemon shutdown. This check runs after method
+authorization, non-root ingress charging, the early busy check, and live
+config reload, but before handler preflight or capture admission. UID 0
+bypasses only this remote-session provenance check: ordinary authorization and
+the persistent
+biometric-guess limiter remain unchanged. `TestAuthenticate` remains its
+separate root-only diagnostic method. When `abort_if_ssh = false`, the daemon
+performs no ProcessFD, PID, logind, or session lookup at all. The one-shot
+transport continues to enforce SSH provenance from the PAM-sanitized
+`SSH_CONNECTION` / `SSH_TTY` environment instead of D-Bus.
+
+Ingress buckets are process-local, are discarded after enough idle monotonic
+time to refill the full burst, and are capped at 1024 UID entries with
+least-recently-seen eviction. Daemon restart therefore resets this
+availability budget but not the SQLite-backed biometric-guess budget. The cap
+bounds memory, not aggregate admission across many distinct local UIDs. If the
+ingress-state mutex is poisoned, every later non-root admission fails closed as
+the same recoverable in-band rate-limit result until daemon restart. Poisoned
+state is neither read nor mutated.
+
+For an admitted request, a changed config mtime is claimed before rebuilding
+the handler. A failed rebuild keeps the existing handler and is not retried
+for that same mtime; a later mtime permits one new attempt. A completed rebuild
+is generation-checked before installation: if a newer mtime was claimed while
+it was building, the stale handler is discarded rather than reactivating older
+security configuration. The nested lock order is `config_mtime` then `handler`;
+no path acquires them in the opposite order.
 
 Raw camera frames require privilege. Both `PreviewFrame` and
 `PreviewDetectFrame` are root-only, so a non-root caller is denied with
@@ -2876,9 +2944,20 @@ Capture concurrency: `Authenticate`, `TestAuthenticate`, `Enroll`,
 capture guard. While one capture is in progress, a concurrent call to any of
 these methods fails **immediately** with an
 `org.freedesktop.DBus.Error.Failed` error whose message contains `daemon
-busy` (no queuing on the internal handler lock).
-Clients (PAM included) must treat this like any other daemon error — degrade
-to the next auth mechanism (password), never a lockout.
+busy` (no queuing behind the internal handler lock). An authorized non-root
+`Authenticate` spends its ingress token before this busy rejection.
+
+`Authenticate` and `TestAuthenticate` run their camera-independent audited
+preflight on one locked handler generation before claiming the capture guard.
+A preflight rejection such as no enrolled models therefore never occupies the
+global capture slot. The handler stays locked across a successful preflight
+and capture admission so live reload cannot turn the split into a fail-open
+configuration race. A suspend, `ReleaseCamera`, or shutdown cancellation that
+lands during preflight is carried across admission and prevents the delayed
+request from opening the camera.
+
+Clients (PAM included) must treat a busy error like any other daemon error —
+degrade to the next auth mechanism (password), never a lockout.
 
 ### Signals
 - `AuthAttempted(user: s, matched: b)` — emitted after each camera-backed
@@ -2911,8 +2990,9 @@ Sentinel `model_id` values (only meaningful with `matched == false`):
 Recoverable errors travel **in-band** (model_id `-2`), not as D-Bus errors, so
 clients can distinguish "the daemon decided auth cannot proceed" from "the
 daemon is unavailable". D-Bus errors remain for authorization failures,
-daemon-busy, and transport problems. In particular, a rate-limited state is a
-daemon decision and must never make the PAM client retry via a root oneshot.
+daemon-busy, transport problems, and the non-root ProcessFD/session gate above.
+In particular, a rate-limited state is a daemon decision and must never make
+the PAM client retry via a root oneshot.
 
 `-4` exists because `similarity` cannot carry "was a face seen?": the score is
 redacted to `0.0` for every non-root caller, so a user-run locker (hyprlock)

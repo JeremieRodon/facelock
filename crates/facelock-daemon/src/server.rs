@@ -8,6 +8,10 @@
 //! constructing the production handler — the server receives a built handler
 //! plus an injected rebuild recipe ([`HandlerRebuild`]) for the live reload.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
@@ -24,6 +28,7 @@ use nix::unistd::{Uid, User};
 use tracing::{error, info, warn};
 use zbus::{fdo, interface, object_server::SignalEmitter};
 
+use crate::auth::{ErrorKind, PreCheckContext};
 use crate::cancel::CancelToken;
 use crate::handler::{AuthIntent, CAMERA_POLL_INTERVAL, DaemonRequest, DaemonResponse, Handler};
 
@@ -38,6 +43,179 @@ pub type HandlerRebuild<C, E> = Box<dyn Fn() -> Result<Handler<C, E>, String> + 
 
 /// [`HandlerRebuild`] with the production camera and engine.
 pub type ProductionRebuild = HandlerRebuild<Camera<'static>, FaceEngine>;
+
+/// Capability probe for integrations that require daemon-side remote-session
+/// enforcement from a D-Bus ProcessFD.
+pub const DBUS_PROCESSFD_SESSION_GATE: bool = true;
+
+/// Deliberately uniform authorization error for a remote caller and for an
+/// identity whose local-session provenance cannot be established. Detailed
+/// causes belong in the privileged daemon journal, not on the unprivileged
+/// wire.
+pub const PROCESS_PROVENANCE_DENIED_MESSAGE: &str =
+    "Authenticate requires a live local caller process";
+
+/// Whole-operation deadline for credentials, ProcessFD, and login1
+/// provenance. This stays below the PAM client's D-Bus method timeout so the
+/// daemon can return its uniform fail-closed denial itself.
+const PROCESS_PROVENANCE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Cancellation is an atomic flag/epoch rather than an async notification;
+/// poll it cheaply while an async D-Bus provenance request is outstanding.
+const PROCESS_PROVENANCE_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+type SessionCheckFuture = Pin<Box<dyn Future<Output = Result<bool, String>> + Send>>;
+type SessionCheck = Box<dyn FnOnce() -> SessionCheckFuture + Send>;
+
+struct SessionProvenance {
+    check: SessionCheck,
+    timeout: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ProcessProvenanceError {
+    #[error("D-Bus credentials omitted ProcessFD")]
+    Missing,
+    #[error("invalid D-Bus ProcessFD: {0}")]
+    Invalid(String),
+    #[error("D-Bus ProcessFD no longer identifies a live process")]
+    Dead,
+    #[error("logind session lookup failed: {0}")]
+    SessionLookup(String),
+}
+
+fn pid_from_pidfd(process_fd: BorrowedFd<'_>) -> Result<u32, ProcessProvenanceError> {
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", process_fd.as_raw_fd()))
+        .map_err(|error| ProcessProvenanceError::Invalid(error.to_string()))?;
+    let value = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .map(str::trim)
+        .ok_or_else(|| {
+            ProcessProvenanceError::Invalid(
+                "descriptor is not a Linux process file descriptor".to_owned(),
+            )
+        })?;
+    if value == "-1" {
+        return Err(ProcessProvenanceError::Dead);
+    }
+
+    let pid = value
+        .parse::<u32>()
+        .map_err(|error| ProcessProvenanceError::Invalid(error.to_string()))?;
+    if pid == 0 {
+        return Err(ProcessProvenanceError::Invalid(
+            "pidfd reported PID 0".to_owned(),
+        ));
+    }
+    Ok(pid)
+}
+
+fn pidfd_is_live(process_fd: BorrowedFd<'_>) -> Result<bool, ProcessProvenanceError> {
+    let mut poll_fd = libc::pollfd {
+        fd: process_fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll_fd` points to one initialized pollfd for the duration of
+    // the non-blocking call, and the borrowed descriptor outlives the call.
+    let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+    if result < 0 {
+        return Err(ProcessProvenanceError::Invalid(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    if poll_fd.revents & libc::POLLNVAL != 0 {
+        return Err(ProcessProvenanceError::Invalid(
+            "descriptor was closed".to_owned(),
+        ));
+    }
+    Ok(result == 0)
+}
+
+async fn stable_process_session_is_remote<L, A, Fut>(
+    pid: u32,
+    mut process_is_live: A,
+    lookup_session: L,
+) -> Result<bool, ProcessProvenanceError>
+where
+    L: FnOnce(u32) -> Fut,
+    A: FnMut() -> Result<bool, ProcessProvenanceError>,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    if !process_is_live()? {
+        return Err(ProcessProvenanceError::Dead);
+    }
+    let remote = lookup_session(pid)
+        .await
+        .map_err(ProcessProvenanceError::SessionLookup)?;
+    if !process_is_live()? {
+        return Err(ProcessProvenanceError::Dead);
+    }
+    Ok(remote)
+}
+
+async fn processfd_session_is_remote<L, Fut>(
+    credentials: &zbus::fdo::ConnectionCredentials,
+    lookup_session: L,
+) -> Result<bool, ProcessProvenanceError>
+where
+    L: FnOnce(u32) -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    let process_fd = credentials
+        .process_fd()
+        .ok_or(ProcessProvenanceError::Missing)?
+        .as_fd();
+    let pid = pid_from_pidfd(process_fd)?;
+    stable_process_session_is_remote(pid, || pidfd_is_live(process_fd), lookup_session).await
+}
+
+async fn logind_session_is_remote(connection: &zbus::Connection, pid: u32) -> Result<bool, String> {
+    let manager = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    .map_err(|error| format!("create logind manager proxy: {error}"))?;
+    let session_path: zbus::zvariant::OwnedObjectPath = manager
+        .call("GetSessionByPID", &(pid,))
+        .await
+        .map_err(|error| format!("logind GetSessionByPID({pid}) failed: {error}"))?;
+    let session = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.login1",
+        session_path,
+        "org.freedesktop.login1.Session",
+    )
+    .await
+    .map_err(|error| format!("create logind session proxy: {error}"))?;
+    session
+        .get_property("Remote")
+        .await
+        .map_err(|error| format!("read logind session Remote property: {error}"))
+}
+
+async fn caller_session_is_remote(
+    connection: &zbus::Connection,
+    sender: Option<zbus::names::OwnedUniqueName>,
+) -> Result<bool, String> {
+    let sender = sender.ok_or_else(|| "D-Bus message omitted its sender".to_owned())?;
+    let dbus = zbus::fdo::DBusProxy::new(connection)
+        .await
+        .map_err(|error| format!("create D-Bus credentials proxy: {error}"))?;
+    let credentials = dbus
+        .get_connection_credentials(zbus::names::BusName::from(sender.inner().clone()))
+        .await
+        .map_err(|error| format!("GetConnectionCredentials({sender}) failed: {error}"))?;
+    processfd_session_is_remote(&credentials, |pid| {
+        logind_session_is_remote(connection, pid)
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
 
 /// Failures bringing up or running the D-Bus server.
 #[derive(Debug, thiserror::Error)]
@@ -63,11 +241,128 @@ const HANDLER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// than blocking the suspend transition any longer.
 const SUSPEND_RELEASE_WAIT: Duration = Duration::from_secs(1);
 
+/// Authorized non-root `Authenticate` calls may arrive in a burst this large
+/// before the server-local availability gate starts rejecting them.
+///
+/// This is deliberately distinct from `[security.rate_limit]`: that
+/// persistent, per-target-user limiter bounds biometric guesses and only
+/// charges a camera-backed failure where a face was detected. This monotonic,
+/// per-caller-UID gate bounds daemon ingress before reload, SQLite, audit and
+/// capture work, so it charges every authorized non-root request regardless
+/// of how cheaply the request later rejects.
+const INGRESS_BURST: u32 = 10;
+
+/// One ingress token is restored per elapsed second.
+const INGRESS_REFILL: Duration = Duration::from_secs(1);
+
+/// A fully idle bucket carries no useful state once it could have refilled
+/// the complete burst, so discard it on the next ingress check.
+const INGRESS_BUCKET_TTL: Duration = Duration::from_secs(INGRESS_BURST as u64);
+
+/// Hard memory ceiling for per-UID state. Evicting the least-recently-seen
+/// bucket at the ceiling keeps memory bounded; aggregate many-UID admission
+/// policy is intentionally deferred to #219.
+const MAX_INGRESS_BUCKETS: usize = 1024;
+
+#[derive(Debug)]
+struct IngressBucket {
+    tokens: u32,
+    last_refill: Instant,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Default)]
+struct IngressState {
+    buckets: HashMap<u32, IngressBucket>,
+}
+
+/// Server-local availability limiter for authorized non-root
+/// `Authenticate` calls.
+#[derive(Debug, Default)]
+struct IngressLimiter {
+    state: Mutex<IngressState>,
+}
+
+impl IngressLimiter {
+    fn check_and_charge(&self, uid: u32) -> bool {
+        self.check_and_charge_at(uid, Instant::now())
+    }
+
+    fn check_and_charge_at(&self, uid: u32, now: Instant) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                tracing::error!(uid, "ingress limiter state poisoned; rejecting request");
+                return false;
+            }
+        };
+        state.buckets.retain(|_, bucket| {
+            now.saturating_duration_since(bucket.last_seen) < INGRESS_BUCKET_TTL
+        });
+
+        if !state.buckets.contains_key(&uid)
+            && state.buckets.len() >= MAX_INGRESS_BUCKETS
+            && let Some(oldest_uid) = state
+                .buckets
+                .iter()
+                .min_by_key(|(_, bucket)| bucket.last_seen)
+                .map(|(uid, _)| *uid)
+        {
+            state.buckets.remove(&oldest_uid);
+        }
+
+        let bucket = state.buckets.entry(uid).or_insert(IngressBucket {
+            tokens: INGRESS_BURST,
+            last_refill: now,
+            last_seen: now,
+        });
+        bucket.last_seen = now;
+
+        let elapsed = now.saturating_duration_since(bucket.last_refill);
+        let refill_units = elapsed.as_nanos() / INGRESS_REFILL.as_nanos();
+        if refill_units >= u128::from(INGRESS_BURST) {
+            bucket.tokens = INGRESS_BURST;
+            bucket.last_refill = now;
+        } else if refill_units > 0 {
+            let refill_units = refill_units as u32;
+            bucket.tokens = bucket
+                .tokens
+                .saturating_add(refill_units)
+                .min(INGRESS_BURST);
+            bucket.last_refill += INGRESS_REFILL * refill_units;
+        }
+
+        if bucket.tokens == 0 {
+            return false;
+        }
+        bucket.tokens -= 1;
+        true
+    }
+
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        match self.state.lock() {
+            Ok(state) => state.buckets.len(),
+            Err(poisoned) => poisoned.into_inner().buckets.len(),
+        }
+    }
+}
+
 /// Try to acquire the handler mutex with a timeout.
 /// Uses try_lock in a polling loop to avoid blocking the thread indefinitely.
 fn lock_handler_with_timeout<H>(
     handler: &Mutex<H>,
 ) -> std::result::Result<MutexGuard<'_, H>, fdo::Error> {
+    lock_handler_with_timeout_before_capture(handler, None)
+}
+
+/// Lock the handler for authentication preflight without queueing behind an
+/// in-flight capture. The ordinary handler timeout still applies when a
+/// short non-capture operation owns the mutex.
+fn lock_handler_with_timeout_before_capture<'a, H>(
+    handler: &'a Mutex<H>,
+    capture: Option<(&CaptureSlot, &str)>,
+) -> std::result::Result<MutexGuard<'a, H>, fdo::Error> {
     let deadline = Instant::now() + HANDLER_LOCK_TIMEOUT;
     let mut waited = false;
     loop {
@@ -83,6 +378,11 @@ fn lock_handler_with_timeout<H>(
                 return Ok(e.into_inner());
             }
             Err(TryLockError::WouldBlock) => {
+                if let Some((slot, operation)) = capture
+                    && slot.is_busy()
+                {
+                    return Err(slot.busy_error(operation));
+                }
                 if !waited {
                     warn!("handler lock contention — waiting for previous operation");
                     waited = true;
@@ -113,9 +413,25 @@ fn lock_handler_with_timeout<H>(
 #[derive(Debug, Default)]
 struct CaptureSlot {
     busy: AtomicBool,
+    #[cfg(test)]
+    acquisitions: AtomicU64,
 }
 
 impl CaptureSlot {
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    fn busy_error(&self, operation: &str) -> fdo::Error {
+        warn!(
+            operation = operation,
+            "capture already in flight — rejecting immediately with busy"
+        );
+        fdo::Error::Failed(format!(
+            "daemon busy: another capture operation is in progress ({operation} rejected)"
+        ))
+    }
+
     /// Try to claim the capture slot. Returns a RAII guard on success, or an
     /// immediate "daemon busy" error if another capture is already in flight.
     fn try_acquire(self: &Arc<Self>, operation: &str) -> fdo::Result<CaptureGuard> {
@@ -124,16 +440,17 @@ impl CaptureSlot {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            #[cfg(test)]
+            self.acquisitions.fetch_add(1, Ordering::Relaxed);
             Ok(CaptureGuard(Arc::clone(self)))
         } else {
-            warn!(
-                operation = operation,
-                "capture already in flight — rejecting immediately with busy"
-            );
-            Err(fdo::Error::Failed(format!(
-                "daemon busy: another capture operation is in progress ({operation} rejected)"
-            )))
+            Err(self.busy_error(operation))
         }
+    }
+
+    #[cfg(test)]
+    fn acquisition_count(&self) -> u64 {
+        self.acquisitions.load(Ordering::Relaxed)
     }
 }
 
@@ -172,6 +489,10 @@ pub struct CurrentRequest(Arc<CurrentRequestInner>);
 struct CurrentRequestInner {
     slot: Mutex<Option<(u64, CancelToken)>>,
     generation: AtomicU64,
+    /// Global cancel events observed while no request owned the capture slot.
+    /// Authentication preflight snapshots this value, then publishes its
+    /// token only if no cancel landed before capture admission.
+    cancellation_epoch: AtomicU64,
 }
 
 impl CurrentRequest {
@@ -188,11 +509,43 @@ impl CurrentRequest {
         }
     }
 
+    fn cancellation_epoch(&self) -> u64 {
+        self.0.cancellation_epoch.load(Ordering::Acquire)
+    }
+
+    /// Publish a request that spent time in camera-independent preflight, but
+    /// only if suspend, `ReleaseCamera`, or shutdown did not cancel between
+    /// its checkpoint and capture admission.
+    ///
+    /// Both this check and [`Self::cancel`] serialize on `slot`: whichever
+    /// wins is definitive. If install wins, the later cancel reaches the
+    /// token; if cancel wins, this method marks the token before returning.
+    fn install_unless_cancelled_since(
+        &self,
+        token: CancelToken,
+        checkpoint: u64,
+    ) -> Option<CurrentRequestGuard> {
+        let mut slot = self.lock();
+        if self.0.cancellation_epoch.load(Ordering::Acquire) != checkpoint {
+            token.cancel();
+            return None;
+        }
+
+        let generation = self.0.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        *slot = Some((generation, token));
+        Some(CurrentRequestGuard {
+            current: self.clone(),
+            generation,
+        })
+    }
+
     /// Cancel whatever is in flight. Lock-free from the request's point of
     /// view (this mutex is not the handler's), and a no-op when the slot is
     /// empty — nothing is running, so there is nothing to stop.
     pub fn cancel(&self) {
-        if let Some((_, token)) = self.lock().as_ref() {
+        let slot = self.lock();
+        self.0.cancellation_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Some((_, token)) = slot.as_ref() {
             token.cancel();
         }
     }
@@ -205,6 +558,39 @@ impl CurrentRequest {
         match self.0.slot.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+async fn wait_for_provenance_cancellation(
+    cancel: CancelToken,
+    current: CurrentRequest,
+    cancellation_checkpoint: u64,
+) {
+    loop {
+        if cancel.is_cancelled() || current.cancellation_epoch() != cancellation_checkpoint {
+            return;
+        }
+        tokio::time::sleep(PROCESS_PROVENANCE_CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+async fn run_bounded_session_check(
+    session_check: SessionCheck,
+    cancel: CancelToken,
+    current: CurrentRequest,
+    cancellation_checkpoint: u64,
+    timeout: Duration,
+) -> Result<bool, String> {
+    tokio::select! {
+        biased;
+        _ = wait_for_provenance_cancellation(cancel, current, cancellation_checkpoint) => {
+            Err("caller session provenance cancelled".to_owned())
+        }
+        result = tokio::time::timeout(timeout, session_check()) => {
+            result.unwrap_or_else(|_| {
+                Err(format!("caller session provenance exceeded its {timeout:?} deadline"))
+            })
         }
     }
 }
@@ -611,6 +997,10 @@ where
     config_mtime: Arc<Mutex<Option<std::time::SystemTime>>>,
     /// In-flight guard for camera-capture operations (DoS control).
     capture_slot: Arc<CaptureSlot>,
+    /// Cheap per-caller availability gate in front of every shared auth-path
+    /// resource. Root is exempt at the call site: UID 0 is trusted, and one
+    /// root bucket would couple PAM authentications for every target user.
+    ingress_limiter: IngressLimiter,
     /// The cancel token of the request currently holding that capture slot,
     /// so suspend, `ReleaseCamera` and shutdown can stop it **without taking
     /// the handler mutex** — which is exactly what the request being
@@ -643,6 +1033,7 @@ where
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             config_mtime: Arc::new(Mutex::new(startup_config_mtime)),
             capture_slot: Arc::new(CaptureSlot::default()),
+            ingress_limiter: IngressLimiter::default(),
             // The slot starts empty: nothing is in flight, so there is
             // nothing to cancel. It survives a config reload untouched
             // because it holds a *request's* token, not the handler's — and
@@ -665,18 +1056,42 @@ where
     /// depend on cached ONNX models and config values.
     fn maybe_reload_handler(&self) {
         // No rebuild recipe injected (tests): live reload is disabled.
-        let Some(rebuild) = self.rebuild.as_ref() else {
+        if self.rebuild.is_none() {
             return;
-        };
+        }
         let config_path = facelock_core::paths::config_path();
         let current_mtime = std::fs::metadata(&config_path)
             .and_then(|m| m.modified())
             .ok();
 
+        self.maybe_reload_handler_at(current_mtime);
+    }
+
+    /// Rebuild for one observed config mtime.
+    ///
+    /// The observed mtime is claimed before the rebuild starts, including
+    /// when that rebuild fails. A broken config therefore costs at most one
+    /// rebuild attempt until the file changes again; concurrent requests
+    /// cannot all observe the same stale cached value and rebuild in
+    /// parallel. The old handler remains active on failure, so auth keeps
+    /// degrading through its established password fallback.
+    fn maybe_reload_handler_at(&self, current_mtime: Option<std::time::SystemTime>) {
+        let Some(rebuild) = self.rebuild.as_ref() else {
+            return;
+        };
+
         // A poisoned lock is not a reason to reload: keep serving with the
-        // handler already built, exactly as the two swap sites below do.
+        // handler already built. Claim the mtime while holding this lock so
+        // exactly one concurrent caller can pay for a given rebuild attempt.
         let needs_reload = match self.config_mtime.lock() {
-            Ok(stored) => matches!((*stored, current_mtime), (Some(old), Some(new)) if new > old),
+            Ok(mut stored) => {
+                let changed =
+                    matches!((*stored, current_mtime), (Some(old), Some(new)) if new > old);
+                if changed {
+                    *stored = current_mtime;
+                }
+                changed
+            }
             Err(_) => false,
         };
 
@@ -694,14 +1109,33 @@ where
             }
         };
 
-        // Swap in the new handler
-        if let Ok(mut guard) = self.handler.lock() {
-            *guard = new_handler;
+        // Re-check the claim after the potentially slow rebuild. A later
+        // mtime may have been claimed and installed while this one was still
+        // building; installing this stale result would reactivate older
+        // security config and suppress correction until another file change.
+        //
+        // Keep config_mtime locked through the handler swap. This establishes
+        // the only nested order used here: config_mtime -> handler. No path
+        // takes these locks in the opposite order.
+        let stored = match self.config_mtime.lock() {
+            Ok(stored) => stored,
+            Err(_) => {
+                error!("config mtime lock poisoned after rebuild — discarding rebuilt handler");
+                return;
+            }
+        };
+        if *stored != current_mtime {
+            info!("discarding stale handler rebuild after a newer config change");
+            return;
         }
 
-        // Update stored mtime
-        if let Ok(mut stored) = self.config_mtime.lock() {
-            *stored = current_mtime;
+        // Recover a poisoned handler mutex just as request dispatch does: the
+        // rebuild is still current, so leaving the old handler behind after
+        // claiming this mtime would suppress every retry until another file
+        // change.
+        match self.handler.lock() {
+            Ok(mut guard) => *guard = new_handler,
+            Err(poisoned) => *poisoned.into_inner() = new_handler,
         }
 
         info!("handler reloaded with new config");
@@ -739,12 +1173,59 @@ where
         user: &str,
         cancel: CancelToken,
     ) -> fdo::Result<AuthResult> {
+        self.authenticate_as_with_session_check(caller, user, cancel, || async {
+            Err("D-Bus caller process provenance was not supplied".to_string())
+        })
+        .await
+    }
+
+    /// `Authenticate` with a lazy ProcessFD-backed session check. The check
+    /// is invoked only for non-root callers when the installed configuration
+    /// enables `abort_if_ssh`; every other path drops it without lookup.
+    pub async fn authenticate_as_with_session_check<F, Fut>(
+        &self,
+        caller: CallerIdentity,
+        user: &str,
+        cancel: CancelToken,
+        session_check: F,
+    ) -> fdo::Result<AuthResult>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        self.authenticate_as_with_session_check_timeout(
+            caller,
+            user,
+            cancel,
+            PROCESS_PROVENANCE_TIMEOUT,
+            session_check,
+        )
+        .await
+    }
+
+    async fn authenticate_as_with_session_check_timeout<F, Fut>(
+        &self,
+        caller: CallerIdentity,
+        user: &str,
+        cancel: CancelToken,
+        session_timeout: Duration,
+        session_check: F,
+    ) -> fdo::Result<AuthResult>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<bool, String>> + Send + 'static,
+    {
+        let session_provenance = SessionProvenance {
+            check: Box::new(move || Box::pin(session_check())),
+            timeout: session_timeout,
+        };
         self.run_authentication(
             caller,
             user,
             Method::Authenticate,
             AuthIntent::Authenticate,
             cancel,
+            session_provenance,
         )
         .await
     }
@@ -771,16 +1252,28 @@ where
             Method::TestAuthenticate,
             AuthIntent::Test,
             cancel,
+            SessionProvenance {
+                check: Box::new(|| {
+                    Box::pin(async {
+                        Err(
+                            "TestAuthenticate does not resolve caller session provenance"
+                                .to_string(),
+                        )
+                    })
+                }),
+                timeout: PROCESS_PROVENANCE_TIMEOUT,
+            },
         )
         .await
     }
 
     /// The body both authentication entry points share, so the diagnostic
     /// method cannot drift from the real one: same authorization table, same
-    /// capture slot, same handler call, same in-band error encoding, same
-    /// notification, same redaction. Only `method` (which authorization
-    /// applies) and `intent` (what the attempt costs and which gates run)
-    /// differ.
+    /// capture slot, same handler call, same recoverable-error encoding, same
+    /// notification, same redaction. `Authenticate` additionally owns the
+    /// non-root caller-provenance boundary above handler preflight. Only
+    /// `method` (which authorization applies) and `intent` (what the attempt
+    /// costs and which gates run) otherwise differ.
     async fn run_authentication(
         &self,
         caller: CallerIdentity,
@@ -788,33 +1281,150 @@ where
         method: Method,
         intent: AuthIntent,
         cancel: CancelToken,
+        session_provenance: SessionProvenance,
     ) -> fdo::Result<AuthResult> {
+        authorize_method(&caller, method, Some(user))?;
+        if method == Method::Authenticate
+            && caller.uid != 0
+            && !self.ingress_limiter.check_and_charge(caller.uid)
+        {
+            warn!(
+                caller_uid = caller.uid,
+                user, "Authenticate ingress rate limited before shared work"
+            );
+            return Ok(recoverable_auth_error(ErrorKind::RateLimited.render("")));
+        }
+        // Busy rejections are charged above, but they should not refresh the
+        // idle timer, trigger config reload, or queue for the handler mutex.
+        if self.capture_slot.is_busy() {
+            return Err(self.capture_slot.busy_error(method.name()));
+        }
+        let cancellation_checkpoint = self.current.cancellation_epoch();
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
-        authorize_method(&caller, method, Some(user))?;
+        let caller_uid = caller.uid;
         let caller_is_root = caller.uid == 0;
-        let capture_guard = self.capture_slot.try_acquire(method.name())?;
-        // Publish the token only now. Both `?` above return without ever
-        // touching the slot, which is the point: the capture slot is what
-        // decides which request is *the* request, so a denied or busy-rejected
-        // call must not be able to displace the entry belonging to the one
-        // actually running — nor to leave its own dead token behind for the
-        // next suspend to cancel instead. Dropped at the end of this method.
-        let _current = self.current.install(cancel.clone());
+        let pre_check_context = if method == Method::Authenticate {
+            PreCheckContext::daemon_authenticate()
+        } else {
+            intent.pre_check_context()
+        };
         let handler = self.handler.clone();
+        let capture_slot = Arc::clone(&self.capture_slot);
+        let current = self.current.clone();
+        let operation = method.name();
+
+        // Snapshot only the installed SSH-gate policy under the handler
+        // mutex. Credentials and login1 are asynchronous D-Bus operations;
+        // awaiting either while retaining this guard would let a stalled
+        // system-bus peer pin all later handler operations and shutdown.
+        let provenance_required = if method == Method::Authenticate && !caller_is_root {
+            let handler = Arc::clone(&handler);
+            let capture_slot = Arc::clone(&capture_slot);
+            tokio::task::spawn_blocking(move || {
+                let handler = lock_handler_with_timeout_before_capture(
+                    &handler,
+                    Some((capture_slot.as_ref(), operation)),
+                )?;
+                Ok::<bool, fdo::Error>(handler.config.security.abort_if_ssh)
+            })
+            .await
+            .map_err(|error| fdo::Error::Failed(format!("task join error: {error}")))??
+        } else {
+            false
+        };
+
+        let provenance = if provenance_required {
+            Some(
+                run_bounded_session_check(
+                    session_provenance.check,
+                    cancel.clone(),
+                    current.clone(),
+                    cancellation_checkpoint,
+                    session_provenance.timeout,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
         let notifier_factory = self.notifier_factory.clone();
         let user = user.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            let mut handler = lock_handler_with_timeout(&handler)?;
-            let response = handler.handle_authenticate(user.clone(), intent, &cancel);
+            // Keep this guard across both phases. A config reload cannot swap
+            // in a new handler after the gates passed but before capture.
+            let mut handler = lock_handler_with_timeout_before_capture(
+                &handler,
+                Some((capture_slot.as_ref(), operation)),
+            )?;
+            if method == Method::Authenticate
+                && !caller_is_root
+                && handler.config.security.abort_if_ssh
+            {
+                match provenance {
+                    Some(Ok(false)) => {}
+                    Some(Ok(true)) => {
+                        warn!(
+                            caller_uid,
+                            user, "remote login session denied for Authenticate"
+                        );
+                        return Err(fdo::Error::AccessDenied(
+                            PROCESS_PROVENANCE_DENIED_MESSAGE.to_string(),
+                        ));
+                    }
+                    Some(Err(reason)) => {
+                        warn!(
+                            caller_uid,
+                            user, reason, "caller session provenance unavailable"
+                        );
+                        return Err(fdo::Error::AccessDenied(
+                            PROCESS_PROVENANCE_DENIED_MESSAGE.to_string(),
+                        ));
+                    }
+                    None => {
+                        // The installed policy changed from disabled to
+                        // enabled while this request was outside the lock.
+                        // Never perform provenance I/O under the guard and
+                        // never admit a request that was not checked under
+                        // the policy now governing capture.
+                        warn!(
+                            caller_uid,
+                            user,
+                            "caller session provenance unavailable after abort_if_ssh was enabled"
+                        );
+                        return Err(fdo::Error::AccessDenied(
+                            PROCESS_PROVENANCE_DENIED_MESSAGE.to_string(),
+                        ));
+                    }
+                }
+            }
+            let response = if let Some(response) =
+                handler.preflight_authenticate_with_context(&user, intent, pre_check_context)
+            {
+                response
+            } else {
+                // Only a request whose camera-independent gates passed may
+                // become the in-flight capture. A competing request can race
+                // the early busy check, so the atomic claim remains required.
+                let capture_guard = capture_slot.try_acquire(operation)?;
+                // Suspend, ReleaseCamera or shutdown can land while preflight
+                // holds the handler but has not claimed the capture slot. The
+                // epoch handoff makes that cancel visible before CameraLease
+                // considers opening a device.
+                let current_guard =
+                    current.install_unless_cancelled_since(cancel.clone(), cancellation_checkpoint);
+                let response =
+                    handler.handle_authenticate_prechecked(user.clone(), intent, &cancel);
+                drop(current_guard);
+                drop(capture_guard);
+                response
+            };
             // Notification settings come from the handler's config — the
             // freshest parse, since maybe_reload_handler ran at method entry.
             // No mid-request file re-read (D7).
             let notify_config = handler.config.notification.clone();
             drop(handler);
-            // Capture finished — free the slot before slower follow-up work
-            // (notifications) so the next auth isn't rejected needlessly.
-            drop(capture_guard);
             match response {
                 DaemonResponse::AuthResult(result) => {
                     // Desktop notification, delivered as root via setpriv. NOT
@@ -869,9 +1479,9 @@ where
         label: &str,
         cancel: CancelToken,
     ) -> fdo::Result<(u32, u32)> {
+        authorize_method(&caller, Method::Enroll, None)?;
         self.last_activity.store(now_secs(), Ordering::Relaxed);
         self.maybe_reload_handler();
-        authorize_method(&caller, Method::Enroll, None)?;
         let capture_guard = self.capture_slot.try_acquire("Enroll")?;
         // Same ordering rule as `run_authentication`: authorized and holding
         // the capture slot, therefore this is the request in flight.
@@ -904,8 +1514,8 @@ where
         caller: CallerIdentity,
         user: &str,
     ) -> fdo::Result<Vec<ModelInfo>> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::ListModels, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         let handler = self.handler.clone();
         let user = user.to_string();
         tokio::task::spawn_blocking(move || {
@@ -941,8 +1551,8 @@ where
         user: &str,
         model_id: u32,
     ) -> fdo::Result<()> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::RemoveModel, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         let handler = self.handler.clone();
         let user = user.to_string();
         tokio::task::spawn_blocking(move || {
@@ -964,8 +1574,8 @@ where
     }
 
     pub async fn clear_models_as(&self, caller: CallerIdentity, user: &str) -> fdo::Result<()> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::ClearModels, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         let handler = self.handler.clone();
         let user = user.to_string();
         tokio::task::spawn_blocking(move || {
@@ -985,8 +1595,8 @@ where
     }
 
     pub async fn preview_frame_as(&self, caller: CallerIdentity) -> fdo::Result<Vec<u8>> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::PreviewFrame, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         let capture_guard = self.capture_slot.try_acquire("PreviewFrame")?;
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
@@ -1011,11 +1621,11 @@ where
         caller: CallerIdentity,
         user: &str,
     ) -> fdo::Result<(Vec<u8>, Vec<PreviewFaceInfo>)> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         // Root-only: preview runs per-frame with neither pre_check nor the
         // rate limiter, so for any weaker caller this method would be a
         // continuous similarity feed at camera framerate.
         authorize_method(&caller, Method::PreviewDetectFrame, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         let caller_is_root = caller.uid == 0;
 
         let capture_guard = self.capture_slot.try_acquire("PreviewDetectFrame")?;
@@ -1060,8 +1670,8 @@ where
     }
 
     pub async fn list_devices_as(&self, caller: CallerIdentity) -> fdo::Result<Vec<DeviceInfo>> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::ListDevices, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         let handler = self.handler.clone();
         tokio::task::spawn_blocking(move || {
             let mut handler = lock_handler_with_timeout(&handler)?;
@@ -1090,8 +1700,8 @@ where
     }
 
     pub async fn release_camera_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::ReleaseCamera, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         // Cancel the in-flight request before queuing for the handler mutex.
         // If a capture is in flight it holds that mutex, so the store below is
         // the only thing that reaches it — and it is what lets the lock be
@@ -1115,14 +1725,14 @@ where
     }
 
     pub async fn ping_as(&self, caller: CallerIdentity) -> fdo::Result<String> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::Ping, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         Ok("pong".to_string())
     }
 
     pub async fn shutdown_as(&self, caller: CallerIdentity) -> fdo::Result<()> {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
         authorize_method(&caller, Method::Shutdown, None)?;
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
         // Same reason as `ReleaseCamera`: stop the capture before waiting on
         // the mutex it is holding.
         self.current.cancel();
@@ -1152,6 +1762,8 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         user: &str,
     ) -> fdo::Result<AuthResult> {
         let caller = resolve_caller_identity(&hdr, connection).await?;
+        let sender = hdr.sender().map(|sender| sender.to_owned().into());
+        let session_connection = connection.clone();
         // One token for this call and nothing else. zbus dispatches each
         // method in its own task, so anything shared between calls is shared
         // between *concurrent* calls: a token owned by the service could be
@@ -1162,7 +1774,11 @@ impl FacelockService<Camera<'static>, FaceEngine> {
         // (ADR 008 §5).
         let cancel = CancelToken::new();
         let _watch = watch_caller_departure(connection, hdr.sender(), cancel.clone()).await;
-        let result = self.authenticate_as(caller, user, cancel).await;
+        let result = self
+            .authenticate_as_with_session_check(caller, user, cancel, move || async move {
+                caller_session_is_remote(&session_connection, sender).await
+            })
+            .await;
 
         // Emit auth_attempted signal (best-effort, don't fail auth if signal
         // fails). The payload deliberately carries no similarity score — the
@@ -1881,11 +2497,633 @@ async fn poll_shutdown(
 mod tests {
     use super::*;
 
+    use std::collections::VecDeque;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    use facelock_core::config::{Config, NotificationConfig, NotificationMode};
+    use facelock_core::notify::{Notifier, NullNotifier};
+    use facelock_core::types::{CameraCaps, MatchResult};
+    use facelock_store::FaceStore;
+    use facelock_test_support::{MockCamera, MockFaceEngine, fixtures};
+
     fn caller(uid: u32, username: Option<&str>) -> CallerIdentity {
         CallerIdentity {
             uid,
             username: username.map(str::to_string),
         }
+    }
+
+    fn pidfd_for(pid: u32) -> OwnedFd {
+        // SAFETY: pidfd_open returns a new owned descriptor on success. The
+        // result is checked before ownership is constructed.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+        assert!(
+            raw >= 0,
+            "pidfd_open failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a fresh descriptor returned by pidfd_open above.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    #[tokio::test]
+    async fn processfd_credentials_fail_closed_when_the_fd_is_missing_or_invalid() {
+        let missing = zbus::fdo::ConnectionCredentials::default();
+        assert!(matches!(
+            processfd_session_is_remote(&missing, |_| async { Ok(false) }).await,
+            Err(ProcessProvenanceError::Missing)
+        ));
+
+        let regular: OwnedFd = tempfile::tempfile().expect("regular file").into();
+        let invalid = zbus::fdo::ConnectionCredentials::default().set_process_fd(regular.into());
+        assert!(matches!(
+            processfd_session_is_remote(&invalid, |_| async { Ok(false) }).await,
+            Err(ProcessProvenanceError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_live_processfd_is_the_only_source_of_the_logind_pid() {
+        let credentials = zbus::fdo::ConnectionCredentials::default()
+            .set_process_id(u32::MAX)
+            .set_process_fd(pidfd_for(std::process::id()).into());
+
+        let remote = processfd_session_is_remote(&credentials, |pid| async move {
+            assert_eq!(pid, std::process::id());
+            Ok(false)
+        })
+        .await
+        .expect("live self pidfd");
+
+        assert!(!remote);
+    }
+
+    #[tokio::test]
+    async fn a_dead_processfd_fails_closed_before_logind_lookup() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let process_fd = pidfd_for(child.id());
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+        let credentials =
+            zbus::fdo::ConnectionCredentials::default().set_process_fd(process_fd.into());
+
+        let result = processfd_session_is_remote(&credentials, |_| async {
+            panic!("a dead identity must not reach logind")
+        })
+        .await;
+        assert!(matches!(result, Err(ProcessProvenanceError::Dead)));
+    }
+
+    #[tokio::test]
+    async fn death_during_lookup_cannot_authorize_a_reused_numeric_pid() {
+        let mut liveness = VecDeque::from([true, false]);
+        let result = stable_process_session_is_remote(
+            4242,
+            || Ok(liveness.pop_front().expect("two liveness checks")),
+            |pid| async move {
+                assert_eq!(pid, 4242);
+                // Even if logind answered for a process that reused 4242,
+                // the dead pidfd below must make this answer unusable.
+                Ok(false)
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProcessProvenanceError::Dead)));
+        assert!(liveness.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stable_process_session_preserves_loginds_local_or_remote_answer() {
+        assert!(
+            !stable_process_session_is_remote(10, || Ok(true), |_| async { Ok(false) })
+                .await
+                .unwrap()
+        );
+        assert!(
+            stable_process_session_is_remote(11, || Ok(true), |_| async { Ok(true) })
+                .await
+                .unwrap()
+        );
+    }
+
+    fn mock_handler_with_timeout(timeout_secs: u32) -> Handler<MockCamera, MockFaceEngine> {
+        let config = Config::parse(&format!(
+            r#"
+[recognition]
+timeout_secs = {timeout_secs}
+
+[security]
+require_ir = false
+require_frame_variance = false
+abort_if_ssh = false
+abort_if_lid_closed = false
+
+[encryption]
+method = "none"
+
+[audit]
+enabled = false
+"#
+        ))
+        .expect("test config");
+        let limiter = crate::rate_limit::RateLimiter::new(
+            config.security.rate_limit.max_attempts,
+            config.security.rate_limit.window_secs,
+        );
+        Handler::new(
+            config,
+            MockFaceEngine::no_faces(),
+            FaceStore::open_memory().expect("in-memory store"),
+            limiter,
+            CameraCaps::default(),
+            Some(Box::new(|_| Ok(MockCamera::bright(64, 64, 8)))),
+            None,
+        )
+        .expect("mock handler")
+    }
+
+    fn mock_service_with_reload(
+        startup_config_mtime: Option<std::time::SystemTime>,
+        rebuild: Option<HandlerRebuild<MockCamera, MockFaceEngine>>,
+    ) -> FacelockService<MockCamera, MockFaceEngine> {
+        FacelockService::new(
+            mock_handler_with_timeout(1),
+            startup_config_mtime,
+            rebuild,
+            Arc::new(|_| Box::new(NullNotifier) as Box<dyn Notifier>),
+        )
+    }
+
+    fn mock_service() -> FacelockService<MockCamera, MockFaceEngine> {
+        mock_service_with_reload(None, None)
+    }
+
+    fn mock_service_with_remote_gate() -> FacelockService<MockCamera, MockFaceEngine> {
+        let mut handler = mock_handler_with_timeout(1);
+        handler.config.security.abort_if_ssh = true;
+        FacelockService::new(
+            handler,
+            None,
+            None,
+            Arc::new(|_| Box::new(NullNotifier) as Box<dyn Notifier>),
+        )
+    }
+
+    async fn wait_until_set(flag: &AtomicBool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session check should start");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_provenance_is_bounded_without_holding_the_handler() {
+        let service = Arc::new(mock_service_with_remote_gate());
+        let started = Arc::new(AtomicBool::new(false));
+        let check_started = Arc::clone(&started);
+        let authenticating = Arc::clone(&service);
+
+        let auth = tokio::spawn(async move {
+            authenticating
+                .authenticate_as_with_session_check_timeout(
+                    caller(1000, Some("alice")),
+                    "alice",
+                    CancelToken::new(),
+                    Duration::from_millis(100),
+                    move || async move {
+                        check_started.store(true, Ordering::SeqCst);
+                        std::future::pending::<Result<bool, String>>().await
+                    },
+                )
+                .await
+        });
+
+        wait_until_set(&started).await;
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            service.list_models_as(caller(0, Some("root")), "alice"),
+        )
+        .await
+        .expect("stalled provenance must not retain the handler")
+        .expect("a later root operation remains authorized");
+
+        let denied = tokio::time::timeout(Duration::from_secs(1), auth)
+            .await
+            .expect("provenance deadline must bound the request")
+            .expect("authentication task must not panic");
+        assert!(matches!(
+            denied,
+            Err(fdo::Error::AccessDenied(message))
+                if message == PROCESS_PROVENANCE_DENIED_MESSAGE
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_a_stalled_provenance_check_without_waiting_for_its_deadline() {
+        let service = Arc::new(mock_service_with_remote_gate());
+        let started = Arc::new(AtomicBool::new(false));
+        let check_started = Arc::clone(&started);
+        let authenticating = Arc::clone(&service);
+
+        let auth = tokio::spawn(async move {
+            authenticating
+                .authenticate_as_with_session_check_timeout(
+                    caller(1000, Some("alice")),
+                    "alice",
+                    CancelToken::new(),
+                    Duration::from_secs(5),
+                    move || async move {
+                        check_started.store(true, Ordering::SeqCst);
+                        std::future::pending::<Result<bool, String>>().await
+                    },
+                )
+                .await
+        });
+
+        wait_until_set(&started).await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            service.shutdown_as(caller(0, Some("root"))),
+        )
+        .await
+        .expect("shutdown must not wait for stalled provenance")
+        .expect("root shutdown remains authorized");
+
+        let denied = tokio::time::timeout(Duration::from_millis(250), auth)
+            .await
+            .expect("shutdown must drop the stalled check before its deadline")
+            .expect("authentication task must not panic");
+        assert!(matches!(
+            denied,
+            Err(fdo::Error::AccessDenied(message))
+                if message == PROCESS_PROVENANCE_DENIED_MESSAGE
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_cancellation_drops_a_stalled_provenance_check_before_its_deadline() {
+        let service = Arc::new(mock_service_with_remote_gate());
+        let started = Arc::new(AtomicBool::new(false));
+        let check_started = Arc::clone(&started);
+        let cancel = CancelToken::new();
+        let request_cancel = cancel.clone();
+        let authenticating = Arc::clone(&service);
+
+        let auth = tokio::spawn(async move {
+            authenticating
+                .authenticate_as_with_session_check_timeout(
+                    caller(1000, Some("alice")),
+                    "alice",
+                    request_cancel,
+                    Duration::from_secs(5),
+                    move || async move {
+                        check_started.store(true, Ordering::SeqCst);
+                        std::future::pending::<Result<bool, String>>().await
+                    },
+                )
+                .await
+        });
+
+        wait_until_set(&started).await;
+        cancel.cancel();
+
+        let denied = tokio::time::timeout(Duration::from_millis(250), auth)
+            .await
+            .expect("caller cancellation must drop the stalled check")
+            .expect("authentication task must not panic");
+        assert!(matches!(
+            denied,
+            Err(fdo::Error::AccessDenied(message))
+                if message == PROCESS_PROVENANCE_DENIED_MESSAGE
+        ));
+    }
+
+    #[tokio::test]
+    async fn denied_authenticate_does_not_refresh_daemon_activity() {
+        let service = mock_service();
+        service.last_activity.store(u64::MAX, Ordering::Relaxed);
+
+        let denied = service
+            .authenticate_as(caller(1000, Some("alice")), "bob", CancelToken::new())
+            .await;
+
+        assert!(matches!(denied, Err(fdo::Error::AccessDenied(_))));
+        assert_eq!(
+            service.last_activity.load(Ordering::Relaxed),
+            u64::MAX,
+            "a rejected caller must not keep the daemon alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_root_only_calls_do_not_refresh_daemon_activity() {
+        let service = mock_service();
+
+        service.last_activity.store(u64::MAX, Ordering::Relaxed);
+        let denied_enroll = service
+            .enroll_as(
+                caller(1000, Some("alice")),
+                "alice",
+                "front",
+                CancelToken::new(),
+            )
+            .await;
+        assert!(matches!(denied_enroll, Err(fdo::Error::AccessDenied(_))));
+        assert_eq!(service.last_activity.load(Ordering::Relaxed), u64::MAX);
+
+        let denied_ping = service.ping_as(caller(1000, Some("alice"))).await;
+        assert!(matches!(denied_ping, Err(fdo::Error::AccessDenied(_))));
+        assert_eq!(
+            service.last_activity.load(Ordering::Relaxed),
+            u64::MAX,
+            "authorization must precede activity mutation on every method"
+        );
+    }
+
+    #[test]
+    fn failed_reload_mtime_is_cached_until_the_file_changes_again() {
+        let rebuilds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rebuild_count = Arc::clone(&rebuilds);
+        let service = mock_service_with_reload(
+            Some(std::time::SystemTime::UNIX_EPOCH),
+            Some(Box::new(move || {
+                rebuild_count.fetch_add(1, Ordering::SeqCst);
+                Err("invalid replacement config".to_string())
+            })),
+        );
+        let changed = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+
+        service.maybe_reload_handler_at(Some(changed));
+        service.maybe_reload_handler_at(Some(changed));
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            1,
+            "one broken mtime must trigger at most one rebuild"
+        );
+
+        service.maybe_reload_handler_at(Some(changed + Duration::from_secs(1)));
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            2,
+            "a later mtime must permit one fresh rebuild attempt"
+        );
+    }
+
+    #[test]
+    fn an_older_slow_rebuild_cannot_overwrite_a_newer_installed_handler() {
+        let t1_started = Arc::new(std::sync::Barrier::new(2));
+        let release_t1 = Arc::new(std::sync::Barrier::new(2));
+        let rebuilds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = Arc::new(mock_service_with_reload(
+            Some(std::time::SystemTime::UNIX_EPOCH),
+            Some(Box::new({
+                let t1_started = Arc::clone(&t1_started);
+                let release_t1 = Arc::clone(&release_t1);
+                let rebuilds = Arc::clone(&rebuilds);
+                move || match rebuilds.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        t1_started.wait();
+                        release_t1.wait();
+                        Ok(mock_handler_with_timeout(11))
+                    }
+                    1 => Ok(mock_handler_with_timeout(22)),
+                    call => Err(format!("unexpected rebuild call {call}")),
+                }
+            })),
+        ));
+        let t1_mtime = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let t2_mtime = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+
+        let slow_t1 = {
+            let service = Arc::clone(&service);
+            std::thread::spawn(move || service.maybe_reload_handler_at(Some(t1_mtime)))
+        };
+        t1_started.wait();
+
+        service.maybe_reload_handler_at(Some(t2_mtime));
+        assert_eq!(
+            service
+                .handler
+                .lock()
+                .expect("handler after t2")
+                .config
+                .recognition
+                .timeout_secs,
+            22,
+            "the newer handler must install while t1 is still rebuilding"
+        );
+
+        release_t1.wait();
+        slow_t1.join().expect("t1 rebuild thread");
+        assert_eq!(
+            service
+                .handler
+                .lock()
+                .expect("handler after both rebuilds")
+                .config
+                .recognition
+                .timeout_secs,
+            22,
+            "a completed stale rebuild must not replace the newer handler"
+        );
+    }
+
+    #[test]
+    fn ingress_allows_an_ordinary_burst_then_refills_monotonically() {
+        let limiter = IngressLimiter::default();
+        let started = Instant::now();
+
+        for request in 0..INGRESS_BURST {
+            assert!(
+                limiter.check_and_charge_at(1000, started),
+                "ordinary request {request} must fit in the burst"
+            );
+        }
+        assert!(!limiter.check_and_charge_at(1000, started));
+        assert!(limiter.check_and_charge_at(1000, started + INGRESS_REFILL));
+        assert!(!limiter.check_and_charge_at(1000, started + INGRESS_REFILL));
+    }
+
+    #[test]
+    fn ingress_bucket_storage_is_bounded_and_stale_entries_are_pruned() {
+        let limiter = IngressLimiter::default();
+        let started = Instant::now();
+
+        for uid in 1..=(MAX_INGRESS_BUCKETS as u32 + 100) {
+            assert!(limiter.check_and_charge_at(uid, started));
+        }
+        assert!(
+            limiter.bucket_count() <= MAX_INGRESS_BUCKETS,
+            "many local UIDs must not grow the daemon's memory without bound"
+        );
+
+        assert!(limiter.check_and_charge_at(50_000, started + INGRESS_BUCKET_TTL));
+        assert_eq!(
+            limiter.bucket_count(),
+            1,
+            "fully stale per-UID state must be discarded"
+        );
+    }
+
+    #[test]
+    fn poisoned_ingress_state_rejects_every_future_check_without_mutation() {
+        let limiter = IngressLimiter::default();
+        let started = Instant::now();
+        assert!(limiter.check_and_charge_at(1000, started));
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = limiter.state.lock().expect("unpoisoned ingress state");
+            panic!("poison ingress state deliberately");
+        }));
+        assert!(poisoned.is_err());
+
+        let before = {
+            let state = limiter.state.lock().unwrap_err().into_inner();
+            let bucket = state.buckets.get(&1000).expect("existing bucket");
+            (state.buckets.len(), bucket.tokens, bucket.last_seen)
+        };
+
+        assert!(!limiter.check_and_charge_at(1000, started + INGRESS_REFILL));
+        assert!(!limiter.check_and_charge_at(2000, started + INGRESS_REFILL));
+
+        let after = {
+            let state = limiter.state.lock().unwrap_err().into_inner();
+            let bucket = state.buckets.get(&1000).expect("existing bucket");
+            (state.buckets.len(), bucket.tokens, bucket.last_seen)
+        };
+        assert_eq!(
+            after, before,
+            "poisoned ingress state must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_model_requests_are_charged_before_shared_authentication_work() {
+        let service = mock_service();
+
+        for request in 0..INGRESS_BURST {
+            let reply = service
+                .authenticate_as(caller(1000, Some("alice")), "alice", CancelToken::new())
+                .await
+                .expect("an allowed no-model request is an in-band response");
+            assert_eq!(reply.model_id, -1, "no-model request {request}: {reply:?}");
+        }
+
+        service.last_activity.store(u64::MAX, Ordering::Relaxed);
+        let limited = service
+            .authenticate_as(caller(1000, Some("alice")), "alice", CancelToken::new())
+            .await
+            .expect("ingress saturation is an in-band rejection");
+        assert_eq!(limited.model_id, -2);
+        assert_eq!(limited.label, "rate limited");
+        assert_eq!(
+            service.last_activity.load(Ordering::Relaxed),
+            u64::MAX,
+            "saturation must reject before activity/reload/preflight/audit/capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_model_preflight_rejects_without_claiming_the_capture_slot() {
+        let service = mock_service();
+
+        let reply = service
+            .authenticate_as(caller(1000, Some("alice")), "alice", CancelToken::new())
+            .await
+            .expect("no-model preflight is an in-band response");
+
+        assert_eq!(reply.model_id, -1);
+        assert_eq!(
+            service.capture_slot.acquisition_count(),
+            0,
+            "camera-independent preflight must reject before capture admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_and_denied_calls_do_not_consume_non_root_ingress_budget() {
+        let service = mock_service();
+
+        for _ in 0..=INGRESS_BURST {
+            let root_reply = service
+                .authenticate_as(caller(0, Some("root")), "alice", CancelToken::new())
+                .await
+                .expect("trusted root is exempt");
+            assert_eq!(root_reply.model_id, -1);
+
+            let denied = service
+                .authenticate_as(caller(1000, Some("alice")), "bob", CancelToken::new())
+                .await;
+            assert!(matches!(denied, Err(fdo::Error::AccessDenied(_))));
+        }
+
+        let own = service
+            .authenticate_as(caller(1000, Some("alice")), "alice", CancelToken::new())
+            .await
+            .expect("denied calls must not spend alice's ingress budget");
+        assert_eq!(own.model_id, -1);
+    }
+
+    #[tokio::test]
+    async fn busy_rejections_spend_non_root_ingress_budget() {
+        let service = Arc::new(mock_service());
+        {
+            let handler = service.handler.lock().expect("mock handler lock");
+            handler
+                .store
+                .add_model(
+                    "alice",
+                    "front",
+                    &fixtures::known_embedding(1),
+                    "test-embedder",
+                )
+                .expect("enrolled test model");
+        }
+
+        let root_cancel = CancelToken::new();
+        let root_request = {
+            let service = Arc::clone(&service);
+            let cancel = root_cancel.clone();
+            tokio::spawn(async move {
+                service
+                    .authenticate_as(caller(0, Some("root")), "alice", cancel)
+                    .await
+            })
+        };
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        while !service.capture_slot.is_busy() && Instant::now() < wait_deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(service.capture_slot.is_busy(), "root capture did not start");
+
+        for request in 0..INGRESS_BURST {
+            let busy = service
+                .authenticate_as(caller(1000, Some("alice")), "alice", CancelToken::new())
+                .await;
+            assert!(
+                matches!(busy, Err(fdo::Error::Failed(ref message)) if message.contains("daemon busy")),
+                "busy rejection {request} was not preserved: {busy:?}"
+            );
+        }
+        let limited = service
+            .authenticate_as(caller(1000, Some("alice")), "alice", CancelToken::new())
+            .await
+            .expect("saturated ingress rejects in band");
+        assert_eq!(limited.model_id, -2);
+        assert_eq!(limited.label, "rate limited");
+
+        root_cancel.cancel();
+        root_request
+            .await
+            .expect("root task joined")
+            .expect("root request returned in band");
     }
 
     #[test]
@@ -1908,8 +3146,6 @@ mod tests {
         assert_eq!(result.similarity, 0.0);
     }
 
-    use facelock_core::config::{NotificationConfig, NotificationMode};
-    use facelock_core::types::MatchResult;
     use facelock_test_support::RecordingNotifier;
 
     fn match_result(matched: bool) -> MatchResult {
@@ -2360,6 +3596,25 @@ impl SyntheticService {
         let _guard = current.install(in_flight.clone());
         current.cancel();
         assert!(in_flight.is_cancelled());
+    }
+
+    /// A request may pass camera-independent preflight without owning the
+    /// capture slot yet. A suspend/release cancel in that window must be
+    /// remembered so the delayed request cannot open the camera afterward.
+    #[test]
+    fn cancellation_during_preflight_prevents_delayed_capture_admission() {
+        let current = CurrentRequest::default();
+        let checkpoint = current.cancellation_epoch();
+        current.cancel();
+
+        let delayed = CancelToken::new();
+        let admitted = current.install_unless_cancelled_since(delayed.clone(), checkpoint);
+
+        assert!(admitted.is_none());
+        assert!(
+            delayed.is_cancelled(),
+            "a delayed request must observe the cancel before camera acquire"
+        );
     }
 
     /// The generation check. Requests overlap at the edges — one is still
