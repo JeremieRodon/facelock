@@ -64,6 +64,7 @@
 //! | [`download`] | model download and verification |
 //! | [`system`] | daemon unit setup and legacy group cleanup |
 //! | [`pam`] | `/etc/pam.d/*` configuration |
+//! | [`purge`] | `data purge`: what was destroyed, what was refused, and why |
 //!
 //! # Adding a message (the conversion pattern)
 //!
@@ -117,6 +118,7 @@ pub mod download;
 pub mod face;
 pub mod notify;
 pub mod pam;
+pub mod purge;
 pub mod setup;
 pub mod status;
 pub mod system;
@@ -127,6 +129,7 @@ pub use download::DownloadMessage;
 pub use face::FaceMessage;
 pub use notify::NotifyMessage;
 pub use pam::PamMessage;
+pub use purge::PurgeMessage;
 pub use setup::SetupMessage;
 pub use status::StatusMessage;
 pub use system::SystemMessage;
@@ -717,6 +720,7 @@ mod tests {
             $sweep::<DownloadMessage>();
             $sweep::<SystemMessage>();
             $sweep::<PamMessage>();
+            $sweep::<PurgeMessage>();
         }};
     }
 

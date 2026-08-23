@@ -33,8 +33,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **CLI lifecycle exclusion lease** (#233): the ownership layer for the
-  upcoming `facelock data purge`. An RAII lease takes the canonical
+- **`facelock data purge`** (#233): the sanctioned way to destroy retained
+  biometric state before uninstalling — enrolled embeddings, the database and
+  its sidecars, keys and sealed blobs, models, markers, audit logs, snapshots
+  and upgrade backups. Package removal deliberately preserves that state, so
+  this is the only path that destroys it, and it is not a removal path.
+  Requires root **and** `--allow-destruction`: `--yes` suppresses the
+  confirmation prompt and authorizes nothing, and neither does `--json`, the
+  same split `facelock pam add` draws with `--allow-sensitive`. The command
+  holds the lifecycle exclusion lease for the duration, so the daemon cannot
+  be re-activated mid-traversal, and hands the engine the lease's interrupt
+  flag so `Ctrl-C` stops at a deletion boundary before the daemon returns.
+  `--dry-run` reports what purge would find without deleting, taking no lease
+  and needing no authorization; `--leave-activation-barred` keeps the daemon
+  stopped and masked for a caller that uninstalls next; `--json` emits the
+  report as a document. Only `/etc/facelock`, `/var/lib/facelock` and
+  `/var/log/facelock` are traversed, configured paths outside them are
+  reported and left untouched, and a run that retained anything says so rather
+  than claiming completeness. Removing a name is not erasure, and the report
+  says so on every run.
+- **CLI lifecycle exclusion lease** (#233): the ownership layer for
+  `facelock data purge`. An RAII lease takes the canonical
   `/run/facelock/lifecycle.lock`, proves the D-Bus activation definition
   delegates to systemd, masks `facelock-daemon.service` through the same
   runtime control-tier barrier the source install uses, and stops the daemon
@@ -46,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tmpfs state, which the next acquisition adopts and clears, and a reboot
   clears on its own. Enablement
   is never changed, and acquisition fails closed without systemd, without the
-  lock, or without a confirmed-stopped daemon. No CLI surface yet.
+  lock, or without a confirmed-stopped daemon.
 - **Explicit authorization for sensitive `setup --pam` writes** (#207):
   `--yes` and its `--no-confirm` alias now suppress only the ordinary per-file
   confirmation. Adding Facelock to a shared or login PAM stack requires the

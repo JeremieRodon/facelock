@@ -25,7 +25,7 @@ use facelock_cli::commands::setup::{SetupArgs, resolve_setup_plan};
 use facelock_cli::logging::Program;
 use facelock_cli::{commands, ipc_client, logging, message, notifications, resolved};
 
-use args::{ConfirmArg, JsonArg, PamCli, SetupCli, UserArg};
+use args::{ConfirmArg, DataCli, JsonArg, PamCli, SetupCli, UserArg};
 
 #[derive(Parser)]
 #[command(name = "facelock", about = "Linux face authentication", version)]
@@ -173,6 +173,19 @@ enum Commands {
     Hyprlock {
         #[command(subcommand)]
         command: HyprlockCommand,
+    },
+    /// Manage retained Facelock state on this machine
+    //
+    // A noun group with one verb, on purpose (#233). ADR 009 asks a group to
+    // own two or more subcommands; `docs/contracts.md` §CLI Subcommands
+    // records this as the stated exception rather than drift. A top-level
+    // `facelock purge` would sit beside `facelock clear`, which already
+    // means "remove all face models for a user", and the two would differ
+    // only in blast radius — naming the object first makes the difference
+    // the first word a reader sees.
+    Data {
+        #[command(subcommand)]
+        command: DataCli,
     },
     /// View structured audit log
     Audit {
@@ -347,6 +360,19 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(commands::pam::run(command.into())?)
                 }
                 Commands::Hyprlock { command } => commands::hyprlock::run(command),
+                // `data purge` is dispatched here, ahead of the shared
+                // config parse, for the reason `pam` is: it must keep
+                // working when `/etc/facelock/config.toml` is missing or
+                // broken. Destroying retained state is the operation an
+                // operator reaches for *because* the install is in a bad
+                // way, and refusing on an unrelated config error would leave
+                // biometric data on disk with no sanctioned way to remove
+                // it. The engine reads that file itself, best-effort, only
+                // to classify configured paths as inside or outside the
+                // compiled roots; an unreadable one becomes a reported
+                // `config_note` and defeats the completeness claim rather
+                // than stopping the purge.
+                Commands::Data { command } => commands::data::run(command.into()),
                 // `config show` (and bare `config`) is the unprivileged read
                 // DEC-6 lists; `config edit` takes root inside the command,
                 // ahead of the editor (C6).
@@ -425,6 +451,7 @@ fn main() -> anyhow::Result<()> {
                         | Commands::Pam { .. }
                         | Commands::Hyprlock { .. }
                         | Commands::Config { .. }
+                        | Commands::Data { .. }
                         | Commands::Setup(..)
                         | Commands::Status { .. } => unreachable!(),
                     }

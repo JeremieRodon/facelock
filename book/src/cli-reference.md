@@ -704,6 +704,139 @@ facelock audit --follow                 # long form
 | `--follow` | `-f` | false | Watch for new entries (like `tail -f`) |
 | `--lines N` | `-l` | 20 | Number of recent entries to display |
 
+## facelock data
+
+Manage retained Facelock state on this machine. One verb today, `purge`.
+
+`data` is a noun group with a single subcommand on purpose. A top-level
+`facelock purge` would sit beside `facelock clear`, which already means "remove
+all face models for a user", and the two would differ only in blast radius —
+naming the object first makes that difference the first word you read.
+
+### facelock data purge
+
+Destroy retained Facelock state: enrolled embeddings, the database and its
+sidecars, encryption keys and sealed blobs, models, enrollment markers, audit
+logs, snapshots and upgrade backups.
+
+This is the sanctioned way to destroy biometric data before uninstalling, and
+the only one. Package removal deliberately leaves retained state behind, so
+there is no removal path that also destroys data — see
+[`contracts.md`](contracts.md) under "Fixed-root purge boundary".
+
+```bash
+facelock data purge --dry-run                       # report what purge would find; removes nothing
+facelock data purge --allow-destruction             # destroy, after a confirmation prompt
+facelock data purge --allow-destruction --yes       # destroy without the prompt
+facelock data purge --allow-destruction --json      # destroy and emit the machine document
+facelock data purge --allow-destruction --yes --leave-activation-barred
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--allow-destruction` | false | Authorize irreversible destruction. Required; nothing else implies it |
+| `--yes` | false | Skip the confirmation prompt (also `--no-confirm`, `-y`) |
+| `--dry-run` | false | Report what purge would find and remove nothing |
+| `--leave-activation-barred` | false | Keep the daemon stopped and D-Bus activation barred afterwards |
+| `--json` | false | Emit the machine document instead of the human report |
+
+**Two gates, and neither implies the other.** `--yes` suppresses the
+confirmation prompt. `--allow-destruction` authorizes the destruction itself.
+A wrapper that passes `--yes` to every command so scripts run unattended has
+not thereby authorized a purge, and `--json` — which suppresses the prompt for
+the same reason it does on `facelock pam add`, because a question on stderr
+while a parser waits on stdout is a hang — does not authorize one either. This
+is the same split `facelock pam add` draws between `--yes` and
+`--allow-sensitive`.
+
+Root is required, and the check runs first: a non-root invocation refuses
+before the prompt, before the daemon is touched, and before anything is read.
+There is no `sudo` re-exec offer, because the command is typically invoked from
+an uninstall script where a stray prompt is a hang.
+
+**What is traversed.** Only the three compiled roots: `/etc/facelock`,
+`/var/lib/facelock`, `/var/log/facelock`. The roots themselves are never
+removed. Configuration cannot add a root. A configured path that points
+outside them — `daemon.model_dir`, `storage.db_path`, `encryption.key_path`,
+`encryption.sealed_key_path`, `audit.path`, `snapshots.dir` — is reported as an
+external remnant and left untouched; deciding what to do with it is yours.
+
+**What is refused.** Symbolic links, hard-linked files, non-regular objects,
+wrong ownership, group- or world-writable modes, anything on another mount, and
+anything below the 64-level depth or 10,000-entry caps. A refusal is reported,
+not worked around. `/var/lib/facelock/pam-backups` stays opaque unless it is
+already empty, because a remaining entry there is unresolved PAM cleanup
+evidence. `/etc/pam.d` is never traversed — use
+[`facelock pam remove`](#facelock-pam) for PAM lines.
+
+**The daemon during a purge.** Stopping `facelock-daemon.service` is not
+enough on its own: the D-Bus activation file lets any PAM `Authenticate` call
+restart it mid-traversal. So purge takes an exclusive lifecycle lock, bars
+activation, stops the daemon, and restores exactly the prior state when it
+finishes — including on error, on panic, and on `Ctrl-C`. An interrupt stops
+the traversal at a deletion boundary before the daemon is allowed back.
+
+`--leave-activation-barred` keeps the daemon stopped and masked after the purge,
+for a caller that uninstalls next. Face authentication stays off until the
+named barrier file is removed and `systemctl daemon-reload` runs, or until the
+machine reboots — the barrier lives on tmpfs.
+
+**Repeating a purge is safe.** Every refusal leaves the object in place, so a
+second run after fixing an ownership or link problem picks up what the first
+one could not prove safe.
+
+**Removing a name is not erasure.** Filesystem deletion does not securely erase
+SSDs, snapshots, or backups. The report says which names were removed and which
+remnants remain; it never describes purge as forensic destruction of biometric
+data.
+
+#### Reading the report
+
+The exit status is 0 whenever the purge ran, whatever it could not remove — a
+safety refusal is a reported outcome, not a crash, and the same rule the Debian
+purge follows so a failed removal cannot strand a half-purged install. **The
+report, not the exit code, is the answer.** A run that retained anything says
+so in the negative and never claims completeness:
+
+```
+Removed 14 name(s) from the compiled Facelock roots.
+2 object(s) inside the roots were retained:
+  /var/lib/facelock/facelock.db — regular file has 2 links
+  /etc/facelock/config.toml — symbolic link
+1 configured path(s) lie outside the compiled roots and were left untouched by design:
+  storage.db_path = /srv/faces/faces.db
+Facelock data was NOT completely destroyed. The remnants above are still
+present; re-run after resolving them, or remove the external paths yourself.
+Removing a name is not erasure. Filesystem deletion does not securely erase
+SSDs, snapshots, or backups.
+```
+
+With `--json`, branch on `complete` — it is the engine's own verdict, false
+whenever a remnant, an external path, an unclassifiable configuration or an
+interrupt occurred:
+
+```json
+{
+  "removed": [{"logical": "/var/lib/facelock/enrolled/alice", "kind": "File"}],
+  "remnants": [
+    {
+      "logical": "/var/lib/facelock/facelock.db",
+      "kind": "HardLink",
+      "detail": "regular file has 2 links"
+    }
+  ],
+  "external": [{"field": "storage.db_path", "path": "/srv/faces/faces.db"}],
+  "config_note": null,
+  "complete": false,
+  "interrupted": false,
+  "secure_erasure": false,
+  "activation_barred": false,
+  "activation_barrier_path": null
+}
+```
+
+`secure_erasure` is a constant `false`, present so no consumer has to infer it.
+
 ## User Resolution
 
 For commands that accept `--user`:
