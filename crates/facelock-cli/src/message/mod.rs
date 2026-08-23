@@ -519,6 +519,8 @@ mod tests {
     /// domain module pins its own alongside its `Samples` list.
     #[test]
     fn face_access_and_pam_fallback_is_byte_identical() {
+        // Asserts rendered text, so it serializes against the locale mutator.
+        let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             FaceMessage::EnrollComplete {
                 model_id: 3,
@@ -645,6 +647,8 @@ mod tests {
     /// has never reached.
     #[test]
     fn quiet_silences_stdout_except_notice() {
+        // Asserts rendered text, so it serializes against the locale mutator.
+        let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
         let msg = FaceMessage::ModelsRequired;
         let text = "Models required. Run `facelock setup` to download them.";
 
@@ -679,6 +683,11 @@ mod tests {
     /// not accept. The composed bytes are the ones these prompts always had.
     #[test]
     fn answer_hints_are_appended_not_translated() {
+        // The .mo fixture below translates this test's msgid ("Run setup
+        // now?"), so of all the locale readers this is the one the lock is
+        // load-bearing for: unserialized, the English pin fails whenever the
+        // fixture's LANGUAGE=xx window is open on another thread.
+        let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             AccessMessage::SudoReexecPrompt.localized(),
             "Root required. Re-run with sudo?",
@@ -715,6 +724,8 @@ mod tests {
     /// substituted — a leftover `{name}` means a template/argument mismatch.
     #[test]
     fn no_unfilled_placeholders() {
+        // Asserts rendered text, so it serializes against the locale mutator.
+        let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
         fn sweep<M: Message + Samples>() {
             for msg in M::samples() {
                 let rendered = msg.localized();
@@ -778,6 +789,8 @@ mod tests {
     /// Unknown msgids fall back to the input string (no catalog installed).
     #[test]
     fn translate_falls_back_to_msgid() {
+        // Asserts rendered text, so it serializes against the locale mutator.
+        let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
         // Via a binding so xgettext (which extracts literal `translate("...")`
         // calls) does not sweep this probe into the catalog.
         let probe = "facelock test msgid that no catalog contains";
@@ -798,6 +811,8 @@ mod tests {
     /// `fail` produces an error whose Display is the localized rendering.
     #[test]
     fn fail_renders_localized_display() {
+        // Asserts rendered text, so it serializes against the locale mutator.
+        let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
         let err = fail(FaceMessage::ModelsRequired);
         assert_eq!(
             format!("{err}"),
@@ -811,12 +826,16 @@ mod tests {
     /// end to end.
     ///
     /// Locale plumbing is process-global, so this test is written to be
-    /// harmless to concurrent tests: the fixture translates exactly one
-    /// msgid ("Run setup now?"), which no other test pins in English, and
-    /// everything is restored on exit. If the environment offers no usable
-    /// non-C locale (LANGUAGE is ignored under "C"), the lookup assertions
-    /// are skipped; the manual recipe in the module docs of `just pot`
-    /// covers that case.
+    /// harmless to concurrent tests, on two legs: the domain is rebound to
+    /// the fixture tempdir *before* the locale leaves "C", so a concurrent
+    /// `dgettext` inside the window can only hit the fixture catalog, where
+    /// every msgid the fixture omits misses back to English; and every test
+    /// that asserts rendered text holds [`LOCALE_MUTATION`] alongside this
+    /// one (see its doc for the rule, and for what growing the fixture
+    /// obliges). Everything is restored on exit. If the environment offers
+    /// no usable non-C locale (LANGUAGE is ignored under "C"), the lookup
+    /// assertions are skipped; the manual recipe in the module docs of
+    /// `just pot` covers that case.
     #[test]
     fn mo_catalog_lookup_translates_localized_but_not_machine() {
         let dir = tempfile::tempdir().unwrap();
@@ -828,14 +847,13 @@ mod tests {
         )
         .unwrap();
 
-        // A non-C locale for LC_MESSAGES, else glibc ignores LANGUAGE.
-        //
         // SAFETY: setlocale is MT-Unsafe and cargo runs tests on parallel
         // threads, so this is the one call site that cannot appeal to being
-        // single-threaded. `LOCALE_MUTATION` serializes locale-mutating tests
-        // against each other; what remains is a window of a few lines against
-        // plain dgettext calls, which is why the fixture translates a single
-        // msgid no other test pins.
+        // single-threaded. `LOCALE_MUTATION` serializes this mutation window
+        // against every test that asserts what `translate()` renders — the
+        // readers hold the same lock, not just other mutators. What remains
+        // outside the lock are dgettext calls that assert nothing, and the
+        // binding order below keeps those on the English fallback anyway.
         let _locale = LOCALE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
         let original = unsafe { setlocale(libc::LC_MESSAGES, std::ptr::null()) };
         let original: CString = if original.is_null() {
@@ -843,22 +861,31 @@ mod tests {
         } else {
             unsafe { CStr::from_ptr(original) }.to_owned()
         };
+
+        // Rebind to the fixture *before* the locale leaves "C": from here to
+        // the restore, a concurrent dgettext can only consult the fixture
+        // catalog — never /usr/share/locale, whatever LANGUAGE the machine
+        // exports — so a msgid outside the fixture cannot render as anything
+        // but English no matter how this window interleaves. A fresh binding
+        // also invalidates glibc's per-domain catalog cache.
+        let c_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+        bindtextdomain(GETTEXT_DOMAIN.as_ptr(), c_dir.as_ptr());
+        bind_textdomain_codeset(GETTEXT_DOMAIN.as_ptr(), c"UTF-8".as_ptr());
+
+        // A non-C locale for LC_MESSAGES, else glibc ignores LANGUAGE.
         // C.UTF-8 is still a C-family locale for gettext purposes: glibc
         // deliberately ignores LANGUAGE there even though setlocale accepts it.
         let usable = [c"en_US.UTF-8", c"en_US.utf8"]
             .into_iter()
             .find(|l| !unsafe { setlocale(libc::LC_MESSAGES, l.as_ptr()) }.is_null());
         if usable.is_none() {
+            bindtextdomain(GETTEXT_DOMAIN.as_ptr(), c"/usr/share/locale".as_ptr());
             eprintln!("skipping .mo lookup assertions: no usable non-C locale in this environment");
             return;
         }
 
         // SAFETY: process-global env mutation in a test; restored below.
         unsafe { std::env::set_var("LANGUAGE", "xx") };
-        let c_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
-        // A fresh binding also invalidates glibc's per-domain catalog cache.
-        bindtextdomain(GETTEXT_DOMAIN.as_ptr(), c_dir.as_ptr());
-        bind_textdomain_codeset(GETTEXT_DOMAIN.as_ptr(), c"UTF-8".as_ptr());
 
         let localized = FaceMessage::ConfirmRunSetupNow.localized();
         let machine = FaceMessage::ConfirmRunSetupNow.machine();
@@ -880,8 +907,24 @@ mod tests {
         );
     }
 
-    /// Held across every test that calls `setlocale`, so two of them cannot
-    /// interleave their save/mutate/restore sequences.
+    /// Held by the locale mutator and by its possible observers, so a
+    /// mutation window and an assertion about rendered text cannot
+    /// interleave. Two kinds of test take it:
+    ///
+    /// - any test that mutates locale state (`setlocale`, `LANGUAGE`,
+    ///   `bindtextdomain`) — today only the `.mo` fixture test above;
+    /// - any test that asserts what `translate()`/`localized()` renders.
+    ///   Every such test in this module takes it. A rendering-asserting test
+    ///   in another file needs it only if it pins a msgid the fixture
+    ///   translates: the mutator rebinds the domain to its tempdir before
+    ///   the locale leaves "C", so every other msgid renders as the English
+    ///   fallback straight through the window.
+    ///
+    /// Growing the fixture (`build_mo` in the test above) therefore means
+    /// grepping the workspace for pins of the new msgid and locking them
+    /// first. "Run setup now?" is pinned by
+    /// `answer_hints_are_appended_not_translated`, which is why that test
+    /// locks.
     static LOCALE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Minimal GNU MO encoder: header entry plus the given pairs.
