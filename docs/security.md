@@ -555,19 +555,26 @@ sealed under one camera cannot be decrypted under another — the cryptographic 
 the advisory device coupling in §1.D. Default off: hard binding fails closed on unstable or
 absent device ids, so it is opt-in only.
 
-**TPM PCR binding is enforced (finding #5).** With `tpm.pcr_binding = true`, the sealed key
-object is created with `userWithAuth = false` and its PCR selection is recorded in the sealed
-blob (version byte `0x03`). Unseal starts a *real* policy session and replays `PolicyPCR`
-against the current PCRs, so a firmware/kernel change to a bound PCR makes the key refuse to
-unseal (face auth then falls through to password). Recovery is `sudo facelock tpm reseal`, which
-re-seals the key under the current PCR state (recovering the key from the existing blob if the
-PCRs still match, otherwise from the `encryption.key` backup). **Keeping that plaintext
-`encryption.key` backup is the recommended setup**: it makes reseal recovery painless — no
-re-enrollment after a firmware/kernel PCR change. The honest tradeoff is that, while the backup
-exists, the `tpm` method's at-rest confidentiality against anyone who can read the file reduces
-to that keyfile's `0600` (root-only) protection. `pcr_binding` remains **default false** —
-enabling it is a deliberate operator choice that commits to the reseal workflow. See
-`docs/configuration.md` for the `[encryption]` and `[tpm]` sections.
+**TPM PCR binding is implemented and enforced when enabled; it is opt-in by default
+(`tpm.pcr_binding`, finding #5).** With `tpm.pcr_binding = true`, the sealed key object is
+created with `userWithAuth = false` and its PCR selection is recorded in the sealed blob
+(version byte `0x03`). Unseal starts a *real* policy session and replays `PolicyPCR` against
+the current PCRs, so a firmware/kernel change to a bound PCR makes the key refuse to unseal
+(face auth then falls through to password).
+
+**Recovery is `sudo facelock tpm reseal`.** It re-seals the AES key under the current PCR
+state, recovering the key by unsealing the existing blob when the PCRs still match, and
+falling back to the plaintext `encryption.key` backup once they have moved. Because it prefers
+the still-valid blob, it is safe to run proactively before a firmware or kernel update.
+`facelock tpm unseal-check` reports which of the two recovery paths a machine is on.
+
+**Why the default stays off.** The recommended setup keeps a plaintext `encryption.key`
+backup, so a PCR change costs a reseal instead of a re-enrollment. While that backup exists,
+PCR binding buys nothing against an attacker with disk access: the AES key sits beside the
+sealed blob in `/etc/facelock`, protected only by that file's `0600` root-only mode. Binding
+is worth enabling when the backup lives off the machine and the operator accepts
+re-enrollment as the failure mode. See `docs/configuration.md` for the `[encryption]` and
+`[tpm]` sections, and `docs/cli.md` for `facelock tpm reseal`.
 
 #### D. Debian purge traversal (Implemented)
 
