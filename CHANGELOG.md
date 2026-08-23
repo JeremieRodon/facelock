@@ -619,6 +619,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password), and a failed model-list read (which folded into an empty
   compare set, a guaranteed no-match that charged the rate limit — the
   hazard the daemon handler refuses per C3/#105).
+
+- **PAM oneshot fallback matches the daemon transport class for class**
+  (#141): `pam_facelock.so` now maps `facelock auth` exit 3 (rate limited) to
+  `PAM_AUTH_ERR` and exit 4 (suppressed) to `PAM_AUTHINFO_UNAVAIL`, the same
+  consequences the daemon transport gives those classes, so daemon
+  unavailability no longer softens rate limiting under `required`/`requisite`
+  stacks. Exit 5 (all frames dark), unknown codes, and a signal-killed binary
+  abstain (`PAM_IGNORE`). The module's table and the binary's are pinned
+  against each other by a cross-crate test, and each code is exercised
+  end-to-end through libpam in the container tier.
 - **Debian PAM and daemon package lifecycle is opt-in and state-preserving**
   (#224): direct `pam add`/`setup --pam` now refuses an already-selected exact
   `pam-auth-update` profile before writing, using fixed-root no-follow evidence

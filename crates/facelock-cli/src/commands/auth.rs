@@ -858,6 +858,60 @@ mod tests {
         );
     }
 
+    /// The PAM module's half of the exit-code contract, compiled from its
+    /// actual source. `pam_facelock.so` cannot be linked here (its
+    /// dependency ceiling is libc/toml/serde/zbus, and the crate builds only
+    /// a cdylib), so the module's mapping table is `include!`d — the same
+    /// bytes `pam-facelock` compiles — and pinned against
+    /// [`oneshot_exit_code`]'s emission table below. Without this the two
+    /// halves live in different crates and drift silently.
+    mod pam_oneshot_map {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pam-facelock/src/oneshot_exit.rs"
+        ));
+    }
+
+    /// Transport parity, class for class (#141): the code the binary emits
+    /// for a rejection class must map, in the module's oneshot table, to the
+    /// PAM code the daemon transport gives the same class (docs/contracts.md,
+    /// "PAM Semantics"). Daemon unavailability must not change what PAM
+    /// concludes about a rate-limited, suppressed, or dark attempt.
+    #[test]
+    fn oneshot_exit_codes_map_to_the_daemon_transports_pam_codes() {
+        use pam_oneshot_map as pam;
+        for kind in ErrorKind::ALL {
+            // The daemon transport's consequence for this class: the module
+            // substring-matches the frozen "rate limited" message to
+            // PAM_AUTH_ERR and maps every other recoverable error message to
+            // PAM_IGNORE (`pam_code_for_daemon_error`).
+            let daemon_code = match kind {
+                ErrorKind::RateLimited => pam::PAM_AUTH_ERR,
+                _ => pam::PAM_IGNORE,
+            };
+            assert_eq!(
+                pam::classify(oneshot_exit_code(*kind)).pam_code,
+                daemon_code,
+                "{kind:?}: the transports disagree"
+            );
+        }
+        // Suppressed: the daemon's `-3` sentinel maps to PAM_AUTHINFO_UNAVAIL.
+        assert_eq!(
+            pam::classify(EXIT_SUPPRESSED).pam_code,
+            pam::PAM_AUTHINFO_UNAVAIL
+        );
+        // Invariant 1: the permanent codes.
+        assert_eq!(pam::classify(0).pam_code, pam::PAM_SUCCESS);
+        assert_eq!(pam::classify(1).pam_code, pam::PAM_AUTH_ERR);
+        assert_eq!(pam::classify(2).pam_code, pam::PAM_IGNORE);
+        // Invariant 3: a code the module does not know abstains, so a newer
+        // binary (or a signal death, read as 2) never hardens the stack.
+        for unknown in [6, 42, 101, 255] {
+            assert_eq!(pam::classify(unknown).pam_code, pam::PAM_IGNORE);
+        }
+    }
+
     /// The suppressed outcome is not an `ErrorKind`, so it has no row in the
     /// coupling table; its exit code is pinned here instead. 4 is frozen
     /// protocol: the module maps it to PAM_AUTHINFO_UNAVAIL, the same

@@ -62,6 +62,18 @@ COPY test/container-config.toml /etc/facelock/config.toml
 # Facelock-test PAM config for pamtester
 COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
 
+# facelock-map-* fixtures for the oneshot exit-code mapping tests (#141),
+# staged OUTSIDE /etc/pam.d: they name pam_facelock.so, and the Arch package
+# removal hook (exercised by run-arch-package-systemd.sh in this same image)
+# treats any /etc/pam.d reference it does not own as administrator-managed
+# and blocks removal. run-container-tests.sh installs them into /etc/pam.d
+# for the duration of the mapping block only.
+COPY test/pam.d/facelock-map-success \
+     test/pam.d/facelock-map-autherr \
+     test/pam.d/facelock-map-authinfo \
+     test/pam.d/facelock-map-ignore \
+     /facelock-map-pam.d/
+
 # Fake daemon harness for the PAM peer-UID container test (plan 05)
 COPY test/fake-facelock-daemon.py /fake-facelock-daemon.py
 

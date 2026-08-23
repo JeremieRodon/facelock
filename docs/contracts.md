@@ -2040,7 +2040,14 @@ The binary's half of the table is pinned in
 `crates/facelock-cli/src/commands/auth.rs`
 (`every_rejection_class_pins_its_message_audit_label_and_exit_code`,
 `rejection_classes_never_claim_the_match_codes`,
-`the_preflight_short_circuit_pins_its_non_error_codes`).
+`the_preflight_short_circuit_pins_its_non_error_codes`). The module's half
+lives in `crates/pam-facelock/src/oneshot_exit.rs`, a dependency-free file
+that `facelock-cli`'s test suite `include!`s to pin the two halves against
+each other class for class
+(`oneshot_exit_codes_map_to_the_daemon_transports_pam_codes`) — the module
+cannot be linked there, so sharing the source is what couples them. The
+live module is exercised per code by the `facelock-map-*` fixtures in
+`test/run-container-tests.sh`.
 
 ## Release Channels and APT Paths
 
@@ -3375,6 +3382,7 @@ the module falls through (oneshot fallback / password), never `PAM_SUCCESS`.
 | IR required / unverified Y16 texture scale / internal daemon error (model_id -2) | `PAM_IGNORE` (25) — no oneshot fallback |
 | Suppressed (model_id -3) | `PAM_AUTHINFO_UNAVAIL` (9) |
 | Daemon unavailable / untrusted (non-root) peer | oneshot fallback, else `PAM_IGNORE` (25) |
+| Oneshot fallback (and `mode = "oneshot"`) | per the `facelock auth` exit-code table above: 0 → `PAM_SUCCESS`, 1/3 → `PAM_AUTH_ERR`, 4 → `PAM_AUTHINFO_UNAVAIL`, 2/5/unknown/signal death → `PAM_IGNORE` |
 | Config missing, unparseable, or untrusted (not root-owned / group- or world-writable, incl. parents) | `PAM_IGNORE` (25) |
 | Timeout (structured zbus timeout or overall deadline) | `PAM_AUTH_ERR` (7) |
 
