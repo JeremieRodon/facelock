@@ -48,6 +48,10 @@ pub enum RemnantKind {
     ExternalHardLink,
     /// An inspect, open, enumerate, unlink, or rmdir syscall failed.
     Inaccessible,
+    /// The caller interrupted the purge before this root was fully
+    /// processed. Distinct from a safety refusal: nothing was proven unsafe,
+    /// and the retained entries are deliberately not enumerated.
+    Interrupted,
 }
 
 /// A retained object inside a compiled root.

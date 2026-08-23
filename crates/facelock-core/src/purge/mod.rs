@@ -40,7 +40,10 @@
 //!
 //! The engine takes no locks and does not stop the daemon; lifecycle
 //! exclusion (daemon stop, lock, D-Bus activation inhibition) and the CLI
-//! surface are owned by sibling changes.
+//! surface are owned by sibling changes. For composition with the lifecycle
+//! lease, [`purge_with_interrupt`] polls a caller-owned flag before every
+//! unlink and rmdir and returns a partial report naming what was removed and
+//! which roots were cut short.
 
 mod config_scan;
 mod engine;
@@ -48,7 +51,9 @@ mod fd;
 mod mounts;
 mod report;
 
-pub use engine::{PurgeError, PurgeOptions, TestEnvironment, purge, report_remnants};
+pub use engine::{
+    PurgeError, PurgeOptions, TestEnvironment, purge, purge_with_interrupt, report_remnants,
+};
 pub use report::{
     ExternalRemnant, PurgeReport, Remnant, RemnantKind, Removed, RemovedKind, sanitize_for_display,
 };

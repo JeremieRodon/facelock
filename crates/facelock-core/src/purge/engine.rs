@@ -12,6 +12,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::config_scan;
 use super::fd::{
@@ -30,6 +31,13 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Bounded number of quarantine name candidates before giving up.
 const MAX_QUARANTINE_ATTEMPTS: u32 = 32;
+
+/// Remnant detail for a subtree retained because the caller interrupted the
+/// purge. Like the node-cap case, retained entries are deliberately not
+/// enumerated: the report names the containing root rather than implying only
+/// one entry remains.
+const INTERRUPTED_DETAIL: &str =
+    "purge interrupted; entries in this root that were not yet processed are retained";
 
 /// Options construction failures. The engine itself never fails: every
 /// runtime refusal becomes a reported remnant instead, because a safety
@@ -175,14 +183,35 @@ impl std::fmt::Debug for PurgeOptions {
 /// themselves are never removed. Success removes names only — it is not
 /// physical erasure of media.
 pub fn purge(options: &PurgeOptions) -> PurgeReport {
-    run(options, Mode::Purge)
+    // A never-set flag: the uninterruptible entry point is a thin wrapper.
+    let never = AtomicBool::new(false);
+    run(options, Mode::Purge, &never)
+}
+
+/// [`purge`], but polling `interrupt` at every deletion boundary.
+///
+/// Each unlink and each rmdir happens inside one traversal step, and every
+/// step begins by loading the flag, so no deletion starts after the flag is
+/// observed set. At most the single in-flight deletion transaction completes
+/// (or safely restores) after the flag rises; quarantine transactions never
+/// straddle a poll, so an interrupt cannot strand an object under a
+/// quarantine name.
+///
+/// On interrupt the engine stops deleting and still returns a report: names
+/// removed so far are listed exactly, and every root whose processing was cut
+/// short (or never started) is reported as a [`RemnantKind::Interrupted`]
+/// remnant, so [`PurgeReport::is_complete`] is false and the caller can name
+/// what remains.
+pub fn purge_with_interrupt(options: &PurgeOptions, interrupt: &AtomicBool) -> PurgeReport {
+    run(options, Mode::Purge, interrupt)
 }
 
 /// Classify configured external paths and report remnants without deleting
 /// anything (the reference implementation's `report` operation, run at
 /// package removal time).
 pub fn report_remnants(options: &PurgeOptions) -> PurgeReport {
-    run(options, Mode::Report)
+    let never = AtomicBool::new(false);
+    run(options, Mode::Report, &never)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -191,7 +220,17 @@ enum Mode {
     Purge,
 }
 
-fn run(options: &PurgeOptions, mode: Mode) -> PurgeReport {
+fn run(options: &PurgeOptions, mode: Mode, interrupt: &AtomicBool) -> PurgeReport {
+    if interrupt.load(Ordering::SeqCst) {
+        // Interrupted before any work: report promptly without touching disk.
+        let mut reporter = Reporter::default();
+        if let Mode::Purge = mode {
+            for logical in PURGE_ROOTS {
+                reporter.remnant(logical, RemnantKind::Interrupted, INTERRUPTED_DETAIL);
+            }
+        }
+        return reporter.into_report();
+    }
     let mounts = match MountTable::load(&options.mountinfo_path) {
         Ok(mounts) => mounts,
         Err(err) => {
@@ -218,10 +257,18 @@ fn run(options: &PurgeOptions, mode: Mode) -> PurgeReport {
         options,
         mounts,
         reporter: Reporter::default(),
+        interrupt,
     };
     ctx.inspect_external_configuration();
     if let Mode::Purge = mode {
         for logical in PURGE_ROOTS {
+            if ctx.interrupted() {
+                // Roots not yet processed are retained wholesale; keep
+                // reporting so every unfinished root is named.
+                ctx.reporter
+                    .remnant(logical, RemnantKind::Interrupted, INTERRUPTED_DETAIL);
+                continue;
+            }
             if ctx.reporter.is_protected(logical) {
                 continue;
             }
@@ -356,9 +403,14 @@ struct Ctx<'a> {
     options: &'a PurgeOptions,
     mounts: MountTable,
     reporter: Reporter,
+    interrupt: &'a AtomicBool,
 }
 
 impl Ctx<'_> {
+    fn interrupted(&self) -> bool {
+        self.interrupt.load(Ordering::SeqCst)
+    }
+
     fn pause(&self, point: PausePoint, logical: &str) {
         if let Some(hook) = &self.options.pause {
             hook(point, logical);
@@ -805,6 +857,15 @@ impl Ctx<'_> {
         }];
         let mut nodes_seen: u64 = 0;
         while let Some(top) = stack.last_mut() {
+            // The cancellation boundary. Every unlink and rmdir happens
+            // inside exactly one iteration, so polling here is a check
+            // before each deletion; once the flag is observed set, no
+            // further deletion starts in any root.
+            if self.interrupted() {
+                self.reporter
+                    .remnant(root.logical, RemnantKind::Interrupted, INTERRUPTED_DETAIL);
+                return;
+            }
             let entry = top.stream.next_entry();
             let name = match entry {
                 Err(err) => {
@@ -2410,5 +2471,110 @@ mod tests {
         let mut file = dir;
         file.mode = libc::S_IFREG | 0o755;
         assert!(!trusted_directory(&file, 0, 0));
+    }
+
+    #[test]
+    fn preset_interrupt_reports_all_roots_and_deletes_nothing() {
+        require_unprivileged!();
+        let fx = Fixture::new();
+        fx.write("/var/lib/facelock/facelock.db", "embeddings");
+        let flag = AtomicBool::new(true);
+
+        let report = purge_with_interrupt(&fx.options(), &flag);
+
+        for root in PURGE_ROOTS {
+            assert_eq!(remnant(&report, root).kind, RemnantKind::Interrupted);
+        }
+        assert!(report.removed.is_empty());
+        assert!(!report.is_complete());
+        assert!(fx.path("/var/lib/facelock/facelock.db").exists());
+    }
+
+    #[test]
+    fn interrupt_mid_traversal_stops_deleting_and_accounts_exactly() {
+        require_unprivileged!();
+        let fx = Fixture::new();
+        let files: Vec<String> = (0..5)
+            .map(|index| format!("/var/lib/facelock/file-{index}"))
+            .collect();
+        for logical in &files {
+            fx.write(logical, "data");
+        }
+        let sentinel = fx.outside("sentinel");
+        fs::write(&sentinel, "must survive").expect("write");
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let flag_for_hook = flag.clone();
+        let options = fx
+            .options()
+            .with_pause_hook(Box::new(move |point, logical| {
+                if point == PausePoint::BeforeRegularDelete && logical == "/var/lib/facelock/file-2"
+                {
+                    flag_for_hook.store(true, Ordering::SeqCst);
+                }
+            }));
+
+        let report = purge_with_interrupt(&options, &flag);
+
+        // The single in-flight deletion completes; nothing after it starts.
+        assert!(removed(&report, "/var/lib/facelock/file-2"));
+        assert_eq!(
+            remnant(&report, "/var/lib/facelock").kind,
+            RemnantKind::Interrupted
+        );
+        assert!(!report.is_complete());
+        // Exact accounting: a file is in the removed list iff it is gone.
+        for logical in &files {
+            assert_eq!(
+                removed(&report, logical),
+                !fx.path(logical).exists(),
+                "removed list and disk state disagree for {logical}"
+            );
+        }
+        // A root never reached is reported, not silently skipped; the root
+        // finished before the flag rose carries no interrupt remnant.
+        assert_eq!(
+            remnant(&report, "/var/log/facelock").kind,
+            RemnantKind::Interrupted
+        );
+        assert!(
+            !report
+                .remnants
+                .iter()
+                .any(|entry| entry.logical == "/etc/facelock")
+        );
+        assert_eq!(fs::read(&sentinel).expect("read"), b"must survive");
+    }
+
+    #[test]
+    fn interrupt_after_the_last_file_deletion_still_reports_partial() {
+        require_unprivileged!();
+        let fx = Fixture::new();
+        fx.mkdir("/var/lib/facelock/dir");
+        fx.write("/var/lib/facelock/dir/only", "data");
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let flag_for_hook = flag.clone();
+        let options = fx
+            .options()
+            .with_pause_hook(Box::new(move |point, logical| {
+                if point == PausePoint::BeforeRegularDelete
+                    && logical == "/var/lib/facelock/dir/only"
+                {
+                    flag_for_hook.store(true, Ordering::SeqCst);
+                }
+            }));
+
+        let report = purge_with_interrupt(&options, &flag);
+
+        assert!(removed(&report, "/var/lib/facelock/dir/only"));
+        assert!(!fx.path("/var/lib/facelock/dir/only").exists());
+        // The wind-down rmdir of the now-empty parent is itself a deletion
+        // and must not run once the flag is up.
+        assert!(fx.path("/var/lib/facelock/dir").is_dir());
+        assert!(!removed(&report, "/var/lib/facelock/dir"));
+        assert_eq!(
+            remnant(&report, "/var/lib/facelock").kind,
+            RemnantKind::Interrupted
+        );
+        assert!(!report.is_complete());
     }
 }
