@@ -1719,27 +1719,24 @@ command uses exactly one:
 
 - **Interactive prompt.** `setup`, `enroll`, `test`, `preview`, `bench`,
   `tpm` (including `tpm encrypt`, `tpm decrypt` and `tpm reseal`),
-  `daemon run`, `daemon restart`, `config edit`, `remove`, `clear`, `list`,
+  `daemon restart`, `config edit`, `remove`, `clear`, `list`,
   `status`, `devices`. Run as non-root with a TTY attached,
   these ask `Root required. Re-run with sudo? [Y/n]` and re-exec via `sudo`
   on yes. Run as non-root with no TTY (scripted, piped, or closed stdin),
   they hard-error instead — `Root required.\n  Run: sudo facelock <cmd>` —
   rather than hang waiting for input that will never arrive
   (`ipc_client::require_root`).
-- **Hard error only.** `facelock pam add`, `facelock pam remove` and
-  `facelock audit` never offer the interactive prompt at all, even with a TTY
-  attached — each is typically invoked non-interactively or by a wrapper,
-  where a stray confirmation prompt is a hang, not a convenience
-  (`ipc_client::require_root_scripted`).
+- **Hard error only.** `facelock daemon run`, `facelock pam add`,
+  `facelock pam remove` and `facelock audit` never offer the interactive
+  prompt at all, even with a TTY attached — each is typically invoked
+  non-interactively or by a wrapper, where a stray confirmation prompt is a
+  hang, not a convenience (`ipc_client::require_root_scripted`).
 
-`facelock daemon run` is listed above under **interactive prompt** because
-that is what `commands::daemon::run` calls (`ipc_client::require_root`), not
-because a service manager should ever meet a prompt. Earlier revisions of this
-table claimed it was hard-error-only; the code has always said otherwise, and
-this row now matches the code. Under systemd there is no TTY, so the branch
-taken is the hard error either way.
-[#188](https://github.com/tyvsmith/facelock/issues/188) tracks whether it
-should be scripted.
+`facelock daemon run` is in the hard-error class because every shipped
+service unit invokes it, and a service manager must never be what a
+confirmation prompt is waiting on. `daemon restart` keeps the prompt: a human
+types it. Run by hand as a non-root user, `daemon run` refuses with the same
+`Run: sudo facelock daemon run` hint a unit would get, TTY or not.
 
 `facelock pam add|remove` are in the hard-error class because the surface they
 replace was: standalone `setup --pam` bailed from its own root check rather

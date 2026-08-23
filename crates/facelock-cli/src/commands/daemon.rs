@@ -295,7 +295,11 @@ pub fn restart() -> anyhow::Result<()> {
 /// `paths::config_path()` both read — so startup, the live reload and the
 /// mtime watch cannot disagree about which file is the config.
 pub fn run(notifier_factory: NotifierFactory, verbose: u8) -> anyhow::Result<()> {
-    crate::ipc_client::require_root("sudo facelock daemon run")?;
+    // Scripted, not interactive (issue #188): every shipped service unit
+    // invokes this verb, and a unit has nobody to answer "Re-run with sudo?
+    // [Y/n]" — the prompt would be a hang, not a convenience. `daemon
+    // restart` above stays interactive because a human types it.
+    crate::ipc_client::require_root_scripted("sudo facelock daemon run")?;
 
     // Init tracing (the daemon is the one caller that wants targets rendered,
     // and the one that keeps INFO by default: the journal is its reader, and
