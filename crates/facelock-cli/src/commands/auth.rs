@@ -1,6 +1,10 @@
 //! One-shot authentication subcommand.
 //!
-//! Exit codes: 0 = matched, 1 = no match/timeout, 2 = error.
+//! Exit codes: 0 = matched, 1 = scanned and not matched, 2 = error / no
+//! opinion, 3 = rate limited, 4 = suppressed, 5 = all frames dark. The full
+//! table and its compatibility invariants are frozen in docs/contracts.md
+//! ("facelock auth Exit Codes"); [`oneshot_exit_code`] and
+//! [`EXIT_SUPPRESSED`] are the implementation.
 
 use std::path::Path;
 
@@ -113,17 +117,15 @@ pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
         &caps,
         AuditSource::Oneshot,
     ) {
-        // Every pre-flight rejection exits 2 ("error"), which the PAM module
-        // maps to PAM_IGNORE — the same code the deleted mirror used for each
-        // gate, so a rate-limited or not-enrolled user still falls through to
-        // password rather than registering a failed match (exit 1). The
-        // suppressed / not-enrolled / rate-limited distinction is carried by
-        // the audit record and the tracing output, not the exit code.
-        //
-        // `oneshot_exit_code` is the single table, so the recommendation to
-        // stop collapsing these classes has one place to land. It cannot
-        // change anything today: no pre-flight gate produces the one class
-        // that maps to 1 (the camera is not open yet).
+        // Each pre-flight rejection exits under its class's own code
+        // (#141), so the PAM module can give it the same consequence the
+        // daemon transport does instead of reading every rejection as "no
+        // opinion" (exit 2) — which is what daemon unavailability used to
+        // buy: a rate-limited user's PAM_AUTH_ERR softened to PAM_IGNORE
+        // whenever PAM fell back to this path. A module older than the split
+        // maps the new codes back to PAM_IGNORE, exactly the collapsed
+        // behavior it always had. The table and its invariants are frozen in
+        // docs/contracts.md ("facelock auth Exit Codes").
         debug!(?resp, "pre-check short-circuit");
 
         // The only marker work a *rejected* attempt performs, and the reason
@@ -132,10 +134,7 @@ pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
         // side of the rate limiter when a marker *write* is not.
         clear_marker_the_store_contradicts(&config, &store, &user);
 
-        return match resp {
-            AuthOutcome::Error { kind, .. } => oneshot_exit_code(kind),
-            _ => 2,
-        };
+        return preflight_exit_code(&resp);
     }
 
     // The user's model list, read before anything opens the camera. The
@@ -295,8 +294,10 @@ pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
             failure_reason,
             ..
         }) => {
-            // Exit code stays 1 (PAM falls through to password); the reason is
-            // diagnostic only.
+            // Exit 1 means exactly this arm: the scan ran and did not match.
+            // The camera-failure class that used to share it (all frames
+            // dark) now exits under its own code, so this is the only place
+            // the binary can say "not you". The reason is diagnostic only.
             info!(
                 user = %user,
                 similarity = format!("{similarity:.4}"),
@@ -307,8 +308,10 @@ pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
         }
         AuthOutcome::Cancelled => {
             // Already audited as `cancelled` by the auth loop. Exit 2 is the
-            // existing "no opinion" code, which PAM maps to PAM_IGNORE — the
-            // contract is unchanged, nothing new is added to it.
+            // "no opinion" code, which every module generation maps to
+            // PAM_IGNORE — the same abstention the daemon transport's frozen
+            // "cancelled" message produces. An abandoned attempt gets no code
+            // of its own: it is the absence of an answer, not a class of one.
             info!(user = %user, duration_ms, "cancelled");
             2
         }
@@ -514,6 +517,31 @@ fn register_cancel_signals(cancel: &CancelToken) {
     }
 }
 
+/// Exit code for [`AuthOutcome::Suppressed`] (#141). Not an [`ErrorKind`],
+/// so it cannot have a row in [`oneshot_exit_code`]'s exhaustive match; this
+/// constant is its entry in the same frozen table (docs/contracts.md,
+/// "facelock auth Exit Codes"). A module that knows the code maps it to
+/// PAM_AUTHINFO_UNAVAIL — the consequence the daemon transport's `-3`
+/// sentinel already had — and an older module maps it to PAM_IGNORE, the
+/// collapsed pre-#141 behavior.
+const EXIT_SUPPRESSED: i32 = 4;
+
+/// The process exit code for a pre-flight short-circuit outcome.
+///
+/// Split from its one call site so the non-`Error` arms are pinned by test
+/// the same way [`oneshot_exit_code`]'s table is.
+fn preflight_exit_code(resp: &AuthOutcome) -> i32 {
+    match resp {
+        AuthOutcome::Error { kind, .. } => oneshot_exit_code(*kind),
+        AuthOutcome::Suppressed => EXIT_SUPPRESSED,
+        // Not-enrolled without `suppress_unknown` (the daemon transport's
+        // plain `-1` reply) and anything unforeseen: "no opinion". The camera
+        // never opened on this path, so exit 1's "scanned and not matched" is
+        // not available to it by construction.
+        _ => 2,
+    }
+}
+
 /// The process exit code for a rejection of class `kind`.
 ///
 /// The oneshot binary is spawned by the PAM module, which turns this number
@@ -522,23 +550,36 @@ fn register_cancel_signals(cancel: &CancelToken) {
 ///
 /// Exhaustive on purpose: a new class must be assigned a code here.
 ///
-/// Today only the camera-produced class earns exit 1; every rejection reached
-/// before the camera collapses to 2 (PAM_IGNORE). That collapse is itself a
-/// defect — it softens a rate-limited rejection whenever the daemon is
-/// unavailable and PAM falls back to this path — but fixing it changes PAM
-/// semantics under `required`/`requisite` stacks and belongs in its own
-/// reviewed change. This function is where that fix will land.
+/// The codes are a frozen contract (docs/contracts.md, "facelock auth Exit
+/// Codes") with three invariants: exit 0, 1 and 2 keep their historical
+/// meanings permanently; every newer code is allocated from the space an
+/// older module already maps to PAM_IGNORE (so old module + new binary
+/// degrades to the pre-split collapse and regresses nothing); and the
+/// module's arm for unknown codes stays PAM_IGNORE (so new module + old
+/// binary is unchanged too). Within that frame, each class whose
+/// daemon-transport consequence is not PAM_IGNORE carries its own code, so
+/// daemon unavailability no longer changes what PAM concludes (#141).
+/// [`EXIT_SUPPRESSED`] is the companion code for the suppressed outcome,
+/// which is not an `ErrorKind`.
 fn oneshot_exit_code(kind: ErrorKind) -> i32 {
     match kind {
-        // The camera produced no usable image. Not an error the stack should
-        // ignore, and not a non-match either; exit 1 keeps PAM falling
-        // through to the password.
-        ErrorKind::AllFramesDark => 1,
+        // The one pre-flight class whose daemon consequence is a deliberate
+        // failure (PAM_AUTH_ERR): an exhausted face-auth budget must not
+        // soften to fall-through just because the daemon was unreachable.
+        ErrorKind::RateLimited => 3,
+        // The camera produced no usable image: not a non-match, and under
+        // the daemon transport not a failure either — its rendered message
+        // maps to PAM_IGNORE. Moved off exit 1 (which is frozen as "scanned
+        // and not matched") to a code both module generations read as the
+        // same abstention the daemon produces.
+        ErrorKind::AllFramesDark => 5,
+        // Every remaining class means "face auth cannot answer here": both
+        // transports abstain (PAM_IGNORE), so they share the historical
+        // catch-all code.
         ErrorKind::Disabled
         | ErrorKind::SshSession
         | ErrorKind::LidClosed
         | ErrorKind::Storage
-        | ErrorKind::RateLimited
         | ErrorKind::RateLimitCheckFailed
         | ErrorKind::IrRequired
         | ErrorKind::Y16BitDepthRequired
@@ -548,7 +589,10 @@ fn oneshot_exit_code(kind: ErrorKind) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupAbort, oneshot_exit_code, start_engine_then_camera};
+    use super::{
+        EXIT_SUPPRESSED, StartupAbort, oneshot_exit_code, preflight_exit_code,
+        start_engine_then_camera,
+    };
     use facelock_core::config::Config;
     use facelock_core::types::MatchResult;
     use facelock_daemon::audit::AuditSource;
@@ -677,8 +721,10 @@ mod tests {
             (ErrorKind::LidClosed, "lid closed", "error", 2),
             (ErrorKind::Storage, "storage error: boom", "error", 2),
             // Frozen: PAM reads this one as a deliberate lockout
-            // (PAM_AUTH_ERR, no oneshot retry).
-            (ErrorKind::RateLimited, "rate limited", "rate_limited", 2),
+            // (PAM_AUTH_ERR, no oneshot retry) — on the daemon transport via
+            // the message, on the oneshot transport via exit 3 (#141). An
+            // older module reads 3 as PAM_IGNORE, the pre-#141 collapse.
+            (ErrorKind::RateLimited, "rate limited", "rate_limited", 3),
             (
                 ErrorKind::RateLimitCheckFailed,
                 "rate limit check failed: boom",
@@ -698,7 +744,11 @@ mod tests {
                 "error",
                 2,
             ),
-            (ErrorKind::AllFramesDark, "all frames dark", "error", 1),
+            // Exit 5, not 1: exit 1 is frozen as "scanned and not matched",
+            // and the daemon transport abstains (PAM_IGNORE) on a dark scan,
+            // so the oneshot side now does too — under every module
+            // generation (#141).
+            (ErrorKind::AllFramesDark, "all frames dark", "error", 5),
             (ErrorKind::Internal, "boom", "error", 2),
         ];
 
@@ -734,6 +784,56 @@ mod tests {
                 "{kind:?} has no row in the coupling table"
             );
         }
+    }
+
+    /// Invariants 1 and 2 of the exit-code contract (docs/contracts.md,
+    /// "facelock auth Exit Codes"): exit 0 and 1 belong to the matched /
+    /// scanned-and-not-matched outcomes permanently, so no rejection class
+    /// may claim either — every class code comes from the space (2 and up)
+    /// that a module predating it maps to PAM_IGNORE. This is what makes the
+    /// upgrade window safe: a new binary under an old module can only ever
+    /// degrade a rejection to the historical collapse, never turn one into a
+    /// success or a non-match.
+    #[test]
+    fn rejection_classes_never_claim_the_match_codes() {
+        for kind in ErrorKind::ALL {
+            let code = oneshot_exit_code(*kind);
+            assert!(
+                code >= 2,
+                "{kind:?} exits {code}: 0 and 1 are frozen for matched / no-match"
+            );
+        }
+        // Compile-time: the suppressed code is a constant, so its half of
+        // the invariant needs no runtime assert.
+        const { assert!(EXIT_SUPPRESSED >= 2, "suppressed may not claim 0 or 1") }
+    }
+
+    /// The suppressed outcome is not an `ErrorKind`, so it has no row in the
+    /// coupling table; its exit code is pinned here instead. 4 is frozen
+    /// protocol: the module maps it to PAM_AUTHINFO_UNAVAIL, the same
+    /// consequence the daemon transport's `-3` sentinel produces.
+    #[test]
+    fn the_preflight_short_circuit_pins_its_non_error_codes() {
+        assert_eq!(EXIT_SUPPRESSED, 4, "suppressed exit code is frozen");
+        assert_eq!(preflight_exit_code(&AuthOutcome::Suppressed), 4);
+        // A rejection class keeps its own code through the short-circuit.
+        assert_eq!(
+            preflight_exit_code(&AuthOutcome::error(ErrorKind::RateLimited)),
+            3
+        );
+        // Not-enrolled without suppress_unknown: a plain "no opinion", never
+        // exit 1 — the camera did not open, so nothing was scanned.
+        assert_eq!(
+            preflight_exit_code(&AuthOutcome::AuthResult(MatchResult {
+                matched: false,
+                model_id: None,
+                label: None,
+                similarity: 0.0,
+                face_detected: false,
+                failure_reason: None,
+            })),
+            2
+        );
     }
     use facelock_daemon::rate_limit::RateLimiter;
     use facelock_store::FaceStore;

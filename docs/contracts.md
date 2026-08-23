@@ -1966,11 +1966,49 @@ and never a correct one.
 
 ### facelock auth Exit Codes
 
-| Code | Meaning | PAM Code |
-|------|---------|----------|
-| 0 | Face matched | PAM_SUCCESS |
-| 1 | No match / timeout / dark | PAM_AUTH_ERR |
-| 2 | Error / no enrolled faces | PAM_IGNORE |
+The exit code is the only thing the PAM module learns from the oneshot
+fallback, and the two sides upgrade at different moments: a package update
+replaces `/usr/bin/facelock` on disk while every long-lived PAM host (a screen
+locker, `sshd`) keeps the `pam_facelock.so` it already loaded. There is no
+version handshake — the module maps the number and nothing else — so the table
+is governed by three frozen invariants:
+
+1. **Exit 0, 1 and 2 keep their meanings permanently.** 0 = matched, 1 =
+   scanned and not matched, 2 = error / no opinion. They are never redefined
+   or repurposed; a class that leaves one of them moves to a *new* code, never
+   onto a changed meaning of an old one.
+2. **New codes are allocated only from the space an older module already maps
+   to `PAM_IGNORE`** (any code ≥ 3 it does not know). Old module + new binary
+   therefore degrades to the pre-split collapse: it loses the class
+   distinction, and regresses nothing.
+3. **The module's arm for unknown codes stays `PAM_IGNORE`**, so new module +
+   old binary is unchanged too. The same arm absorbs a binary killed by a
+   signal (no exit code; the module reads it as 2).
+
+| Code | Class | PAM code (module ≥ 0.2.0) | PAM code (older module) |
+|------|-------|---------------------------|-------------------------|
+| 0 | Face matched | `PAM_SUCCESS` | `PAM_SUCCESS` |
+| 1 | Scanned, no match | `PAM_AUTH_ERR` | `PAM_AUTH_ERR` |
+| 2 | Error / no opinion: disabled, SSH, lid closed, storage, rate-limit check failed, IR required, unverified Y16, internal, cancelled, not enrolled | `PAM_IGNORE` | `PAM_IGNORE` |
+| 3 | Rate limited | `PAM_AUTH_ERR` | `PAM_IGNORE` |
+| 4 | Suppressed (no enrolled models + `suppress_unknown`) | `PAM_AUTHINFO_UNAVAIL` | `PAM_IGNORE` |
+| 5 | All frames dark | `PAM_IGNORE` | `PAM_IGNORE` |
+
+Codes 3–5 exist so the oneshot fallback carries the same PAM consequence per
+class as the daemon transport: rate limited → `PAM_AUTH_ERR`, suppressed
+(`-3`) → `PAM_AUTHINFO_UNAVAIL`, dark scan → `PAM_IGNORE`. Before the split
+every pre-flight rejection collapsed to exit 2, so daemon unavailability
+silently softened a rate-limited rejection from `PAM_AUTH_ERR` to
+`PAM_IGNORE`; a dark scan diverged the other way, exiting 1 (`PAM_AUTH_ERR`)
+where the daemon abstains. Benign under the recommended `sufficient`
+stacking; wrong under `required`/`requisite` or an `[authinfo_unavail=...]`
+action.
+
+The binary's half of the table is pinned in
+`crates/facelock-cli/src/commands/auth.rs`
+(`every_rejection_class_pins_its_message_audit_label_and_exit_code`,
+`rejection_classes_never_claim_the_match_codes`,
+`the_preflight_short_circuit_pins_its_non_error_codes`).
 
 ## Release Channels and APT Paths
 

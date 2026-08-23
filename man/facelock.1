@@ -861,7 +861,17 @@ exits 2 with clap's unrecognized-subcommand error on stderr and nothing on
 stdout, which a caller reads as "no capabilities at all".
 .PP
 .B facelock auth
-exits 0 when the face matched, 1 when it did not, and 2 on error.
+exits 0 when the face matched, 1 when a scan ran and did not match, 2 on an
+error or when face authentication has no opinion (disabled, SSH session, lid
+closed, storage failure, IR required, cancelled, not enrolled), 3 when the
+user is rate limited, 4 when the attempt was suppressed (no enrolled models
+with
+.BR security.suppress_unknown ),
+and 5 when every captured frame was dark. Codes 3\-5 let the PAM module give
+these classes the same consequence in oneshot mode as over D\-Bus; a module
+older than the split reads them as "no opinion" and falls through. The full
+table and its compatibility invariants are in
+.IR docs/contracts.md .
 .SH SECURITY
 The default configuration requires an IR camera
 .RB ( security.require_ir=true ).

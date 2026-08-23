@@ -505,7 +505,11 @@ facelock auth --user alice              # authenticate
 facelock auth --user alice --config /etc/facelock/config.toml
 ```
 
-Exit codes: 0 = matched, 1 = no match, 2 = error.
+Exit codes: 0 = matched, 1 = scanned and not matched, 2 = error / no
+opinion, 3 = rate limited, 4 = suppressed (no enrolled models with
+`security.suppress_unknown`), 5 = all frames dark. The full table and its
+compatibility invariants are frozen in `docs/contracts.md` ("facelock auth
+Exit Codes").
 
 ## facelock tpm
 

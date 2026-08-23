@@ -601,6 +601,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its hard-error (never-prompt) class, and `status` still renders a broken
   config as a finding, after its own root check.
 
+- **Oneshot exit codes carry the rejection class** (#141): `facelock auth`
+  now exits 3 for a rate-limited rejection, 4 for a suppressed attempt (no
+  enrolled models with `security.suppress_unknown`), and 5 when every
+  captured frame was dark; every other pre-flight rejection keeps exit 2.
+  Previously all of them collapsed to 2, so daemon unavailability silently
+  softened a rate-limited rejection from `PAM_AUTH_ERR` to `PAM_IGNORE`, and
+  a dark scan exited 1 (`PAM_AUTH_ERR`) where the daemon transport abstains.
+  Exit 0, 1 and 2 keep their historical meanings; the new codes come only
+  from the space an older PAM module maps to `PAM_IGNORE`, so a module
+  predating the split degrades to the old collapsed behavior instead of
+  regressing. The full table and its compatibility invariants are frozen in
+  `docs/contracts.md`.
 - **Debian PAM and daemon package lifecycle is opt-in and state-preserving**
   (#224): direct `pam add`/`setup --pam` now refuses an already-selected exact
   `pam-auth-update` profile before writing, using fixed-root no-follow evidence
