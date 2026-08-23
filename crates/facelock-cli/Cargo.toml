@@ -41,6 +41,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 xkbcommon = { version = "0.9", optional = true }
 dialoguer = "0.12"
 signal-hook = "0.4"
+thiserror = { workspace = true }
 libc = "0.2"
 nix = { version = "0.31", features = ["user"] }
 facelock-tpm = { path = "../facelock-tpm" }

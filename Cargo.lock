@@ -1058,6 +1058,7 @@ dependencies = [
  "signal-hook",
  "smithay-client-toolkit",
  "tempfile",
+ "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",

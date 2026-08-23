@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CLI lifecycle exclusion lease** (#233): the ownership layer for the
+  upcoming `facelock data purge`. An RAII lease takes the canonical
+  `/run/facelock/lifecycle.lock`, proves the D-Bus activation definition
+  delegates to systemd, masks `facelock-daemon.service` through the same
+  runtime control-tier barrier the source install uses, and stops the daemon
+  with manager and bus-name proofs — so an `Authenticate` call cannot
+  re-activate it mid-operation. Restore is exact on completion, error, panic,
+  and HUP/INT/TERM; a SIGKILL leaves only tmpfs state, which the next
+  acquisition adopts and clears, and a reboot clears on its own. Enablement
+  is never changed, and acquisition fails closed without systemd, without the
+  lock, or without a confirmed-stopped daemon. No CLI surface yet.
 - **Explicit authorization for sensitive `setup --pam` writes** (#207):
   `--yes` and its `--no-confirm` alias now suppress only the ordinary per-file
   confirmation. Adding Facelock to a shared or login PAM stack requires the

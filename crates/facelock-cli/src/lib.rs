@@ -17,6 +17,7 @@ pub mod commands;
 pub mod direct;
 pub mod health;
 pub mod ipc_client;
+pub mod lifecycle;
 pub mod logging;
 pub mod message;
 pub mod notifications;

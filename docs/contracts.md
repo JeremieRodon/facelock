@@ -2383,6 +2383,46 @@ therefore removes static integration and safely cleaned PAM provenance, while
 preserving biometric state and whatever administrator-configuration artifact
 their package manager retained.
 
+### CLI lifecycle exclusion lease
+
+Destructive CLI maintenance (the `facelock data purge` work, #233) has no
+package transaction to own its exclusion interval, so the `facelock` binary
+establishes one itself through an RAII lifecycle lease. Acquisition takes the
+canonical `/run/facelock/lifecycle.lock` — the same never-unlinked lock the
+source install holds — with a non-blocking exclusive `flock` on a validated
+mode `0600` zero-byte single-link regular file opened without following the
+public path; refuses to proceed without a booted systemd; proves every
+existing `org.facelock.Daemon.service` activation definition delegates
+through `SystemdService=facelock-daemon.service`, because a unit mask cannot
+inhibit direct D-Bus execution; and records the unit's active and enabled
+state, admitting only loaded or not-found, active or inactive state. It then
+creates the owned activation barrier — an empty mode `0600` regular file at
+`/run/systemd/system.control/facelock-daemon.service`, the same mechanism the
+source install uses — reloads the manager and proves `LoadState=masked`
+before stopping the daemon and proving both `ActiveState=inactive` and that
+nothing owns `org.facelock.Daemon` on the system bus. A masked unit without a
+stale barrier, transitional or failed state, a foreign object at the control
+path, and a non-delegating activation definition all fail closed before any
+mutation, and a rejected acquisition rolls back whatever it had staged.
+
+Release restores exactly the recorded state in reverse order — barrier
+removal proven against the held descriptor, manager reload with an unmasking
+proof, restart only if the daemon was active, then lock release by closing
+the descriptor — on normal completion, error return, panic unwind, and
+HUP/INT/TERM, with non-reentrant signal cleanup. An explicit barred release
+instead keeps the barrier and the stopped daemon for a caller that uninstalls
+next. Enablement is never changed on any path.
+
+SIGKILL is the bounded failure mode: the barrier file survives, so face
+authentication stays masked (password PAM fallback is unaffected) while the
+`flock` dies with the process. Both the lock and the barrier live on tmpfs,
+so a reboot fully recovers on its own. Before reboot, the next lease
+acquisition adopts a control-path file matching the exact barrier identity
+(empty, mode `0600`, single-link, expected owner) as a stale barrier and
+removes it on restore; any other object at that path is preserved and
+reported. Manual recovery is removing the barrier file and running
+`systemctl daemon-reload`.
+
 ### Fedora authselect retirement boundary
 
 The RPM does not ship or select an authselect profile, does not edit
@@ -2492,7 +2532,9 @@ inode-conditional `unlinkat` or `rmdirat`: after the quarantine identity's final
 proof, deletion assumes no concurrent process with root or equivalent mutation
 authority is changing names in that root-owned, non-group/world-writable
 parent. The package transaction stops the service and owns this interval;
-ordinary unprivileged users cannot enter it. A separate same-authority process
+ordinary unprivileged users cannot enter it. A user-invoked CLI purge has no
+package transaction and establishes the same interval itself through the CLI
+lifecycle exclusion lease above. A separate same-authority process
 that deliberately mutates those parents is outside the package-purge contract,
 because no maintainer script can both delete a pathname and preserve an object
 that such a process substitutes at the deletion syscall itself.
