@@ -98,10 +98,16 @@ and setup state. Debian also retains its conffile until `purge`; RPM follows
 `%config(noreplace)` and may retain an administrator-modified config as
 `config.toml.rpmsave`.
 
-Facelock does not currently expose a safe "remove everything" command. Do not
-replace package lifecycle handling with a broad recursive deletion: configured
-state paths can live outside the default directories, and links, mounts, or
-wrong-owner remnants require inspection rather than traversal. See
+Debian purge removes only provably safe entries inside the three compiled
+Facelock roots. Unsafe or externally configured remnants are retained and
+reported. The helper leaves the three compiled roots in place; dpkg may then
+remove an empty `/etc/facelock` conffile parent, while admitted files
+and empty descendant directories are removed.
+
+The Facelock CLI does not currently expose a safe "remove everything" command.
+Do not replace package lifecycle handling with a broad recursive deletion:
+configured state paths can live outside the default directories, and links,
+mounts, or wrong-owner remnants require inspection rather than traversal. See
 [Package Lifecycle Ownership](contracts.md#package-lifecycle-ownership) for the
 fixed roots, retained-data rules, and the limits of filesystem deletion.
 

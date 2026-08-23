@@ -14,6 +14,12 @@ RUN printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo
 # daemon by parsing it rather than by grepping the report a person reads.
 RUN pacman -Syu --noconfirm pam polkit sudo base-devel libxkbcommon just dbus onnxruntime-cpu protobuf python python-gobject sqlite jq && pacman -Scc --noconfirm
 
+# Give the disposable PID1 image a deterministic machine identity so
+# dbus-broker can establish the system bus without extra mounts.
+RUN rm -f /etc/machine-id && \
+    printf '%s\n' 0123456789abcdef0123456789abcdef > /etc/machine-id && \
+    chmod 0444 /etc/machine-id
+
 # Build pamtester from upstream source (curl and the toolchain come from base-devel above)
 COPY test/install-pamtester.sh /tmp/install-pamtester.sh
 RUN sh /tmp/install-pamtester.sh && rm -f /tmp/install-pamtester.sh
@@ -27,15 +33,21 @@ COPY target/release/libpam_facelock.so /build/target/release/libpam_facelock.so
 
 # Copy project files needed for install
 COPY justfile /build/justfile
+COPY scripts/source-install-daemon-lifecycle.sh /build/scripts/source-install-daemon-lifecycle.sh
+COPY scripts/migrate-legacy-system-assets.sh /build/scripts/migrate-legacy-system-assets.sh
 COPY config/ /build/config/
 COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/
+COPY test/Containerfile /build/test/Containerfile
+COPY test/source-install-offline-image.marker /build/test/source-install-offline-image.marker
 COPY dist/ /build/dist/
 COPY models/ /build/models/
 WORKDIR /build
 
 # Install using the real install path
-RUN just install-files
+RUN FACELOCK_SOURCE_INSTALL_OFFLINE_IMAGE=container-build \
+    FACELOCK_SOURCE_INSTALL_OFFLINE_MARKER=/build/test/source-install-offline-image.marker \
+    just install-files
 
 # Copy models to the configured model_dir for integration tests
 RUN cp models/*.onnx /var/lib/facelock/models/ 2>/dev/null || true && \
@@ -49,6 +61,33 @@ COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
 
 # Fake daemon harness for the PAM peer-UID container test (plan 05)
 COPY test/fake-facelock-daemon.py /fake-facelock-daemon.py
+
+# Stable source-install lifecycle oracle for the booted real-systemd gate.
+COPY scripts/source-install-daemon-lifecycle.sh /source-install-lifecycle/scripts/source-install-daemon-lifecycle.sh
+COPY scripts/migrate-legacy-system-assets.sh /source-install-lifecycle/scripts/migrate-legacy-system-assets.sh
+COPY dist/legacy-system-assets.sha256 /source-install-lifecycle/dist/legacy-system-assets.sha256
+COPY dbus/org.facelock.Daemon.service /source-install-lifecycle/dbus/org.facelock.Daemon.service
+COPY test/fake-facelock-daemon.py /source-install-lifecycle/test/fake-facelock-daemon.py
+COPY test/source-install-daemon-lifecycle-systemd.sh /source-install-lifecycle/test/source-install-daemon-lifecycle-systemd.sh
+COPY test/source-install-daemon-stub.sh /source-install-lifecycle/test/source-install-daemon-stub.sh
+COPY test/source-install-daemon-stop-probe.sh /source-install-lifecycle/test/bin/systemctl
+COPY test/source-install-recipe-install-probe.sh /source-install-lifecycle/test/bin/install
+COPY test/source-install-recipe-install-probe.sh /source-install-lifecycle/test/fake-bin/install
+COPY test/source-install-recipe-install-probe.sh /source-install-lifecycle/test/source-install-recipe-install-probe.sh
+COPY test/source-install-recipe-fake-systemctl.sh /source-install-lifecycle/test/fake-bin/systemctl
+COPY test/source-install-recipe-fake-busctl.sh /source-install-lifecycle/test/fake-bin/busctl
+COPY test/source-install-recipe-fake-systemctl.sh /source-install-lifecycle/test/source-install-recipe-fake-systemctl.sh
+COPY test/source-install-recipe-fake-busctl.sh /source-install-lifecycle/test/source-install-recipe-fake-busctl.sh
+COPY test/source-install-daemon-test.service /source-install-lifecycle/test/source-install-daemon-test.service
+COPY justfile /source-install-lifecycle/repository/justfile
+COPY scripts/source-install-daemon-lifecycle.sh /source-install-lifecycle/repository/scripts/source-install-daemon-lifecycle.sh
+COPY scripts/migrate-legacy-system-assets.sh /source-install-lifecycle/repository/scripts/migrate-legacy-system-assets.sh
+COPY dist/legacy-system-assets.sha256 /source-install-lifecycle/repository/dist/legacy-system-assets.sha256
+COPY config/ /source-install-lifecycle/repository/config/
+COPY systemd/ /source-install-lifecycle/repository/systemd/
+COPY dbus/ /source-install-lifecycle/repository/dbus/
+COPY target/release/facelock /source-install-lifecycle/repository/target/release/facelock
+COPY target/release/libpam_facelock.so /source-install-lifecycle/repository/target/release/libpam_facelock.so
 
 # Install a minimal real libalpm package carrying the production hook and
 # scriptlet. The booted package test removes it only after the ordinary PAM
@@ -65,7 +104,14 @@ COPY test/run-oneshot-tests.sh /run-oneshot-tests.sh
 COPY test/run-layout-tests.sh /run-layout-tests.sh
 COPY test/arch-package-validate.sh /arch-package-validate.sh
 RUN chmod +x /run-tests.sh /run-integration-tests.sh /run-oneshot-tests.sh \
-    /run-layout-tests.sh /arch-package-validate.sh
+    /run-layout-tests.sh /arch-package-validate.sh \
+    /source-install-lifecycle/test/source-install-daemon-lifecycle-systemd.sh \
+    /source-install-lifecycle/test/source-install-daemon-stub.sh \
+    /source-install-lifecycle/test/bin/systemctl \
+    /source-install-lifecycle/test/bin/install \
+    /source-install-lifecycle/test/fake-bin/install \
+    /source-install-lifecycle/test/fake-bin/systemctl \
+    /source-install-lifecycle/test/fake-bin/busctl
 
 # Clean up build dir to save image size
 RUN rm -rf /build

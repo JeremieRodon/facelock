@@ -36,7 +36,7 @@ The step starts the daemon, or restarts it if one is already running. The encryp
 ```bash
 facelock setup                          # interactive wizard
 facelock setup --non-interactive        # base setup, no prompts, no PAM/systemd/enroll
-facelock setup --systemd                # install systemd units
+facelock setup --systemd                # validate installed assets, reload and enable
 facelock setup --systemd --disable      # disable systemd units
 facelock setup --pam                    # install to /etc/pam.d/sudo
 facelock setup --pam --service polkit-1 # install to a specific service
@@ -126,7 +126,7 @@ Two details worth knowing:
 | `--remove` | `--pam` | Remove the facelock PAM line instead of adding it. |
 | `--if-present` | `--pam` | Treat an absent service file as success rather than an error, on the add side as well as `--remove`. Read, parse and write failures stay fatal. Without it, a service that is not there is a hard error. |
 | `--allow-sensitive` | `--pam` add | Explicitly authorize adding Facelock to `common-auth`, `login`, `password-auth`, `password-auth-ac`, `sshd`, `system-auth`, `system-auth-ac`, or `system-login`. Does not suppress the confirmation prompt and conflicts with `--remove`. |
-| `--disable` | `--systemd` | Disable and stop the units instead of installing them. |
+| `--disable` | `--systemd` | Disable and stop the units without changing installed assets. |
 
 These `requires` relationships are enforced by the parser. `facelock setup --remove` is a clear error naming the missing `--pam`, not a silently ignored flag.
 

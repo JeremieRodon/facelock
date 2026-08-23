@@ -1,5 +1,12 @@
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS dependency-closure
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY test/deb-dependency-closure.sh /deb-dependency-closure.sh
+RUN chmod +x /deb-dependency-closure.sh
+
+FROM ${BASE_IMAGE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -21,22 +28,13 @@ RUN printf '%s\n' \
         'path-include=/usr/share/doc/facelock/**' \
         > /etc/dpkg/dpkg.cfg.d/zz-facelock-test-docs
 
-COPY facelock-test-package.deb /facelock-test-package.deb
-RUN cp /etc/pam.d/common-auth /tmp/common-auth.before && \
-    stat -c '%a %u %g' /etc/pam.d/common-auth > /tmp/common-auth.metadata.before && \
-    apt-get update && \
-    apt-get install -y /facelock-test-package.deb && \
-    cmp -s /etc/pam.d/common-auth /tmp/common-auth.before && \
-    test "$(stat -c '%a %u %g' /etc/pam.d/common-auth)" = "$(cat /tmp/common-auth.metadata.before)" && \
-    ! grep -q pam_facelock.so /etc/pam.d/common-auth && \
-    touch /facelock-common-auth-install-invariant && \
-    rm -f /tmp/common-auth.before /tmp/common-auth.metadata.before && \
-    rm -rf /var/lib/apt/lists/*
-
 COPY test/pkg-validate.sh /pkg-validate.sh
+COPY test/deb-package-lifecycle.sh /deb-package-lifecycle.sh
 COPY test/polkit-agent-validate.sh /polkit-agent-validate.sh
 COPY test/tpm-pcr-e2e.sh /tpm-pcr-e2e.sh
-COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
-RUN chmod +x /pkg-validate.sh /polkit-agent-validate.sh /tpm-pcr-e2e.sh
+COPY test/pam.d/facelock-test /facelock-test.pam
+RUN chmod +x /pkg-validate.sh /deb-package-lifecycle.sh \
+        /polkit-agent-validate.sh /tpm-pcr-e2e.sh && \
+    rm -rf /var/lib/apt/lists/*
 
 CMD ["/lib/systemd/systemd"]

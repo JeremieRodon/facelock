@@ -83,7 +83,17 @@ Decline PAM configuration entirely. No file under
 is read, backed up or written.
 .TP
 .B \-\-systemd
-Install and enable systemd units for the facelock daemon.
+Validate the installed package/source-owned systemd and D-Bus assets, remove
+only exact known legacy copies under
+.IR /etc ,
+using a no-replace quarantine transaction, reload and verify unit and activation
+resolution, then enable the facelock daemon unit. Modified or linked legacy
+copies are preserved and make the action fail. D-Bus policy fragments are
+merged, so unrelated local policy is preserved and reported rather than called
+ineffective. Immutable assets
+under
+.I /usr
+are never written by setup.
 .TP
 .B \-\-no\-systemd
 Decline systemd configuration. No unit files are written and

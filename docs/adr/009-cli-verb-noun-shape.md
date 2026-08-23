@@ -148,11 +148,15 @@ The two Omarchy rows record package-owned prototypes that existed when this ADR
 was accepted. Issue #173 later retired them; the rows are historical evidence,
 not current callers or shipped integration points.
 
+The `ExecStart=...` marker row is historical for the same reason. Issue #228
+replaced marker-based refresh with an exact historical-byte allowlist and made
+setup validate, rather than write, package-owned assets.
+
 | Invocation | Caller |
 |---|---|
 | `facelock auth --user X --config Y` | `pam_facelock.so`, pinned by `legacy_invocations_still_parse` |
 | `facelock daemon` | `systemd/facelock-daemon.service`, `dist/nix/module.nix`, `dist/s6/facelock-daemon/run`, `dist/runit/run`, and a `justfile` check that greps the unit for that exact string |
-| `ExecStart=/usr/bin/facelock daemon`, as a hard-coded literal | `commands::setup::run_systemd` passes it to `refresh_legacy_copy_if_present` as the marker deciding whether the unit at `/etc/systemd/system/facelock-daemon.service` is facelock's and should be refreshed. A rename makes the marker stop matching **silently**: the legacy unit is left stale and nothing fails to compile |
+| `ExecStart=/usr/bin/facelock daemon`, as a then-hard-coded literal | `commands::setup::run_systemd` passed it to the retired marker-based legacy refresh. Issue #228 removed that coupling; the row records why substring authority was unsafe |
 | `facelock setup --non-interactive`, `facelock devices`, `facelock enroll`, `facelock hyprlock enable`, `facelock test` | then-shipped Omarchy setup prototype (retired by #173) |
 | `facelock hyprlock disable`, `facelock setup --pam --service X --remove --yes` | then-shipped Omarchy removal prototype (retired by #173) |
 | `facelock is-enrolled`, `facelock pam status`, `facelock capabilities` | lock screens and wrapper scripts, per `docs/contracts.md` §CLI Subcommands |
@@ -235,8 +239,7 @@ enum, so rebasing under them costs more than waiting.
 - `crates/facelock-cli/src/main.rs`: `Cli`, `Commands`, `SHORT_REGISTRY`,
   `JSON_COMMANDS`, `cli_flag_conformance`, `legacy_invocations_still_parse`,
   `capability_names_are_all_implemented`
-- `crates/facelock-cli/src/commands/setup.rs`: `run_systemd`,
-  `refresh_legacy_copy_if_present`
+- `crates/facelock-cli/src/commands/setup.rs`: `run_systemd`
 - `docs/contracts.md` §CLI Subcommands, §CLI Flag Spelling, §CLI Privilege
   Model (DEC-6); `docs/releasing.md` pre-1.0 versioning contract
 - [ADR 004](004-tpm-encryption.md): software AES with optional TPM key sealing

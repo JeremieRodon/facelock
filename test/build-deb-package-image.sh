@@ -2,10 +2,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-suite="${1:?usage: build-deb-package-image.sh <trixie|resolute> <image>}"
-image="${2:?usage: build-deb-package-image.sh <trixie|resolute> <image>}"
-[ "$#" -eq 2 ] || {
-    echo "usage: build-deb-package-image.sh <trixie|resolute> <image>" >&2
+suite="${1:?usage: build-deb-package-image.sh <trixie|resolute> <image> <package-output>}"
+image="${2:?usage: build-deb-package-image.sh <trixie|resolute> <image> <package-output>}"
+package_output="${3:?usage: build-deb-package-image.sh <trixie|resolute> <image> <package-output>}"
+[ "$#" -eq 3 ] || {
+    echo "usage: build-deb-package-image.sh <trixie|resolute> <image> <package-output>" >&2
     exit 2
 }
 
@@ -13,6 +14,18 @@ case "$suite" in
     trixie|resolute) ;;
     *) echo "unsupported Debian package suite: $suite" >&2; exit 2 ;;
 esac
+
+package_parent="$(dirname "$package_output")"
+[ -d "$package_parent" ] || {
+    echo "package output parent does not exist: $package_parent" >&2
+    exit 1
+}
+package_parent="$(cd "$package_parent" && pwd)"
+package_output="$package_parent/$(basename "$package_output")"
+[ ! -e "$package_output" ] && [ ! -L "$package_output" ] || {
+    echo "package output already exists: $package_output" >&2
+    exit 1
+}
 
 base_image="$(python3 - "$repo_root/dist/release-matrix.json" "$suite" <<'PY'
 import json
@@ -40,6 +53,7 @@ trap 'rm -rf -- "$context" "$artifact_dir" "$rebuild_dir"' EXIT
 tar -C "$context" -cf "$context/facelock-git-metadata.tar" .git
 assembler_image="${image}-assembler"
 rebuild_image="${image}-rebuild"
+dependency_image="${image}-dependency-closure"
 podman build \
     --build-arg "BASE_IMAGE=$base_image" \
     --build-arg "SUITE=$suite" \
@@ -73,9 +87,19 @@ package_name="$(grep -E '\.deb$' "$manifest")"
     echo "Debian manifest must name exactly one binary package" >&2
     exit 1
 }
-cp -- "$artifact_dir/$package_name" "$context/facelock-test-package.deb"
+install -m 0444 -- "$artifact_dir/$package_name" "$package_output"
 podman build \
     --build-arg "BASE_IMAGE=$base_image" \
+    --target dependency-closure \
+    -t "$dependency_image" \
+    -f "$context/test/Containerfile.deb-runtime" \
+    "$context"
+podman run --rm \
+    -v "$package_output:/facelock-test-package.deb:ro,Z" \
+    "$dependency_image" /deb-dependency-closure.sh
+podman build \
+    --build-arg "BASE_IMAGE=$base_image" \
+    --target runtime \
     -t "$image" \
     -f "$context/test/Containerfile.deb-runtime" \
     "$context"

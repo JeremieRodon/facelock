@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Source-install activation lifecycle** (#221): source installs now hold the
+  canonical `/run/facelock/lifecycle.lock`, establish a manager-proved systemd
+  activation barrier, preserve the daemon's active/inactive and enabled state,
+  and restore safely on normal exit or caught signals. Exact known historical
+  systemd/D-Bus copies are staged and rollback-capable through the protected
+  writes, with signal-safe child/parent handoff and preplan reconciliation,
+  published only while activation remains barred, and ambiguous or
+  administrator-modified state preserved. Privileged entrypoints use fixed
+  trusted paths; ordinary installs fail closed without systemd except for the
+  authenticated offline test-image path.
+- **System asset ownership migration** (#228): `facelock setup --systemd` no
+  longer creates or overwrites package/source-owned systemd and D-Bus files.
+  It validates their exact bytes and metadata, removes only reviewed exact
+  historical `/etc` copies through a failure-atomic no-replace quarantine,
+  preserves ambiguous administrator state, and verifies the intended unit and
+  activation files resolve before enabling the daemon. It treats D-Bus policy
+  as merged configuration and reports unrelated local fragments. Package
+  configuration no longer refreshes a marker-matched legacy policy, source
+  installs consume the same reviewed digest inventory, and source uninstall
+  leaves every historical `/etc` copy untouched without changing daemon-state
+  restoration policy.
+
 ### Added
 
 - **Explicit authorization for sensitive `setup --pam` writes** (#207):

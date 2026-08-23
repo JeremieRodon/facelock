@@ -1,23 +1,1352 @@
 #!/bin/sh
 set -e
 
+run_lifecycle_helper() {
+    facelock_helper_mode="$1"
+    facelock_prefix=""
+    facelock_trusted_uid=0
+    facelock_trusted_gid=0
+    facelock_mountinfo=/proc/self/mountinfo
+    facelock_max_depth=64
+    facelock_max_nodes=10000
+    facelock_renameat2_syscall=316
+    facelock_test_pause_root=""
+    facelock_test_pause_dir=""
+    facelock_test_pause_point=""
+    facelock_test_pause_logical=""
+
+    # Tests exercise the real maintainer script below disposable roots. The
+    # override is deliberately unavailable to a root caller, so a package
+    # transaction can never redirect its privileged cleanup through the
+    # environment.
+    if [ -n "${FACELOCK_PURGE_TEST_ROOT:-}" ]; then
+        facelock_effective_uid="$({
+            while read -r facelock_label _ facelock_seen_uid _; do
+                if [ "$facelock_label" = "Uid:" ]; then
+                    printf '%s\n' "$facelock_seen_uid"
+                    break
+                fi
+            done </proc/self/status
+        } 2>/dev/null)"
+        case "$facelock_effective_uid" in
+            ''|*[!0-9]*)
+                echo "facelock purge: cannot verify the maintainer-script uid" >&2
+                return 1
+                ;;
+        esac
+        if [ "$facelock_effective_uid" -eq 0 ]; then
+            echo "facelock purge: refusing a test root in a privileged maintainer script" >&2
+            return 1
+        fi
+        case "$FACELOCK_PURGE_TEST_ROOT" in
+            /*) facelock_prefix="$FACELOCK_PURGE_TEST_ROOT" ;;
+            *)
+                echo "facelock purge: test root must be absolute" >&2
+                return 1
+                ;;
+        esac
+        case "${FACELOCK_PURGE_TEST_UID:-}" in
+            ''|*[!0-9]*)
+                echo "facelock purge: invalid test uid" >&2
+                return 1
+                ;;
+            *) facelock_trusted_uid="$FACELOCK_PURGE_TEST_UID" ;;
+        esac
+        case "${FACELOCK_PURGE_TEST_GID:-}" in
+            ''|*[!0-9]*)
+                echo "facelock purge: invalid test gid" >&2
+                return 1
+                ;;
+            *) facelock_trusted_gid="$FACELOCK_PURGE_TEST_GID" ;;
+        esac
+        if [ -n "${FACELOCK_PURGE_TEST_MOUNTINFO:-}" ]; then
+            facelock_mountinfo="$FACELOCK_PURGE_TEST_MOUNTINFO"
+        fi
+        case "${FACELOCK_PURGE_TEST_MAX_DEPTH:-}" in
+            '') ;;
+            *[!0-9]*)
+                echo "facelock purge: invalid test depth limit" >&2
+                return 1
+                ;;
+            *) facelock_max_depth="$FACELOCK_PURGE_TEST_MAX_DEPTH" ;;
+        esac
+        case "${FACELOCK_PURGE_TEST_MAX_NODES:-}" in
+            '') ;;
+            0|*[!0-9]*)
+                echo "facelock purge: invalid test node limit" >&2
+                return 1
+                ;;
+            *) facelock_max_nodes="$FACELOCK_PURGE_TEST_MAX_NODES" ;;
+        esac
+        case "${FACELOCK_PURGE_TEST_RENAMEAT2_SYSCALL:-}" in
+            '') ;;
+            0|*[!0-9]*)
+                echo "facelock purge: invalid test renameat2 syscall" >&2
+                return 1
+                ;;
+            *) facelock_renameat2_syscall="$FACELOCK_PURGE_TEST_RENAMEAT2_SYSCALL" ;;
+        esac
+        if [ -n "${FACELOCK_PURGE_TEST_PAUSE_ROOT:-}" ]; then
+            case "${FACELOCK_PURGE_TEST_PAUSE_ROOT:-}" in
+                /etc/facelock|/var/lib/facelock|/var/log/facelock)
+                    facelock_test_pause_root="$FACELOCK_PURGE_TEST_PAUSE_ROOT"
+                    ;;
+                *)
+                    echo "facelock purge: invalid test pause root" >&2
+                    return 1
+                    ;;
+            esac
+            if [ -z "${FACELOCK_PURGE_TEST_PAUSE_DIR:-}" ]; then
+                echo "facelock purge: test pause root requires a control directory" >&2
+                return 1
+            fi
+        fi
+        if [ -n "${FACELOCK_PURGE_TEST_PAUSE_DIR:-}" ]; then
+            case "${FACELOCK_PURGE_TEST_PAUSE_DIR:-}" in
+                "$facelock_prefix"/*)
+                    facelock_test_pause_dir="$FACELOCK_PURGE_TEST_PAUSE_DIR"
+                    ;;
+                *)
+                    echo "facelock purge: invalid test pause directory" >&2
+                    return 1
+                    ;;
+            esac
+        fi
+        if [ -n "${FACELOCK_PURGE_TEST_PAUSE_POINT:-}${FACELOCK_PURGE_TEST_PAUSE_LOGICAL:-}" ]; then
+            case "${FACELOCK_PURGE_TEST_PAUSE_POINT:-}" in
+                before-config-open|before-regular-open|before-regular-quarantine|before-regular-quarantine-move|after-regular-quarantine|before-regular-restore-move|before-regular-delete|before-directory-quarantine|before-directory-quarantine-move|after-directory-quarantine|before-directory-restore-move|before-directory-delete)
+                    facelock_test_pause_point="$FACELOCK_PURGE_TEST_PAUSE_POINT"
+                    ;;
+                *)
+                    echo "facelock purge: invalid test pause point" >&2
+                    return 1
+                    ;;
+            esac
+            case "${FACELOCK_PURGE_TEST_PAUSE_LOGICAL:-}" in
+                /etc/facelock|/etc/facelock/*|/var/lib/facelock|/var/lib/facelock/*|/var/log/facelock|/var/log/facelock/*)
+                    case "$FACELOCK_PURGE_TEST_PAUSE_LOGICAL" in
+                        */../*|*/..|*/./*|*/.)
+                            echo "facelock purge: invalid test pause path" >&2
+                            return 1
+                            ;;
+                    esac
+                    facelock_test_pause_logical="$FACELOCK_PURGE_TEST_PAUSE_LOGICAL"
+                    ;;
+                *)
+                    echo "facelock purge: invalid test pause path" >&2
+                    return 1
+                    ;;
+            esac
+            if [ -z "$facelock_test_pause_dir" ]; then
+                echo "facelock purge: test pause point requires a control directory" >&2
+                return 1
+            fi
+        fi
+    fi
+
+    if [ ! -x /usr/bin/perl ]; then
+        echo "facelock purge: /usr/bin/perl is unavailable; retained state was not inspected" >&2
+        return 1
+    fi
+
+    /usr/bin/perl - \
+        "$facelock_helper_mode" \
+        "$facelock_prefix" \
+        "$facelock_trusted_uid" \
+        "$facelock_trusted_gid" \
+        "$facelock_mountinfo" \
+        "$facelock_max_depth" \
+        "$facelock_max_nodes" \
+        "$facelock_renameat2_syscall" \
+        "$facelock_test_pause_root" \
+        "$facelock_test_pause_dir" \
+        "$facelock_test_pause_point" \
+        "$facelock_test_pause_logical" <<'PERL'
+use strict;
+use warnings;
+use Config;
+use Errno qw(EEXIST ENOENT ENOSYS ENOTEMPTY);
+use Fcntl qw(:DEFAULT :mode O_DIRECTORY O_NOFOLLOW O_NONBLOCK);
+
+my (
+    $operation,
+    $prefix,
+    $trusted_uid,
+    $trusted_gid,
+    $mountinfo_path,
+    $max_depth,
+    $max_nodes,
+    $renameat2_syscall,
+    $test_pause_root,
+    $test_pause_dir,
+    $test_pause_point,
+    $test_pause_logical,
+) = @ARGV;
+my @logical_roots = (
+    '/etc/facelock',
+    '/var/lib/facelock',
+    '/var/log/facelock',
+);
+my %reported;
+my %protected;
+my %mountpoints;
+my %mount_ids;
+my $test_pause_done = 0;
+
+sub actual_path {
+    my ($logical) = @_;
+    return $prefix . $logical;
+}
+
+sub report_text {
+    my ($text) = @_;
+    $text =~ s/([\x00-\x1f\x7f-\x9f])/sprintf('\\x%02x', ord($1))/ge;
+    return $text;
+}
+
+sub report_remnant {
+    my ($logical, $reason) = @_;
+    $protected{$logical} = 1;
+    my $key = "remnant\0$logical";
+    return if $reported{$key}++;
+    print STDERR 'facelock purge: remnant retained: ', report_text($logical),
+        ' (', report_text($reason), ")\n";
+}
+
+sub report_external {
+    my ($field, $path) = @_;
+    my $key = "external\0$field\0$path";
+    return if $reported{$key}++;
+    print STDERR 'facelock purge: external remnant retained: ',
+        report_text($field), '=', report_text($path), "\n";
+}
+
+sub report_external_hardlink {
+    my ($logical, $reason) = @_;
+    my $key = "external-hardlink\0$logical";
+    return if $reported{$key}++;
+    print STDERR 'facelock purge: external hard-link remnant retained: ',
+        report_text($logical), ' (', report_text($reason), ")\n";
+}
+
+sub decode_mount_path {
+    my ($path) = @_;
+    $path =~ s/\\([0-7]{3})/chr(oct($1))/ge;
+    return $path;
+}
+
+sub load_mountpoints {
+    my $mountinfo;
+    if (!open($mountinfo, '<', $mountinfo_path)) {
+        print STDERR 'facelock purge: cannot read mount topology from ',
+            report_text($mountinfo_path), ": $!\n";
+        return 0;
+    }
+    while (my $line = <$mountinfo>) {
+        chomp $line;
+        my @fields = split(/ /, $line);
+        next if @fields < 6;
+        $mount_ids{$fields[0]} = 1 if $fields[0] =~ /\A[0-9]+\z/;
+        $mountpoints{decode_mount_path($fields[4])} = 1;
+    }
+    if (!close($mountinfo)) {
+        print STDERR 'facelock purge: cannot finish reading mount topology from ',
+            report_text($mountinfo_path), ": $!\n";
+        return 0;
+    }
+    return 1;
+}
+
+sub trusted_directory {
+    my (@st) = @_;
+    return S_ISDIR($st[2])
+        && $st[4] == $trusted_uid
+        && $st[5] == $trusted_gid
+        && ($st[2] & 0022) == 0;
+}
+
+sub direct_enrollment_marker {
+    my ($logical) = @_;
+    return $logical =~ m{\A/var/lib/facelock/enrolled/[^/]+\z};
+}
+
+sub trusted_regular {
+    my ($logical, @st) = @_;
+    return 0 if !S_ISREG($st[2]) || $st[3] != 1;
+    if (direct_enrollment_marker($logical)) {
+        return ($st[2] & 0077) == 0;
+    }
+    return $st[4] == $trusted_uid
+        && $st[5] == $trusted_gid
+        && ($st[2] & 0022) == 0;
+}
+
+sub same_identity {
+    my ($left, $right) = @_;
+    return $left->[0] == $right->[0]
+        && $left->[1] == $right->[1]
+        && $left->[2] == $right->[2]
+        && $left->[3] == $right->[3]
+        && $left->[4] == $right->[4]
+        && $left->[5] == $right->[5];
+}
+
+sub same_directory_identity {
+    my ($left, $right) = @_;
+    return $left->[0] == $right->[0]
+        && $left->[1] == $right->[1]
+        && $left->[2] == $right->[2]
+        && $left->[4] == $right->[4]
+        && $left->[5] == $right->[5];
+}
+
+sub normalize_absolute {
+    my ($path) = @_;
+    return undef if $path !~ m{\A/};
+    my @parts;
+    for my $part (split(m{/+}, $path)) {
+        next if $part eq '' || $part eq '.';
+        if ($part eq '..') {
+            pop @parts if @parts;
+            next;
+        }
+        push @parts, $part;
+    }
+    return '/' . join('/', @parts);
+}
+
+sub is_compiled_path {
+    my ($path) = @_;
+    my $normalized = normalize_absolute($path);
+    return 0 if !defined($normalized);
+    for my $root (@logical_roots) {
+        return 1 if $normalized eq $root;
+        return 1 if index($normalized, $root . '/') == 0;
+    }
+    return 0;
+}
+
+sub decode_basic_string {
+    my ($raw) = @_;
+    my $decoded = '';
+    while (length($raw)) {
+        my $char = substr($raw, 0, 1, '');
+        if ($char ne '\\') {
+            $decoded .= $char;
+            next;
+        }
+        return undef if !length($raw);
+        my $escape = substr($raw, 0, 1, '');
+        my %simple = (
+            'b' => "\x08", 't' => "\x09", 'n' => "\x0a",
+            'f' => "\x0c", 'r' => "\x0d", '"' => '"', '\\' => '\\',
+        );
+        if (exists($simple{$escape})) {
+            $decoded .= $simple{$escape};
+            next;
+        }
+        if ($escape eq 'u' || $escape eq 'U') {
+            my $digits = $escape eq 'u' ? 4 : 8;
+            return undef if length($raw) < $digits;
+            my $hex = substr($raw, 0, $digits, '');
+            return undef if $hex !~ /\A[0-9A-Fa-f]+\z/;
+            my $value = hex($hex);
+            return undef if $value > 0x10ffff || ($value >= 0xd800 && $value <= 0xdfff);
+            $decoded .= chr($value);
+            next;
+        }
+        return undef;
+    }
+    return $decoded;
+}
+
+sub parse_string_value {
+    my ($value) = @_;
+    $value =~ s/\A\s+//;
+    $value =~ s/\s+\z//;
+    if ($value =~ /\A'([^']*)'\s*(?:#.*)?\z/) {
+        return $1;
+    }
+    if ($value =~ /\A"((?:[^"\\]|\\.)*)"\s*(?:#.*)?\z/) {
+        return decode_basic_string($1);
+    }
+    return undef;
+}
+
+sub parse_key_path {
+    my ($raw) = @_;
+    my @parts;
+    $raw =~ s/\A\s+//;
+    $raw =~ s/\s+\z//;
+    while (length($raw)) {
+        my $part;
+        if ($raw =~ s/\A"((?:[^"\\]|\\.)*)"//) {
+            $part = decode_basic_string($1);
+            return () if !defined($part);
+        } elsif ($raw =~ s/\A'([^']*)'//) {
+            $part = $1;
+        } elsif ($raw =~ s/\A([A-Za-z0-9_-]+)//) {
+            $part = $1;
+        } else {
+            return ();
+        }
+        push @parts, $part;
+        $raw =~ s/\A\s+//;
+        return @parts if !length($raw);
+        return () if $raw !~ s/\A\.//;
+        $raw =~ s/\A\s+//;
+        return () if !length($raw);
+    }
+    return @parts;
+}
+
+sub report_unclassifiable_configuration {
+    my ($reason) = @_;
+    my $key = 'configuration-unclassifiable';
+    return if $reported{$key}++;
+    print STDERR 'facelock purge: configuration could not be fully classified: ',
+        report_text($reason), "\n";
+}
+
+sub multiline_delimiter {
+    my ($raw_value) = @_;
+    $raw_value =~ s/\A\s+//;
+    return "'''" if index($raw_value, "'''") == 0
+        && index(substr($raw_value, 3), "'''") < 0;
+    return '"""' if index($raw_value, '"""') == 0
+        && index(substr($raw_value, 3), '"""') < 0;
+    return undef;
+}
+
+sub descriptor_path {
+    my ($handle, $name) = @_;
+    my $fd = fileno($handle);
+    die 'descriptor unexpectedly closed' if !defined($fd);
+    my $path = "/proc/self/fd/$fd";
+    return $path if !defined($name);
+    die 'invalid directory entry name' if $name eq '.' || $name eq '..'
+        || $name =~ m{/} || index($name, "\0") >= 0;
+    return "$path/$name";
+}
+
+sub descriptor_mount_id {
+    my ($handle) = @_;
+    my $fd = fileno($handle);
+    return undef if !defined($fd);
+    my $fdinfo;
+    return undef if !open($fdinfo, '<', "/proc/self/fdinfo/$fd");
+    my $mount_id;
+    while (my $line = <$fdinfo>) {
+        if ($line =~ /\Amnt_id:\s*([0-9]+)\s*\z/) {
+            $mount_id = $1;
+            last;
+        }
+    }
+    return undef if !close($fdinfo);
+    return $mount_id;
+}
+
+sub mount_identity_is_current {
+    my ($mount_id) = @_;
+    return 0 if !defined($mount_id);
+    # Synthetic mountinfo fixtures name exact fake mountpoints but cannot alter
+    # the kernel mount ID of their disposable directories.
+    return 1 if length($prefix);
+    return $mount_ids{$mount_id};
+}
+
+sub open_fixed_root {
+    my ($logical) = @_;
+    my $base_path = length($prefix) ? $prefix : '/';
+    my @base_before = lstat($base_path);
+    if (!@base_before || S_ISLNK($base_before[2]) || !trusted_directory(@base_before)) {
+        report_remnant($logical, 'fixed traversal anchor is not a trusted directory');
+        return undef;
+    }
+    my $base;
+    if (!sysopen($base, $base_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) {
+        report_remnant($logical, "cannot open fixed traversal anchor: $!");
+        return undef;
+    }
+    my @base_opened = stat($base);
+    if (!@base_opened || !same_directory_identity(\@base_before, \@base_opened)) {
+        close($base);
+        report_remnant($logical, 'fixed traversal anchor changed while it was opened');
+        return undef;
+    }
+    my $base_mount_id = descriptor_mount_id($base);
+    if (!mount_identity_is_current($base_mount_id)) {
+        close($base);
+        report_remnant($logical, 'cannot prove fixed traversal anchor mount identity');
+        return undef;
+    }
+
+    my @held = ($base);
+    my @chain;
+    my $parent = $base;
+    my $parent_mount_id = $base_mount_id;
+    my $component_logical = '';
+    my @parts = grep { length($_) } split(m{/+}, $logical);
+    for my $index (0 .. $#parts) {
+        my $name = $parts[$index];
+        $component_logical .= "/$name";
+        my $anchored = descriptor_path($parent, $name);
+        my @before = lstat($anchored);
+        return undef if !@before && $! == ENOENT;
+        if (!@before) {
+            report_remnant($component_logical, "cannot inspect fixed path component: $!");
+            return undef;
+        }
+        if (S_ISLNK($before[2])) {
+            report_remnant($component_logical, 'fixed path component is a symbolic link');
+            return undef;
+        }
+        if (!trusted_directory(@before)) {
+            report_remnant($component_logical, 'fixed path component is not a trusted directory');
+            return undef;
+        }
+        my $child;
+        if (!sysopen($child, $anchored, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) {
+            report_remnant($component_logical, "cannot open fixed path component: $!");
+            return undef;
+        }
+        my @opened = stat($child);
+        if (!@opened || !same_directory_identity(\@before, \@opened)) {
+            close($child);
+            report_remnant($component_logical, 'fixed path component changed while it was opened');
+            return undef;
+        }
+        my $mount_id = descriptor_mount_id($child);
+        if (!mount_identity_is_current($mount_id)) {
+            close($child);
+            report_remnant($component_logical, 'cannot prove fixed path component mount identity');
+            return undef;
+        }
+        if ($index == $#parts
+            && ($mount_id != $parent_mount_id || $mountpoints{actual_path($logical)})) {
+            close($child);
+            report_remnant($logical, 'root is a mount point');
+            return undef;
+        }
+        push @held, $child;
+        push @chain, {
+            parent => $parent,
+            handle => $child,
+            name => $name,
+            logical => $component_logical,
+            before => [@opened],
+            mount_id => $mount_id,
+        };
+        $parent = $child;
+        $parent_mount_id = $mount_id;
+    }
+
+    return {
+        held => \@held,
+        base_path => $base_path,
+        base_handle => $base,
+        base_before => [@base_opened],
+        base_mount_id => $base_mount_id,
+        chain => \@chain,
+        parent => $held[-2],
+        root => $held[-1],
+        name => $parts[-1],
+        before => [stat($held[-1])],
+        mount_id => $parent_mount_id,
+        dev => (stat($held[-1]))[0],
+        logical => $logical,
+    };
+}
+
+sub fixed_root_is_current {
+    my ($root, $logical) = @_;
+    my @base_public = lstat($root->{base_path});
+    my @base_opened = stat($root->{base_handle});
+    my $base_mount_id = descriptor_mount_id($root->{base_handle});
+    if (!@base_public || !@base_opened
+        || !same_directory_identity($root->{base_before}, \@base_public)
+        || !same_directory_identity($root->{base_before}, \@base_opened)
+        || !mount_identity_is_current($base_mount_id)
+        || $base_mount_id != $root->{base_mount_id}) {
+        report_remnant($logical, 'fixed traversal anchor changed before deletion');
+        return 0;
+    }
+
+    for my $entry (@{$root->{chain}}) {
+        my $anchored = descriptor_path($entry->{parent}, $entry->{name});
+        my @public = lstat($anchored);
+        my @opened = stat($entry->{handle});
+        if (!@public || !@opened
+            || !same_directory_identity($entry->{before}, \@public)
+            || !same_directory_identity($entry->{before}, \@opened)) {
+            report_remnant($logical, 'fixed path chain changed before deletion');
+            return 0;
+        }
+        my $current;
+        if (!sysopen($current, $anchored, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) {
+            report_remnant($logical, 'fixed path chain cannot be reopened before deletion');
+            return 0;
+        }
+        my @current = stat($current);
+        my $mount_id = descriptor_mount_id($current);
+        my $valid = @current
+            && same_directory_identity($entry->{before}, \@current)
+            && mount_identity_is_current($mount_id)
+            && $mount_id == $entry->{mount_id};
+        close($current);
+        if (!$valid) {
+            report_remnant($logical, 'fixed path chain mount changed before deletion');
+            return 0;
+        }
+    }
+    return 1;
+}
+
+sub maybe_pause_after_root_open {
+    my ($logical) = @_;
+    return if $test_pause_done || !length($test_pause_dir) || $logical ne $test_pause_root;
+    $test_pause_done = 1;
+    my $ready;
+    sysopen($ready, "$test_pause_dir/ready", O_WRONLY | O_CREAT | O_EXCL, 0600)
+        or die "cannot create test pause marker: $!";
+    close($ready) or die "cannot close test pause marker: $!";
+    for (1 .. 1000) {
+        return if -e "$test_pause_dir/resume";
+        select(undef, undef, undef, 0.01);
+    }
+    die 'timed out waiting for test traversal resume';
+}
+
+sub maybe_pause_at_test_point {
+    my ($point, $logical) = @_;
+    return if $test_pause_done || !length($test_pause_dir)
+        || $point ne $test_pause_point || $logical ne $test_pause_logical;
+    $test_pause_done = 1;
+    my $ready;
+    sysopen($ready, "$test_pause_dir/ready", O_WRONLY | O_CREAT | O_EXCL, 0600)
+        or die "cannot create test pause marker: $!";
+    close($ready) or die "cannot close test pause marker: $!";
+    for (1 .. 1000) {
+        return if -e "$test_pause_dir/resume";
+        select(undef, undef, undef, 0.01);
+    }
+    die 'timed out waiting for test traversal resume';
+}
+
+sub opened_entry_is_on_root_mount {
+    my ($handle, $root, $logical) = @_;
+    my $mount_id = descriptor_mount_id($handle);
+    my @opened = stat($handle);
+    if (!@opened
+        || $opened[0] != $root->{dev}
+        || !mount_identity_is_current($mount_id)
+        || $mount_id != $root->{mount_id}
+        || $mountpoints{actual_path($logical)}) {
+        report_remnant($logical, 'mount boundary');
+        return 0;
+    }
+    return 1;
+}
+
+sub inspect_external_configuration {
+    my $root_logical = '/etc/facelock';
+    my $root = open_fixed_root($root_logical);
+    return if !defined($root);
+
+    my $logical = '/etc/facelock/config.toml';
+    my $anchored = descriptor_path($root->{root}, 'config.toml');
+    my @before = lstat($anchored);
+    return if !@before && $! == ENOENT;
+    if (!@before) {
+        report_remnant($logical, "cannot inspect configuration: $!");
+        return;
+    }
+    if (!trusted_regular($logical, @before) || $before[7] > 1024 * 1024) {
+        report_remnant($logical, 'configuration is not a trusted single-link regular file');
+        return;
+    }
+    my $config;
+    maybe_pause_at_test_point('before-config-open', $logical);
+    if (!sysopen($config, $anchored, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {
+        report_remnant($logical, "cannot open configuration: $!");
+        return;
+    }
+    my @opened = stat($config);
+    if (!@opened || !same_identity(\@before, \@opened)) {
+        close($config);
+        report_remnant($logical, 'configuration changed while it was inspected');
+        return;
+    }
+    if (!opened_entry_is_on_root_mount($config, $root, $logical)) {
+        close($config);
+        return;
+    }
+
+    my %wanted = (
+        daemon => { model_dir => 1 },
+        storage => { db_path => 1 },
+        encryption => { key_path => 1, sealed_key_path => 1 },
+        audit => { path => 1 },
+        snapshots => { dir => 1 },
+    );
+    my $section = '';
+    my $multiline;
+    while (my $line = <$config>) {
+        $line =~ s/\r?\n\z//;
+        if (defined($multiline)) {
+            $multiline = undef if index($line, $multiline) >= 0;
+            next;
+        }
+        next if $line =~ /\A\s*(?:#|\z)/;
+        if ($line =~ /\A\s*\[(.*)\]\s*(?:#.*)?\z/) {
+            my @table_path = parse_key_path($1);
+            if (@table_path != 1) {
+                $section = undef;
+                report_unclassifiable_configuration('unsupported table syntax');
+                next;
+            }
+            $section = $table_path[0];
+            next;
+        }
+        if ($line !~ /\A\s*(.*?)\s*=\s*(.*)\z/) {
+            report_unclassifiable_configuration('unsupported statement syntax');
+            next;
+        }
+        my ($raw_key, $raw_value) = ($1, $2);
+        my @key_path = parse_key_path($raw_key);
+        if (!@key_path || @key_path > 2) {
+            report_unclassifiable_configuration('unsupported key syntax');
+            next;
+        }
+        my ($field_section, $key);
+        if (@key_path == 2) {
+            # TOML dotted keys are relative to the active table. Only a
+            # document-root pair can name one of the six supported fields.
+            next if !defined($section) || length($section);
+            ($field_section, $key) = @key_path;
+        } else {
+            next if !defined($section);
+            ($field_section, $key) = ($section, $key_path[0]);
+        }
+        my $delimiter = multiline_delimiter($raw_value);
+        if (defined($delimiter)) {
+            report_unclassifiable_configuration('multiline string value');
+            $multiline = $delimiter;
+            next;
+        }
+        if (@key_path == 1 && defined($section) && !length($section)
+            && exists($wanted{$key})) {
+            report_unclassifiable_configuration("inline $key configuration");
+            next;
+        }
+        next if !exists($wanted{$field_section}) || !$wanted{$field_section}{$key};
+        my $path = parse_string_value($raw_value);
+        if (!defined($path)) {
+            report_unclassifiable_configuration("unsupported $field_section.$key value");
+            next;
+        }
+        report_external("$field_section.$key", $path) if !is_compiled_path($path);
+    }
+    report_unclassifiable_configuration('unterminated multiline string') if defined($multiline);
+    if (!close($config)) {
+        report_remnant($logical, "cannot finish reading configuration: $!");
+    }
+}
+
+sub close_traversal_streams {
+    my ($stack) = @_;
+    for my $frame (reverse(@$stack)) {
+        closedir($frame->{stream}) if defined($frame->{stream});
+        $frame->{stream} = undef;
+    }
+}
+
+sub restore_quarantined_directory {
+    my ($parent, $source_name, $quarantine_name, $logical, $identity) = @_;
+    my $source_path = descriptor_path($parent, $source_name);
+    my $quarantine_path = descriptor_path($parent, $quarantine_name);
+    my $quarantine_logical = $logical;
+    $quarantine_logical =~ s{[^/]+\z}{$quarantine_name};
+
+    maybe_pause_at_test_point('before-directory-restore-move', $logical);
+    if (!rename_noreplace($parent, $quarantine_name, $source_name)) {
+        if ($! == EEXIST) {
+            report_remnant($logical, 'replacement appeared while the verified directory was quarantined');
+            report_remnant($quarantine_logical, 'quarantined directory retained for recovery');
+        } else {
+            report_remnant($quarantine_logical, "cannot restore quarantined directory atomically: $!");
+        }
+        return 0;
+    }
+    my @restored = lstat($source_path);
+    if (!@restored || !same_directory_identity($identity, \@restored)) {
+        report_remnant($logical, 'restored directory identity is ambiguous');
+        return 0;
+    }
+    report_remnant($logical, 'directory changed during quarantine and was restored');
+    return 1;
+}
+
+sub traversal_chain_is_current;
+
+sub finish_directory_frame {
+    my ($frame, $root) = @_;
+    if (!closedir($frame->{stream})) {
+        $frame->{stream} = undef;
+        report_remnant($frame->{logical}, "cannot finish reading directory: $!");
+        return 0;
+    }
+    $frame->{stream} = undef;
+    # Keep the three compiled roots themselves as inert empty anchors. Their
+    # parents are outside the purge boundary, so removing a root cannot use the
+    # same in-root quarantine transaction as descendant directories.
+    return fixed_root_is_current($root, $root->{logical}) if $frame->{depth} == 0;
+    # A refused child makes this directory a retained remnant. Do not move the
+    # administrator-visible path merely to discover that the quarantine is
+    # nonempty when rmdir is attempted.
+    return 0 if !$frame->{children_removed};
+
+    my @opened = stat($frame->{handle});
+    my @current = lstat(descriptor_path($frame->{parent}, $frame->{name}));
+    if (!@opened || !@current
+        || !same_directory_identity($frame->{before}, \@opened)
+        || !same_directory_identity($frame->{before}, \@current)) {
+        report_remnant($frame->{logical}, 'directory changed before removal');
+        return 0;
+    }
+    my @parent_chain = @{$frame->{path_chain}};
+    pop @parent_chain;
+    if (!fixed_root_is_current($root, $root->{logical})
+        || !traversal_chain_is_current(\@parent_chain, $frame->{logical})) {
+        return 0;
+    }
+    maybe_pause_at_test_point('before-directory-quarantine', $frame->{logical});
+    my $quarantine_name = quarantine_entry(
+        $frame->{parent}, $frame->{name}, $frame->{logical}, $frame->{before},
+        'before-directory-quarantine-move');
+    return 0 if !defined($quarantine_name);
+    my $source_path = descriptor_path($frame->{parent}, $frame->{name});
+    my $quarantine_path = descriptor_path($frame->{parent}, $quarantine_name);
+    my $quarantine_logical = $frame->{logical};
+    $quarantine_logical =~ s{[^/]+\z}{$quarantine_name};
+    maybe_pause_at_test_point('after-directory-quarantine', $frame->{logical});
+    my @quarantined = lstat($quarantine_path);
+    my $quarantined_handle;
+    my $quarantined_valid = @quarantined
+        && same_directory_identity($frame->{before}, \@quarantined)
+        && sysopen($quarantined_handle, $quarantine_path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if ($quarantined_valid) {
+        my @opened_quarantine = stat($quarantined_handle);
+        $quarantined_valid = @opened_quarantine
+            && same_directory_identity($frame->{before}, \@opened_quarantine)
+            && opened_entry_is_on_root_mount(
+                $quarantined_handle, $root, $quarantine_logical);
+    }
+    # The disposable-root fixture can force the recovery branch so it can
+    # exercise a public-name collision at the exact atomic restore boundary.
+    if (length($prefix)
+        && $test_pause_point eq 'before-directory-restore-move'
+        && $test_pause_logical eq $frame->{logical}) {
+        $quarantined_valid = 0;
+    }
+    if (!$quarantined_valid) {
+        close($quarantined_handle) if defined($quarantined_handle);
+        my @identity = @quarantined ? @quarantined : @{$frame->{before}};
+        restore_quarantined_directory(
+            $frame->{parent}, $frame->{name}, $quarantine_name,
+            $frame->{logical}, \@identity);
+        return 0;
+    }
+    if (!fixed_root_is_current($root, $root->{logical})
+        || !traversal_chain_is_current(\@parent_chain, $frame->{logical})) {
+        close($quarantined_handle);
+        restore_quarantined_directory(
+            $frame->{parent}, $frame->{name}, $quarantine_name,
+            $frame->{logical}, \@quarantined);
+        return 0;
+    }
+    my @final = lstat($quarantine_path);
+    if (!@final || !same_directory_identity($frame->{before}, \@final)) {
+        close($quarantined_handle);
+        restore_quarantined_directory(
+            $frame->{parent}, $frame->{name}, $quarantine_name,
+            $frame->{logical}, @final ? \@final : \@quarantined);
+        return 0;
+    }
+    maybe_pause_at_test_point('before-directory-delete', $frame->{logical});
+    if (!rmdir($quarantine_path)) {
+        my $removal_error = "$!";
+        my @retained = lstat($quarantine_path);
+        if (@retained
+            && same_directory_identity($frame->{before}, \@retained)) {
+            restore_quarantined_directory(
+                $frame->{parent}, $frame->{name}, $quarantine_name,
+                $frame->{logical}, \@retained);
+        } else {
+            report_remnant(
+                $quarantine_logical, "directory removal failed: $removal_error");
+        }
+        close($quarantined_handle);
+        return 0;
+    }
+    close($quarantined_handle);
+    return 1;
+}
+
+sub traversal_chain_is_current {
+    my ($chain, $logical) = @_;
+    for my $entry (@$chain) {
+        my $anchored = descriptor_path($entry->{parent}, $entry->{name});
+        my @current = lstat($anchored);
+        my @opened = stat($entry->{handle});
+        my $mount_id = descriptor_mount_id($entry->{handle});
+        if (!@current || !@opened
+            || !same_directory_identity($entry->{before}, \@current)
+            || !same_directory_identity($entry->{before}, \@opened)
+            || !mount_identity_is_current($mount_id)
+            || $mount_id != $entry->{mount_id}) {
+            report_remnant($logical, 'opened descendant path changed before deletion');
+            return 0;
+        }
+    }
+    return 1;
+}
+
+sub traversal_frame_is_current {
+    my ($frame, $logical) = @_;
+    return traversal_chain_is_current($frame->{path_chain}, $logical);
+}
+
+sub rename_noreplace {
+    my ($parent, $source_name, $destination_name) = @_;
+    # Facelock's supported Debian-family packages are Architecture: amd64.
+    # x86-64 assigns renameat2 syscall number 316; RENAME_NOREPLACE is 1.
+    # Fail closed rather than falling back to a check followed by plain rename.
+    if ($Config{archname} !~ /\Ax86_64-/) {
+        $! = ENOSYS;
+        return 0;
+    }
+    my $parent_fd = fileno($parent);
+    my $mutable_source = "$source_name";
+    my $mutable_destination = "$destination_name";
+    return syscall($renameat2_syscall, $parent_fd, $mutable_source,
+        $parent_fd, $mutable_destination, 1) == 0;
+}
+
+sub quarantine_entry {
+    my ($parent, $source_name, $logical, $before, $pause_point) = @_;
+    for my $attempt (0 .. 31) {
+        my $name = sprintf('.facelock-purge-%x-%x-%02x',
+            $before->[0], $before->[1], $attempt);
+        next if $name eq $source_name;
+        maybe_pause_at_test_point($pause_point, $logical);
+        return $name if rename_noreplace($parent, $source_name, $name);
+        if ($! == EEXIST) {
+            my $collision_logical = $logical;
+            $collision_logical =~ s{[^/]+\z}{$name};
+            report_remnant($collision_logical, 'quarantine name collision');
+            next;
+        }
+        report_remnant($logical, "cannot quarantine entry atomically: $!");
+        return undef;
+    }
+    report_remnant($logical, 'no collision-free quarantine name is available');
+    return undef;
+}
+
+sub restore_quarantined_entry {
+    my ($parent, $source_name, $quarantine_name, $logical, $identity) = @_;
+    my $source_path = descriptor_path($parent, $source_name);
+    my $quarantine_path = descriptor_path($parent, $quarantine_name);
+    my $quarantine_logical = $logical;
+    $quarantine_logical =~ s{[^/]+\z}{$quarantine_name};
+
+    maybe_pause_at_test_point('before-regular-restore-move', $logical);
+    if (!rename_noreplace($parent, $quarantine_name, $source_name)) {
+        if ($! == EEXIST) {
+            report_remnant($logical, 'replacement appeared while the verified entry was quarantined');
+            report_remnant($quarantine_logical, 'quarantined entry retained for recovery');
+        } else {
+            report_remnant($quarantine_logical, "cannot restore quarantined entry atomically: $!");
+        }
+        return 0;
+    }
+    my @restored = lstat($source_path);
+    if (!@restored || !same_identity($identity, \@restored)) {
+        report_remnant($logical, 'restored entry identity is ambiguous');
+        return 0;
+    }
+    report_remnant($logical, 'entry changed during quarantine and was restored');
+    return 1;
+}
+
+sub purge_regular_entry {
+    my ($frame, $name, $logical, $before, $root) = @_;
+    my $parent = $frame->{handle};
+    if ($before->[3] != 1) {
+        report_remnant($logical, 'hard-linked regular file');
+        return 0;
+    }
+    if (!trusted_regular($logical, @$before)) {
+        report_remnant($logical, 'wrong owner or unsafe mode');
+        return 0;
+    }
+    my $anchored = descriptor_path($parent, $name);
+    my $opened;
+    maybe_pause_at_test_point('before-regular-open', $logical);
+    if (!sysopen($opened, $anchored, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {
+        report_remnant($logical, "cannot open regular file: $!");
+        return 0;
+    }
+    my @opened = stat($opened);
+    if (!@opened || !same_identity($before, \@opened)) {
+        close($opened);
+        report_remnant($logical, 'regular file changed while it was opened');
+        return 0;
+    }
+    if (!opened_entry_is_on_root_mount($opened, $root, $logical)) {
+        close($opened);
+        return 0;
+    }
+    my @current = lstat($anchored);
+    if (!@current || !same_identity($before, \@current)) {
+        close($opened);
+        report_remnant($logical, 'changed before unlink');
+        return 0;
+    }
+    if (!fixed_root_is_current($root, $root->{logical})
+        || !traversal_frame_is_current($frame, $logical)) {
+        close($opened);
+        return 0;
+    }
+    maybe_pause_at_test_point('before-regular-quarantine', $logical);
+    my $quarantine_name = quarantine_entry(
+        $parent, $name, $logical, $before, 'before-regular-quarantine-move');
+    if (!defined($quarantine_name)) {
+        close($opened);
+        return 0;
+    }
+    my $quarantine_path = descriptor_path($parent, $quarantine_name);
+    my $quarantine_logical = $frame->{logical} . '/' . $quarantine_name;
+    maybe_pause_at_test_point('after-regular-quarantine', $logical);
+    my @quarantined = lstat($quarantine_path);
+    my $quarantined_handle;
+    my $quarantined_valid = @quarantined
+        && same_identity($before, \@quarantined)
+        && sysopen($quarantined_handle, $quarantine_path,
+            O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if ($quarantined_valid) {
+        my @opened_quarantine = stat($quarantined_handle);
+        $quarantined_valid = @opened_quarantine
+            && same_identity($before, \@opened_quarantine)
+            && opened_entry_is_on_root_mount($quarantined_handle, $root, $quarantine_logical);
+    }
+    # See the directory branch above: production never forces recovery.
+    if (length($prefix)
+        && $test_pause_point eq 'before-regular-restore-move'
+        && $test_pause_logical eq $logical) {
+        $quarantined_valid = 0;
+    }
+    if (!$quarantined_valid) {
+        close($quarantined_handle) if defined($quarantined_handle);
+        my @identity = @quarantined ? @quarantined : @$before;
+        restore_quarantined_entry(
+            $parent, $name, $quarantine_name, $logical, \@identity);
+        close($opened);
+        return 0;
+    }
+    if (!fixed_root_is_current($root, $root->{logical})
+        || !traversal_frame_is_current($frame, $logical)) {
+        close($quarantined_handle);
+        restore_quarantined_entry(
+            $parent, $name, $quarantine_name, $logical, \@quarantined);
+        close($opened);
+        return 0;
+    }
+    my @final = lstat($quarantine_path);
+    if (!@final || !same_identity($before, \@final)) {
+        close($quarantined_handle);
+        restore_quarantined_entry(
+            $parent, $name, $quarantine_name, $logical,
+            @final ? \@final : \@quarantined);
+        close($opened);
+        return 0;
+    }
+    maybe_pause_at_test_point('before-regular-delete', $logical);
+    if (!unlink($quarantine_path)) {
+        my $unlink_error = "$!";
+        my @retained = lstat($quarantine_path);
+        if (@retained && same_identity($before, \@retained)) {
+            restore_quarantined_entry(
+                $parent, $name, $quarantine_name, $logical, \@retained);
+        } else {
+            report_remnant($quarantine_logical, "unlink failed: $unlink_error");
+        }
+        close($quarantined_handle);
+        close($opened);
+        return 0;
+    }
+    my @after_unlink = stat($quarantined_handle);
+    if (!@after_unlink || $after_unlink[3] != 0) {
+        report_external_hardlink(
+            $logical, 'inode remains linked after quarantine unlink');
+    }
+    close($quarantined_handle);
+    close($opened);
+    return 1;
+}
+
+sub purge_open_root {
+    my ($root, $logical) = @_;
+    maybe_pause_after_root_open($logical);
+    return 0 if !fixed_root_is_current($root, $logical);
+    my $stream;
+    if (!opendir($stream, descriptor_path($root->{root}))) {
+        report_remnant($logical, "cannot enumerate opened root: $!");
+        return 0;
+    }
+    my @stack = ({
+        handle => $root->{root},
+        stream => $stream,
+        parent => $root->{parent},
+        name => $root->{name},
+        logical => $logical,
+        before => $root->{before},
+        depth => 0,
+        children_removed => 1,
+        path_chain => [],
+    });
+    my $nodes_seen = 0;
+
+    while (@stack) {
+        my $frame = $stack[-1];
+        $! = 0;
+        my $name = readdir($frame->{stream});
+        if (!defined($name)) {
+            if ($!) {
+                report_remnant($frame->{logical}, "cannot continue reading directory: $!");
+                close_traversal_streams(\@stack);
+                return 0;
+            }
+            my $removed = finish_directory_frame($frame, $root);
+            pop @stack;
+            if (@stack && !$removed) {
+                $stack[-1]->{children_removed} = 0;
+            }
+            next;
+        }
+        next if $name eq '.' || $name eq '..';
+        my $child_logical = $frame->{logical} . '/' . $name;
+        if ($protected{$child_logical}) {
+            $frame->{children_removed} = 0;
+            next;
+        }
+        $nodes_seen++;
+        if ($nodes_seen > $max_nodes) {
+            # The unvisited entries are deliberately not enumerated once the
+            # ceiling is reached. Name the retained subtree that contains all
+            # of them rather than implying only this first unseen child
+            # remains.
+            report_remnant($logical, "node limit exceeded ($max_nodes)");
+            close_traversal_streams(\@stack);
+            return 0;
+        }
+
+        my $anchored = descriptor_path($frame->{handle}, $name);
+        my @before = lstat($anchored);
+        next if !@before && $! == ENOENT;
+        if (!@before) {
+            report_remnant($child_logical, "cannot inspect: $!");
+            $frame->{children_removed} = 0;
+            next;
+        }
+        # PAM rollback state is opaque to this self-contained postrm. Only an
+        # exact trusted empty directory is eligible for removal; every other
+        # object at the fixed path is unresolved cleanup evidence regardless
+        # of whether the generic traversal could otherwise delete its type.
+        if ($child_logical eq '/var/lib/facelock/pam-backups'
+            && !S_ISDIR($before[2])) {
+            report_remnant(
+                $child_logical,
+                'PAM rollback state path is not a trusted empty directory');
+            $frame->{children_removed} = 0;
+            next;
+        }
+        if (S_ISLNK($before[2])) {
+            report_remnant($child_logical, 'symbolic link');
+            $frame->{children_removed} = 0;
+            next;
+        }
+        if (S_ISREG($before[2])) {
+            $frame->{children_removed} = 0
+                if !purge_regular_entry(
+                    $frame, $name, $child_logical, \@before, $root);
+            next;
+        }
+        if (!S_ISDIR($before[2])) {
+            report_remnant($child_logical, 'non-regular object');
+            $frame->{children_removed} = 0;
+            next;
+        }
+        if (!trusted_directory(@before)) {
+            report_remnant($child_logical, 'wrong owner or unsafe directory mode');
+            $frame->{children_removed} = 0;
+            next;
+        }
+        my $child_depth = $frame->{depth} + 1;
+        if ($child_depth > $max_depth) {
+            report_remnant($child_logical, "depth limit exceeded ($max_depth)");
+            $frame->{children_removed} = 0;
+            next;
+        }
+        my $child;
+        if (!sysopen($child, $anchored, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)) {
+            report_remnant($child_logical, "cannot open directory: $!");
+            $frame->{children_removed} = 0;
+            next;
+        }
+        my @opened = stat($child);
+        if (!@opened || !same_directory_identity(\@before, \@opened)) {
+            close($child);
+            report_remnant($child_logical, 'directory changed while it was opened');
+            $frame->{children_removed} = 0;
+            next;
+        }
+        if (!opened_entry_is_on_root_mount($child, $root, $child_logical)) {
+            close($child);
+            $frame->{children_removed} = 0;
+            next;
+        }
+        my $child_stream;
+        if (!opendir($child_stream, descriptor_path($child))) {
+            close($child);
+            report_remnant($child_logical, "cannot enumerate directory: $!");
+            $frame->{children_removed} = 0;
+            next;
+        }
+        if ($child_logical eq '/var/lib/facelock/pam-backups') {
+            my $has_rollback_state = 0;
+            my $scan_failed = 0;
+            while (1) {
+                $! = 0;
+                my $rollback_name = readdir($child_stream);
+                if (!defined($rollback_name)) {
+                    $scan_failed = 1 if $!;
+                    last;
+                }
+                next if $rollback_name eq '.' || $rollback_name eq '..';
+                $has_rollback_state = 1;
+                last;
+            }
+            if ($scan_failed) {
+                report_remnant(
+                    $child_logical, "cannot inspect PAM rollback state: $!");
+                closedir($child_stream);
+                close($child);
+                $frame->{children_removed} = 0;
+                next;
+            }
+            if ($has_rollback_state) {
+                report_remnant(
+                    $child_logical,
+                    'PAM rollback state remains after removal cleanup');
+                closedir($child_stream);
+                close($child);
+                $frame->{children_removed} = 0;
+                next;
+            }
+            rewinddir($child_stream);
+        }
+        push @stack, {
+            handle => $child,
+            stream => $child_stream,
+            parent => $frame->{handle},
+            name => $name,
+            logical => $child_logical,
+            before => \@before,
+            depth => $child_depth,
+            children_removed => 1,
+            path_chain => [
+                @{$frame->{path_chain}},
+                {
+                    parent => $frame->{handle},
+                    handle => $child,
+                    name => $name,
+                    before => [@opened],
+                    mount_id => descriptor_mount_id($child),
+                },
+            ],
+        };
+    }
+    return 1;
+}
+
+sub purge_roots {
+    if (!load_mountpoints()) {
+        report_remnant($_, 'mount topology is unavailable') for @logical_roots;
+        return;
+    }
+    inspect_external_configuration();
+    for my $logical (@logical_roots) {
+        next if $protected{$logical};
+        my $root = open_fixed_root($logical);
+        next if !defined($root);
+        purge_open_root($root, $logical);
+    }
+}
+
+my $ok = eval {
+    if ($operation eq 'report') {
+        if (load_mountpoints()) {
+            inspect_external_configuration();
+        }
+    } elsif ($operation eq 'purge') {
+        purge_roots();
+    } else {
+        die "unknown lifecycle helper operation: $operation";
+    }
+    1;
+};
+if (!$ok) {
+    my $error = $@ || 'unknown helper error';
+    chomp $error;
+    print STDERR 'facelock purge: helper stopped after preserving every uncertain remnant: ',
+        report_text($error), "\n";
+}
+
+# A refusal must not keep dpkg in a permanently half-purged state.
+exit 0;
+PERL
+}
+
 case "$1" in
     remove)
+        if ! run_lifecycle_helper report; then
+            echo "facelock purge: external paths could not be classified; no retained state was removed" >&2
+        fi
         cat <<EOF
 
-facelock uninstalled. User data preserved at:
+Facelock's package payload was removed. Ordinary removal preserves user data at:
   /etc/facelock/      (config.toml, encryption.key.sealed, setup markers)
   /var/lib/facelock/  (face database, ONNX models)
   /var/log/facelock/  (audit logs and snapshots)
 
-Retained state cleanup is intentionally not automated.
+If package purge was requested, a later maintainer-script phase attempts the bounded cleanup described below.
+Ordinary removal does not automate retained-state cleanup.
 Cleanup must stay within the fixed roots above, leave configured external paths untouched, and refuse links or mount crossings.
 Filesystem deletion does not securely erase SSDs, snapshots, or backups.
 
 EOF
         ;;
 
-    purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    purge)
+        if ! run_lifecycle_helper purge; then
+            echo "facelock purge: bounded cleanup was unavailable; retained state remains" >&2
+        fi
+        ;;
+
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
         ;;
 
     *)

@@ -436,6 +436,72 @@ for arch_consumer in (".github/workflows/ci.yml", ".github/workflows/scripts/pub
     require_arch_mirror_before_each_pacman(arch_consumer)
 ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text()
 justfile = (ROOT / "justfile").read_text()
+
+
+def workflow_job_body(content: str, job_name: str) -> str:
+    match = re.search(
+        rf"(?ms)^  {re.escape(job_name)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        content,
+    )
+    require(match is not None, f"workflow omits required job: {job_name}")
+    return match.group("body")
+
+
+ci_agent_docs_job = workflow_job_body(ci_workflow, "agent-docs")
+release_deb_job = workflow_job_body(workflow, "build-deb")
+for package in ("just", "python", "ripgrep"):
+    require(
+        re.search(rf"(?m)^\s+{re.escape(package)}(?: \\)?\s*$", ci_agent_docs_job)
+        is not None,
+        f"CI agent-docs job must install {package} for Debian source-contract validation",
+    )
+for package in ("just", "python3", "ripgrep"):
+    require(
+        re.search(rf"(?m)^\s+{re.escape(package)}(?: \\)?\s*$", release_deb_job)
+        is not None,
+        f"release build-deb job must install {package} for Debian source-contract validation",
+    )
+require(
+    len(
+        re.findall(
+            r"(?m)^\s+run:\s+just test-deb-source-contract\s*$",
+            ci_agent_docs_job,
+        )
+    )
+    == 1,
+    "CI agent-docs job must run exactly one combined Debian source-contract target",
+)
+require(
+    len(
+        re.findall(
+            r"(?m)^\s+just test-deb-source-contract\s*$",
+            release_deb_job,
+        )
+    )
+    == 1,
+    "release build-deb job must run exactly one combined Debian source-contract target",
+)
+deb_source_contract_recipe = re.search(
+    r"(?m)^test-deb-source-contract:\s*\n(?P<body>(?:^[ \t].*(?:\n|\Z))*)",
+    justfile,
+)
+require(
+    deb_source_contract_recipe is not None,
+    "justfile omits the Debian source-contract target",
+)
+deb_source_contract_commands = [
+    line.strip()
+    for line in deb_source_contract_recipe.group("body").splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+]
+require(
+    deb_source_contract_commands
+    == [
+        "bash test/deb-source-contract.sh",
+        "python3 test/deb-source-contract-test.py",
+    ],
+    "just Debian source-contract target must run the exact shell and mutation commands",
+)
 live_channel_command = "python3 test/check-live-release-channels.py"
 require(live_channel_command in ci_workflow, "CI does not compare live release channels with the checked-in authority")
 require(live_channel_command in justfile, "release preflight does not compare live release channels with the checked-in authority")
@@ -642,10 +708,7 @@ for phrase in debian_source_phrases:
     require(phrase in normalized_contracts, f"system contracts omit Debian source policy: {phrase}")
 
 compatibility_paths = ("docs/compatibility.md", "book/src/compatibility.md")
-compatibility_support_floor = (
-    "Debian-family support starts at Debian 13+ and Ubuntu 26.04+; "
-    "older Debian and Ubuntu releases are unsupported."
-)
+compatibility_support_floor = debian_support_phrase
 tested_debian_family_rows = (
     "| Debian 13 (Trixie) | systemd | daemon + D-Bus activation | Booted package gate |",
     "| Ubuntu 26.04 LTS (Resolute) | systemd | daemon + D-Bus activation | Booted package gate |",

@@ -81,10 +81,10 @@ pub struct SetupCli {
     /// Do not touch PAM configuration at all (no prompt, no write)
     #[arg(long = "no-pam", overrides_with = "pam")]
     pub no_pam: bool,
-    /// Install and enable systemd units
+    /// Validate installed systemd/D-Bus assets, reload, and enable the daemon
     #[arg(long, overrides_with = "no_systemd")]
     pub systemd: bool,
-    /// Do not install or enable systemd units
+    /// Do not validate, reload, or enable systemd/D-Bus assets
     #[arg(long = "no-systemd", overrides_with = "systemd")]
     pub no_systemd: bool,
     /// Enroll a face during setup

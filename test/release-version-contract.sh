@@ -338,6 +338,23 @@ assert_matrix_mutation_rejected() {
     echo "release matrix mutation case: $context rejected"
 }
 
+assert_matrix_mutation_rejected \
+    "CI Debian source-contract target invocation" \
+    ".github/workflows/ci.yml" \
+    's/run: just test-deb-source-contract/run: just test-deb-source-contract-disabled/'
+assert_matrix_mutation_rejected \
+    "release Debian source-contract target invocation" \
+    ".github/workflows/release.yml" \
+    's/just test-deb-source-contract/just test-deb-source-contract-disabled/'
+assert_matrix_mutation_rejected \
+    "Debian source-contract shell recipe command" \
+    "justfile" \
+    's@    bash test/deb-source-contract.sh@    bash test/deb-source-contract-disabled.sh@'
+assert_matrix_mutation_rejected \
+    "Debian source-contract mutation recipe command" \
+    "justfile" \
+    's@    python3 test/deb-source-contract-test.py@    python3 test/deb-source-contract-test-disabled.py@'
+
 assert_matrix_payload_mutation_rejected_with_diagnostic() {
     local context="$1"
     local relative_file="$2"
@@ -774,8 +791,18 @@ esac
 assert_rejected bash "$repo_root/.github/workflows/scripts/publish-aur.sh" 0.2.0-alpha.1 unused
 
 apt_recipe_root="$tmp_root/apt-recipe-root"
-mkdir -p "$apt_recipe_root/dist/apt/conf" "$apt_recipe_root/scripts" "$apt_recipe_root/test"
+mkdir -p \
+    "$apt_recipe_root/debian" \
+    "$apt_recipe_root/dist/apt/conf" \
+    "$apt_recipe_root/scripts" \
+    "$apt_recipe_root/test"
 cp "$repo_root/justfile" "$apt_recipe_root/"
+cp "$repo_root/debian/postrm" "$apt_recipe_root/debian/"
+cat >"$apt_recipe_root/debian/generated-postrm-helper" <<'SCRIPT'
+if [ "$1" = "purge" ]; then
+    deb-systemd-helper purge 'facelock-daemon.service' >/dev/null || true
+fi
+SCRIPT
 cp "$repo_root/dist/apt/conf/distributions" "$apt_recipe_root/dist/apt/conf/"
 cp "$repo_root/scripts/release-versions.sh" "$apt_recipe_root/scripts/"
 cp "$repo_root/test/deb-package-contract.sh" \
@@ -887,12 +914,9 @@ if [ -z "$DPKG_ROOT" ] && [ "$1" = remove ] && [ -d /run/systemd/system ]; then
     deb-systemd-invoke stop 'facelock-daemon.service' >/dev/null || true
 fi
 SCRIPT
-        cat >"$3/postrm" <<'SCRIPT'
-#!/bin/sh
-if [ "$1" = "purge" ]; then
-    deb-systemd-helper purge 'facelock-daemon.service' >/dev/null || true
-fi
-SCRIPT
+        sed -e '/^#DEBHELPER#$/r debian/generated-postrm-helper' \
+            -e '/^#DEBHELPER#$/d' debian/postrm >"$3/postrm"
+        printf '%s\n' '/etc/facelock/config.toml' >"$3/conffiles"
         ;;
     *) exit 2 ;;
 esac

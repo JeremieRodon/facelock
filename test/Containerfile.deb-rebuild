@@ -24,7 +24,11 @@ RUN case "$SUITE" in \
 
 COPY test/run-deb-offline-build.sh /usr/local/bin/run-deb-offline-build.sh
 COPY .github/workflows/scripts/run-networkless.sh /usr/local/libexec/facelock/run-networkless.sh
+COPY test/deb-package-contract.sh test/deb-maintscript-contract.sh /usr/local/libexec/facelock/test/
+COPY scripts/release-versions.sh /usr/local/libexec/facelock/scripts/release-versions.sh
 RUN chmod +x /usr/local/bin/run-deb-offline-build.sh \
-    /usr/local/libexec/facelock/run-networkless.sh
+    /usr/local/libexec/facelock/run-networkless.sh \
+    /usr/local/libexec/facelock/test/deb-package-contract.sh \
+    /usr/local/libexec/facelock/test/deb-maintscript-contract.sh
 
 ENTRYPOINT ["/usr/local/bin/run-deb-offline-build.sh"]

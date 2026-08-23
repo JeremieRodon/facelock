@@ -29,7 +29,7 @@ The CLI works in all modes -- it connects to the daemon if available, otherwise 
 
 ```
 facelock (unified binary)
-├── facelock setup          Download models, install systemd/PAM
+├── facelock setup          Download models, validate systemd, configure PAM
 ├── facelock enroll         Capture and store a face
 ├── facelock test           Test recognition
 ├── facelock list           List enrolled models

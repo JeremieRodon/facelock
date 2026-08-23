@@ -4,6 +4,7 @@ set -euo pipefail
 PASS=0
 FAIL=0
 SKIP=0
+ALLOWED_SKIP=0
 
 # Record an assertion (or a whole block of them) that did not run.
 #
@@ -16,9 +17,14 @@ SKIP=0
 skip_test() {
     local name="$1"
     local reason="$2"
+    local classification="${3:-mandatory}"
 
     echo "SKIP: $name ($reason)"
     SKIP=$((SKIP + 1))
+    if [ "$classification" = allowed-partial ] &&
+       [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = 1 ]; then
+        ALLOWED_SKIP=$((ALLOWED_SKIP + 1))
+    fi
 }
 
 run_test() {
@@ -40,18 +46,6 @@ run_test() {
         echo "FAIL (exit=$result, expected=$expected_result)"
         cat /tmp/test-output
         FAIL=$((FAIL + 1))
-    fi
-}
-
-run_warn_check() {
-    local name="$1"
-    local cmd="$2"
-
-    echo -n "WARN: $name ... "
-    if bash -c "$cmd" > /tmp/test-output 2>&1; then
-        echo "present"
-    else
-        echo "missing"
     fi
 }
 
@@ -155,6 +149,7 @@ verify_debian_packaged_pam_profile() {
     local bad_output=/tmp/facelock-common-auth-profile.bad
     local active=/tmp/facelock-common-auth-profile.active
     local selected=/tmp/facelock-pam-state-profile.active
+    local active_before="" enabled_before="" active_after="" enabled_after=""
     local failed=0 service_path=/etc/pam.d/facelock-profile-test
 
     cp -- /etc/pam.d/common-auth "$before" || return 1
@@ -168,12 +163,46 @@ verify_debian_packaged_pam_profile() {
         /etc/pam.d/common-auth || failed=1
     cp -- /etc/pam.d/common-auth "$active" || failed=1
     cp -- /var/lib/pam/auth "$selected" || failed=1
+    if [ -d /run/systemd/system ]; then
+        if ! active_before="$(systemctl show --property=ActiveState --value facelock-daemon.service 2>/dev/null)"; then
+            printf '%s\n' 'packaged PAM profile reinstall ActiveState: expected=<nonempty-before> actual=<command-error>' >&2
+            failed=1
+        elif [ -z "$active_before" ]; then
+            printf '%s\n' 'packaged PAM profile reinstall ActiveState: expected=<nonempty-before> actual=<empty>' >&2
+            failed=1
+        fi
+        if ! enabled_before="$(systemctl show --property=UnitFileState --value facelock-daemon.service 2>/dev/null)"; then
+            printf '%s\n' 'packaged PAM profile reinstall UnitFileState: expected=<nonempty-before> actual=<command-error>' >&2
+            failed=1
+        elif [ -z "$enabled_before" ]; then
+            printf '%s\n' 'packaged PAM profile reinstall UnitFileState: expected=<nonempty-before> actual=<empty>' >&2
+            failed=1
+        fi
+    fi
     apt-get install -y --reinstall /facelock-test-package.deb || failed=1
     cmp -s "$active" /etc/pam.d/common-auth || failed=1
     cmp -s "$selected" /var/lib/pam/auth || failed=1
     if [ -d /run/systemd/system ]; then
-        ! systemctl is-active --quiet facelock-daemon || failed=1
-        [ "$(systemctl is-enabled facelock-daemon 2>/dev/null || true)" = disabled ] || failed=1
+        if ! active_after="$(systemctl show --property=ActiveState --value facelock-daemon.service 2>/dev/null)"; then
+            printf 'packaged PAM profile reinstall ActiveState: expected=%s actual=<command-error>\n' "$active_before" >&2
+            failed=1
+        elif [ -z "$active_after" ]; then
+            printf 'packaged PAM profile reinstall ActiveState: expected=%s actual=<empty>\n' "$active_before" >&2
+            failed=1
+        elif [ "$active_after" != "$active_before" ]; then
+            printf 'packaged PAM profile reinstall ActiveState: expected=%s actual=%s\n' "$active_before" "$active_after" >&2
+            failed=1
+        fi
+        if ! enabled_after="$(systemctl show --property=UnitFileState --value facelock-daemon.service 2>/dev/null)"; then
+            printf 'packaged PAM profile reinstall UnitFileState: expected=%s actual=<command-error>\n' "$enabled_before" >&2
+            failed=1
+        elif [ -z "$enabled_after" ]; then
+            printf 'packaged PAM profile reinstall UnitFileState: expected=%s actual=<empty>\n' "$enabled_before" >&2
+            failed=1
+        elif [ "$enabled_after" != "$enabled_before" ]; then
+            printf 'packaged PAM profile reinstall UnitFileState: expected=%s actual=%s\n' "$enabled_before" "$enabled_after" >&2
+            failed=1
+        fi
     fi
 
     if ! printf '%s\n' test | LC_ALL=C timeout 30 \
@@ -304,8 +333,9 @@ case "$PACKAGE_FORMAT" in
         ;;
 esac
 
-run_warn_check "facelock-polkit-agent binary" "[ -x /usr/bin/facelock-polkit-agent ]"
-run_warn_check "quirks database files" "ls /usr/share/facelock/quirks.d/*.toml >/dev/null 2>&1"
+run_test "facelock-polkit-agent binary is installed" "[ -x /usr/bin/facelock-polkit-agent ]"
+run_test "quirks database files are installed" \
+    "find /usr/share/facelock/quirks.d -maxdepth 1 -type f -name '*.toml' -print -quit | grep -q ."
 
 run_test "PAM module exports pam_sm_authenticate" "nm -D \"$PAM_MODULE_PATH\" | grep -q pam_sm_authenticate"
 run_test "PAM module exports pam_sm_setcred" "nm -D \"$PAM_MODULE_PATH\" | grep -q pam_sm_setcred"
@@ -567,11 +597,12 @@ if [ -d /run/systemd/system ] && systemctl show facelock-daemon >/dev/null 2>&1;
         # Explicitly asked for a partial run. Name every assertion that is not
         # running so the results line has to account for them.
         no_models="no ONNX models at /var/lib/facelock/models, FACELOCK_ALLOW_MISSING_MODELS=1"
-        skip_test "facelock-daemon starts under hardened unit" "$no_models"
-        skip_test "facelock-daemon answers on D-Bus" "$no_models"
-        skip_test "runtime: no daemon thread holds CAP_CHOWN while serving" "$no_models"
+        skip_test "facelock-daemon starts under hardened unit" "$no_models" allowed-partial
+        skip_test "facelock-daemon answers on D-Bus" "$no_models" allowed-partial
+        skip_test "runtime: no daemon thread holds CAP_CHOWN while serving" "$no_models" allowed-partial
         if [ "$PACKAGE_FORMAT" = deb ]; then
-            skip_test "Debian reinstall restarts only active daemons and preserves enabled state" "$no_models"
+            skip_test "Debian reinstall restarts only active daemons and preserves enabled state" \
+                "$no_models" allowed-partial
         fi
     else
         # Under a booted systemd, missing models are a broken invocation, not a
@@ -765,11 +796,21 @@ rm -f "$PACKAGE_OWNED_PAM" "$PACKAGE_BLOCKER_PAM" \
     /tmp/facelock-package-owned.sha /tmp/facelock-package-blocker.sha \
     /tmp/facelock-common-auth.before
 
+UNEXPECTED_SKIP=$((SKIP - ALLOWED_SKIP))
+if [ "$UNEXPECTED_SKIP" -gt 0 ]; then
+    echo "FAIL: $UNEXPECTED_SKIP unexpected skip(s) make package validation incomplete"
+    FAIL=$((FAIL + UNEXPECTED_SKIP))
+fi
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped ==="
 if [ "$SKIP" -gt 0 ]; then
-    echo "NOTE: $SKIP assertion(s)/block(s) above did not run — this run proves less"
-    echo "      than a full one. Grep the log for '^SKIP:' to see which."
+    if [ "$UNEXPECTED_SKIP" -gt 0 ]; then
+        echo "ERROR: skipped mandatory coverage is a package-validation failure"
+    else
+        echo "NOTE: $ALLOWED_SKIP model-dependent assertion(s) were skipped by the explicit"
+        echo "      FACELOCK_ALLOW_MISSING_MODELS=1 partial-run opt-out."
+    fi
 fi
 
 if [ "$FAIL" -gt 0 ]; then

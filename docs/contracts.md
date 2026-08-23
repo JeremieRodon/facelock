@@ -54,7 +54,7 @@ follow it.
 | Command | Purpose |
 |---------|---------|
 | `facelock setup` | Interactive setup wizard (camera, models, inference device, encryption, daemon, enrollment, PAM — the daemon before enrollment, so enrollment and the recognition test run on the transport later authentications use); removes a leftover `facelock` group from an older install, best-effort (ADR 010) |
-| `facelock setup --systemd` | Install/enable systemd units |
+| `facelock setup --systemd` | Validate installed systemd/D-Bus assets, retire exact known legacy copies, reload, verify resolution, and enable the daemon unit |
 | `facelock setup --pam` | Alias onto `facelock pam add\|remove` (see "facelock pam" below). Kept, and kept parsing, for every wrapper written against it |
 | `facelock setup --pam --allow-sensitive` | Explicitly authorize an add to a sensitive PAM service. Does not suppress confirmation and conflicts with `--remove` |
 | `facelock pam add` | Add the facelock line to one or more `/etc/pam.d/<service>` files. Root |
@@ -272,6 +272,90 @@ path took in the vendor directories, `--service polkit-1` finds
 `/usr/lib/pam.d/polkit-1` on a stock Arch box without it. Reserve
 `--if-present` for services a machine may genuinely not have. The default stays
 a hard error, which is what catches `--service polkti-1`.
+
+### facelock setup System Asset Ownership
+
+`facelock setup --systemd` is not an installer for immutable service assets.
+The Debian/RPM/Arch packages and `just install-files` own these canonical
+files:
+
+- `/usr/lib/systemd/system/facelock-daemon.service`
+- `/usr/share/dbus-1/system.d/org.facelock.Daemon.conf`
+- `/usr/share/dbus-1/system-services/org.facelock.Daemon.service`
+
+Setup requires each path to be a single-link `0644 root:root` regular file
+whose bytes match the running build. It never creates, overwrites, changes the
+mode or changes the owner of one. After `daemon-reload`, setup requires
+systemd's `FragmentPath` to name the canonical unit and refuses drop-ins. D-Bus
+activation is also winner-selected: setup refuses exact-name definitions in
+the higher-priority `/etc`, `/run`, and `/usr/local` service directories. D-Bus
+policy is different: every policy fragment is merged. Setup proves the
+canonical policy bytes are present and the exact historical `/etc` duplicate
+is retired; it preserves and reports every other local policy fragment and
+never claims those administrator rules are ineffective.
+
+The only static-file mutation setup may perform is retiring these historical
+legacy copies:
+
+- `/etc/systemd/system/facelock-daemon.service`
+- `/etc/dbus-1/system.d/org.facelock.Daemon.conf`
+- `/etc/dbus-1/system-services/org.facelock.Daemon.service`
+
+The complete canonical, legacy, and fixed quarantine set is preflighted before
+the first mutation.
+A legacy path is removable only when it is a single-link `0644 root:root`
+regular file whose SHA-256 is in `dist/legacy-system-assets.sha256`, the
+reviewed inventory of exact historical Facelock bytes. Missing paths are
+healthy and repeated migration is a no-op. Modified, unknown, symlinked,
+hardlinked, non-regular, wrongly owned or wrongly moded paths are preserved and
+make the action fail with the exact path and recovery direction; an ambiguous
+peer or quarantine collision prevents removal of every otherwise exact peer in
+that run. The sole recoverable pre-existing quarantine state is an absent
+public legacy name paired with its exact known, trusted fixed quarantine.
+Before restoring any such pair, setup preflights the complete canonical and
+three-pair set. It restores every recoverable pair in reverse order with
+no-replace semantics, revalidates the result, then restarts the complete
+migration preflight. A dual-name pair, changed quarantine, ambiguous peer, or
+recovery collision is preserved and reported without overwrite.
+
+Migration first moves every candidate with no-replace semantics to its fixed,
+same-parent `.facelock-migrate-*` quarantine. A later staging or revalidation
+failure rolls earlier candidates back in reverse order before any quarantine
+is deleted. Rollback never overwrites a replacement: a collision preserves
+both fixed names and reports incomplete recovery. Only after every legacy name
+is absent and the complete canonical and quarantine set has been revalidated
+does deletion of the quarantines publish the migration. Cleanup failure after
+that boundary can leave a reported fixed quarantine, but cannot leave a mix of
+active historical names; the next run authenticates, restores, and remigrates
+that exact pair through the same bounded protocol. Rust uses Linux
+`renameat2(RENAME_NOREPLACE)` without a replacing-rename fallback; the source
+helper uses same-parent GNU `mv -Tn` and verifies both names so a no-clobber
+skip is an error.
+
+Production pins the trusted identity to UID/GID `0:0` and requires the layout
+root, every existing parent, and every asset to have the documented trusted
+ownership and modes. The source helper's explicit alternate-layout test mode
+treats that real, non-linked layout directory's owner as the root-equivalent
+identity and also rejects a group/world-writable root. That identity can change
+the fixture just as root can change the production filesystem; it is not an
+isolation boundary.
+
+`setup --systemd --disable` stops and disables the unit without writing any
+service asset. A concurrent privileged writer can always replace root-owned
+names between filesystem operations; setup detects stable-path changes by
+revalidating immediately before removal, but does not claim isolation from a
+second root process. Administrators must not edit these paths concurrently.
+`just uninstall` removes only canonical `/usr` assets. It never inspects or
+removes any of the three historical `/etc` names, even when one is an exact
+known regular copy; linked and parent-linked forms are preserved as well. It
+preflights the complete canonical set before deletion: every existing parent
+component must be a non-linked directory owned by the trusted root-equivalent
+identity and not writable by group/other, while each existing direct target
+must be a single-link `0644` regular file with that identity. A linked,
+multiply linked, wrongly owned, wrongly moded or non-regular canonical target,
+or any untrusted canonical parent, preserves every canonical peer and fails the
+uninstall-files action. This path-based shell preflight does not claim
+isolation from another process with the same root-equivalent authority.
 
 **`--pam` is an alias onto `facelock pam add` / `facelock pam remove`.** The
 plan resolution above stays on `setup` — `--pam`, `--no-pam`, `--service`,
@@ -1932,10 +2016,12 @@ available after explicit setup. Reinstall and upgrade restart the daemon only
 when it was already active, including an active D-Bus-activated instance; they
 preserve both enabled and disabled state and leave every inactive instance
 inactive. The post-install convergence still removes the retired `facelock`
-group, fixes ADR 010 ownership, refreshes a recognized legacy D-Bus policy
-copy, asks the bus to reload policy, and registers the opt-in PAM profile
-without selecting it. Package validation requires the installed TPM command
-surface and the suite-native `libtss2` dependency closure.
+group, fixes ADR 010 ownership, leaves every legacy `/etc` systemd/D-Bus copy
+untouched, asks the bus to reload policy, and registers the opt-in PAM profile
+without selecting it. Exact known legacy-copy migration belongs to
+`facelock setup --systemd`; package configuration never overwrites an
+administrator-owned shadow. Package validation requires the installed TPM
+command surface and the suite-native `libtss2` dependency closure.
 
 Compat 13's generated `dh_installtmpfiles` post-install snippet is the sole
 install-time tmpfiles activation and invokes `systemd-tmpfiles` for
@@ -2112,11 +2198,12 @@ global tmpfiles command.
 
 ## Package Lifecycle Ownership
 
-This is the Wave 0 ownership freeze for issue #232. It defines what later
-package lifecycle work is allowed to remove; it does not claim that the current
-Debian purge script already implements the bounded purge described below.
-**Ordinary removal is not data deletion.** Removing the package must leave a
-machine reinstallable without losing its biometric or operational state.
+This is the Wave 0 ownership freeze for issue #232. It defines what package
+lifecycle work is allowed to remove, and the Debian post-removal script
+implements the bounded purge described below. **Ordinary removal is not data
+deletion.** Ordinary `remove` remains preservation-only: removing the package
+must leave a machine reinstallable without losing its biometric or operational
+state.
 
 The ownership classes are deliberately separate:
 
@@ -2125,7 +2212,7 @@ The ownership classes are deliberately separate:
 | Package-owned static integration | binaries and shared libraries, systemd/OpenRC/runit/s6 units, D-Bus policy and activation, tmpfiles configuration, shipped quirks, PAM/authselect profiles, translations, bundled runtime libraries | Remove through the package manager. These files can be recreated byte-for-byte by reinstalling the package |
 | Administrator configuration | `/etc/facelock/config.toml` and the package manager's saved replacement for an administrator-modified copy | Apply the native package-family rules below. Do not treat administrator configuration as biometric state or as disposable static integration |
 | Biometric and operational state | the database and its WAL/SHM sidecars, encryption keys and sealed keys, downloaded models, enrollment markers, setup state, audit logs, and snapshots under the compiled roots | Preserve all of it. A reinstall reuses it; ordinary removal never interprets absence of the package as consent to discard it |
-| PAM integration and provenance | a `pam_facelock.so` rule, a Facelock-created local override and its provenance header, and `<service>.facelock-backup` rollback files | Attempt safe cleanup inside the fixed PAM root. Delete provenance only after the corresponding PAM cleanup is proven complete |
+| PAM integration and provenance | a `pam_facelock.so` rule, a Facelock-created local override and its provenance header, legacy `<service>.facelock-backup` files, and rollback state under `/var/lib/facelock/pam-backups` | Attempt safe cleanup while the binary is still present. Delete provenance only after the corresponding PAM cleanup is proven complete |
 | Externally configured state | any database, model directory, key, sealed key, audit log, or snapshot path configured outside the compiled Facelock roots | Never package-owned. Leave it untouched and report it as an external remnant |
 
 PAM provenance and rollback files are not biometric state. They exist to
@@ -2145,6 +2232,10 @@ unwritable, wrong-owner, non-regular, changed, linked, or mount-separated
 service file makes cleanup incomplete: preserve its override, provenance
 header, and `.facelock-backup`, and report the exact remnant. Cleanup of one
 service does not authorize deleting provenance for a different service.
+The final Debian `postrm` never interprets rollback schemas. If
+`/var/lib/facelock/pam-backups` is nonempty after the earlier binary-backed
+cleanup, it retains and reports the entire opaque subtree; only a trusted empty
+directory is eligible for ordinary fixed-root removal.
 
 ### Native configuration lifecycles
 
@@ -2159,12 +2250,118 @@ mechanisms:
 | Arch package removal | the `backup` entry follows pacman's native saved-configuration behavior (including `.pacsave` when applicable). Facelock lifecycle code does not bypass it |
 | `just uninstall` | no package manager owns the config, so the source-install uninstall preserves `/etc/facelock` with the biometric and operational state |
 
+### Source-install daemon lifecycle
+
+The privileged `install` and `uninstall` entrypoints invoke absolute
+`/usr/bin/sudo`, `/usr/bin/env`, and `/usr/bin/just` paths with
+`PATH=/usr/bin:/bin`. The `install-files` and `uninstall-files` recipes use the
+exact `#!/usr/bin/bash -p` interpreter, set that fixed path before their first
+operation, and reject caller-supplied Bash startup hooks through the structural
+gate. Directly executed production helpers also use `/usr/bin/bash -p` and pin
+their production path. The root-owned checkout and another actor with root or
+equivalent filesystem authority remain trusted inputs.
+
+`just install-files` serializes its protected interval with
+`/run/facelock/lifecycle.lock`. It safely creates or validates
+`/run/facelock` as `root:root` mode `0755` (the fixture-root identity in
+offline tests), then captures the never-unlinked lock as a `root:root` mode
+`0600`, zero-byte, single-link regular file without following the public path.
+The lock stays held through manager/D-Bus restoration, migration publication,
+signal cleanup, and descriptor release. This is the canonical cross-entrypoint
+lifecycle lock path; other lifecycle entrypoints join it in their owning work.
+
+Before its first replacement write, the installer records exactly one service
+load, active, unit-file, fragment, effective command, and drop-in state. It
+admits only loaded active/inactive service state or a genuine first install.
+Probe failures, transitional/failed states, inconsistent manager/disk state,
+untrusted effective assets, a concurrent lifecycle holder, and malformed or
+duplicate properties abort before mutation. Persistent and runtime ordinary
+unit paths are snapshotted independently. An admitted path is absent, an exact
+administrator `/dev/null` or empty-file mask, or a bounded trusted regular
+override retained by descriptor, metadata, and digest. Systemd precedence is
+preserved; linked, multiply linked, writable, or changing state fails closed.
+
+Every admitted online state receives an owned activation barrier at
+`/run/systemd/system.control/facelock-daemon.service`. The no-clobber-created,
+descriptor-held `root:root` mode `0600` empty regular file is manager-proved as
+the effective mask before the daemon is stopped and before any install write.
+The helper also proves the active system bus, its standard service-directory
+topology, selected Facelock activation definition, policy-only includes, bus
+owner state, and systemd delegation. Custom or unreadable activation topology,
+direct D-Bus execution, or a higher-priority control conflict aborts. The
+source installer never changes enablement and restores only the active/inactive
+state captured at entry.
+
+The source recipe writes service assets only to the canonical `/usr` paths. It
+plans all three historical `/etc` public/quarantine pairs before the protected
+writes, including exact known copies, interrupted exact quarantines,
+administrator files, and systemd masks. After the canonical writes, it moves
+only reviewed exact historical copies to fixed same-parent quarantines with
+no-replace semantics. Trusted modified administrator files and masks remain at
+their exact recorded identities; a selected administrator D-Bus activation
+definition must still delegate to systemd. Unknown, linked, wrongly owned,
+wrongly moded, changing, or ambiguous state fails closed.
+
+Staging is not publication. Quarantines remain rollback-capable while later
+source writes and permission fixes run. A recipe failure or `HUP`, `INT`, or
+`TERM` restores every newly staged public name in reverse order before manager
+and D-Bus restoration; a pair that was already an interrupted quarantine is
+restored to that same pre-run state. The lifecycle treats the staging child
+and its exact parent-side identity record as one signal-critical operation.
+The child also traps exit and caught signals to reverse its locally known
+prefix; parent cleanup independently reconciles unchanged or staged names
+against the complete preplan even when the record was interrupted. Any mixed
+pair that cannot be restored without replacement remains preserved and keeps
+activation barred. Normal completion reloads and proves the
+canonical winners while the activation barrier is still effective, then
+revalidates and deletes the exact quarantines. Only after that commit and
+another topology proof may cleanup quarantine/remove the barrier and restart
+an initially active daemon. A pre-publication commit failure rolls back,
+reloads, and proves the original winners while still barred. A collision,
+partial publication, incomplete rollback, or unprovable manager/D-Bus state
+retains the safest provable barrier and suppresses restart.
+
+Barrier cleanup itself uses held descriptors, fixed same-parent quarantine
+names, no-replace recovery, bounded retries, and repeated disk/manager/D-Bus
+proof. An inactive or first-install daemon remains inactive. The initiating
+failure or signal remains the process result, and signal cleanup is
+non-reentrant until restoration and lock/descriptor release finish.
+
+Ordinary source install fails closed without systemd. The sole exception is
+the checked-in `test/Containerfile` offline image step, selected by its exact
+mode and marker. It authenticates the copied lifecycle/migration helpers and
+digest manifest, takes the same canonical lock inside the image, and proves no
+manager, bus, activation asset, installed Facelock indicator, or unreadable
+process identity exists before allowing writes. Distro maintainer scripts own
+their separate native lifecycle. The mocked/static gate is
+`just test-source-install-daemon-lifecycle`; the mount-free PID-1 gate is
+`just test-source-install-daemon-lifecycle-systemd`.
+
 Debian `postrm purge` is self-contained. It never invokes the already-removed
 `facelock` binary. By the time `postrm` runs, package payloads cannot be treated
-as available cleanup tools. The future bounded purge must make its decisions
-from fixed constants and the remaining filesystem state, using only utilities
-that the maintainer script can rely on after removal; it cannot delegate safety
-checks or deletion to the CLI it is purging.
+as available cleanup tools. The bounded purge makes its decisions from fixed
+constants and the remaining filesystem state and uses the Essential
+`perl-base` interpreter available throughout the package lifecycle; it cannot
+delegate safety checks or deletion to the CLI it is purging.
+The supported Debian-family artifacts are explicitly `Architecture: amd64`.
+For quarantine and recovery, the helper therefore invokes x86-64
+`renameat2(RENAME_NOREPLACE)` directly through Perl's `syscall`; an unsupported
+architecture, kernel, or filesystem fails closed and retains the entry. It
+never falls back to an absence check followed by a replacing rename.
+
+The post-removal script classifies the six supported configured path fields
+while the conffile is still available during `remove`, and repeats that report
+at `purge` when a configuration file remains. Its bounded TOML classifier
+recognizes canonical section assignments plus dotted and quoted key or table
+components with their TOML table scope intact. If a valid representation is
+outside that bounded grammar, including a multiline string, the script emits a
+controlled warning that the configuration could not be fully classified. An
+external value is reported but never opened, removed, or used as a traversal
+root. A configuration object that cannot be safely inspected and is reported
+as retained is protected from the later generic walk. The report therefore
+survives dpkg's normal ordering, in which it can remove the conffile before the
+final `postrm purge` call, without turning configuration into deletion
+authority.
 
 RPM and Arch have no Debian-style second `purge` phase. Their ordinary erase
 therefore removes static integration and safely cleaned PAM provenance, while
@@ -2221,9 +2418,11 @@ generated files unchanged. Neither test mutates the host PAM stack.
 The only purge roots are the compiled Facelock roots:
 `/etc/facelock`, `/var/lib/facelock`, and `/var/log/facelock`. `/etc/pam.d` is
 a separate, fixed root for the narrow PAM cleanup above; it is never a recursive
-purge root. A configured path that remains within a compiled Facelock root is
-eligible for a later Debian purge only under the same safety checks as every
-other descendant.
+purge root. The nonempty `/var/lib/facelock/pam-backups` subtree is an opaque
+exception inside the state root because any remaining entry is unresolved PAM
+cleanup evidence. A configured path that remains within a compiled Facelock
+root is eligible for a later Debian purge only under the same safety checks as
+every other descendant.
 
 Configured paths outside those roots are external remnants. This includes
 external values of `daemon.model_dir`, `storage.db_path`, `encryption.key_path`,
@@ -2232,20 +2431,74 @@ purge must leave them untouched, report that they were refused as external, and
 must not claim that all Facelock data is gone. A path becoming external through
 configuration does not expand package ownership.
 
-Any later purge implementation operates from fixed path constants and examines
-each entry without trusting path traversal. It must never follow a symbolic link
-or act through a hard-linked object, never cross a mount point, and never recurse through a
-non-directory or an object whose ownership cannot be proven safe. A root or
-descendant that fails those checks remains in place and is reported. A safe
-root may still be cleaned around an unsafe child, but the final report must name
-every remnant rather than describe the root as removed.
+The purge operates from fixed path constants and examines each entry without
+trusting path traversal. A root and every traversed directory must be a
+root-owned, non-group/world-writable directory on the root's device. Deletable
+leaves are single-link regular files with the same ownership and write-mode
+constraint. The only ownership exception is an owner-only regular file that is
+one of the direct children of `/var/lib/facelock/enrolled`; those enrollment
+markers are deliberately owned by the enrolled user. Other wrong-owner,
+non-regular, or multiply-linked objects remain in place.
+
+The helper pins every component from the fixed prefix through each purge root
+with `O_DIRECTORY|O_NOFOLLOW` descriptors, opens regular candidates with
+`O_NONBLOCK|O_NOFOLLOW`, and operates through `/proc/self/fd/<fd>` rather than
+reopening public pathnames. It revalidates the complete fixed chain and every
+opened descendant immediately before and after a removal quarantine. Mount IDs
+from `/proc/self/fdinfo` are combined with `/proc/self/mountinfo` to detect bind
+mounts even when their device number is unchanged; every descendant's `st_dev`
+must also equal the opened root's device.
+
+A safe regular file or empty descendant directory is first moved within its
+trusted, non-writable parent by a descriptor-anchored, atomic no-replace
+quarantine operation. A colliding quarantine name is preserved and reported;
+the helper may try a later bounded candidate but never replaces the collision.
+The helper reopens the admitted quarantine name and proves the original device,
+inode, type, link count, ownership, mode, mount, and fixed-chain identity before
+unlink or `rmdir`. Recovery uses the same atomic no-replace operation, so a
+replacement at the public name preserves both public and quarantine remnants.
+A failed unlink or directory removal restores the proven quarantine identity
+with no-replace recovery when possible instead of stranding it under a hidden
+name. After regular-file unlink, the still-open inode must reach link count
+zero; otherwise an external hard-link remnant is reported without claiming the
+data was fully removed.
+A directory with any refused child is never moved. The helper never removes
+the three compiled root directories because their parents are outside the
+recursive purge boundary; safely admitted contents and empty descendant
+directories are removed, while a root may still contain reported refused or
+opaque remnants. After the helper returns, dpkg may remove an empty
+`/etc/facelock` directory as part of native conffile purge. The helper must
+never cross a mount point.
+It must never follow a symbolic link, act through a hard-linked object, or
+recurse through an object whose ownership cannot be proven safe.
+
+The trusted-parent mode is also the purge concurrency boundary. Linux has no
+inode-conditional `unlinkat` or `rmdirat`: after the quarantine identity's final
+proof, deletion assumes no concurrent process with root or equivalent mutation
+authority is changing names in that root-owned, non-group/world-writable
+parent. The package transaction stops the service and owns this interval;
+ordinary unprivileged users cannot enter it. A separate same-authority process
+that deliberately mutates those parents is outside the package-purge contract,
+because no maintainer script can both delete a pathname and preserve an object
+that such a process substitutes at the deletion syscall itself.
+
+Traversal is iterative and bounded independently for each compiled root: at
+most 64 descendant-directory levels and 10,000 inspected entries. A directory
+beyond the depth limit remains as a reported subtree while safe siblings may
+still be cleaned. Reaching the node limit stops further cleanup of that root
+and reports the whole root subtree as retained rather than implying that only
+the first unseen entry is unsafe. A root or descendant that fails any other
+check remains in place and is reported. A safe root may still be cleaned around
+an unsafe child, but the final report must name every remnant rather than
+describe the root as removed. `/etc/pam.d` is not among these recursive roots,
+so purge cannot erase an incomplete PAM edit or its rollback provenance.
 
 Safety refusals and external remnants must not strand package-manager state.
-In particular, Debian purge reports and preserves an unsafe object but lets the
-maintainer-script lifecycle finish, so a link, mount, or wrong-owner file cannot
-leave the package permanently half-purged. This is not a broad recursive-delete
-contract: later code must enumerate the bounded roots and reject anything it
-cannot prove is inside them.
+In particular, Debian purge reports and preserves an unsafe object but returns
+success after reporting safety refusals, so a link, mount, wrong-owner object,
+or partial unlink failure cannot leave the package permanently half-purged.
+This is not a broad recursive-delete contract: the script enumerates the
+bounded roots and rejects anything it cannot prove is inside them.
 
 Finally, filesystem removal does not promise secure erasure. Unlinking files
 does not guarantee that data is absent from SSD flash translation layers,

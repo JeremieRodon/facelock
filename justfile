@@ -79,10 +79,27 @@ check-agent-docs base='':
         python3 test/check-agent-docs.py
     fi
     bash test/lifecycle-ownership-contract.sh
+    bash test/debian-postrm-purge.sh
     bash test/rpm-authselect-contract.sh
 
+# Exercise Debian remove/purge policy below disposable fixed roots only.
+test-debian-postrm-purge:
+    bash test/debian-postrm-purge.sh
+
 # Run all checks (test + lint + format + audit + PAM standalone surface + agent docs)
-check: test lint fmt-check audit check-pam-standalone check-agent-docs test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test
+check: test lint fmt-check audit check-pam-standalone check-agent-docs test-source-install-daemon-lifecycle test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test test-legacy-system-assets
+
+# Preserve the daemon's pre-install runtime state across source file replacement.
+test-source-install-daemon-lifecycle:
+    bash test/source-install-daemon-lifecycle.sh
+
+# Exercise the source-install barrier against a real systemd and system bus.
+test-source-install-daemon-lifecycle-systemd: _build-test-container
+    test/run-source-install-daemon-lifecycle-systemd.sh facelock-pam-test
+
+# Validate immutable system assets and migrate only exact historical /etc copies.
+test-legacy-system-assets:
+    bash test/legacy-system-assets.sh
 
 # Prove the deterministic, exact Cargo source component used by Debian builds.
 test-cargo-vendor-contract:
@@ -91,6 +108,7 @@ test-cargo-vendor-contract:
 # Static Debian source/metadata/release-consumer contract.
 test-deb-source-contract:
     bash test/deb-source-contract.sh
+    python3 test/deb-source-contract-test.py
 
 # Validate every binary package named by one exact generated manifest.
 test-deb-package-contract manifest:
@@ -477,17 +495,24 @@ test-arch-release-shell: _build-test-container
 
 # Run as: just install (builds as you, installs as root)
 install: build-release
-    sudo env PATH="$PATH" just install-files
+    /usr/bin/sudo /usr/bin/env PATH=/usr/bin:/bin /usr/bin/just install-files
 
 # Install pre-built binaries to system (requires root, no build)
 install-files:
-    #!/usr/bin/env bash
+    #!/usr/bin/bash -p
     set -euo pipefail
+    PATH=/usr/bin:/bin
+    export PATH
 
     # Verify binaries exist
     for f in target/release/facelock target/release/libpam_facelock.so; do
         [ -f "$f" ] || { echo "Error: $f not found. Run 'just build-release' first."; exit 1; }
     done
+
+    # Keep a live daemon available across source upgrades without changing
+    # enablement or activating one that was inactive or only D-Bus-activatable.
+    source scripts/source-install-daemon-lifecycle.sh
+    facelock_source_install_begin
 
     # Binaries
     install -Dm755 target/release/facelock /usr/bin/facelock
@@ -510,25 +535,14 @@ install-files:
 
     # systemd unit
     install -Dm644 systemd/facelock-daemon.service /usr/lib/systemd/system/facelock-daemon.service
-    if [ -f /etc/systemd/system/facelock-daemon.service ] && \
-       grep -q 'ExecStart=/usr/bin/facelock daemon' /etc/systemd/system/facelock-daemon.service; then
-        install -Dm644 systemd/facelock-daemon.service /etc/systemd/system/facelock-daemon.service
-    fi
 
     # D-Bus policy and activation
     install -Dm644 dbus/org.facelock.Daemon.conf /usr/share/dbus-1/system.d/org.facelock.Daemon.conf
     install -Dm644 dbus/org.facelock.Daemon.service /usr/share/dbus-1/system-services/org.facelock.Daemon.service
-    if [ -f /etc/dbus-1/system.d/org.facelock.Daemon.conf ] && \
-       grep -q 'org.facelock.Daemon' /etc/dbus-1/system.d/org.facelock.Daemon.conf; then
-        install -Dm644 dbus/org.facelock.Daemon.conf /etc/dbus-1/system.d/org.facelock.Daemon.conf
-    fi
-    if [ -f /etc/dbus-1/system-services/org.facelock.Daemon.service ] && \
-       grep -q 'org.facelock.Daemon' /etc/dbus-1/system-services/org.facelock.Daemon.service; then
-        install -Dm644 dbus/org.facelock.Daemon.service /etc/dbus-1/system-services/org.facelock.Daemon.service
-    fi
-    # The bus may not have noticed the policy change yet; ask (best-effort).
-    dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
-        /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true
+    # Retire only byte-exact historical Facelock copies while the source-install
+    # activation barrier is effective. The lifecycle records the fixed mutation
+    # identities before the first install write and proves the final state.
+    facelock_source_install_stage_and_record_legacy_migration /
 
     # Polkit agent binary (optional, do NOT install autostart — agent is not production-ready
     # and will steal polkit auth from the DE's agent, causing all privilege prompts to hang)
@@ -546,15 +560,6 @@ install-files:
     install -dm700 -o root -g root /var/lib/facelock/pam-backups
     install -dm700 -o root -g root /var/log/facelock
     install -dm700 -o root -g root /var/log/facelock/snapshots
-
-    # Enable D-Bus activation (if systemd present)
-    if [ -d /run/systemd/system ]; then
-        systemctl stop facelock-daemon.service 2>/dev/null || true
-        systemctl daemon-reload
-        systemctl reset-failed facelock-daemon.service 2>/dev/null || true
-        systemctl enable facelock-daemon.service 2>/dev/null || true
-        echo "D-Bus activation enabled."
-    fi
 
     # Fix permissions on existing data
     [ -d /etc/facelock ] && chown root:root /etc/facelock && chmod 755 /etc/facelock || true
@@ -579,6 +584,13 @@ install-files:
     # remove a group an older install created. Best-effort.
     if getent group facelock >/dev/null 2>&1; then
         groupdel facelock 2>/dev/null || true
+    fi
+
+    # Reload the replaced activation assets and restore only the runtime state
+    # captured before the protected write interval.
+    facelock_source_install_complete
+    if [ -d /run/systemd/system ]; then
+        echo "D-Bus activation enabled."
     fi
 
     echo ""
@@ -628,14 +640,16 @@ install-files:
 
 # Uninstall from system
 
-# Run as: just uninstall (elevates to root, preserving PATH)
+# Run as: just uninstall (elevates to root with a trusted command path)
 uninstall:
-    sudo env PATH="$PATH" just uninstall-files
+    /usr/bin/sudo /usr/bin/env PATH=/usr/bin:/bin /usr/bin/just uninstall-files
 
 # Uninstall files from system (requires root, called by uninstall)
 uninstall-files:
-    #!/usr/bin/env bash
+    #!/usr/bin/bash -p
     set -euo pipefail
+    PATH=/usr/bin:/bin
+    export PATH
     # Stop and disable daemon
     systemctl stop facelock-daemon.service 2>/dev/null || true
     systemctl disable facelock-daemon.service 2>/dev/null || true
@@ -649,24 +663,9 @@ uninstall-files:
 
     # Remove binaries and units
     rm -f /usr/bin/facelock /lib/security/pam_facelock.so
-    # Decide whether the /etc/systemd/system/ override matches the installed unit
-    # (we want to clean up our own override, but never clobber an admin customization).
-    # We must compare BEFORE removing /usr/lib/systemd/system/facelock-daemon.service.
-    SYSTEM_OVERRIDE="/etc/systemd/system/facelock-daemon.service"
-    INSTALLED_UNIT="/usr/lib/systemd/system/facelock-daemon.service"
-    REMOVE_OVERRIDE=false
-    if [ -f "$SYSTEM_OVERRIDE" ] && [ -f "$INSTALLED_UNIT" ] && cmp -s "$INSTALLED_UNIT" "$SYSTEM_OVERRIDE"; then
-        REMOVE_OVERRIDE=true
-    fi
-    rm -f "$INSTALLED_UNIT"
-    if [ "$REMOVE_OVERRIDE" = true ]; then
-        rm -f "$SYSTEM_OVERRIDE"
-        echo "Removed $SYSTEM_OVERRIDE (matched installed unit)"
-    elif [ -f "$SYSTEM_OVERRIDE" ]; then
-        echo "Kept $SYSTEM_OVERRIDE (admin-modified or installed unit not present for comparison)"
-    fi
-    rm -f /usr/share/dbus-1/system.d/org.facelock.Daemon.conf
-    rm -f /usr/share/dbus-1/system-services/org.facelock.Daemon.service
+    # Remove only canonical /usr system assets. Historical /etc copies are
+    # administrator state and the reviewed migration is their sole owner.
+    scripts/uninstall-system-assets.sh /
     rm -f /usr/bin/facelock-polkit-agent
     rm -f /etc/xdg/autostart/org.facelock.AuthAgent.desktop
 
@@ -934,17 +933,27 @@ test-deb: test-deb-trixie-pkg test-deb-resolute-pkg
 test-deb-trixie-pkg: (_require-models "1")
     #!/usr/bin/env bash
     set -euo pipefail
-    test/build-deb-package-image.sh trixie facelock-deb-trixie-pkg
-    podman run --rm facelock-deb-trixie-pkg /tpm-pcr-e2e.sh
-    test/run-pkg-validate-systemd.sh facelock-deb-trixie-pkg
+    artifact_dir="$(mktemp -d "${TMPDIR:-/tmp}/facelock-deb-trixie.XXXXXX")"
+    trap 'rm -rf -- "$artifact_dir"' EXIT
+    package="$artifact_dir/facelock.deb"
+    test/build-deb-package-image.sh trixie facelock-deb-trixie-pkg "$package"
+    podman run --rm -v "$package:/facelock-test-package.deb:ro,Z" \
+        facelock-deb-trixie-pkg \
+        /bin/bash -c '/deb-package-lifecycle.sh install && exec /tpm-pcr-e2e.sh'
+    test/run-pkg-validate-systemd.sh facelock-deb-trixie-pkg "$package"
 
 # Ubuntu 26.04 Resolute package — exact source build, TPM/PCR, and booted lifecycle.
 test-deb-resolute-pkg: (_require-models "1")
     #!/usr/bin/env bash
     set -euo pipefail
-    test/build-deb-package-image.sh resolute facelock-deb-resolute-pkg
-    podman run --rm facelock-deb-resolute-pkg /tpm-pcr-e2e.sh
-    test/run-pkg-validate-systemd.sh facelock-deb-resolute-pkg
+    artifact_dir="$(mktemp -d "${TMPDIR:-/tmp}/facelock-deb-resolute.XXXXXX")"
+    trap 'rm -rf -- "$artifact_dir"' EXIT
+    package="$artifact_dir/facelock.deb"
+    test/build-deb-package-image.sh resolute facelock-deb-resolute-pkg "$package"
+    podman run --rm -v "$package:/facelock-test-package.deb:ro,Z" \
+        facelock-deb-resolute-pkg \
+        /bin/bash -c '/deb-package-lifecycle.sh install && exec /tpm-pcr-e2e.sh'
+    test/run-pkg-validate-systemd.sh facelock-deb-resolute-pkg "$package"
 
 # Same model requirement (and same opt-out) as the two Debian suite package gates.
 
@@ -966,7 +975,10 @@ test-copr:
 test-deb-dev-shell:
     #!/usr/bin/env bash
     set -euo pipefail
-    test/build-deb-package-image.sh resolute facelock-deb-resolute-pkg
+    artifact_dir="$(mktemp -d "${TMPDIR:-/tmp}/facelock-deb-dev-shell.XXXXXX")"
+    trap 'rm -rf -- "$artifact_dir"' EXIT
+    package="$artifact_dir/facelock.deb"
+    test/build-deb-package-image.sh resolute facelock-deb-resolute-pkg "$package"
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
@@ -975,12 +987,12 @@ test-deb-dev-shell:
     for f in /var/lib/facelock/models/*.onnx /var/lib/facelock/models/*.toml; do
         [ -f "$f" ] && mounts="$mounts -v $f:/tmp/host-models/$(basename $f):ro"
     done
-    mounts="$mounts -v $(pwd)/test/container-config.toml:/tmp/container-config.toml:ro"
+    mounts="$mounts -v $(pwd)/test/container-config.toml:/tmp/container-config.toml:ro -v $package:/facelock-test-package.deb:ro,Z"
     echo "Starting dev shell (Ubuntu 26.04, .deb installed, host models). Try:"
     echo "  facelock enroll --user root --label myface"
     echo "  facelock test --user root"
     podman run --rm -it $devices $mounts facelock-deb-resolute-pkg \
-        bash -c "cp /tmp/container-config.toml /etc/facelock/config.toml; cp /tmp/host-models/* /var/lib/facelock/models/ 2>/dev/null; exec bash"
+        bash -c "/deb-package-lifecycle.sh install; cp /tmp/container-config.toml /etc/facelock/config.toml; cp /tmp/host-models/* /var/lib/facelock/models/ 2>/dev/null; exec bash"
 
 # Dev shell — interactive .rpm container with host models for fast iteration (requires camera)
 test-rpm-dev-shell: build-release
@@ -1006,18 +1018,21 @@ test-rpm-dev-shell: build-release
 test-deb-release-shell:
     #!/usr/bin/env bash
     set -euo pipefail
-    test/build-deb-package-image.sh resolute facelock-deb-resolute-pkg
+    artifact_dir="$(mktemp -d "${TMPDIR:-/tmp}/facelock-deb-release-shell.XXXXXX")"
+    trap 'rm -rf -- "$artifact_dir"' EXIT
+    package="$artifact_dir/facelock.deb"
+    test/build-deb-package-image.sh resolute facelock-deb-resolute-pkg "$package"
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
     done
-    mounts="-v $(pwd)/test/container-config.toml:/tmp/container-config.toml:ro"
+    mounts="-v $(pwd)/test/container-config.toml:/tmp/container-config.toml:ro -v $package:/facelock-test-package.deb:ro,Z"
     echo "Starting release shell (Ubuntu 26.04, .deb installed, clean room). Try:"
     echo "  facelock setup"
     echo "  facelock enroll --user root --label myface"
     echo "  facelock test --user root"
     podman run --rm -it $devices $mounts facelock-deb-resolute-pkg \
-        bash -c "cp /tmp/container-config.toml /etc/facelock/config.toml; exec bash"
+        bash -c "/deb-package-lifecycle.sh install; cp /tmp/container-config.toml /etc/facelock/config.toml; exec bash"
 
 # Release shell — clean-room .rpm container, real user experience (requires camera)
 test-rpm-release-shell: build-release

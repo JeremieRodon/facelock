@@ -183,19 +183,35 @@ jobs:
         run: |
           printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           pacman -Syu --noconfirm \
+            fakeroot \
             git \
             just \
-            python
+            perl \
+            python \
+            ripgrep \
+            util-linux
 
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Normalize checkout trust metadata
+        run: |
+          checkout_owner="$(stat -c '%u:%g' -- "$GITHUB_WORKSPACE")"
+          chown -R -- "$checkout_owner" "$GITHUB_WORKSPACE"
+          chmod go-w -- "$GITHUB_WORKSPACE"
 
       - name: Trust the workspace checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Verify agent docs still describe the tree
         run: just check-agent-docs "${{ github.event.pull_request.base.sha }}"
+
+      - name: Verify source-install daemon lifecycle
+        run: just test-source-install-daemon-lifecycle
+
+      - name: Verify Debian source contract
+        run: just test-deb-source-contract
 
       - name: Verify release target declarations
         run: python3 test/check-release-matrix.py
@@ -299,3 +315,6 @@ jobs:
           else
             echo "No Containerfile, skipping"
           fi
+
+      - name: Verify source-install lifecycle under systemd
+        run: test/run-source-install-daemon-lifecycle-systemd.sh facelock-pam-test

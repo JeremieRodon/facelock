@@ -41,6 +41,34 @@ exact_manifest() {
     printf '%s\n' "${manifests[0]}"
 }
 
+write_data_archive_inventory() {
+    local package="$1" output="$2" data_tar
+    data_tar="$(mktemp "${TMPDIR:-/tmp}/facelock-deb-data.XXXXXX.tar")"
+    dpkg-deb --fsys-tarfile "$package" >"$data_tar"
+    python3 - "$data_tar" >"$output" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], mode="r:") as archive:
+    for member in sorted(archive.getmembers(), key=lambda item: item.name):
+        if member.isdir():
+            kind = "directory"
+        elif member.isfile():
+            kind = "regular"
+        elif member.issym():
+            kind = "symlink"
+        elif member.islnk():
+            kind = "hardlink"
+        else:
+            kind = f"type-{member.type!r}"
+        print(
+            f"{member.name}\t{kind}\t{member.mode:o}\t{member.uid}\t"
+            f"{member.gid}\t{member.size}\t{member.linkname}"
+        )
+PY
+    rm -f -- "$data_tar"
+}
+
 compare_packages() {
     local release_deb="$1"
     local rebuilt_deb="$2"
@@ -80,6 +108,55 @@ compare_packages() {
         echo "offline Debian build: installed hash differences follow" >&2
         diff -u "$comparison_root/release.hashes" "$comparison_root/rebuilt.hashes" >&2 || true
         fail "clean rebuild changed installed file bytes"
+    fi
+    write_data_archive_inventory \
+        "$release_deb" "$comparison_root/release.archive-metadata"
+    write_data_archive_inventory \
+        "$rebuilt_deb" "$comparison_root/rebuilt.archive-metadata"
+    if ! cmp -s \
+        "$comparison_root/release.archive-metadata" \
+        "$comparison_root/rebuilt.archive-metadata"; then
+        echo "offline Debian build: data archive metadata differences follow" >&2
+        diff -u \
+            "$comparison_root/release.archive-metadata" \
+            "$comparison_root/rebuilt.archive-metadata" >&2 || true
+        fail "clean rebuild changed data path/type/mode/UID/GID/link inventory"
+    fi
+    rm -rf -- "$comparison_root"
+}
+
+compare_control_archives() {
+    local release_deb="$1"
+    local rebuilt_deb="$2"
+    local comparison_root release_root rebuilt_root
+    comparison_root="$(mktemp -d "${TMPDIR:-/tmp}/facelock-deb-control-compare.XXXXXX")"
+    release_root="$comparison_root/release"
+    rebuilt_root="$comparison_root/rebuilt"
+    mkdir "$release_root" "$rebuilt_root"
+    dpkg-deb --control "$release_deb" "$release_root"
+    dpkg-deb --control "$rebuilt_deb" "$rebuilt_root"
+    (
+        cd "$release_root"
+        find . -mindepth 1 -printf '%P %y %m %l\n' | LC_ALL=C sort
+    ) >"$comparison_root/release.paths"
+    (
+        cd "$rebuilt_root"
+        find . -mindepth 1 -printf '%P %y %m %l\n' | LC_ALL=C sort
+    ) >"$comparison_root/rebuilt.paths"
+    cmp -s "$comparison_root/release.paths" "$comparison_root/rebuilt.paths" ||
+        fail "clean rebuild changed control path/type/mode/link inventory"
+    (
+        cd "$release_root"
+        find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+    ) >"$comparison_root/release.hashes"
+    (
+        cd "$rebuilt_root"
+        find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+    ) >"$comparison_root/rebuilt.hashes"
+    if ! cmp -s "$comparison_root/release.hashes" "$comparison_root/rebuilt.hashes"; then
+        echo "offline Debian build: control hash differences follow" >&2
+        diff -u "$comparison_root/release.hashes" "$comparison_root/rebuilt.hashes" >&2 || true
+        fail "clean rebuild changed control archive bytes"
     fi
     rm -rf -- "$comparison_root"
 }
@@ -130,6 +207,8 @@ case "$mode" in
         rebuilt_deb="$rebuild_root/facelock_${package_version}_${architecture}.deb"
         [ -f "$rebuilt_deb" ] || fail "clean rebuild did not emit expected deb: $rebuilt_deb"
         compare_packages "$release_deb" "$rebuilt_deb"
+        compare_control_archives "$release_deb" "$rebuilt_deb"
+        bash "/usr/local/libexec/facelock/test/deb-package-contract.sh" "$rebuilt_deb"
         cp -- "$rebuilt_deb" "$output_dir/"
         ;;
     *)

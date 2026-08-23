@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 control_path="${FACELOCK_DEBIAN_CONTROL:-debian/control}"
 workflow_path="${FACELOCK_RELEASE_WORKFLOW:-.github/workflows/release.yml}"
+lifecycle_path="${FACELOCK_DEB_LIFECYCLE:-test/deb-package-lifecycle.sh}"
+package_validator_path="${FACELOCK_PACKAGE_VALIDATOR:-test/pkg-validate.sh}"
 
 fail() {
     echo "deb source contract: $*" >&2
@@ -36,6 +38,11 @@ if grep -Eq 'systemd-tmpfiles[[:space:]].*--create' debian/postinst; then
 fi
 [ "$(grep -Foc '#DEBHELPER#' debian/postinst)" -eq 1 ] ||
     fail "Debian postinst must contain exactly one debhelper substitution marker"
+[ -x debian/postrm ] || fail "Debian postrm must be executable"
+[ "$(grep -Foc '#DEBHELPER#' debian/postrm)" -eq 1 ] ||
+    fail "Debian postrm must contain exactly one debhelper substitution marker"
+grep -Fq 'facelock_renameat2_syscall=316' debian/postrm ||
+    fail "Debian postrm must carry the audited amd64 no-replace purge helper"
 grep -Fq 'systemctl is-active --quiet facelock-daemon.service' debian/postinst ||
     fail "Debian postinst must distinguish an already-active daemon"
 grep -Fq 'systemctl try-restart facelock-daemon.service' debian/postinst ||
@@ -88,6 +95,8 @@ compat_count="$(grep -Eic 'debhelper-compat[[:space:]]*\(=[[:space:]]*13\)' "$co
 [ "$compat_count" -eq 1 ] || fail "expected exactly one debhelper-compat (= 13) declaration"
 grep -Eq '^Rules-Requires-Root:[[:space:]]*no[[:space:]]*$' "$control_path" ||
     fail "debian/control must declare Rules-Requires-Root: no"
+grep -Eq '^Architecture:[[:space:]]*amd64[[:space:]]*$' "$control_path" ||
+    fail "raw postrm renameat2 syscall must remain bound to amd64"
 [ "$(tr -d '\r\n' < debian/source/format)" = "3.0 (quilt)" ] ||
     fail "debian/source/format must be 3.0 (quilt)"
 
@@ -207,6 +216,8 @@ for helper in \
     test/prepare-deb-test-context.sh \
     test/run-deb-offline-build.sh \
     test/build-deb-package-image.sh \
+    test/deb-dependency-closure.sh \
+    test/deb-package-lifecycle.sh \
     test/verify-deb-test-context.sh \
     test/deb-maintscript-contract.sh \
     test/cargo-vendor-contract.sh \
@@ -214,6 +225,20 @@ for helper in \
     test/publish-directory-atomic.py; do
     [ -x "$helper" ] || fail "$helper must be an executable package-gate helper"
 done
+
+grep -Eq '^FROM \$\{BASE_IMAGE\} AS dependency-closure$' \
+    test/Containerfile.deb-runtime ||
+    fail "Debian runtime fixture must expose a clean-base dependency-closure stage"
+# shellcheck disable=SC2016
+dependency_stage="$(sed -n \
+    '/^FROM \${BASE_IMAGE} AS dependency-closure$/,/^FROM \${BASE_IMAGE} AS runtime$/p' \
+    test/Containerfile.deb-runtime)"
+if printf '%s\n' "$dependency_stage" | grep -Eq 'apt-get[[:space:]]+install'; then
+    fail "Debian dependency-closure stage must not preinstall candidate dependencies"
+fi
+grep -Fq 'COPY test/deb-dependency-closure.sh /deb-dependency-closure.sh' \
+    test/Containerfile.deb-runtime ||
+    fail "Debian clean-base stage must include its exact-artifact closure probe"
 
 for containerfile in \
     test/Containerfile.deb-assemble \
@@ -226,14 +251,321 @@ grep -Fq 'path-include=/usr/share/doc/facelock/**' test/Containerfile.deb-runtim
     fail "Debian runtime fixture must preserve Facelock legal/provenance documents"
 grep -Fq '> /etc/dpkg/dpkg.cfg.d/zz-facelock-test-docs' test/Containerfile.deb-runtime ||
     fail "Debian runtime fixture's Facelock include must sort after base-image exclusions"
-grep -Fq '/facelock-common-auth-install-invariant' test/Containerfile.deb-runtime ||
-    fail "Debian runtime fixture must prove fresh install leaves common-auth unchanged"
+grep -Fq 'COPY test/deb-package-lifecycle.sh /deb-package-lifecycle.sh' \
+    test/Containerfile.deb-runtime ||
+    fail "Debian runtime fixture must include the exact-artifact lifecycle helper"
+if grep -Eq 'COPY[[:space:]]+facelock-test-package\.deb|apt-get[[:space:]]+install[[:space:]].*/facelock-test-package\.deb' \
+    test/Containerfile.deb-runtime; then
+    fail "Debian runtime fixture must not bake in or preinstall the candidate package"
+fi
+for lifecycle_phase in \
+    install-remove-reinstall \
+    versioned-upgrade-inactive \
+    versioned-upgrade-active \
+    purge; do
+    grep -Fq "/deb-package-lifecycle.sh $lifecycle_phase" \
+        test/run-pkg-validate-systemd.sh ||
+        fail "booted package runner must execute Debian lifecycle phase: $lifecycle_phase"
+done
+grep -Fq -- '--target dependency-closure' test/build-deb-package-image.sh ||
+    fail "Debian builder must materialize the clean dependency-closure stage"
+# shellcheck disable=SC2016
+grep -Fq '"$dependency_image" /deb-dependency-closure.sh' \
+    test/build-deb-package-image.sh ||
+    fail "Debian builder must validate dependency closure before the harness image"
+# Match literal runner/build-helper source, not values in this contract.
+# shellcheck disable=SC2016
+grep -Fq '$PACKAGE:/facelock-test-package.deb:ro,Z' \
+    test/run-pkg-validate-systemd.sh ||
+    fail "booted Debian runner must bind the exact package read-only"
+# shellcheck disable=SC2016
+grep -Fq 'install -m 0444 -- "$artifact_dir/$package_name" "$package_output"' \
+    test/build-deb-package-image.sh ||
+    fail "Debian builder must emit a non-writable exact package for runtime binding"
+# shellcheck disable=SC2016
+grep -Fq -- '--target "$PACKAGE"' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must verify that its candidate artifact is a mount"
+# shellcheck disable=SC2016
+grep -Fq 'apt_transaction install -y --no-install-recommends "$PACKAGE"' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must install the exact runtime-bound package through APT"
+grep -Fq 'snapshot_retained_state' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must compare retained state across ordinary removal and reinstall"
+grep -Fq '/var/lib/facelock/pam-backups/lifecycle-retained-provenance' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must preserve a non-empty PAM provenance directory on remove"
+grep -Fq 'apt_transaction purge -y facelock' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must exercise the native package purge transaction"
+# shellcheck disable=SC2016
+grep -Fq 'lower_version="${candidate_version}~facelock.${label_token}"' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must derive a controlled lower version from the candidate"
+# shellcheck disable=SC2016
+grep -Fq 'dpkg --compare-versions "$lower_version" lt "$candidate_version"' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must prove its upgrade seed sorts below the candidate"
+grep -Fq 'versioned upgrade preserves active/inactive and enabled/disabled state' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must exercise the four genuine service-upgrade states"
+upgrade_snapshot_body="$(sed -n \
+    '/^snapshot_versioned_upgrade_state()/,/^}/p' \
+    "$lifecycle_path")"
+printf '%s\n' "$upgrade_snapshot_body" |
+    grep -Eq '^[[:space:]]*snapshot_enrollment_database_state[[:space:]]*$' ||
+    fail "Debian lifecycle must snapshot authoritative enrollment rows across versioned upgrades"
+printf '%s\n' "$upgrade_snapshot_body" |
+    grep -Eq '^[[:space:]]*snapshot_enrollment_marker /var/lib/facelock/enrolled/testuser[[:space:]]*$' ||
+    fail "Debian lifecycle must snapshot enrollment-marker semantics across versioned upgrades"
+retained_state_body="$(sed -n \
+    '/^create_retained_state()/,/^}/p' \
+    "$lifecycle_path")"
+printf '%s\n' "$retained_state_body" |
+    grep -Eq '^[[:space:]]*"INSERT INTO face_models "[[:space:]]*$' ||
+    fail "Debian retained-state fixture must seed an authoritative enrolled model"
+printf '%s\n' "$retained_state_body" |
+    grep -Eq '^[[:space:]]*"INSERT INTO face_embeddings \(model_id, embedding, sealed\) VALUES \(\?, \?, \?\)",[[:space:]]*$' ||
+    fail "Debian retained-state fixture must seed the enrolled model embedding"
+printf '%s\n' "$retained_state_body" |
+    grep -Eq '^[[:space:]]*embedding = struct\.pack\("<512f", .*range\(512\).*\)[[:space:]]*$' ||
+    fail "Debian retained-state fixture must seed deterministic nonzero embedding data"
+database_snapshot_body="$(sed -n \
+    '/^snapshot_enrollment_database_state()/,/^}/p' \
+    "$lifecycle_path")"
+printf '%s\n' "$database_snapshot_body" |
+    grep -Eq '^[[:space:]]*"SELECT COUNT\(\*\) FROM face_models"[[:space:]]*$' ||
+    fail "Debian enrollment snapshot must count authoritative model rows separately"
+printf '%s\n' "$database_snapshot_body" |
+    grep -Eq '^[[:space:]]*"SELECT COUNT\(\*\) FROM face_embeddings"[[:space:]]*$' ||
+    fail "Debian enrollment snapshot must count embedding rows separately"
+printf '%s\n' "$database_snapshot_body" |
+    grep -Eq '^[[:space:]]*if \(model_count, embedding_count\) != \(1, 1\):[[:space:]]*$' ||
+    fail "Debian enrollment snapshot must enforce separate authoritative row counts"
+printf '%s\n' "$database_snapshot_body" |
+    grep -Eq '^[[:space:]]*"82a0081de4c338fc91c362ed4d2ab615bca1dd45152aaa713322b5482078ddee"[[:space:]]*$' ||
+    fail "Debian enrollment snapshot must assert the deterministic embedding digest"
+printf '%s\n' "$database_snapshot_body" |
+    grep -Eq '^[[:space:]]*if embedding_digest != expected_embedding_digest:[[:space:]]*$' ||
+    fail "Debian enrollment snapshot must compare the deterministic embedding digest"
+marker_snapshot_body="$(sed -n \
+    '/^snapshot_enrollment_marker()/,/^}/p' \
+    "$lifecycle_path")"
+printf '%s\n' "$marker_snapshot_body" |
+    grep -Eq '^[[:space:]]*if type\(marker\["models"\]\) is not int or marker\["models"\] != 1:[[:space:]]*$' ||
+    fail "Debian enrollment snapshot must require an exact integer marker model count"
+grep -Fq 'restore_validator_service_baseline' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must restore the validator service baseline after its upgrade matrix"
+# shellcheck disable=SC2016
+grep -Fq 'Unpacking facelock ($candidate_version) over ($lower_version)' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must prove APT performed a versioned upgrade"
+grep -Fq 'assert_trusted_inert_anchor' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must verify trusted inert purge-root anchors"
+grep -Fq 'assert_absent_or_trusted_inert_anchor /etc/facelock 755' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must accept only absent-or-trusted native conffile root state"
+grep -Fq 'assert_no_purge_eligible_children' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must reject any purge-eligible child left below an anchor"
+grep -Fq 'fixed root crosses its parent device' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must reject a fixed-root device crossing"
+grep -Fq 'fixed root is a mount point' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must reject a fixed-root mount crossing"
+grep -Fq 'opaque PAM rollback remnant is hard-linked' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must reject linked opaque PAM rollback state"
+# shellcheck disable=SC2016
+grep -Fq 'snapshot_file "$PAM_RETAINED"' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must preserve opaque non-empty PAM rollback state on purge"
+# shellcheck disable=SC2016
+grep -Fq 'snapshot_file "$EXTERNAL_SENTINEL"' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must preserve external state byte-for-byte on purge"
+for purge_root in /etc/facelock /var/lib/facelock /var/log/facelock; do
+    grep -Fq "$purge_root" test/deb-package-lifecycle.sh ||
+        fail "Debian lifecycle must assert the fixed purge root: $purge_root"
+done
+grep -Fq 'compare_control_archives' test/run-deb-offline-build.sh ||
+    fail "offline Debian rebuild must compare release and rebuilt control archives"
+grep -Fq 'write_data_archive_inventory' test/run-deb-offline-build.sh ||
+    fail "offline Debian rebuild must compare data archive mode/UID/GID metadata"
+grep -Fq 'assert_installed_payload_metadata' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must compare installed ownership/modes with the candidate archive"
+grep -Fq 'package data is group/world writable' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must reject unsafe writable package payload metadata"
+grep -Fq 'installed package file bytes differ from archive' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must compare every installed regular file with the archive bytes"
+grep -Fq 'dpkg package list differs from data archive' test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must prove dpkg list parity with the candidate data archive"
+grep -Fq 'dpkg does not attribute package payload to facelock' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must prove dpkg ownership for every candidate payload entry"
+grep -Fq 'base-files, libc6:amd64, facelock: /etc' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must regression-test shared parent directory ownership"
+grep -Fq 'base-files, libc6:amd64: /etc' \
+    test/deb-package-lifecycle.sh ||
+    fail "Debian lifecycle must reject shared parent ownership without Facelock"
+# shellcheck disable=SC2016
+grep -Fq 'deb-package-contract.sh" "$rebuilt_deb"' test/run-deb-offline-build.sh ||
+    fail "offline Debian rebuild must validate its generated control archive"
 grep -Fq 'PAM module executes through the synthetic service' test/pkg-validate.sh ||
     fail "package validation must prove pam_facelock executes, not accept a generic PAM failure"
 grep -Fq 'missing PAM module control is rejected' test/pkg-validate.sh ||
     fail "package validation must prove its PAM execution assertion rejects a missing module"
+grep -Fq 'run_test "facelock-polkit-agent binary is installed"' test/pkg-validate.sh ||
+    fail "package validation must require the shipped polkit agent"
+grep -Fq 'run_test "quirks database files are installed"' test/pkg-validate.sh ||
+    fail "package validation must require the shipped quirks database"
+# shellcheck disable=SC2016
+grep -Fq 'UNEXPECTED_SKIP=$((SKIP - ALLOWED_SKIP))' test/pkg-validate.sh ||
+    fail "mandatory package validation must classify every non-opted-out skip as failure"
+grep -Fq 'allowed-partial' test/pkg-validate.sh ||
+    fail "package validation must distinguish explicit model-only partial skips"
+grep -Fq 'unexpected skip(s) make package validation incomplete' test/pkg-validate.sh ||
+    fail "package validation must fail loudly on unexpected skipped coverage"
+grep -Fq 'Any other skipped assertion fails package validation.' docs/security.md ||
+    fail "security documentation must state the mandatory no-skip package policy"
 grep -Fq 'packaged opt-in PAM profile survives reinstall, falls back to password, and restores common-auth' test/pkg-validate.sh ||
     fail "Debian package validation must exercise the shipped pam-auth-update profile"
+python3 - "$package_validator_path" <<'PY'
+import sys
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"deb source contract: {message}")
+
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+lines = text.splitlines()
+identifier = "verify_debian_packaged_pam_profile"
+definition = "verify_debian_packaged_pam_profile() {"
+export = (
+    "export -f verify_debian_packaged_pam_profile "
+    "verify_debian_active_profile_removal_guard"
+)
+invocation = '        "verify_debian_packaged_pam_profile"'
+definition_lines = [index for index, line in enumerate(lines) if line == definition]
+export_lines = [index for index, line in enumerate(lines) if line == export]
+invocation_lines = [index for index, line in enumerate(lines) if line == invocation]
+if len(invocation_lines) != 1:
+    fail("packaged PAM profile PASS label must invoke its verifier directly")
+if (
+    text.count(identifier) != 3
+    or len(definition_lines) != 1
+    or len(export_lines) != 1
+):
+    fail(
+        "packaged PAM profile verifier identifier must occur exactly at its "
+        "canonical definition, export, and invocation"
+    )
+helper_start = definition_lines[0]
+# Nested command-group closing braces in this helper are indented. Under that
+# enforced topology, its first unindented full-line brace is the matching close.
+closing_lines = [
+    index
+    for index in range(helper_start + 1, len(lines))
+    if lines[index] == "}"
+]
+if not closing_lines:
+    fail("Debian package validation must define the packaged PAM profile verifier")
+helper_end = closing_lines[0]
+helper = lines[helper_start : helper_end + 1]
+
+reinstall = "    apt-get install -y --reinstall /facelock-test-package.deb || failed=1"
+reinstall_lines = [index for index, line in enumerate(helper) if line == reinstall]
+if len(reinstall_lines) != 1:
+    fail("packaged PAM profile verifier must execute exactly one full-line reinstall")
+reinstall_line = reinstall_lines[0]
+
+label = (
+    '    run_test "packaged opt-in PAM profile survives reinstall, falls back to '
+    'password, and restores common-auth" ' + chr(92)
+)
+label_lines = [index for index, line in enumerate(lines) if line == label]
+if (
+    len(label_lines) != 1
+    or invocation_lines[0] != label_lines[0] + 1
+):
+    fail("packaged PAM profile PASS label must invoke its verifier directly")
+
+guard = "    if [ -d /run/systemd/system ]; then"
+guard_lines = [index for index, line in enumerate(helper) if line == guard]
+if len(guard_lines) != 2:
+    fail("packaged PAM profile verifier must use exact systemd guards")
+
+state_diagnostic = (
+    "packaged PAM profile verifier must failure-check nonempty state and emit "
+    "labeled diagnostics"
+)
+
+
+def require_block(source: list[str], block: list[str]) -> int:
+    positions = [
+        index
+        for index in range(len(source) - len(block) + 1)
+        if source[index : index + len(block)] == block
+    ]
+    if len(positions) != 1:
+        fail(state_diagnostic)
+    return positions[0]
+
+
+before_active = """        if ! active_before="$(systemctl show --property=ActiveState --value facelock-daemon.service 2>/dev/null)"; then
+            printf '%s\\n' 'packaged PAM profile reinstall ActiveState: expected=<nonempty-before> actual=<command-error>' >&2
+            failed=1
+        elif [ -z "$active_before" ]; then
+            printf '%s\\n' 'packaged PAM profile reinstall ActiveState: expected=<nonempty-before> actual=<empty>' >&2
+            failed=1
+        fi""".splitlines()
+before_enabled = """        if ! enabled_before="$(systemctl show --property=UnitFileState --value facelock-daemon.service 2>/dev/null)"; then
+            printf '%s\\n' 'packaged PAM profile reinstall UnitFileState: expected=<nonempty-before> actual=<command-error>' >&2
+            failed=1
+        elif [ -z "$enabled_before" ]; then
+            printf '%s\\n' 'packaged PAM profile reinstall UnitFileState: expected=<nonempty-before> actual=<empty>' >&2
+            failed=1
+        fi""".splitlines()
+after_active = """        if ! active_after="$(systemctl show --property=ActiveState --value facelock-daemon.service 2>/dev/null)"; then
+            printf 'packaged PAM profile reinstall ActiveState: expected=%s actual=<command-error>\\n' "$active_before" >&2
+            failed=1
+        elif [ -z "$active_after" ]; then
+            printf 'packaged PAM profile reinstall ActiveState: expected=%s actual=<empty>\\n' "$active_before" >&2
+            failed=1
+        elif [ "$active_after" != "$active_before" ]; then
+            printf 'packaged PAM profile reinstall ActiveState: expected=%s actual=%s\\n' "$active_before" "$active_after" >&2
+            failed=1
+        fi""".splitlines()
+after_enabled = """        if ! enabled_after="$(systemctl show --property=UnitFileState --value facelock-daemon.service 2>/dev/null)"; then
+            printf 'packaged PAM profile reinstall UnitFileState: expected=%s actual=<command-error>\\n' "$enabled_before" >&2
+            failed=1
+        elif [ -z "$enabled_after" ]; then
+            printf 'packaged PAM profile reinstall UnitFileState: expected=%s actual=<empty>\\n' "$enabled_before" >&2
+            failed=1
+        elif [ "$enabled_after" != "$enabled_before" ]; then
+            printf 'packaged PAM profile reinstall UnitFileState: expected=%s actual=%s\\n' "$enabled_before" "$enabled_after" >&2
+            failed=1
+        fi""".splitlines()
+
+before_active_line = require_block(helper, before_active)
+before_enabled_line = require_block(helper, before_enabled)
+after_active_line = require_block(helper, after_active)
+after_enabled_line = require_block(helper, after_enabled)
+
+
+def outer_guard_end(start: int) -> int:
+    try:
+        return helper.index("    fi", start + 1)
+    except ValueError:
+        fail("packaged PAM profile verifier must use exact systemd guards")
+
+
+before_guard, after_guard = guard_lines
+before_guard_end = outer_guard_end(before_guard)
+after_guard_end = outer_guard_end(after_guard)
+if not (
+    before_guard < before_active_line < before_enabled_line < before_guard_end
+    and reinstall_line == before_guard_end + 1
+    and reinstall_line < after_guard < after_active_line < after_enabled_line < after_guard_end
+):
+    fail("packaged PAM profile verifier must capture state around its exact reinstall")
+PY
 grep -Fq 'active administrator-selected profile blocks removal, preserves PAM, and allows verified migration retry' test/pkg-validate.sh ||
     fail "Debian package validation must preserve selected shared profiles across removal refusal"
 active_profile_guard_line="$(grep -n -m1 -F '"active administrator-selected profile blocks removal, preserves PAM, and allows verified migration retry"' test/pkg-validate.sh | cut -d: -f1)"
@@ -568,8 +900,13 @@ grep -Fq -- '--manifest' test/deb-package-contract.sh ||
 if grep -Fq 'sed "s#^#$OUTPUT_DIR/#"' .github/workflows/scripts/build-deb.sh; then
     fail "generated manifest must contain portable exact basenames, not build-host paths"
 fi
-grep -Fq 'bash test/deb-source-contract.sh' .github/workflows/release.yml ||
-    fail "release workflow must run the Debian source contract before packaging"
+for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
+    grep -Eq '^[[:space:]]*(run:[[:space:]]+)?just test-deb-source-contract[[:space:]]*$' "$workflow" ||
+        fail "$workflow must run the combined Debian source-contract target"
+    if grep -Eq '^[[:space:]]*(run:[[:space:]]+)?bash test/deb-source-contract\.sh[[:space:]]*$' "$workflow"; then
+        fail "$workflow must not bypass Debian source-contract mutation tests"
+    fi
+done
 grep -Fq 'bash test/deb-package-contract.sh --manifest' .github/workflows/release.yml ||
     fail "release workflow must validate the exact generated package manifest"
 # Match the literal workflow staging expression.
@@ -578,6 +915,14 @@ grep -Fq -- '--stage "$PWD/debian-upload"' .github/workflows/release.yml ||
     fail "release workflow must stage uploads only from the exact generated manifest"
 grep -Eq '^test-deb-source-contract:' justfile ||
     fail "justfile must expose the Debian source contract"
+deb_source_contract_recipe="$(sed -n \
+    '/^test-deb-source-contract:/,/^[^[:space:]#].*:/p' justfile)"
+printf '%s\n' "$deb_source_contract_recipe" |
+    grep -Eq '^[[:space:]]*bash test/deb-source-contract\.sh[[:space:]]*$' ||
+    fail "just Debian source-contract target must run the shell contract"
+printf '%s\n' "$deb_source_contract_recipe" |
+    grep -Eq '^[[:space:]]*python3 test/deb-source-contract-test\.py[[:space:]]*$' ||
+    fail "just Debian source-contract target must run mutation tests"
 grep -Eq '^test-deb-package-contract[[:space:]]+manifest:' justfile ||
     fail "justfile must expose manifest-driven Debian package validation"
 grep -Eq '^test-deb-package-contract-test:' justfile ||

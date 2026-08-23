@@ -95,7 +95,7 @@ The CLI works in all modes — it connects to the daemon if available, otherwise
 ## CLI Reference
 
 ```
-facelock setup          Download models, install systemd/PAM
+facelock setup          Download models, validate systemd, configure PAM
 facelock is-enrolled    Is this user enrolled? (exit 0/1/2)
 facelock enroll         Capture and store a face
 facelock test           Test recognition

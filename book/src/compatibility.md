@@ -12,8 +12,8 @@
 
 ## Tested Distributions
 
-Debian-family support starts at Debian 13+ and Ubuntu 26.04+; older Debian and
-Ubuntu releases are unsupported.
+Debian-family release support is exactly Debian 13 (Trixie) and Ubuntu 26.04
+LTS (Resolute). Other Debian and Ubuntu releases are unsupported.
 
 | Distribution | Init System | Mode | Status |
 |-------------|-------------|------|--------|

@@ -21,6 +21,11 @@ assert_rejected() {
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/facelock-deb-package-contract.XXXXXX")"
 trap 'rm -rf -- "$fixture_root"' EXIT
 mkdir -p "$fixture_root/bin"
+cat >"$fixture_root/generated-postrm-helper" <<'SH'
+if [ "$1" = "purge" ]; then
+    deb-systemd-helper purge 'facelock-daemon.service' >/dev/null || true
+fi
+SH
 
 cat >"$fixture_root/bin/dpkg-deb" <<'SH'
 #!/usr/bin/env bash
@@ -70,6 +75,9 @@ case "${1:-}" in
                 printf '%s\n' '#!/bin/sh' 'exit 0' >"$destination/$script"
             fi
         done
+        if [ -f "$package.conffiles" ]; then
+            cp "$package.conffiles" "$destination/conffiles"
+        fi
         ;;
     *) exit 2 ;;
 esac
@@ -127,12 +135,11 @@ if [ -z "$DPKG_ROOT" ] && [ "$1" = remove ] && [ -d /run/systemd/system ]; then
     deb-systemd-invoke stop 'facelock-daemon.service' >/dev/null || true
 fi
 SH
-    cat >"$root/${binary_basename}.deb.postrm" <<'SH'
-#!/bin/sh
-if [ "$1" = "purge" ]; then
-    deb-systemd-helper purge 'facelock-daemon.service' >/dev/null || true
-fi
-SH
+    sed -e "/^#DEBHELPER#$/r $fixture_root/generated-postrm-helper" \
+        -e '/^#DEBHELPER#$/d' "$repo_root/debian/postrm" \
+        >"$root/${binary_basename}.deb.postrm"
+    printf '%s\n' '/etc/facelock/config.toml' \
+        >"$root/${binary_basename}.deb.conffiles"
     {
         printf '%s\n' \
             'Format: 1.8' \
@@ -213,6 +220,23 @@ systemd-tmpfiles ${DPKG_ROOT:+--root="$DPKG_ROOT"} --create facelock.conf || tru
 SH
 PATH="$fixture_root/bin:$PATH" \
     bash "$contract" --manifest "$conditional_enable/$manifest_name" >/dev/null
+
+missing_conffile="$fixture_root/missing-conffile"
+cp -a "$baseline" "$missing_conffile"
+rm "$missing_conffile/facelock_0.1.4-1~ubuntu26.04.1_amd64.deb.conffiles"
+assert_rejected "accepted a package without the native Facelock conffile record" \
+    env PATH="$fixture_root/bin:$PATH" bash "$contract" \
+    --manifest "$missing_conffile/$manifest_name"
+
+payload_dependent_purge="$fixture_root/payload-dependent-purge"
+cp -a "$baseline" "$payload_dependent_purge"
+# Match the fixture's literal maintainer-script positional parameter.
+# shellcheck disable=SC2016
+sed -i '/if \[ "$1" = "purge" \]; then/a\    /usr/bin/facelock data purge' \
+    "$payload_dependent_purge/facelock_0.1.4-1~ubuntu26.04.1_amd64.deb.postrm"
+assert_rejected "accepted a postrm purge that invokes the removed package payload" \
+    env PATH="$fixture_root/bin:$PATH" bash "$contract" \
+    --manifest "$payload_dependent_purge/$manifest_name"
 
 unconditional_enable="$fixture_root/unconditional-enable"
 cp -a "$baseline" "$unconditional_enable"

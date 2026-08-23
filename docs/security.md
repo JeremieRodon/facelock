@@ -584,6 +584,80 @@ to that keyfile's `0600` (root-only) protection. `pcr_binding` remains **default
 enabling it is a deliberate operator choice that commits to the reseal workflow. See
 `docs/configuration.md` for the `[encryption]` and `[tpm]` sections.
 
+#### D. Debian purge traversal (Implemented)
+
+Package purge is a privileged deletion boundary, separate from ordinary
+removal and from the explicit CLI data-purge workflow. The Debian `postrm`
+enumerates only `/etc/facelock`, `/var/lib/facelock`, and
+`/var/log/facelock`; it never grants deletion authority to configured paths.
+Before dpkg removes the conffile, the `remove` phase reports any configured
+model, database, key, sealed-key, audit, or snapshot path outside those roots.
+The bounded classifier accepts canonical section assignments and dotted or
+quoted key and table components while retaining their active TOML table scope.
+It reports a controlled classification warning for valid representations
+outside that grammar, including multiline strings. An unsafe configuration
+object reported as retained is protected from the later generic walk. The
+`purge` phase repeats the report when the conffile still exists but never opens
+an external value.
+
+PAM rollback state has a separate owner. If
+`/var/lib/facelock/pam-backups` remains nonempty after the binary-backed PAM
+cleanup, `postrm` treats the directory as an opaque subtree and retains it
+whole. It does not reinterpret provenance or delete safe-looking children; an
+empty trusted directory may be removed normally.
+
+Every traversed root and directory must be a root-owned,
+non-group/world-writable directory chain on one device. Every removable leaf
+must be a single-link regular file with compatible ownership and modes. The
+one narrow exception is a direct user-owned enrollment marker beneath
+`/var/lib/facelock/enrolled`, whose owner-only mode and protected parent make
+its provenance distinguishable from a wrong-owner file elsewhere. Symlinks,
+other hard links, special files, unsafe ownership or modes, and inspection or
+unlink failures are retained and named.
+
+The helper opens every fixed-prefix and root component with
+`O_DIRECTORY|O_NOFOLLOW`, keeps those descriptors pinned, and opens regular
+candidates with `O_NONBLOCK|O_NOFOLLOW`. Mount IDs from `/proc/self/fdinfo` are
+checked against `/proc/self/mountinfo`, which detects same-device bind mounts
+that an `st_dev` comparison alone misses; each descendant's device is also
+compared directly with the opened root. The fixed chain and opened descendant
+chain are rechecked immediately before and after quarantine.
+
+Safe regular files and empty descendant directories are moved within their
+trusted parent with descriptor-anchored x86-64
+`renameat2(RENAME_NOREPLACE)`, reopened at the admitted quarantine name, and
+proved to retain the inspected identity before unlink or `rmdir`. Quarantine
+collisions are preserved and reported, and recovery uses the same no-replace
+primitive so a public replacement cannot be overwritten. The supported Debian
+artifacts are `Architecture: amd64`; an unavailable syscall fails closed rather
+than degrading to check-then-rename. Failed unlink or `rmdir` attempts restore
+the proven object when possible. A still-open regular inode whose link count is
+nonzero after quarantine unlink is reported as an external hard-link remnant.
+Directories containing any refused child are never moved. The helper never
+removes the three compiled root directories, so no helper deletion operation
+is authorized in their out-of-bound parents. After the helper returns, native
+conffile purge may remove an empty `/etc/facelock` directory owned by dpkg;
+the state and log roots remain helper-owned anchors and may contain reported
+opaque or refused remnants.
+
+Root ownership and the prohibition on group/world-writable traversal parents
+form the concurrency boundary as well as the provenance boundary. Linux has no
+identity-conditional unlink or directory removal operation. After the final
+quarantine proof, package purge therefore assumes no concurrent root-equivalent
+writer substitutes that trusted name at the deletion syscall. The service is
+stopped for the package transaction and unprivileged users cannot mutate those
+parents; a deliberately concurrent same-authority writer is outside this
+maintainer-script contract.
+
+Traversal is iterative and bounded per compiled root to 64 descendant
+directory levels and 10,000 inspected entries. A directory beyond the depth
+limit is retained and reported while safe siblings remain eligible. Reaching
+the node limit stops that root and reports the whole root subtree. The helper
+otherwise cleans safe siblings around a refused child and returns success after
+reporting remnants so an unsafe filesystem object cannot strand dpkg. This is
+safe unlinking, not secure erasure: storage firmware, snapshots, backups,
+journals, and remapped blocks remain outside its guarantee.
+
 ### 4. D-Bus IPC Security
 
 **Attack**: Unauthorized user sends D-Bus messages to the daemon to trigger auth, enroll faces, or extract data.
@@ -594,9 +668,13 @@ enabling it is a deliberate operator choice that commits to the reseal workflow.
 
 Access to the daemon is governed by the D-Bus system bus policy in
 `dbus/org.facelock.Daemon.conf`, installed to `/usr/share/dbus-1/system.d/`
-and enforced by the bus itself (dbus-daemon or dbus-broker). Setup and package
-install may also refresh a legacy `/etc/dbus-1/system.d/` copy when present,
-but `/usr/share/...` is the canonical install path. Two grants (ADR 010):
+and enforced by the bus itself (dbus-daemon or dbus-broker). Package
+transactions never overwrite a legacy `/etc/dbus-1/system.d/` copy. Setup
+removes one only when it is an exact reviewed historical Facelock file;
+modified or linked copies are preserved and reported. D-Bus merges policy
+fragments rather than selecting one winner, so setup also reports unrelated
+local policy files without modifying them or claiming the package policy
+overrides them. Two grants (ADR 010):
 
 - **root**: may own the name, send anything on the interface, and receive the
   daemon's signals.
@@ -1156,7 +1234,10 @@ That walk only happens if the daemon actually starts, which needs `models/*.onnx
 checkout (they are gitignored). The Debian suite package gates and `just test-rpm-pkg` refuse to run without
 them, and `pkg-validate.sh` fails rather than skipping — set
 `FACELOCK_ALLOW_MISSING_MODELS=1` to accept a partial run, which then reports the missing
-assertions in its `N skipped` count instead of passing silently.
+model-dependent assertions in its `N skipped` count instead of passing silently.
+Any other skipped assertion fails package validation. The opt-out also names the active-service Debian
+upgrade cases it cannot run; inactive versioned upgrades and the clean-base dependency proof
+remain mandatory.
 
 #### B. systemd Hardening (Implemented)
 
@@ -1252,6 +1333,66 @@ with systemd as PID 1 (`test/run-pkg-validate-systemd.sh`) and assert via `syste
 that the installed unit carries the Phase 3 directives, that the daemon starts and answers on
 D-Bus inside the sandbox, and that an `AF_INET` socket cannot be created under the same
 directive set (outbound TCP blocked).
+
+#### C. Source-install activation barrier (Required)
+
+Replacing a source-installed binary or activation file while D-Bus/systemd can
+launch the daemon creates a time-of-check/time-of-use window. The privileged
+entrypoint uses absolute program paths and a fixed trusted `PATH`; the recipe
+uses privileged Bash mode, rejects startup-hook variables, and holds the
+canonical `/run/facelock/lifecycle.lock` for its complete protected interval.
+The helper safely creates or validates the `root:root` mode `0755` parent and
+captures the never-unlinked lock as a `root:root` mode `0600`, zero-byte,
+single-link regular file through a no-follow descriptor proof.
+
+The installer snapshots service state plus persistent/runtime administrator
+unit identities, then creates and opens an exact temporary systemd control-tier
+mask. It proves the barrier manager-effective before stop and requires the unit
+inactive, the bus name unowned, and every ordinary snapshot unchanged before
+the first write. The system bus executable, unit, configuration, supported
+policy includes, service directories, and selected Facelock definition require
+trusted parents and bounded non-writable identities. Only standard system
+service-directory topology and D-Bus activation delegated to
+`facelock-daemon.service` are admitted; direct activation and custom/unreadable
+topology fail closed.
+
+Canonical assets are written only under `/usr`. Before any install write, the
+lifecycle records exact identities for all three historical `/etc`
+public/quarantine pairs. After canonical writes it stages only digest-allowlisted
+historical copies to fixed same-parent quarantines without replacement.
+Trusted modified administrator files and systemd masks remain unchanged and
+are revalidated throughout. The quarantines remain available for reverse-order
+rollback across all later writes and signal/failure cleanup. Parent signal
+deferral spans both the staging child and the exact identity record. The child
+traps exit and caught signals to reverse its local prefix, while parent cleanup
+independently reconciles every preplanned pair if staging ended before that
+record. Recovery uses only exact unchanged/staged identities and no-replace
+moves; a collision preserves both names and the activation barrier.
+
+On normal completion, systemd and D-Bus reload and prove the canonical winners
+while activation remains barred. Only then may exact staged quarantines be
+deleted; barrier removal and an initially active daemon's restart follow a
+second complete proof. A pre-publication failure restores the original public
+or interrupted-quarantine state before manager/D-Bus restoration. A commit
+failure rolls back and reloads/proves the original winners while still barred.
+Incomplete rollback, a collision, changing identity, partial publication, or
+an unprovable reload retains the safest barrier and suppresses restart.
+
+Barrier quarantine/removal uses held descriptors, no-clobber recovery, bounded
+retries, and repeated disk, manager, D-Bus definition/configuration, and owner
+checks. Linux provides no inode-conditional `unlink`/`rmdir`; the final syscall
+therefore excludes an actor with root-equivalent write/search authority over
+the trusted parent. Such an actor could already replace the barrier directly.
+The protocol covers pre-existing hostile objects and unprivileged races and
+never claims isolation from a second hostile root process.
+
+Without systemd the source install aborts before mutation. Only the exact
+checked-in offline container-build marker may select the offline path, which
+authenticates its copied helpers/manifest, takes the same canonical lock, and
+proves the absence of manager, bus, activation, installed-Facelock, and running
+Facelock surfaces. Static/mocked and booted PID-1 regressions are respectively
+`just test-source-install-daemon-lifecycle` and
+`just test-source-install-daemon-lifecycle-systemd`.
 
 ### 7. Polkit / sudo Face Auth (Implemented)
 

@@ -1,0 +1,8 @@
+[Unit]
+Description=Facelock source-install lifecycle test daemon
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.facelock.Daemon
+ExecStart=/usr/bin/facelock daemon

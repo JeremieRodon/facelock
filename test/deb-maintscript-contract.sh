@@ -80,6 +80,19 @@ done <"$control_root/postinst"
 
 [ -f "$control_root/prerm" ] || fail "package has no generated prerm"
 [ -f "$control_root/postrm" ] || fail "package has no generated postrm"
+[ -f "$control_root/conffiles" ] || fail "package has no generated conffiles record"
+mapfile -t conffiles < <(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+    "$control_root/conffiles" | sed '/^$/d')
+[ "${#conffiles[@]}" -eq 1 ] &&
+    [ "${conffiles[0]}" = /etc/facelock/config.toml ] ||
+    fail "generated conffiles must contain only /etc/facelock/config.toml"
+grep -Fq 'facelock_renameat2_syscall=316' "$control_root/postrm" ||
+    fail "generated postrm omits the self-contained no-replace purge helper"
+grep -Fq 'run_lifecycle_helper purge' "$control_root/postrm" ||
+    fail "generated postrm does not dispatch bounded cleanup on purge"
+if grep -Fq '#DEBHELPER#' "$control_root/postrm"; then
+    fail "generated postrm retains an unresolved debhelper marker"
+fi
 if grep -Eq 'systemctl[[:space:]]+(stop|disable)[[:space:]]+facelock-daemon' \
     "$control_root/prerm"; then
     fail "prerm must not manually stop or disable facelock-daemon"
@@ -109,6 +122,11 @@ fi
 if ! grep -Fq 'if [ "$1" = "purge" ]; then' "$control_root/postrm" ||
    ! grep -Fq "deb-systemd-helper purge 'facelock-daemon.service'" "$control_root/postrm"; then
     fail "generated postrm must reserve service-state purge for package purge"
+fi
+if grep -Fq '/usr/bin/facelock' "$control_root/postrm" ||
+   grep -Eq '^[[:space:]]*facelock[[:space:]]+(data|pam|setup|daemon)([[:space:]]|$)' \
+       "$control_root/postrm"; then
+    fail "generated postrm must not invoke the removed Facelock payload"
 fi
 
 echo "deb maintscript contract: ok"

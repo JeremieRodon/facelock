@@ -1,6 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::fs;
-use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::io::{self, IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
@@ -32,13 +36,20 @@ use super::pam::only;
 use super::pam::{PAM_LINE, PAM_MODULE_PATHS, PamAction, PamDirs, PamRequest};
 
 /// Embedded systemd unit file.
-const SERVICE_UNIT: &str = include_str!("../../../../systemd/facelock-daemon.service");
+const SERVICE_UNIT_BYTES: &[u8] = include_bytes!("../../../../systemd/facelock-daemon.service");
 
 /// Embedded D-Bus activation service file.
-const DBUS_SERVICE: &str = include_str!("../../../../dbus/org.facelock.Daemon.service");
+const DBUS_SERVICE_BYTES: &[u8] = include_bytes!("../../../../dbus/org.facelock.Daemon.service");
 
 /// Embedded D-Bus policy configuration.
+#[cfg(test)]
 const DBUS_POLICY: &str = include_str!("../../../../dbus/org.facelock.Daemon.conf");
+const DBUS_POLICY_BYTES: &[u8] = include_bytes!("../../../../dbus/org.facelock.Daemon.conf");
+
+/// Reviewed hashes of every exact historical system asset eligible for
+/// automatic legacy-copy migration.  The source installer reads the same file.
+const LEGACY_SYSTEM_ASSET_HASHES: &str =
+    include_str!("../../../../dist/legacy-system-assets.sha256");
 
 /// Embedded model manifest (same source as facelock-face).
 const MANIFEST_TOML: &str = include_str!("../../../../models/manifest.toml");
@@ -2386,7 +2397,7 @@ fn wizard_hyprlock_handoff(theme: &ColorfulTheme) {
         return;
     }
 
-    let status = Command::new("runuser")
+    let status = privileged_command("runuser")
         .args(["-u", &sudo_user, "--", "facelock", "hyprlock", "enable"])
         .status();
 
@@ -3007,19 +3018,820 @@ fn verify_after_download(path: &Path, expected_sha256: &str, name: &str) -> anyh
 }
 
 // ---------------------------------------------------------------------------
-// systemd unit installation
+// systemd and D-Bus asset validation
 // ---------------------------------------------------------------------------
 
-const SYSTEMD_UNIT_DIR: &str = "/usr/lib/systemd/system";
 const SERVICE_FILENAME: &str = "facelock-daemon.service";
-const DBUS_SYSTEM_SERVICES_DIR: &str = "/usr/share/dbus-1/system-services";
-const DBUS_SYSTEM_CONF_DIR: &str = "/usr/share/dbus-1/system.d";
-const DBUS_SERVICE_FILENAME: &str = "org.facelock.Daemon.service";
-const DBUS_POLICY_FILENAME: &str = "org.facelock.Daemon.conf";
-const LEGACY_SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/facelock-daemon.service";
-const LEGACY_DBUS_SYSTEM_SERVICE_PATH: &str =
-    "/etc/dbus-1/system-services/org.facelock.Daemon.service";
-const LEGACY_DBUS_SYSTEM_CONF_PATH: &str = "/etc/dbus-1/system.d/org.facelock.Daemon.conf";
+
+#[derive(Debug, Clone, Copy)]
+struct SystemAsset {
+    id: &'static str,
+    canonical_path: &'static str,
+    legacy_path: &'static str,
+    quarantine_path: &'static str,
+    current: &'static [u8],
+}
+
+const SYSTEM_ASSETS: &[SystemAsset] = &[
+    SystemAsset {
+        id: "systemd-unit",
+        canonical_path: "/usr/lib/systemd/system/facelock-daemon.service",
+        legacy_path: "/etc/systemd/system/facelock-daemon.service",
+        quarantine_path: "/etc/systemd/system/.facelock-migrate-systemd-unit",
+        current: SERVICE_UNIT_BYTES,
+    },
+    SystemAsset {
+        id: "dbus-policy",
+        canonical_path: "/usr/share/dbus-1/system.d/org.facelock.Daemon.conf",
+        legacy_path: "/etc/dbus-1/system.d/org.facelock.Daemon.conf",
+        quarantine_path: "/etc/dbus-1/system.d/.facelock-migrate-dbus-policy",
+        current: DBUS_POLICY_BYTES,
+    },
+    SystemAsset {
+        id: "dbus-activation",
+        canonical_path: "/usr/share/dbus-1/system-services/org.facelock.Daemon.service",
+        legacy_path: "/etc/dbus-1/system-services/org.facelock.Daemon.service",
+        quarantine_path: "/etc/dbus-1/system-services/.facelock-migrate-dbus-activation",
+        current: DBUS_SERVICE_BYTES,
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct SystemAssetLayout<'a> {
+    root: &'a Path,
+    expected_uid: u32,
+    expected_gid: u32,
+}
+
+impl<'a> SystemAssetLayout<'a> {
+    fn new(root: &'a Path, expected_uid: u32, expected_gid: u32) -> Self {
+        Self {
+            root,
+            expected_uid,
+            expected_gid,
+        }
+    }
+
+    fn production() -> Self {
+        Self::new(Path::new("/"), 0, 0)
+    }
+
+    fn path(self, absolute: &str) -> PathBuf {
+        self.root.join(absolute.trim_start_matches('/'))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_legacy_system_asset_hashes(
+    manifest: &str,
+) -> anyhow::Result<BTreeMap<&str, BTreeSet<&str>>> {
+    let mut parsed: BTreeMap<&str, BTreeSet<&str>> = SYSTEM_ASSETS
+        .iter()
+        .map(|asset| (asset.id, BTreeSet::new()))
+        .collect();
+
+    for (line_number, line) in manifest.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let Some(id) = fields.next() else {
+            continue;
+        };
+        let Some(hash) = fields.next() else {
+            bail!(
+                "invalid legacy system-asset allowlist record at line {}",
+                line_number + 1
+            );
+        };
+        if fields.next().is_some() || hash.len() != 64 {
+            bail!(
+                "invalid legacy system-asset allowlist record at line {}",
+                line_number + 1
+            );
+        }
+        if !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!(
+                "invalid legacy system-asset allowlist digest at line {}",
+                line_number + 1
+            );
+        }
+        let Some(hashes) = parsed.get_mut(id) else {
+            bail!(
+                "unknown legacy system-asset allowlist id at line {}",
+                line_number + 1
+            );
+        };
+        if !hashes.insert(hash) {
+            bail!(
+                "duplicate legacy system-asset allowlist record at line {}",
+                line_number + 1
+            );
+        }
+    }
+    Ok(parsed)
+}
+
+fn legacy_hash_is_known(asset_id: &str, digest: &str) -> anyhow::Result<bool> {
+    let parsed = parse_legacy_system_asset_hashes(LEGACY_SYSTEM_ASSET_HASHES)?;
+    let Some(hashes) = parsed.get(asset_id) else {
+        bail!("unknown system asset id {asset_id}");
+    };
+    if hashes.contains(digest) {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn validate_system_asset_parents(
+    layout: &SystemAssetLayout<'_>,
+    absolute: &str,
+) -> anyhow::Result<()> {
+    let root_metadata = fs::symlink_metadata(layout.root).with_context(|| {
+        format!(
+            "failed to inspect system-asset layout root {}",
+            layout.root.display()
+        )
+    })?;
+    if !root_metadata.file_type().is_dir()
+        || root_metadata.uid() != layout.expected_uid
+        || root_metadata.gid() != layout.expected_gid
+        || root_metadata.mode() & 0o022 != 0
+    {
+        bail!(
+            "system-asset layout root is linked, non-directory, wrongly owned, or writable by group/other: {}",
+            layout.root.display()
+        );
+    }
+    let relative = absolute
+        .strip_prefix('/')
+        .context("system asset path is not absolute")?;
+    let mut current = layout.root.to_path_buf();
+    let mut components = relative.split('/').peekable();
+
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        if component.is_empty() || component == "." || component == ".." {
+            bail!("system asset path has an unsafe component: {absolute}");
+        }
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect system asset parent {}",
+                        current.display()
+                    )
+                });
+            }
+        };
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != layout.expected_uid
+            || metadata.gid() != layout.expected_gid
+            || metadata.mode() & 0o022 != 0
+        {
+            bail!(
+                "system asset parent is linked, non-directory, wrongly owned, or writable by group/other and was preserved: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_asset(
+    layout: &SystemAssetLayout<'_>,
+    asset: &SystemAsset,
+) -> anyhow::Result<()> {
+    validate_system_asset_parents(layout, asset.canonical_path)?;
+    let path = layout.path(asset.canonical_path);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("package-owned system asset is missing: {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "package-owned system asset is not a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    if metadata.nlink() != 1 {
+        bail!(
+            "package-owned system asset has {} links instead of one: {}",
+            metadata.nlink(),
+            path.display()
+        );
+    }
+    if metadata.uid() != layout.expected_uid || metadata.gid() != layout.expected_gid {
+        bail!(
+            "package-owned system asset has owner {}:{} instead of {}:{}: {}",
+            metadata.uid(),
+            metadata.gid(),
+            layout.expected_uid,
+            layout.expected_gid,
+            path.display()
+        );
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode != 0o644 {
+        bail!(
+            "package-owned system asset has mode {mode:04o} instead of 0644: {}",
+            path.display()
+        );
+    }
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "failed to read package-owned system asset {}",
+            path.display()
+        )
+    })?;
+    if bytes != asset.current {
+        bail!(
+            "package-owned system asset bytes do not match this Facelock build: {}",
+            path.display()
+        );
+    }
+    let current_digest = sha256_hex(asset.current);
+    if !legacy_hash_is_known(asset.id, &current_digest)? {
+        bail!(
+            "current {} bytes are missing from the reviewed legacy allowlist",
+            asset.canonical_path
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyAssetState {
+    Absent,
+    ExactKnown,
+}
+
+fn inspect_known_legacy_path(
+    layout: &SystemAssetLayout<'_>,
+    asset: &SystemAsset,
+    absolute: &str,
+    description: &str,
+) -> anyhow::Result<LegacyAssetState> {
+    validate_system_asset_parents(layout, absolute)?;
+    let path = layout.path(absolute);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyAssetState::Absent);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {description} {}", path.display()));
+        }
+    };
+
+    let preserved = |reason: &str| {
+        anyhow::anyhow!(
+            "{description} {} is {reason}; it was preserved. Move it aside or restore an exact Facelock copy, then retry",
+            path.display()
+        )
+    };
+    if !metadata.file_type().is_file() {
+        return Err(preserved("linked or non-regular"));
+    }
+    if metadata.nlink() != 1 {
+        return Err(preserved("multiply linked"));
+    }
+    if metadata.uid() != layout.expected_uid || metadata.gid() != layout.expected_gid {
+        return Err(preserved("not owned by the trusted system owner"));
+    }
+    if metadata.mode() & 0o7777 != 0o644 {
+        return Err(preserved("not mode 0644"));
+    }
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "failed to read {description} {}; it was preserved",
+            path.display()
+        )
+    })?;
+    if !legacy_hash_is_known(asset.id, &sha256_hex(&bytes))? {
+        return Err(preserved("modified or unknown"));
+    }
+    Ok(LegacyAssetState::ExactKnown)
+}
+
+fn inspect_legacy_asset(
+    layout: &SystemAssetLayout<'_>,
+    asset: &SystemAsset,
+) -> anyhow::Result<LegacyAssetState> {
+    inspect_known_legacy_path(layout, asset, asset.legacy_path, "legacy system asset")
+}
+
+fn system_asset_quarantine_path(layout: &SystemAssetLayout<'_>, asset: &SystemAsset) -> PathBuf {
+    layout.path(asset.quarantine_path)
+}
+
+fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source path contains an interior NUL",
+        )
+    })?;
+    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target path contains an interior NUL",
+        )
+    })?;
+
+    // Linux is Facelock's platform contract. Fail closed when renameat2 is not
+    // available; a replacing rename is never an acceptable fallback.
+    // SAFETY: both pointers come from live, NUL-terminated `CString` values;
+    // `renameat2` reads them only for this call, and both directory fds are the
+    // documented `AT_FDCWD` sentinel.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn quarantine_is_absent(layout: &SystemAssetLayout<'_>, asset: &SystemAsset) -> anyhow::Result<()> {
+    let absolute = asset.quarantine_path;
+    validate_system_asset_parents(layout, absolute)?;
+    let path = layout.path(absolute);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => bail!(
+            "fixed migration quarantine collides with an existing path and was preserved: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect migration quarantine {}", path.display())),
+    }
+}
+
+fn rollback_system_asset_quarantines<F>(
+    layout: &SystemAssetLayout<'_>,
+    staged: &[&SystemAsset],
+    rename: &mut F,
+) -> Vec<String>
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    let mut failures = Vec::new();
+    for asset in staged.iter().rev() {
+        let quarantine_absolute = asset.quarantine_path;
+        let quarantine = layout.path(quarantine_absolute);
+        let legacy = layout.path(asset.legacy_path);
+        match inspect_known_legacy_path(layout, asset, quarantine_absolute, "migration quarantine")
+        {
+            Ok(LegacyAssetState::ExactKnown) => {}
+            Ok(LegacyAssetState::Absent) => {
+                failures.push(format!(
+                    "rollback quarantine disappeared and could not restore {}",
+                    legacy.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(error.to_string());
+                continue;
+            }
+        }
+        match fs::symlink_metadata(&legacy) {
+            Ok(_) => {
+                failures.push(format!(
+                    "rollback collision preserved both names for administrator review: {} and {}",
+                    legacy.display(),
+                    quarantine.display()
+                ));
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failures.push(format!(
+                    "failed to inspect rollback destination {}: {error}",
+                    legacy.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(error) = rename(&quarantine, &legacy) {
+            failures.push(format!(
+                "failed to roll back {} without replacement: {error}",
+                legacy.display()
+            ));
+            continue;
+        }
+        match inspect_legacy_asset(layout, asset) {
+            Ok(LegacyAssetState::ExactKnown) => {}
+            Ok(LegacyAssetState::Absent) => failures.push(format!(
+                "rollback reported success but did not restore {}",
+                legacy.display()
+            )),
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    failures
+}
+
+fn migration_failure_with_rollback<F>(
+    layout: &SystemAssetLayout<'_>,
+    staged: &[&SystemAsset],
+    rename: &mut F,
+    failure: anyhow::Error,
+) -> anyhow::Error
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    let rollback_failures = rollback_system_asset_quarantines(layout, staged, rename);
+    if rollback_failures.is_empty() {
+        anyhow::anyhow!("{failure}; every earlier migration candidate was rolled back")
+    } else {
+        anyhow::anyhow!(
+            "{failure}; migration rollback was incomplete:\n  - {}",
+            rollback_failures.join("\n  - ")
+        )
+    }
+}
+
+/// Validate immutable package/source-owned assets, then remove only exact
+/// reviewed legacy copies.  The complete canonical and legacy set is
+/// preflighted before the first removal, so an ambiguous entry preserves all
+/// legacy paths for administrator inspection.
+fn validate_and_migrate_system_assets(
+    layout: &SystemAssetLayout<'_>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    validate_and_migrate_system_assets_with(layout, &mut rename_noreplace)
+}
+
+fn validate_and_migrate_system_assets_with<F>(
+    layout: &SystemAssetLayout<'_>,
+    rename: &mut F,
+) -> anyhow::Result<Vec<PathBuf>>
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    let mut recovery_completed = false;
+    let candidates = loop {
+        let mut failures = Vec::new();
+        let mut candidates = Vec::new();
+        let mut interrupted = Vec::new();
+
+        for asset in SYSTEM_ASSETS {
+            if let Err(error) = validate_canonical_asset(layout, asset) {
+                failures.push(error.to_string());
+            }
+        }
+        for asset in SYSTEM_ASSETS {
+            let legacy = inspect_legacy_asset(layout, asset);
+            let quarantine = inspect_known_legacy_path(
+                layout,
+                asset,
+                asset.quarantine_path,
+                "migration quarantine",
+            );
+            match (legacy, quarantine) {
+                (Ok(LegacyAssetState::Absent), Ok(LegacyAssetState::Absent)) => {}
+                (Ok(LegacyAssetState::ExactKnown), Ok(LegacyAssetState::Absent)) => {
+                    candidates.push(asset);
+                }
+                (Ok(LegacyAssetState::Absent), Ok(LegacyAssetState::ExactKnown)) => {
+                    interrupted.push(asset);
+                }
+                (Ok(LegacyAssetState::ExactKnown), Ok(LegacyAssetState::ExactKnown)) => {
+                    failures.push(format!(
+                        "both the legacy asset and its fixed migration quarantine exist and were preserved as ambiguous: {} and {}",
+                        layout.path(asset.legacy_path).display(),
+                        layout.path(asset.quarantine_path).display()
+                    ));
+                }
+                (Err(legacy_error), Err(quarantine_error)) => {
+                    failures.push(legacy_error.to_string());
+                    failures.push(quarantine_error.to_string());
+                }
+                (Err(error), Ok(_)) | (Ok(_), Err(error)) => {
+                    failures.push(error.to_string());
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            if recovery_completed {
+                bail!(
+                    "system asset validation failed after interrupted-staging names were restored; no fixed quarantine was deleted. Resolve the preserved paths and retry:\n  - {}",
+                    failures.join("\n  - ")
+                );
+            } else {
+                bail!(
+                    "system asset validation failed; no legacy files were changed. Reinstall Facelock with the package manager or `sudo just install-files`, resolve preserved /etc overrides, and retry:\n  - {}",
+                    failures.join("\n  - ")
+                );
+            }
+        }
+        if interrupted.is_empty() {
+            break candidates;
+        }
+        if recovery_completed {
+            bail!(
+                "fixed migration state changed immediately after interrupted-staging recovery; the exact known names were preserved for administrator review"
+            );
+        }
+
+        // A killed setup can leave a prefix of exact candidates at their
+        // fixed quarantine names. The complete three-pair set is authenticated
+        // above before any recovery move. Restore in rollback order with the
+        // same no-replace primitive, then restart the complete preflight.
+        for asset in interrupted.iter().rev() {
+            let legacy = layout.path(asset.legacy_path);
+            let quarantine = layout.path(asset.quarantine_path);
+            match inspect_legacy_asset(layout, asset)? {
+                LegacyAssetState::Absent => {}
+                LegacyAssetState::ExactKnown => {
+                    bail!(
+                        "interrupted-staging recovery found a new public collision and preserved both names: {} and {}",
+                        legacy.display(),
+                        quarantine.display()
+                    );
+                }
+            }
+            match inspect_known_legacy_path(
+                layout,
+                asset,
+                asset.quarantine_path,
+                "migration quarantine",
+            )? {
+                LegacyAssetState::ExactKnown => {}
+                LegacyAssetState::Absent => {
+                    bail!(
+                        "interrupted-staging recovery quarantine disappeared and was preserved: {}",
+                        quarantine.display()
+                    );
+                }
+            }
+            rename(&quarantine, &legacy).with_context(|| {
+                format!(
+                    "failed to restore interrupted migration quarantine without replacement; both names were preserved when present: {} to {}",
+                    quarantine.display(),
+                    legacy.display()
+                )
+            })?;
+            match inspect_legacy_asset(layout, asset)? {
+                LegacyAssetState::ExactKnown => {}
+                LegacyAssetState::Absent => {
+                    bail!(
+                        "interrupted-staging recovery reported success but did not restore {}",
+                        legacy.display()
+                    );
+                }
+            }
+            quarantine_is_absent(layout, asset)?;
+        }
+        recovery_completed = true;
+    };
+
+    let mut staged = Vec::new();
+    for asset in candidates {
+        let legacy = layout.path(asset.legacy_path);
+        let quarantine = system_asset_quarantine_path(layout, asset);
+        let state = match inspect_legacy_asset(layout, asset) {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(migration_failure_with_rollback(
+                    layout, &staged, rename, error,
+                ));
+            }
+        };
+        match state {
+            LegacyAssetState::Absent => {
+                let failure = anyhow::anyhow!(
+                    "legacy asset disappeared after preflight: {}",
+                    legacy.display()
+                );
+                return Err(migration_failure_with_rollback(
+                    layout, &staged, rename, failure,
+                ));
+            }
+            LegacyAssetState::ExactKnown => {
+                if let Err(error) = quarantine_is_absent(layout, asset) {
+                    return Err(migration_failure_with_rollback(
+                        layout, &staged, rename, error,
+                    ));
+                }
+                if let Err(error) = rename(&legacy, &quarantine) {
+                    let failure = anyhow::anyhow!(
+                        "failed to quarantine exact known legacy system asset {} without replacement: {error}",
+                        legacy.display()
+                    );
+                    return Err(migration_failure_with_rollback(
+                        layout, &staged, rename, failure,
+                    ));
+                }
+                staged.push(asset);
+                let quarantine_absolute = asset.quarantine_path;
+                match inspect_known_legacy_path(
+                    layout,
+                    asset,
+                    quarantine_absolute,
+                    "migration quarantine",
+                ) {
+                    Ok(LegacyAssetState::ExactKnown) => {}
+                    Ok(LegacyAssetState::Absent) => {
+                        let failure = anyhow::anyhow!(
+                            "migration quarantine disappeared after staging: {}",
+                            quarantine.display()
+                        );
+                        return Err(migration_failure_with_rollback(
+                            layout, &staged, rename, failure,
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(migration_failure_with_rollback(
+                            layout, &staged, rename, error,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // All public legacy names are absent, but rollback is still possible. The
+    // fixed quarantines are not published by deletion until every canonical
+    // path and staged identity has passed a final complete preflight.
+    for asset in SYSTEM_ASSETS {
+        if let Err(error) = validate_canonical_asset(layout, asset) {
+            return Err(migration_failure_with_rollback(
+                layout, &staged, rename, error,
+            ));
+        }
+    }
+    for asset in &staged {
+        let absolute = asset.quarantine_path;
+        match inspect_known_legacy_path(layout, asset, absolute, "migration quarantine") {
+            Ok(LegacyAssetState::ExactKnown) => {}
+            Ok(LegacyAssetState::Absent) => {
+                let failure = anyhow::anyhow!(
+                    "migration quarantine disappeared before publication: {}",
+                    layout.path(absolute).display()
+                );
+                return Err(migration_failure_with_rollback(
+                    layout, &staged, rename, failure,
+                ));
+            }
+            Err(error) => {
+                return Err(migration_failure_with_rollback(
+                    layout, &staged, rename, error,
+                ));
+            }
+        }
+    }
+
+    let mut migrated = Vec::new();
+    for asset in &staged {
+        let quarantine = system_asset_quarantine_path(layout, asset);
+        fs::remove_file(&quarantine).with_context(|| {
+            format!(
+                "legacy names were retired, but failed to remove fixed migration quarantine {}",
+                quarantine.display()
+            )
+        })?;
+        migrated.push(layout.path(asset.legacy_path));
+    }
+
+    // The transaction cannot isolate a second root process. Never report a
+    // completed migration without rechecking canonical bytes and the trusted
+    // root-equivalent identity after quarantine publication.
+    for asset in SYSTEM_ASSETS {
+        validate_canonical_asset(layout, asset)?;
+    }
+    Ok(migrated)
+}
+
+fn validate_systemd_unit_resolution(snapshot: &str, expected: &Path) -> anyhow::Result<()> {
+    let mut fragment_path = None;
+    let mut drop_in_paths = None;
+    for line in snapshot.lines() {
+        if let Some(value) = line.strip_prefix("FragmentPath=") {
+            if fragment_path.replace(value).is_some() {
+                bail!("systemd returned FragmentPath more than once");
+            }
+        } else if let Some(value) = line.strip_prefix("DropInPaths=") {
+            if drop_in_paths.replace(value).is_some() {
+                bail!("systemd returned DropInPaths more than once");
+            }
+        } else {
+            bail!("systemd returned an unexpected unit-resolution field");
+        }
+    }
+
+    let fragment_path = fragment_path.context("systemd did not return FragmentPath")?;
+    let drop_in_paths = drop_in_paths.context("systemd did not return DropInPaths")?;
+    if Path::new(fragment_path) != expected {
+        bail!(
+            "systemd resolves facelock-daemon.service to {fragment_path}, not the package/source-owned {}",
+            expected.display()
+        );
+    }
+    if !drop_in_paths.is_empty() {
+        bail!("systemd applies non-package drop-ins to facelock-daemon.service: {drop_in_paths}");
+    }
+    Ok(())
+}
+
+fn validate_dbus_asset_resolution(layout: &SystemAssetLayout<'_>) -> anyhow::Result<Vec<PathBuf>> {
+    for asset in &SYSTEM_ASSETS[1..] {
+        validate_canonical_asset(layout, asset)?;
+    }
+
+    // Activation definitions are winner-selected by exact bus-name filename.
+    // Policy is not: every policy fragment is merged. The exact historical
+    // duplicate must be retired, while unrelated local policy is preserved and
+    // reported below rather than described as ineffective.
+    for shadow in [
+        "/etc/dbus-1/system-services/org.facelock.Daemon.service",
+        "/run/dbus-1/system-services/org.facelock.Daemon.service",
+        "/usr/local/share/dbus-1/system-services/org.facelock.Daemon.service",
+        "/etc/dbus-1/system.d/org.facelock.Daemon.conf",
+    ] {
+        let path = layout.path(shadow);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => bail!(
+                "D-Bus activation is shadowed or the exact historical policy duplicate remains at {}; it was preserved",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect D-Bus shadow path {}", path.display())
+                });
+            }
+        }
+    }
+
+    let mut local_policy = Vec::new();
+    for absolute in ["/etc/dbus-1/system.conf", "/etc/dbus-1/system-local.conf"] {
+        let path = layout.path(absolute);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => local_policy.push(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect local D-Bus policy {}", path.display())
+                });
+            }
+        }
+    }
+
+    let fragment_dir = layout.path("/etc/dbus-1/system.d");
+    match fs::read_dir(&fragment_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.with_context(|| {
+                    format!(
+                        "failed to enumerate local D-Bus policy directory {}",
+                        fragment_dir.display()
+                    )
+                })?;
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "conf")
+                {
+                    local_policy.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to enumerate local D-Bus policy directory {}",
+                    fragment_dir.display()
+                )
+            });
+        }
+    }
+    local_policy.sort();
+    local_policy.dedup();
+    Ok(local_policy)
+}
 
 fn check_systemd() -> anyhow::Result<()> {
     if !Path::new("/run/systemd/system").exists() {
@@ -3036,8 +3848,20 @@ fn check_root() -> anyhow::Result<()> {
     Ok(())
 }
 
+const PRIVILEGED_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn privileged_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env("PATH", PRIVILEGED_PATH);
+    command
+}
+
 fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new(program)
+    run_cmd_output(program, args).map(|_| ())
+}
+
+fn run_cmd_output(program: &str, args: &[&str]) -> anyhow::Result<String> {
+    let output = privileged_command(program)
         .args(args)
         .output()
         .with_context(|| format!("failed to execute {program}"))?;
@@ -3045,26 +3869,7 @@ fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("{program} {} failed: {stderr}", args.join(" "));
     }
-    Ok(())
-}
-
-fn refresh_legacy_copy_if_present(path: &Path, contents: &str, marker: &str) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let existing = fs::read_to_string(path)
-        .with_context(|| format!("failed to read existing legacy file {}", path.display()))?;
-    if !existing.contains(marker) {
-        return Ok(());
-    }
-
-    write_file(path, contents.as_bytes(), 0o644)
-        .with_context(|| format!("failed to refresh {}", path.display()))?;
-    Terminal.info(&SystemMessage::RefreshedLegacyFile {
-        path: path.display().to_string(),
-    });
-    Ok(())
+    String::from_utf8(output.stdout).with_context(|| format!("{program} returned non-UTF-8 output"))
 }
 
 pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
@@ -3076,64 +3881,41 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
         run_cmd("systemctl", &["disable", "--now", "facelock-daemon"])?;
         Terminal.info(&SystemMessage::SystemdUnitsDisabled);
     } else {
-        Terminal.info(&SystemMessage::InstallingSystemdUnits);
-
-        // Install systemd service unit
-        let unit_dir = Path::new(SYSTEMD_UNIT_DIR);
-        fs::create_dir_all(unit_dir)
-            .with_context(|| format!("failed to create {SYSTEMD_UNIT_DIR}"))?;
-
-        let service_path = unit_dir.join(SERVICE_FILENAME);
-        write_file(&service_path, SERVICE_UNIT.as_bytes(), 0o644)
-            .with_context(|| format!("failed to write {}", service_path.display()))?;
-        Terminal.info(&SystemMessage::WroteFile {
-            path: service_path.display().to_string(),
-        });
-        refresh_legacy_copy_if_present(
-            Path::new(LEGACY_SYSTEMD_UNIT_PATH),
-            SERVICE_UNIT,
-            "ExecStart=/usr/bin/facelock daemon",
-        )?;
-
-        // Install D-Bus policy file
-        let conf_dir = Path::new(DBUS_SYSTEM_CONF_DIR);
-        fs::create_dir_all(conf_dir)
-            .with_context(|| format!("failed to create {DBUS_SYSTEM_CONF_DIR}"))?;
-
-        let policy_path = conf_dir.join(DBUS_POLICY_FILENAME);
-        write_file(&policy_path, DBUS_POLICY.as_bytes(), 0o644)
-            .with_context(|| format!("failed to write {}", policy_path.display()))?;
-        Terminal.info(&SystemMessage::WroteFile {
-            path: policy_path.display().to_string(),
-        });
-        refresh_legacy_copy_if_present(
-            Path::new(LEGACY_DBUS_SYSTEM_CONF_PATH),
-            DBUS_POLICY,
-            "org.facelock.Daemon",
-        )?;
-
-        // Install D-Bus activation service
-        let svc_dir = Path::new(DBUS_SYSTEM_SERVICES_DIR);
-        fs::create_dir_all(svc_dir)
-            .with_context(|| format!("failed to create {DBUS_SYSTEM_SERVICES_DIR}"))?;
-
-        let dbus_svc_path = svc_dir.join(DBUS_SERVICE_FILENAME);
-        write_file(&dbus_svc_path, DBUS_SERVICE.as_bytes(), 0o644)
-            .with_context(|| format!("failed to write {}", dbus_svc_path.display()))?;
-        Terminal.info(&SystemMessage::WroteFile {
-            path: dbus_svc_path.display().to_string(),
-        });
-        refresh_legacy_copy_if_present(
-            Path::new(LEGACY_DBUS_SYSTEM_SERVICE_PATH),
-            DBUS_SERVICE,
-            "org.facelock.Daemon",
-        )?;
+        Terminal.info(&SystemMessage::ValidatingSystemAssets);
+        let migrated = validate_and_migrate_system_assets(&SystemAssetLayout::production())?;
+        for path in migrated {
+            Terminal.info(&SystemMessage::RemovedLegacySystemAsset {
+                path: path.display().to_string(),
+            });
+        }
 
         run_cmd("systemctl", &["daemon-reload"])?;
         Terminal.info(&SystemMessage::SystemctlDaemonReloadDone);
 
+        let layout = SystemAssetLayout::production();
+        let resolution = run_cmd_output(
+            "systemctl",
+            &[
+                "show",
+                SERVICE_FILENAME,
+                "--property=FragmentPath",
+                "--property=DropInPaths",
+                "--no-pager",
+            ],
+        )?;
+        validate_systemd_unit_resolution(
+            &resolution,
+            &layout.path(SYSTEM_ASSETS[0].canonical_path),
+        )?;
+        for path in validate_dbus_asset_resolution(&layout)? {
+            Terminal.notice(&SystemMessage::PreservedLocalDbusPolicy {
+                path: path.display().to_string(),
+            });
+        }
+        Terminal.info(&SystemMessage::SystemAssetsValidated);
+
         // The bus half of the same reload. Until the bus re-reads the policy
-        // written above, nothing may own `org.facelock.Daemon` — the system
+        // validated above, nothing may own `org.facelock.Daemon` — the system
         // bus denies `own` by default and root is not exempt. Bus
         // implementations differ on whether they pick the directory up over
         // inotify, so ask; where it was unnecessary this is a no-op, and a
@@ -3153,6 +3935,677 @@ pub fn run_systemd(disable: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod system_asset_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+
+    const STALE_KNOWN_UNIT: &str = r#"[Unit]
+Description=Facelock Face Authentication Daemon
+After=local-fs.target
+
+[Service]
+Type=dbus
+BusName=org.facelock.Daemon
+ExecStart=/usr/bin/facelock daemon
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1024
+
+# Phase 1: Filesystem isolation
+ProtectSystem=strict
+# ProtectHome=yes also hides /run/user/, breaking desktop notifications
+# (daemon sends notify-send via runuser to /run/user/<uid>/bus).
+# Use InaccessiblePaths instead to protect /home and /root without
+# affecting /run/user/.
+InaccessiblePaths=/home /root
+ReadWritePaths=/var/lib/facelock /var/log/facelock
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# Phase 2: Kernel hardening
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Phase 2.5: Device access
+# DevicePolicy=closed/auto both use cgroup device ACLs which hide /dev/video*
+# from stat(), breaking camera auto-detection. Omitted — the daemon only needs
+# /dev/video* and /dev/tpmrm0, both protected by standard Unix permissions.
+# ProtectSystem=strict already prevents writing to /dev/.
+
+# Deferred: MemoryDenyWriteExecute=yes breaks ONNX Runtime JIT.
+# Phase 3 (seccomp, capabilities, network) deferred to future work.
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+    fn rooted(root: &Path, absolute: &str) -> PathBuf {
+        root.join(absolute.trim_start_matches('/'))
+    }
+
+    fn identity() -> (u32, u32) {
+        // SAFETY: these process-identity queries have no preconditions.
+        unsafe { (libc::geteuid(), libc::getegid()) }
+    }
+
+    fn seed_canonical_assets(root: &Path) {
+        for asset in SYSTEM_ASSETS {
+            let path = rooted(root, asset.canonical_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, asset.current).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    fn snapshot_canonical_assets(root: &Path) -> BTreeMap<&'static str, (Vec<u8>, u32, u32, u32)> {
+        SYSTEM_ASSETS
+            .iter()
+            .map(|asset| {
+                let path = rooted(root, asset.canonical_path);
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                (
+                    asset.canonical_path,
+                    (
+                        fs::read(path).unwrap(),
+                        metadata.uid(),
+                        metadata.gid(),
+                        metadata.mode() & 0o7777,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn layout(root: &Path) -> SystemAssetLayout<'_> {
+        let (uid, gid) = identity();
+        SystemAssetLayout::new(root, uid, gid)
+    }
+
+    fn seed_current_legacy_assets(root: &Path) {
+        for asset in SYSTEM_ASSETS {
+            let legacy = rooted(root, asset.legacy_path);
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(legacy, asset.current).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_allowlist_parser_rejects_malformed_duplicate_and_unknown_records() {
+        let parsed = parse_legacy_system_asset_hashes(LEGACY_SYSTEM_ASSET_HASHES).unwrap();
+        assert_eq!(parsed["systemd-unit"].len(), 9);
+        assert_eq!(parsed["dbus-policy"].len(), 4);
+        assert_eq!(parsed["dbus-activation"].len(), 1);
+        let lines: Vec<&str> = LEGACY_SYSTEM_ASSET_HASHES.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let id = line.split_ascii_whitespace().next().unwrap_or_default();
+            let expected_path = match id {
+                "systemd-unit" => Some("systemd/facelock-daemon.service"),
+                "dbus-policy" => Some("dbus/org.facelock.Daemon.conf"),
+                "dbus-activation" => Some("dbus/org.facelock.Daemon.service"),
+                _ => None,
+            };
+            let Some(expected_path) = expected_path else {
+                continue;
+            };
+            let provenance = lines
+                .get(index.wrapping_sub(1))
+                .and_then(|line| line.trim().strip_prefix("# source "))
+                .unwrap_or_else(|| panic!("record line {} lacks provenance", index + 1));
+            let (commit, path) = provenance
+                .split_once(':')
+                .unwrap_or_else(|| panic!("invalid provenance at line {index}"));
+            assert_eq!(commit.len(), 40, "provenance line {index}");
+            assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(path, expected_path, "provenance line {index}");
+        }
+        assert_eq!(
+            sha256_hex(STALE_KNOWN_UNIT.as_bytes()),
+            "d66167d09f8ff8303e583566970dfb4202e8c781082702191ecf2dbf336971ce"
+        );
+
+        let valid =
+            "systemd-unit a5ea88523bd5dd952a620da43f5552c656d69544301db6f5eda892458ea2ea12\n";
+        for (label, manifest) in [
+            ("missing digest", "systemd-unit\n".to_string()),
+            ("short digest", "systemd-unit cafe\n".to_string()),
+            (
+                "non-hex digest",
+                format!("systemd-unit {}g\n", "a".repeat(63)),
+            ),
+            ("duplicate", format!("{valid}{valid}")),
+            (
+                "unknown id",
+                valid.replacen("systemd-unit", "unknown-asset", 1),
+            ),
+            (
+                "extra field",
+                valid.trim_end().to_string() + " unexpected\n",
+            ),
+        ] {
+            let error = parse_legacy_system_asset_hashes(&manifest)
+                .expect_err(label)
+                .to_string();
+            assert!(error.contains("line"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn systemd_resolution_requires_the_canonical_fragment_and_no_dropins() {
+        let canonical = "/usr/lib/systemd/system/facelock-daemon.service";
+        validate_systemd_unit_resolution(
+            "FragmentPath=/usr/lib/systemd/system/facelock-daemon.service\nDropInPaths=\n",
+            Path::new(canonical),
+        )
+        .unwrap();
+
+        for (label, snapshot) in [
+            (
+                "legacy fragment",
+                "FragmentPath=/etc/systemd/system/facelock-daemon.service\nDropInPaths=\n",
+            ),
+            (
+                "drop-in",
+                "FragmentPath=/usr/lib/systemd/system/facelock-daemon.service\nDropInPaths=/etc/systemd/system/facelock-daemon.service.d/admin.conf\n",
+            ),
+            (
+                "duplicate field",
+                "FragmentPath=/usr/lib/systemd/system/facelock-daemon.service\nFragmentPath=/usr/lib/systemd/system/facelock-daemon.service\nDropInPaths=\n",
+            ),
+            (
+                "missing field",
+                "FragmentPath=/usr/lib/systemd/system/facelock-daemon.service\n",
+            ),
+        ] {
+            let error = validate_systemd_unit_resolution(snapshot, Path::new(canonical))
+                .expect_err(label)
+                .to_string();
+            assert!(error.contains("systemd"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn dbus_policy_is_merged_while_activation_rejects_higher_priority_definitions() {
+        for shadow in [
+            "/run/dbus-1/system-services/org.facelock.Daemon.service",
+            "/usr/local/share/dbus-1/system-services/org.facelock.Daemon.service",
+            "/etc/dbus-1/system.d/org.facelock.Daemon.conf",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            seed_canonical_assets(temp.path());
+            let shadow = rooted(temp.path(), shadow);
+            fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+            let bytes = if shadow.extension().is_some_and(|value| value == "conf") {
+                DBUS_POLICY_BYTES
+            } else {
+                DBUS_SERVICE_BYTES
+            };
+            fs::write(&shadow, bytes).unwrap();
+
+            let error = validate_dbus_asset_resolution(&layout(temp.path()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(shadow.to_str().unwrap()), "{error}");
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        let local_fragment = rooted(temp.path(), "/etc/dbus-1/system.d/90-facelock-admin.conf");
+        let system_local = rooted(temp.path(), "/etc/dbus-1/system-local.conf");
+        fs::create_dir_all(local_fragment.parent().unwrap()).unwrap();
+        fs::write(&local_fragment, b"<busconfig/>\n").unwrap();
+        fs::write(&system_local, b"<busconfig/>\n").unwrap();
+
+        let reported = validate_dbus_asset_resolution(&layout(temp.path())).unwrap();
+        assert_eq!(reported, vec![system_local, local_fragment]);
+        for path in &reported {
+            assert_eq!(fs::read(path).unwrap(), b"<busconfig/>\n");
+        }
+    }
+
+    #[test]
+    fn exact_current_and_stale_known_legacy_copies_are_removed_without_touching_canonical_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        let before = snapshot_canonical_assets(temp.path());
+
+        let current_policy = rooted(temp.path(), SYSTEM_ASSETS[1].legacy_path);
+        fs::create_dir_all(current_policy.parent().unwrap()).unwrap();
+        fs::write(&current_policy, SYSTEM_ASSETS[1].current).unwrap();
+
+        let current_activation = rooted(temp.path(), SYSTEM_ASSETS[2].legacy_path);
+        fs::create_dir_all(current_activation.parent().unwrap()).unwrap();
+        fs::write(&current_activation, SYSTEM_ASSETS[2].current).unwrap();
+
+        let stale_unit = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        fs::create_dir_all(stale_unit.parent().unwrap()).unwrap();
+        fs::write(&stale_unit, STALE_KNOWN_UNIT.as_bytes()).unwrap();
+
+        let migrated = validate_and_migrate_system_assets(&layout(temp.path())).unwrap();
+
+        assert_eq!(migrated.len(), 3);
+        assert!(!stale_unit.exists());
+        assert!(!current_policy.exists());
+        assert!(!current_activation.exists());
+        assert_eq!(snapshot_canonical_assets(temp.path()), before);
+
+        assert!(
+            validate_and_migrate_system_assets(&layout(temp.path()))
+                .unwrap()
+                .is_empty(),
+            "a repeated setup is idempotent"
+        );
+        assert_eq!(snapshot_canonical_assets(temp.path()), before);
+    }
+
+    #[test]
+    fn ambiguous_legacy_copy_prevents_every_removal_and_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+
+        let exact = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        fs::create_dir_all(exact.parent().unwrap()).unwrap();
+        fs::write(&exact, SYSTEM_ASSETS[0].current).unwrap();
+
+        let modified = rooted(temp.path(), SYSTEM_ASSETS[1].legacy_path);
+        fs::create_dir_all(modified.parent().unwrap()).unwrap();
+        fs::write(&modified, b"administrator policy\n").unwrap();
+
+        let error = validate_and_migrate_system_assets(&layout(temp.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(modified.to_str().unwrap()), "{error}");
+        assert!(error.contains("preserved"), "{error}");
+        assert_eq!(fs::read(exact).unwrap(), SYSTEM_ASSETS[0].current);
+        assert_eq!(fs::read(modified).unwrap(), b"administrator policy\n");
+    }
+
+    #[test]
+    fn symlinked_and_hardlinked_legacy_copies_are_preserved_and_rejected() {
+        for linked in ["symlink", "hardlink"] {
+            let temp = tempfile::tempdir().unwrap();
+            seed_canonical_assets(temp.path());
+            let legacy = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            let outside = temp.path().join("outside-unit");
+            fs::write(&outside, SYSTEM_ASSETS[0].current).unwrap();
+            if linked == "symlink" {
+                symlink(&outside, &legacy).unwrap();
+            } else {
+                fs::hard_link(&outside, &legacy).unwrap();
+            }
+
+            let error = validate_and_migrate_system_assets(&layout(temp.path()))
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(legacy.to_str().unwrap()), "{error}");
+            assert!(fs::symlink_metadata(&legacy).is_ok());
+            assert_eq!(fs::read(&outside).unwrap(), SYSTEM_ASSETS[0].current);
+        }
+    }
+
+    #[test]
+    fn a_symlinked_legacy_parent_is_preserved_without_touching_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        let legacy = rooted(temp.path(), SYSTEM_ASSETS[1].legacy_path);
+        let outside_dir = temp.path().join("outside-policy-dir");
+        let outside = outside_dir.join("org.facelock.Daemon.conf");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(&outside, SYSTEM_ASSETS[1].current).unwrap();
+        fs::create_dir_all(legacy.parent().unwrap().parent().unwrap()).unwrap();
+        symlink(&outside_dir, legacy.parent().unwrap()).unwrap();
+
+        let error = validate_and_migrate_system_assets(&layout(temp.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(legacy.parent().unwrap().to_str().unwrap()));
+        assert_eq!(fs::read(outside).unwrap(), SYSTEM_ASSETS[1].current);
+    }
+
+    #[test]
+    fn invalid_canonical_asset_fails_before_an_exact_legacy_copy_is_removed() {
+        for failure in ["content", "mode"] {
+            let temp = tempfile::tempdir().unwrap();
+            seed_canonical_assets(temp.path());
+            let canonical = rooted(temp.path(), SYSTEM_ASSETS[0].canonical_path);
+            if failure == "content" {
+                fs::write(&canonical, b"stale package unit\n").unwrap();
+            } else {
+                fs::set_permissions(&canonical, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let legacy = rooted(temp.path(), SYSTEM_ASSETS[1].legacy_path);
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(&legacy, SYSTEM_ASSETS[1].current).unwrap();
+
+            let error = validate_and_migrate_system_assets(&layout(temp.path()))
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(canonical.to_str().unwrap()), "{error}");
+            assert!(legacy.exists(), "canonical preflight must precede removal");
+        }
+    }
+
+    #[test]
+    fn a_late_quarantine_failure_rolls_back_every_earlier_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let mut calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            calls += 1;
+            if calls == 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected second-stage failure",
+                ));
+            }
+            rename_noreplace(source, target)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("injected second-stage failure"), "{error}");
+        for asset in SYSTEM_ASSETS {
+            assert!(rooted(temp.path(), asset.legacy_path).is_file());
+            assert!(!system_asset_quarantine_path(&layout, asset).exists());
+        }
+    }
+
+    #[test]
+    fn a_late_revalidation_failure_also_rolls_back_earlier_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let later = rooted(temp.path(), SYSTEM_ASSETS[1].legacy_path);
+        let mut calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            rename_noreplace(source, target)?;
+            calls += 1;
+            if calls == 1 {
+                fs::write(&later, b"administrator changed policy\n").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("modified or unknown"), "{error}");
+        let first = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        assert!(first.is_file(), "the first candidate was not rolled back");
+        assert!(!system_asset_quarantine_path(&layout, &SYSTEM_ASSETS[0]).exists());
+        assert_eq!(fs::read(later).unwrap(), b"administrator changed policy\n");
+    }
+
+    #[test]
+    fn quarantine_collision_is_a_whole_set_preflight_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let collision = system_asset_quarantine_path(&layout, &SYSTEM_ASSETS[1]);
+        fs::write(&collision, b"administrator collision sentinel\n").unwrap();
+        let mut rename_calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            rename_calls += 1;
+            rename_noreplace(source, target)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(collision.to_str().unwrap()), "{error}");
+        assert_eq!(rename_calls, 0, "preflight must precede every mutation");
+        assert_eq!(
+            fs::read(collision).unwrap(),
+            b"administrator collision sentinel\n"
+        );
+        for asset in SYSTEM_ASSETS {
+            assert!(rooted(temp.path(), asset.legacy_path).is_file());
+        }
+    }
+
+    #[test]
+    fn exact_interrupted_staging_is_restored_before_migration_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        for asset in &SYSTEM_ASSETS[..2] {
+            rename_noreplace(
+                &rooted(temp.path(), asset.legacy_path),
+                &system_asset_quarantine_path(&layout, asset),
+            )
+            .unwrap();
+        }
+
+        let migrated = validate_and_migrate_system_assets(&layout).unwrap();
+
+        assert_eq!(migrated.len(), SYSTEM_ASSETS.len());
+        for asset in SYSTEM_ASSETS {
+            assert!(!rooted(temp.path(), asset.legacy_path).exists());
+            assert!(!system_asset_quarantine_path(&layout, asset).exists());
+        }
+    }
+
+    #[test]
+    fn interrupted_staging_recovery_preflights_every_peer_before_restoring() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let interrupted_legacy = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        let interrupted_quarantine = system_asset_quarantine_path(&layout, &SYSTEM_ASSETS[0]);
+        rename_noreplace(&interrupted_legacy, &interrupted_quarantine).unwrap();
+        let ambiguous_peer = rooted(temp.path(), SYSTEM_ASSETS[1].legacy_path);
+        fs::write(&ambiguous_peer, b"administrator policy\n").unwrap();
+        let mut rename_calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            rename_calls += 1;
+            rename_noreplace(source, target)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(ambiguous_peer.to_str().unwrap()), "{error}");
+        assert_eq!(rename_calls, 0, "recovery began before whole-set preflight");
+        assert!(!interrupted_legacy.exists());
+        assert_eq!(
+            fs::read(interrupted_quarantine).unwrap(),
+            SYSTEM_ASSETS[0].current
+        );
+        assert_eq!(fs::read(ambiguous_peer).unwrap(), b"administrator policy\n");
+    }
+
+    #[test]
+    fn dual_public_and_quarantine_names_are_preserved_as_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let legacy = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        let quarantine = system_asset_quarantine_path(&layout, &SYSTEM_ASSETS[0]);
+        fs::write(&quarantine, SYSTEM_ASSETS[0].current).unwrap();
+        let mut rename_calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            rename_calls += 1;
+            rename_noreplace(source, target)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(quarantine.to_str().unwrap()), "{error}");
+        assert_eq!(rename_calls, 0);
+        assert_eq!(fs::read(legacy).unwrap(), SYSTEM_ASSETS[0].current);
+        assert_eq!(fs::read(quarantine).unwrap(), SYSTEM_ASSETS[0].current);
+    }
+
+    #[test]
+    fn absent_public_with_unknown_quarantine_is_not_recovered() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let legacy = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        let quarantine = system_asset_quarantine_path(&layout, &SYSTEM_ASSETS[0]);
+        rename_noreplace(&legacy, &quarantine).unwrap();
+        fs::write(&quarantine, b"unknown quarantine\n").unwrap();
+        let mut rename_calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            rename_calls += 1;
+            rename_noreplace(source, target)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(quarantine.to_str().unwrap()), "{error}");
+        assert!(error.contains("modified or unknown"), "{error}");
+        assert_eq!(rename_calls, 0);
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(quarantine).unwrap(), b"unknown quarantine\n");
+    }
+
+    #[test]
+    fn interrupted_staging_recovery_never_replaces_a_new_public_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let legacy = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        let quarantine = system_asset_quarantine_path(&layout, &SYSTEM_ASSETS[0]);
+        rename_noreplace(&legacy, &quarantine).unwrap();
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            if source == quarantine && target == legacy {
+                fs::write(&legacy, b"administrator replacement\n").unwrap();
+            }
+            rename_noreplace(source, target)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("without replacement"), "{error}");
+        assert_eq!(fs::read(legacy).unwrap(), b"administrator replacement\n");
+        assert_eq!(fs::read(quarantine).unwrap(), SYSTEM_ASSETS[0].current);
+    }
+
+    #[test]
+    fn rollback_collision_preserves_both_names_and_reports_incomplete_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let first_legacy = rooted(temp.path(), SYSTEM_ASSETS[0].legacy_path);
+        let first_quarantine = system_asset_quarantine_path(&layout, &SYSTEM_ASSETS[0]);
+        let mut calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            calls += 1;
+            if calls == 2 {
+                fs::write(&first_legacy, b"administrator replacement\n").unwrap();
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected second-stage failure",
+                ));
+            }
+            rename_noreplace(source, target)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("rollback was incomplete"), "{error}");
+        assert!(error.contains(first_legacy.to_str().unwrap()), "{error}");
+        assert_eq!(
+            fs::read(first_legacy).unwrap(),
+            b"administrator replacement\n"
+        );
+        assert_eq!(
+            fs::read(first_quarantine).unwrap(),
+            SYSTEM_ASSETS[0].current
+        );
+    }
+
+    #[test]
+    fn canonical_change_before_publication_rolls_back_every_quarantine() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        let layout = layout(temp.path());
+        let canonical = rooted(temp.path(), SYSTEM_ASSETS[0].canonical_path);
+        let mut calls = 0;
+
+        let error = validate_and_migrate_system_assets_with(&layout, &mut |source, target| {
+            rename_noreplace(source, target)?;
+            calls += 1;
+            if calls == SYSTEM_ASSETS.len() {
+                fs::write(&canonical, b"privileged concurrent replacement\n").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(canonical.to_str().unwrap()), "{error}");
+        for asset in SYSTEM_ASSETS {
+            assert!(rooted(temp.path(), asset.legacy_path).is_file());
+            assert!(!system_asset_quarantine_path(&layout, asset).exists());
+        }
+    }
+
+    #[test]
+    fn an_untrusted_layout_root_fails_before_every_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_canonical_assets(temp.path());
+        seed_current_legacy_assets(temp.path());
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let layout = layout(temp.path());
+
+        let error = validate_and_migrate_system_assets(&layout)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("layout root"), "{error}");
+        for asset in SYSTEM_ASSETS {
+            assert!(rooted(temp.path(), asset.legacy_path).is_file());
+        }
+    }
+
+    #[test]
+    fn kernel_quarantine_rename_never_replaces_a_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::write(&source, b"source bytes\n").unwrap();
+        fs::write(&target, b"collision bytes\n").unwrap();
+
+        let error = rename_noreplace(&source, &target).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(fs::read(source).unwrap(), b"source bytes\n");
+        assert_eq!(fs::read(target).unwrap(), b"collision bytes\n");
+    }
 }
 
 /// How long a base flow waits for a freshly installed daemon to answer.
@@ -3303,7 +4756,7 @@ fn daemon_unit_is_active() -> bool {
 /// as "cannot prove a restart happened" on the restart branch and ignores
 /// entirely on the start branch.
 fn daemon_main_pid() -> Option<u32> {
-    let out = Command::new("systemctl")
+    let out = privileged_command("systemctl")
         .args(["show", "-p", "MainPID", "--value", SERVICE_FILENAME])
         .output()
         .ok()?;
@@ -3981,6 +5434,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn privileged_commands_use_a_fixed_trusted_path() {
+        let command = privileged_command("systemctl");
+        let path = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value);
+
+        assert_eq!(path, Some(std::ffi::OsStr::new(PRIVILEGED_PATH)));
+    }
+
+    #[test]
     fn parse_manifest() {
         let manifest: ModelManifest = toml::from_str(MANIFEST_TOML).unwrap();
         assert_eq!(manifest.models.len(), 4);
@@ -4225,8 +5689,14 @@ mod tests {
         assert!(validation.contains("db:Status-Status"));
         let rpm = fs::read_to_string(root.join("test/Containerfile.rpm-e2e")).unwrap();
         let deb = fs::read_to_string(root.join("test/Containerfile.deb-runtime")).unwrap();
-        assert!(deb.contains("/facelock-test-package.deb"));
-        assert!(deb.contains("apt-get install -y /facelock-test-package.deb"));
+        let deb_lifecycle = fs::read_to_string(root.join("test/deb-package-lifecycle.sh")).unwrap();
+        assert!(deb.contains("COPY test/deb-package-lifecycle.sh /deb-package-lifecycle.sh"));
+        assert!(!deb.contains("COPY facelock-test-package.deb"));
+        assert!(!deb.contains("apt-get install -y /facelock-test-package.deb"));
+        assert!(
+            deb_lifecycle
+                .contains("apt_transaction install -y --no-install-recommends \"$PACKAGE\"")
+        );
         assert!(rpm.contains("/facelock-test-package.rpm"));
     }
 

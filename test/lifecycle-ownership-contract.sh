@@ -191,6 +191,14 @@ require_lifecycle_row() {
     done
 }
 
+require_security_text() {
+    local text="$1"
+
+    if ! grep -Fq -- "$text" <<<"$security_prose"; then
+        fail "docs/security.md must contain: $text"
+    fi
+}
+
 reject_state_purge_command() {
     local path="$1"
     local unsafe_lines
@@ -225,8 +233,8 @@ lifecycle_prose="$(tr '\n' ' ' <<<"$lifecycle_section")"
 # Freeze status and the ownership classes are scoped to the lifecycle section,
 # not satisfied by an unrelated mention elsewhere in this large contract file.
 require_lifecycle_text "This is the Wave 0 ownership freeze for issue #232."
-require_lifecycle_text "does not claim that the current"
-require_lifecycle_text "Debian purge script already implements the bounded purge"
+require_lifecycle_text "Debian post-removal script implements the bounded purge"
+require_lifecycle_text "Ordinary \`remove\` remains preservation-only"
 require_lifecycle_text "Ordinary removal is not data deletion."
 require_lifecycle_row "Package-owned static integration" \
     "Remove through the package manager" \
@@ -267,6 +275,7 @@ require_lifecycle_row "\`just uninstall\`" \
 
 require_lifecycle_text "PAM provenance and rollback files are not biometric state."
 require_lifecycle_text "Preserve PAM provenance when cleanup is incomplete"
+require_lifecycle_text "retains and reports the entire opaque subtree"
 require_lifecycle_text "The only purge roots are the compiled Facelock roots"
 require_lifecycle_text "Configured paths outside those roots are external remnants"
 require_lifecycle_text "leave them untouched, report that they were refused as external"
@@ -277,9 +286,46 @@ require_lifecycle_text "must not strand package-manager state"
 require_lifecycle_text "does not promise secure erasure"
 require_lifecycle_text "Debian \`postrm purge\` is self-contained"
 require_lifecycle_text "never invokes the already-removed \`facelock\` binary"
+require_lifecycle_text "single-link regular files"
+require_lifecycle_text "direct children of \`/var/lib/facelock/enrolled\`"
+require_lifecycle_text "Mount IDs from \`/proc/self/fdinfo\`"
+require_lifecycle_text "with \`O_DIRECTORY|O_NOFOLLOW\` descriptors"
+require_lifecycle_text "through \`/proc/self/fd/<fd>\`"
+require_lifecycle_text "dotted and quoted key or table components"
+require_lifecycle_text "TOML table scope intact"
+require_lifecycle_text "configuration could not be fully classified"
+require_lifecycle_text "opens regular candidates with \`O_NONBLOCK|O_NOFOLLOW\`"
+require_lifecycle_text "atomic no-replace"
+require_lifecycle_text "no inode-conditional \`unlinkat\` or \`rmdirat\`"
+require_lifecycle_text "same-authority process"
+require_lifecycle_text "helper never removes the three compiled root directories"
+require_lifecycle_text "64 descendant-directory levels"
+require_lifecycle_text "10,000 inspected entries"
+require_lifecycle_text "whole root subtree as retained"
+require_lifecycle_text "returns success after reporting safety refusals"
+
+security_prose="$(tr '\n' ' ' <"$repo_root/docs/security.md")"
+require_security_text "Debian purge traversal"
+require_security_text "treats the directory as an opaque subtree"
+require_security_text "never grants deletion authority to configured paths"
+require_security_text "root-owned, non-group/world-writable directory chain"
+require_security_text "single-link regular file"
+require_security_text "direct user-owned enrollment marker"
+require_security_text "opens every fixed-prefix and root component"
+require_security_text "opens regular candidates with \`O_NONBLOCK|O_NOFOLLOW\`"
+require_security_text "Mount IDs from \`/proc/self/fdinfo\`"
+require_security_text "against \`/proc/self/mountinfo\`"
+require_security_text "renameat2(RENAME_NOREPLACE)"
+require_security_text "no identity-conditional unlink"
+require_security_text "same-authority writer"
+require_security_text "helper never removes the three compiled root directories"
+require_security_text "64 descendant directory levels"
+require_security_text "10,000 inspected entries"
 
 for guide in docs/quickstart.md book/src/quickstart.md; do
     require_text "$guide" "Package lifecycle and retained data"
+    require_text "$guide" "Debian purge removes only provably safe entries"
+    require_text "$guide" "Unsafe or externally configured remnants are retained"
 done
 
 lifecycle_messages=(
@@ -301,10 +347,15 @@ done
 
 for message in "${lifecycle_messages[@]}"; do
     reject_text "$message" "To remove all face data"
-    require_text "$message" "Retained state cleanup is intentionally not automated."
     require_text "$message" "Cleanup must stay within the fixed roots above, leave configured external paths untouched, and refuse links or mount crossings."
     require_text "$message" "Filesystem deletion does not securely erase SSDs, snapshots, or backups."
 done
+
+for message in justfile dist/facelock.spec dist/facelock.install; do
+    require_text "$message" "Retained state cleanup is intentionally not automated."
+done
+require_text debian/postrm "Ordinary removal does not automate retained-state cleanup."
+require_text debian/postrm "If package purge was requested, a later maintainer-script phase attempts the bounded cleanup described below."
 
 if [ "$failures" -ne 0 ]; then
     echo "lifecycle ownership contract: $failures failure(s)" >&2
