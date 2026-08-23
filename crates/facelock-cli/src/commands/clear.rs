@@ -5,10 +5,9 @@ use crate::ipc_client;
 use crate::message::{FaceMessage, Terminal};
 
 pub fn run(config: &Config, user: Option<String>, yes: bool) -> anyhow::Result<()> {
-    // ClearModels is root-only on the daemon side too, so demand root up front.
-    // Otherwise the user gets prompted Y/N first and only then hits AccessDenied.
-    ipc_client::require_root("sudo facelock clear")?;
-
+    // ClearModels is root-only on the daemon side too; root is demanded up
+    // front by `main`'s `require_root_for` gate (C6) — otherwise the user
+    // would be prompted Y/N first and only then hit AccessDenied.
     let user = ipc_client::resolve_user(user.as_deref());
 
     // One selection for the whole command (D1): the old code probed the bus

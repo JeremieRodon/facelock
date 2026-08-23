@@ -551,6 +551,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Root refusal now precedes config-state errors** (#191): for the commands
+  dispatched through the shared config parse (`enroll`, `remove`, `clear`,
+  `list`, `test`, `preview`, `devices`, `bench`, `tpm …`, `audit`), the root
+  check moved into `main`'s dispatch gate, ahead of the config read. A
+  non-root caller with a missing or broken config now gets `Root required`
+  (or the sudo re-exec offer) instead of "no config file at …", restoring
+  the C6 ordering guarantee. Escalation hints are unchanged, `audit` keeps
+  its hard-error (never-prompt) class, and `status` still renders a broken
+  config as a finding, after its own root check.
+
 - **Debian PAM and daemon package lifecycle is opt-in and state-preserving**
   (#224): direct `pam add`/`setup --pam` now refuses an already-selected exact
   `pam-auth-update` profile before writing, using fixed-root no-follow evidence

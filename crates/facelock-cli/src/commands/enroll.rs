@@ -6,19 +6,34 @@ use crate::backend::Backend;
 use crate::ipc_client;
 use crate::message::{FaceMessage, Terminal, fail};
 
+/// The escalation hint `main`'s root gate (C6) names for `enroll`. When the
+/// setup marker is absent (and `--skip-setup-check` not given), the remedy
+/// the refusal names is `setup` — the command [`run`] will offer to execute
+/// it — rather than `enroll` itself.
+pub fn sudo_hint(skip_setup_check: bool) -> &'static str {
+    if !skip_setup_check && !std::path::Path::new(super::setup::SETUP_COMPLETE_MARKER).exists() {
+        "sudo facelock setup"
+    } else {
+        "sudo facelock enroll"
+    }
+}
+
 pub fn run(
     config: &Config,
     user: Option<String>,
     label: Option<String>,
     skip_setup_check: bool,
 ) -> anyhow::Result<()> {
+    // Root is established by `main`'s `require_root_for` gate, ahead of the
+    // config parse (C6, issue #191); `sudo_hint` below picks the spelling
+    // that gate escalates with.
+    //
     // Setup gate: prompt user if setup hasn't been run.
     // Setup includes model downloads, encryption, and face enrollment,
     // so if setup runs successfully we're done — no need to enroll again.
     if !skip_setup_check {
         let marker = std::path::Path::new(super::setup::SETUP_COMPLETE_MARKER);
         if !marker.exists() {
-            ipc_client::require_root("sudo facelock setup")?;
             Terminal.info(&FaceMessage::SetupNotCompleted);
             if Terminal.confirm(&FaceMessage::ConfirmRunSetupNow)? {
                 super::setup::run(false)?;
@@ -33,8 +48,6 @@ pub fn run(
             }
         }
     }
-
-    ipc_client::require_root("sudo facelock enroll")?;
 
     // Encryption posture (Plan 04): refuse plaintext enrollment unless opted in;
     // warn prominently when the opt-in is active.
