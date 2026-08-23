@@ -181,6 +181,7 @@ jobs:
             libv4l-dev \
             libwayland-dev \
             libxkbcommon-dev \
+            lintian \
             pkg-config \
             python3 \
             ripgrep \

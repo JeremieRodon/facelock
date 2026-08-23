@@ -69,4 +69,26 @@ dpkg-deb --extract "$DEB_FILE" "$EXTRACT_ROOT"
   "$EXTRACT_ROOT/usr/lib/facelock/libonnxruntime.so" \
   "$EXTRACT_ROOT/usr/share/doc/facelock/onnxruntime"
 
+echo ""
+echo "=== lintian ==="
+command -v lintian >/dev/null 2>&1 || {
+  echo "FAIL: lintian is not installed in the validation environment" >&2
+  exit 1
+}
+# Severity floor: the gate fails on error-severity tags only. Errors are
+# Debian policy violations; the warning and lower tags this package carries
+# (no-manual-page and similar) are advisory, and gating on them would leave a
+# first lintian gate on a shipping package permanently red. Lintian still
+# prints them for review.
+#
+# Suppressed error tags, each a deliberate deviation:
+# - aliased-location: the PAM module deliberately ships at
+#   /lib/security/pam_facelock.so (docs/contracts.md, canonical-path table and
+#   module probe order; the required-file CHECKS above pin the same path).
+#   Trixie and Resolute lintian both report the merged-/usr alias as an error,
+#   but moving the module is a packaging-semantics change, not a validation
+#   change. As of lintian 2.122/2.129 this placement is the package's only
+#   error-severity source; anything new fails the gate.
+lintian --fail-on error --suppress-tags aliased-location "$DEB_FILE"
+
 echo "=== .deb validation passed ==="

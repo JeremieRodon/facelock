@@ -136,6 +136,13 @@ with Rust 1.95.0 through the immutable `dtolnay/rust-toolchain` action commit
 `4360b52568e2003a75bf9bc1d59f33a8e3fc893c`, matching the repository's pinned
 1.95 toolchain channel.
 
+Every built `.deb` passes `.github/workflows/scripts/validate-deb.sh` in the
+suite container before staging: package identity, forbidden transition fields,
+generated dependencies, the required file set, the hash-verified ORT bundle,
+and a lintian run that fails on error-severity tags. Deliberate deviations are
+suppressed in that script, each with a recorded reason; warnings are printed
+for review but do not gate.
+
 ### Supported release matrix
 
 `dist/release-matrix.json` is the checked-in authority. The release workflow,
