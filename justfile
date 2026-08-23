@@ -86,6 +86,17 @@ check-agent-docs base='':
 test-debian-postrm-purge:
     bash test/debian-postrm-purge.sh
 
+# Re-check documented package names against live Arch, AUR, Debian and Fedora.
+#
+# Opt-in, and deliberately outside `just check`: it needs the network, and a
+# repository outage must not turn an unrelated pull request red. The offline
+# half runs under `cargo test` -- `conformance::packages` holds every
+# documented name to the packaging manifest that declares it. This recipe is
+# what proves the manifests themselves are not naming a package that stopped
+# existing.
+check-package-names-live:
+    python3 test/check-package-names-live.py
+
 # Run all checks (test + lint + format + audit + PAM standalone surface + agent docs)
 check: test lint fmt-check audit check-pam-standalone check-agent-docs test-source-install-daemon-lifecycle test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test test-legacy-system-assets
 

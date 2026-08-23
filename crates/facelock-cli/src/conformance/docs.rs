@@ -38,12 +38,10 @@ const MARKDOWN_REFERENCES: &[(&str, &str)] = &[
     ("book/src/cli-reference.md", BOOK_CLI_DOC),
 ];
 
-/// `man(7)` writes a literal hyphen as `\-`, so `system-auth` is on disk as
-/// `system\-auth` and a plain substring search for it fails. Undoing that
-/// one escape is the whole normalization these checks need; nothing here
-/// looks at roff structure.
+/// The man page with its roff hyphen escapes undone. Shared with
+/// [`super::man_pam`], which asks the same question of the other page.
 fn unescaped_man_page() -> String {
-    MAN_PAGE.replace(r"\-", "-")
+    super::unescape_roff(MAN_PAGE)
 }
 
 /// The body of one `##` section, so a check scoped to a section cannot be

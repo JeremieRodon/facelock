@@ -165,6 +165,7 @@ Local full CI: `bash test/run-tests.sh`
 | `just test` | Unit tests |
 | `just lint` | Clippy |
 | `just check` | test + lint + fmt |
+| `just check-package-names-live` | Re-check documented package names against live Arch, AUR, Debian and Fedora (network; not part of `just check`) |
 | `just test-arch-pam` | Arch container PAM smoke |
 | `just test-arch-integration` | E2E daemon mode |
 | `just test-arch-oneshot` | E2E oneshot mode |

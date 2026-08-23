@@ -129,6 +129,20 @@ describe the tree: that every `paths:` glob matches something, that referenced
 a workflow still match their source. A rule scoped to a path that no longer
 exists fails silently otherwise -- it simply never loads.
 
+`cargo test` also holds the user-facing documentation to the tree, in
+`crates/facelock-cli/src/conformance/`. `docs.rs` and `man_pam.rs` check that
+the CLI reference and both man pages describe the binary and the PAM module
+that shipped. `packages.rs` checks that every package name a document tells a
+reader to install is declared by `dist/PKGBUILD*`, `debian/control` or
+`dist/facelock.spec`; if you add an install instruction, declare the dependency
+in the packaging manifest that should already have had it. `pairs.rs` checks
+that the six pages carried in both `docs/` and `book/src/` do not contradict
+each other on package names, command names or file paths.
+
+None of these reach the network. `just check-package-names-live` does, and asks
+Arch, the AUR, Debian and Fedora whether the names still exist. Run it when you
+touch a dependency; it is deliberately outside `just check`.
+
 ## Security considerations
 
 Read `docs/security.md` before implementing any auth-related code. Key rules:

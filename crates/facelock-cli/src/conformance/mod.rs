@@ -11,17 +11,34 @@
 //! - [`capabilities`] — every name `facelock capabilities` emits is backed by
 //!   the clap surface it names.
 //! - [`docs`] — the reference docs describe the binary that shipped.
+//! - [`man_pam`] — `man/pam_facelock.8` describes the PAM module that shipped.
+//! - [`packages`] — every package name an instruction hands a reader is one
+//!   the project's own packaging manifests declare.
+//! - [`pairs`] — the six pages that exist in both `docs/` and `book/src/` do
+//!   not contradict each other.
 //!
-//! What is shared is here: the clap-tree navigation helpers all three suites
-//! use, and the derive check every one of them presumes.
+//! What is shared is here: the clap-tree navigation helpers the suites use,
+//! the roff normalization the two man-page suites both need, and the derive
+//! check every one of them presumes.
 
 mod capabilities;
 mod docs;
 mod flags;
+mod man_pam;
+mod packages;
+mod pairs;
 
 use clap::CommandFactory;
 
 use crate::Cli;
+
+/// `man(7)` writes a literal hyphen as `\-`, so `system-auth` is on disk as
+/// `system\-auth` and a plain substring search for it fails. Undoing that one
+/// escape is the whole normalization the man-page checks need; nothing here
+/// looks at roff structure.
+fn unescape_roff(page: &str) -> String {
+    page.replace(r"\-", "-")
+}
 
 #[test]
 fn verify_cli() {

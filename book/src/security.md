@@ -100,7 +100,23 @@ Face embeddings are **biometric data**. Unlike passwords, they cannot be changed
 
 #### C. Encryption at Rest (Implemented)
 
-For high-security deployments, embeddings can be encrypted with AES-256-GCM using either a plaintext key file (`encryption.method = "keyfile"`) or a TPM-sealed key (`encryption.method = "tpm"`). The TPM method seals the AES key at rest; it is unsealed at daemon startup and held in memory. See [Configuration](configuration.md) for the `[encryption]` and `[tpm]` sections.
+Templates are encrypted at rest by default. The key lives in a plaintext key file (`encryption.method = "keyfile"`, the default) or sealed to the TPM (`encryption.method = "tpm"`), and either way the embeddings themselves are AES-256-GCM. The keyfile is generated at mode `0600` on first use. A TPM-sealed key is unsealed once at daemon startup and held in memory.
+
+Plaintext storage (`encryption.method = "none"`) is an explicit opt-out: enrollment refuses to write unencrypted templates unless `security.allow_plaintext = true`. Auth is never affected by any of this. A decrypt failure falls back to the password, never to a lockout.
+
+`tpm.pcr_binding` is **off by default**, and turning it on is a commitment rather than a hardening tweak. With it on, the sealed key is bound to a PCR selection recorded in the sealed blob, and unsealing replays a real `PolicyPCR` session against the machine's current PCRs. A firmware or kernel change to a bound PCR makes the key refuse to unseal. Face auth then falls through to the password, which is the safe failure, but the templates stay locked until you act.
+
+Recovery is one command:
+
+```bash
+sudo facelock tpm reseal
+```
+
+It re-seals the key under the current PCR state, recovering the key from the existing blob if the PCRs still match and from the plaintext `encryption.key` backup if they do not.
+
+**Keep that `encryption.key` backup.** It is the recommended setup and it is what makes a reseal painless: without it, a PCR change after a firmware update means re-enrolling every face. The honest cost is that while the backup exists, the `tpm` method's protection against anyone who can read the file is the backup's own `0600` root-only permissions, not the TPM. Deleting the backup buys stronger at-rest confidentiality and pays for it in re-enrollment.
+
+See [Configuration](configuration.md) for the `[encryption]` and `[tpm]` sections, and `docs/security.md` for the full finding.
 
 ### 4. D-Bus IPC Security
 
