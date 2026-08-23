@@ -53,10 +53,19 @@
 //!
 //! HUP, INT and TERM run the same restore before the process dies, guarded
 //! non-reentrantly against the normal drop path (the pattern the source
-//! install's signal cleanup established). The traversal engine composed on
-//! top must poll [`LifecycleLease::interrupt_flag`] at each deletion
-//! boundary; the flag is raised before restoration begins, so a
-//! cooperating engine stops before the daemon can return.
+//! install's signal cleanup established). Restoration does not begin until
+//! the operation acknowledges: the signal thread raises
+//! [`LifecycleLease::interrupt_flag`], then waits, bounded by
+//! [`AcquireTuning::signal_ack_timeout`], for
+//! [`LifecycleLease::mark_operation_finished`] before unmasking or
+//! restarting anything. The composed caller runs the engine polling the
+//! flag at each deletion boundary and calls `mark_operation_finished` as
+//! soon as the engine returns, so the daemon cannot come back while a
+//! cooperating traversal is still deleting. If the acknowledgement never
+//! arrives, the wait expires and the process dies with activation still
+//! barred — the recoverable SIGKILL state above — because restarting the
+//! daemon under an operation that may still be mutating the purge roots is
+//! the exact race this lease exists to prevent.
 
 use std::fs;
 use std::io;
@@ -66,7 +75,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use facelock_core::dbus_interface::BUS_NAME;
@@ -244,13 +253,23 @@ pub trait BusProbe {
     fn daemon_name_has_owner(&self) -> Result<bool, LifecycleError>;
 }
 
-/// Poll bounds for the stop and bus-release proofs. Defaults suit a real
-/// systemd; tests shrink them to fail fast.
+/// Poll bounds for the stop and bus-release proofs, and the signal path's
+/// acknowledgement wait. Defaults suit a real systemd; tests shrink them to
+/// fail fast.
 #[derive(Debug, Clone)]
 pub struct AcquireTuning {
     pub stop_timeout: Duration,
     pub bus_timeout: Duration,
     pub poll_interval: Duration,
+    /// How long a signal-triggered restore waits for
+    /// [`LifecycleLease::mark_operation_finished`] before giving up and
+    /// leaving activation barred. The default is two orders of magnitude
+    /// above a worst-case single engine deletion step (one quarantine
+    /// rename, unlink, and revalidation, milliseconds even with fsync on
+    /// rotational media), and well inside systemd's default 90-second stop
+    /// timeout, so a TERM delivered during shutdown settles, restored or
+    /// deliberately barred, before SIGKILL follows.
+    pub signal_ack_timeout: Duration,
 }
 
 impl Default for AcquireTuning {
@@ -259,6 +278,7 @@ impl Default for AcquireTuning {
             stop_timeout: Duration::from_secs(10),
             bus_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(100),
+            signal_ack_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -751,9 +771,50 @@ fn take_restore(shared: &SharedRestore) -> Option<RestoreState> {
         .take()
 }
 
+/// The acknowledgement channel between the operation and the signal thread.
+/// `mark_finished` says nothing is touching the filesystem any more;
+/// `wait_finished` blocks a signal-triggered restore until then, bounded.
+struct OperationGate {
+    finished: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl OperationGate {
+    fn new() -> Self {
+        Self {
+            finished: Mutex::new(false),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn mark_finished(&self) {
+        let mut finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *finished = true;
+        self.condvar.notify_all();
+    }
+
+    /// Whether the operation acknowledged within `timeout`.
+    fn wait_finished(&self, timeout: Duration) -> bool {
+        let guard = self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (finished, _) = self
+            .condvar
+            .wait_timeout_while(guard, timeout, |finished| !*finished)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *finished
+    }
+}
+
 /// The armed signal watcher: HUP, INT and TERM raise the interrupt flag,
-/// run the shared restore, then hand the signal its default outcome so the
-/// process still dies with the correct wait status.
+/// wait bounded for the operation's acknowledgement, run the shared restore
+/// (full after an acknowledgement, activation left barred without one),
+/// then hand the signal its default outcome so the process still dies with
+/// the correct wait status.
 struct SignalWatch {
     handle: signal_hook::iterator::Handle,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -763,6 +824,8 @@ impl SignalWatch {
     fn arm(
         shared: SharedRestore,
         interrupted: Arc<AtomicBool>,
+        gate: Arc<OperationGate>,
+        ack_timeout: Duration,
         terminate: Box<dyn Fn(i32) + Send>,
     ) -> io::Result<Self> {
         let mut signals = signal_hook::iterator::Signals::new([
@@ -776,10 +839,25 @@ impl SignalWatch {
             .spawn(move || {
                 if let Some(signal) = signals.forever().next() {
                     interrupted.store(true, Ordering::SeqCst);
-                    if let Some(state) = take_restore(&shared)
-                        && let Err(e) = restore(state, RestoreMode::Full)
-                    {
-                        tracing::error!(signal, "lifecycle restore on signal incomplete: {e}");
+                    // Restoring before the operation stops touching the
+                    // filesystem would restart the daemon under a live
+                    // traversal — the race the barrier exists to prevent.
+                    let acknowledged = gate.wait_finished(ack_timeout);
+                    if let Some(state) = take_restore(&shared) {
+                        let mode = if acknowledged {
+                            RestoreMode::Full
+                        } else {
+                            tracing::error!(
+                                signal,
+                                "operation did not acknowledge within {ack_timeout:?}; \
+                                 leaving activation barred (recoverable: the next \
+                                 lifecycle acquisition adopts the barrier, or reboot)"
+                            );
+                            RestoreMode::LeaveBarred
+                        };
+                        if let Err(e) = restore(state, mode) {
+                            tracing::error!(signal, "lifecycle restore on signal incomplete: {e}");
+                        }
                     }
                     terminate(signal);
                 }
@@ -810,6 +888,8 @@ impl Drop for SignalWatch {
 pub struct LifecycleLease {
     shared: SharedRestore,
     interrupted: Arc<AtomicBool>,
+    gate: Arc<OperationGate>,
+    signal_ack_timeout: Duration,
     signals: Option<SignalWatch>,
     was_active: bool,
     prior_unit_file_state: String,
@@ -874,6 +954,8 @@ impl LifecycleLease {
         let mut lease = Self {
             shared: Arc::new(Mutex::new(Some(staged))),
             interrupted: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(OperationGate::new()),
+            signal_ack_timeout: tuning.signal_ack_timeout,
             signals: None,
             was_active: prior.active,
             prior_unit_file_state: prior.unit_file_state,
@@ -893,7 +975,13 @@ impl LifecycleLease {
         &mut self,
         terminate: Box<dyn Fn(i32) + Send>,
     ) -> Result<(), LifecycleError> {
-        match SignalWatch::arm(self.shared.clone(), self.interrupted.clone(), terminate) {
+        match SignalWatch::arm(
+            self.shared.clone(),
+            self.interrupted.clone(),
+            self.gate.clone(),
+            self.signal_ack_timeout,
+            terminate,
+        ) {
             Ok(watch) => {
                 self.signals = Some(watch);
                 Ok(())
@@ -921,18 +1009,33 @@ impl LifecycleLease {
         &self.prior_unit_file_state
     }
 
-    /// Raised before signal-triggered restoration begins. The traversal
+    /// Raised when a signal arrives, before any restoration. The traversal
     /// engine composed on top must poll this at each deletion boundary and
-    /// stop when it is set, so the restored daemon can never race a
-    /// still-running traversal for more than one bounded step.
+    /// stop when it is set; restoration then waits for
+    /// [`Self::mark_operation_finished`], so the restored daemon never
+    /// overlaps a cooperating traversal at all.
     pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
         self.interrupted.clone()
+    }
+
+    /// Acknowledge that the operation has stopped touching the filesystem.
+    /// The composing CLI calls this immediately after the engine returns,
+    /// on every path, interrupted or not. A signal-triggered restore blocks
+    /// on this acknowledgement (bounded by
+    /// [`AcquireTuning::signal_ack_timeout`]); if the bound expires the
+    /// process dies with activation left barred instead of restarting the
+    /// daemon under an operation that may still be running. Idempotent.
+    pub fn mark_operation_finished(&self) {
+        self.gate.mark_finished();
     }
 
     /// Restore the prior state and report any step that could not be
     /// undone. Dropping the lease performs the same restore, logging
     /// instead of returning.
     pub fn release(mut self) -> Result<(), LifecycleError> {
+        // Releasing implies the operation is done; a signal thread already
+        // waiting must wake now or the disarm join below would stall.
+        self.gate.mark_finished();
         if let Some(mut watch) = self.signals.take() {
             watch.disarm();
         }
@@ -948,6 +1051,7 @@ impl LifecycleLease {
     /// stopped and masked; the returned path names the barrier to remove —
     /// or a reboot clears it, since it lives on tmpfs.
     pub fn release_leaving_activation_barred(mut self) -> Result<PathBuf, LifecycleError> {
+        self.gate.mark_finished();
         if let Some(mut watch) = self.signals.take() {
             watch.disarm();
         }
@@ -966,6 +1070,7 @@ impl LifecycleLease {
 
 impl Drop for LifecycleLease {
     fn drop(&mut self) {
+        self.gate.mark_finished();
         if let Some(mut watch) = self.signals.take() {
             watch.disarm();
         }
@@ -1371,7 +1476,17 @@ mod tests {
             stop_timeout: Duration::from_millis(50),
             bus_timeout: Duration::from_millis(50),
             poll_interval: Duration::from_millis(5),
+            signal_ack_timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Signal tests raise real signals, and every armed watcher in the
+    /// process sees every raise. Serialize them so one test's raise cannot
+    /// consume another watcher's single signal.
+    fn signal_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn fixture() -> (tempfile::TempDir, LifecycleLayout) {
@@ -1726,6 +1841,7 @@ mod tests {
 
     #[test]
     fn a_signal_restores_and_then_terminates() {
+        let _serial = signal_test_guard();
         let (_dir, layout) = fixture();
         let unit = MockSystemd::new(&layout, true);
         let bus = MockBus::released();
@@ -1739,6 +1855,8 @@ mod tests {
             }))
             .expect("arm signals");
 
+        // No operation is in flight, and the caller has said so.
+        lease.mark_operation_finished();
         signal_hook::low_level::raise(signal_hook::consts::SIGHUP).expect("raise");
         let deadline = Instant::now() + Duration::from_secs(5);
         while delivered.load(Ordering::SeqCst) == 0 {
@@ -1758,6 +1876,112 @@ mod tests {
         drop(lease);
         let starts = unit.log().iter().filter(|entry| *entry == "start").count();
         assert_eq!(starts, 1);
+    }
+
+    #[test]
+    fn a_signal_waits_for_the_operation_to_acknowledge() {
+        let _serial = signal_test_guard();
+        let (_dir, layout) = fixture();
+        let unit = MockSystemd::new(&layout, true);
+        let bus = MockBus::released();
+        let mut lease = acquire(&layout, &unit, &bus).expect("acquire");
+        let interrupt = lease.interrupt_flag();
+        let delivered = Arc::new(AtomicI32::new(0));
+        let recorded = delivered.clone();
+        lease
+            .arm_signals_with(Box::new(move |signal| {
+                recorded.store(signal, Ordering::SeqCst);
+            }))
+            .expect("arm signals");
+
+        signal_hook::low_level::raise(signal_hook::consts::SIGHUP).expect("raise");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !interrupt.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "interrupt flag never raised");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The flag is up but nothing has acknowledged: restoration must not
+        // have started. Generous delay, asserting absence.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!unit.log().contains(&"start".to_string()));
+        assert!(layout.barrier_path().exists());
+        assert_eq!(delivered.load(Ordering::SeqCst), 0);
+
+        // The acknowledgement releases the restore, then the terminate.
+        lease.mark_operation_finished();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "signal restore never ran");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!layout.barrier_path().exists());
+        assert!(unit.log().contains(&"start".to_string()));
+    }
+
+    #[test]
+    fn a_non_polling_operation_never_races_a_restarted_daemon() {
+        // The defect this pins down: restoring on a signal without waiting
+        // for the operation once restarted the daemon while a non-polling
+        // operation kept mutating the filesystem (299 of 300 steps ran
+        // after the daemon was back). With the acknowledgement gate the
+        // wait expires and activation stays barred, so the count is zero.
+        let _serial = signal_test_guard();
+        let (dir, layout) = fixture();
+        let unit = MockSystemd::new(&layout, true);
+        let bus = MockBus::released();
+        let mut tuning = fast_tuning();
+        tuning.signal_ack_timeout = Duration::from_millis(30);
+        let mut lease =
+            LifecycleLease::acquire(layout.clone(), Box::new(unit.clone()), &bus, tuning, false)
+                .expect("acquire");
+        let delivered = Arc::new(AtomicI32::new(0));
+        let recorded = delivered.clone();
+        lease
+            .arm_signals_with(Box::new(move |signal| {
+                recorded.store(signal, Ordering::SeqCst);
+            }))
+            .expect("arm signals");
+
+        // A runaway operation: ignores the interrupt flag, never
+        // acknowledges, touches the filesystem at every step.
+        let op_unit = unit.clone();
+        let scratch = dir.path().join("op-scratch");
+        fs::create_dir_all(&scratch).expect("scratch");
+        let operation = std::thread::spawn(move || {
+            let mut steps_after_daemon_start = 0u32;
+            for step in 0..300u32 {
+                if op_unit.log().contains(&"start".to_string()) {
+                    steps_after_daemon_start += 1;
+                }
+                let probe = scratch.join(format!("step-{step}"));
+                fs::write(&probe, b"").expect("step write");
+                fs::remove_file(&probe).expect("step unlink");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            steps_after_daemon_start
+        });
+
+        signal_hook::low_level::raise(signal_hook::consts::SIGHUP).expect("raise");
+        let races = operation.join().expect("operation thread");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "signal path never terminated");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(races, 0);
+        assert!(!unit.log().contains(&"start".to_string()));
+        // Activation stayed barred: the SIGKILL-equivalent recoverable state.
+        assert!(layout.barrier_path().exists());
+        assert!(lease.interrupt_flag().load(Ordering::SeqCst));
+        drop(lease);
+
+        // Recovery: the next acquisition adopts the retained barrier.
+        let next = MockSystemd::new(&layout, false);
+        next.masked_by_crash();
+        drop(acquire(&layout, &next, &MockBus::released()).expect("adopting acquire"));
+        assert!(!layout.barrier_path().exists());
     }
 
     #[test]

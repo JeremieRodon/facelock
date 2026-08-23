@@ -2409,9 +2409,15 @@ Release restores exactly the recorded state in reverse order — barrier
 removal proven against the held descriptor, manager reload with an unmasking
 proof, restart only if the daemon was active, then lock release by closing
 the descriptor — on normal completion, error return, panic unwind, and
-HUP/INT/TERM, with non-reentrant signal cleanup. An explicit barred release
-instead keeps the barrier and the stopped daemon for a caller that uninstalls
-next. Enablement is never changed on any path.
+HUP/INT/TERM, with non-reentrant signal cleanup. A signal-triggered restore
+raises the lease's interrupt flag and then waits, bounded, for the
+operation's acknowledgement that nothing is touching the filesystem any
+more; only then does it unmask and restart. If the acknowledgement never
+arrives, the wait expires and the process dies with activation still barred
+— the recoverable state below — rather than restarting the daemon under an
+operation that may still be mutating the purge roots. An explicit barred
+release instead keeps the barrier and the stopped daemon for a caller that
+uninstalls next. Enablement is never changed on any path.
 
 SIGKILL is the bounded failure mode: the barrier file survives, so face
 authentication stays masked (password PAM fallback is unaffected) while the

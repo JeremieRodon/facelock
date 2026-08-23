@@ -40,8 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime control-tier barrier the source install uses, and stops the daemon
   with manager and bus-name proofs — so an `Authenticate` call cannot
   re-activate it mid-operation. Restore is exact on completion, error, panic,
-  and HUP/INT/TERM; a SIGKILL leaves only tmpfs state, which the next
-  acquisition adopts and clears, and a reboot clears on its own. Enablement
+  and HUP/INT/TERM; a signal-triggered restore first waits, bounded, for the
+  operation to acknowledge it has stopped touching the filesystem, and leaves
+  activation barred if the acknowledgement never comes. A SIGKILL leaves only
+  tmpfs state, which the next acquisition adopts and clears, and a reboot
+  clears on its own. Enablement
   is never changed, and acquisition fails closed without systemd, without the
   lock, or without a confirmed-stopped daemon. No CLI surface yet.
 - **Explicit authorization for sensitive `setup --pam` writes** (#207):
