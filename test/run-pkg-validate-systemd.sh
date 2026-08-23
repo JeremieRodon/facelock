@@ -133,6 +133,12 @@ fi
 
 podman exec "${exec_env[@]}" "$cid" /pkg-validate.sh
 
+# pkg-validate.sh pins %config(noreplace) on erase and finishes with the package
+# uninstalled, which is the clean slate the upgrade half needs.
+if podman exec "$cid" test -x /rpm-config-lifecycle.sh; then
+    podman exec "$cid" /rpm-config-lifecycle.sh
+fi
+
 if podman exec "$cid" test -x /deb-package-lifecycle.sh; then
     podman exec "$cid" /deb-package-lifecycle.sh purge
 fi

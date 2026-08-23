@@ -507,6 +507,48 @@ require(live_channel_command in ci_workflow, "CI does not compare live release c
 require(live_channel_command in justfile, "release preflight does not compare live release channels with the checked-in authority")
 require("ARCH_SNAPSHOT" not in justfile, "unused ARCH_SNAPSHOT signaling remains")
 
+# Fedora lifecycle lanes take their base image from this matrix rather than
+# carrying a digest each. That is what stops a declared release from going
+# unbuilt, stops an undeclared one (Rawhide) from acquiring a lane, and puts
+# every lane behind the same EOL gate.
+for relative_path in (
+    "test/Containerfile.rpm-e2e",
+    "test/Containerfile.rpm-authselect",
+    "test/Containerfile.copr",
+    "test/Containerfile.fedora",
+):
+    fedora_containerfile = (ROOT / relative_path).read_text()
+    require(
+        re.search(r"(?m)^ARG BASE_IMAGE\s*$\n^FROM \$\{BASE_IMAGE\}\s*$", fedora_containerfile)
+        is not None,
+        f"{relative_path} does not take its base image from the release matrix",
+    )
+    require(
+        "registry.fedoraproject.org/fedora:" not in fedora_containerfile,
+        f"{relative_path} pins a Fedora image outside the release matrix",
+    )
+lane_resolver = (ROOT / "test/fedora-lane-image.sh").read_text()
+for phrase in ("RELEASE_MATRIX_TODAY", "_eol_gate", "staging_copr_targets"):
+    require(phrase in lane_resolver, f"Fedora lane resolver omits matrix authority: {phrase}")
+require(
+    "bash test/fedora-lane-image.sh" in justfile,
+    "justfile Fedora lanes do not resolve their image through the matrix",
+)
+require(
+    re.search(r"(?m)^test-rpm-lanes:", justfile) is not None,
+    "justfile omits the aggregate Fedora lifecycle lane target",
+)
+for copr_target in sorted(expected_copr_targets):
+    fedora_release = copr_target.split("-")[1]
+    require(
+        re.search(rf'\(test-rpm-(?:pkg|smoke) "{fedora_release}"\)', justfile) is not None,
+        f"just test-rpm-lanes omits declared release target Fedora {fedora_release}",
+    )
+require(
+    platforms_by_id.get("fedora-43", {}).get("eol_gate") == matrix["fedora"]["43_eol_gate"],
+    "Fedora 43 platform row EOL gate disagrees with the matrix-wide gate",
+)
+
 for pkgbuild_name in ("PKGBUILD", "PKGBUILD-bin"):
     pkgbuild = (ROOT / "dist" / pkgbuild_name).read_text()
     require(re.search(r"^_tag=", pkgbuild, re.MULTILINE) is not None, f"dist/{pkgbuild_name} has no upstream _tag")
@@ -675,6 +717,16 @@ require(
 require(
     "SKIP: packit" not in justfile,
     "release preflight can still skip Packit schema validation",
+)
+copr_chroot_default = re.search(r'(?m)^CHROOT="\$\{COPR_CHROOT:-([^"}]+)\}"', copr_build_test)
+require(copr_chroot_default is not None, "COPR-equivalent gate has no parseable chroot default")
+require(
+    copr_chroot_default.group(1) in expected_copr_targets,
+    f"COPR-equivalent gate defaults to an undeclared chroot: {copr_chroot_default.group(1)}",
+)
+require(
+    "staging_copr_targets" in copr_build_test,
+    "COPR-equivalent gate does not check its chroot against the declared staging targets",
 )
 
 install_docs = {

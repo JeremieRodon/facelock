@@ -198,6 +198,7 @@ just test-deb            # delegate to both exact supported-suite package gates
 just test-deb-trixie-pkg    # Debian 13 — offline source rebuild, install, TPM, lifecycle
 just test-deb-resolute-pkg  # Ubuntu 26.04 — the same complete package gate
 just test-rpm-pkg        # Fedora — build real .rpm, install via dnf, validate
+just test-rpm-lanes      # every declared Fedora target at its declared depth
 just test-rpm-authselect # Fedora — retired-profile upgrade guard lifecycle
 just test-packit-config  # Packit config schema — real `packit` in a pinned Fedora container
 just test-copr           # COPR-equivalent — Packit SRPM + mock from-source rebuild (slow)
@@ -219,6 +220,30 @@ install path.
 The `*-dev-shell` recipes mount host models for fast interactive camera testing.
 The `*-release-shell` recipes start from a clean package install with nothing from the
 host — run `facelock setup` to download models, then enroll and test.
+
+#### Fedora lanes
+
+Every Fedora recipe takes a release — `just test-rpm-pkg 43`, `just test-copr 45`
+— and defaults to 44. `just test-rpm-lanes` runs each declared release target at
+the lifecycle depth `dist/release-matrix.json` gives it: full lifecycle for
+Fedora 43 and 44, build plus runtime smoke for branched Fedora 45. Rawhide is
+optional and experimental, has no lane, and can never stand in for a Fedora 43,
+44, or 45 result.
+
+`test/fedora-lane-image.sh` resolves each lane's digest-pinned base image from
+the matrix, so no Containerfile carries its own Fedora digest. It refuses a
+release the matrix does not declare and refuses one that has reached its EOL
+gate: Fedora 43 goes EOL on 2026-12-02, and from that date the Fedora 43 lane
+stops with a message instead of quietly testing an unmaintained release. Set
+`RELEASE_MATRIX_TODAY` to rehearse that date, the same override
+`test/check-release-matrix.py` reads. Retiring the lane means retiring its
+matrix rows, and moving the date is a deliberate matrix edit.
+
+The full lifecycle lane also pins `%config(noreplace)`: an unmodified
+`/etc/facelock/config.toml` is replaced in place on upgrade, a modified one
+survives byte for byte with the new file diverted to `.rpmnew`, and erase
+removes an unmodified copy outright while retaining a modified one as
+`.rpmsave`. `docs/contracts.md` carries the same contract.
 
 The RPM embeds a read-only retired-profile upgrade guard in `%pre`. The
 model-free `test-rpm-authselect` gate boots Fedora with systemd and exercises

@@ -148,8 +148,8 @@ just uninstall
 Ordinary package removal and `just uninstall` preserve the face database,
 encryption keys, downloaded models, enrollment markers, audit logs, snapshots,
 and setup state. Debian also retains its conffile until `purge`; RPM follows
-`%config(noreplace)` and may retain an administrator-modified config as
-`config.toml.rpmsave`.
+`%config(noreplace)`, removing an unmodified config and retaining an
+administrator-modified one as `config.toml.rpmsave`.
 
 Debian purge removes only provably safe entries inside the three compiled
 Facelock roots. Unsafe or externally configured remnants are retained and

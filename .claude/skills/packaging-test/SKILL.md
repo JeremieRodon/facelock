@@ -32,6 +32,21 @@ All recipes need `podman`. None of the ones in the routing table need a camera.
 remaining quick syntax-level check is `just test-rpm` (Fedora container), which
 is weaker than `test-rpm-pkg` because it does not install and boot.
 
+## Which Fedora
+
+Every Fedora recipe takes a release and defaults to 44 — `just test-rpm-pkg 43`,
+`just test-copr 45`. `dist/release-matrix.json` declares 43, 44 and 45, so one
+Fedora run is not the whole story: use `just test-rpm-lanes` when a change could
+behave differently across releases (dnf/rpm behavior, scriptlets, dependency
+resolution, systemd or SELinux versions). It runs 43 and 44 at full lifecycle
+depth and branched 45 at build plus runtime smoke, which is the depth the matrix
+gives each one.
+
+Never add a Rawhide lane. Rawhide is optional and experimental in the matrix and
+cannot substitute for a Fedora 43, 44 or 45 result. Lane images come from the
+matrix through `test/fedora-lane-image.sh`, which also refuses a release past its
+EOL gate — Fedora 43 stops on 2026-12-02.
+
 ## The `-pkg` recipes are the real ones
 
 `test-deb-trixie-pkg`, `test-deb-resolute-pkg`, and `test-rpm-pkg` build a real package,

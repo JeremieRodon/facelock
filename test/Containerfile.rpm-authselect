@@ -1,4 +1,9 @@
-FROM registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e90866c488d5d04fc6612284169e20a1bdb
+# Base image comes from dist/release-matrix.json via
+# test/fedora-lane-image.sh, which is where the digest pin and the Fedora
+# EOL gate live. No default: a build without --build-arg must fail, not
+# silently pick a release.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 RUN dnf -y install --setopt=install_weak_deps=False \
         authselect coreutils findutils gettext grep python3 util-linux-core rpm-build rpm \
@@ -6,6 +11,9 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         tpm2-tss onnxruntime libxkbcommon \
     && dnf clean all
 
+# The upgrade fixture is the released v0.1.4 fc44 artifact, the only build of
+# the retired-profile package that exists. That is what the guard has to handle
+# on any Fedora release, so this stays pinned to fc44 regardless of BASE_IMAGE.
 ARG FACELOCK_LEGACY_RPM_URL=https://github.com/tyvsmith/facelock/releases/download/v0.1.4/facelock-0.1.4-1.fc44.x86_64.rpm
 ARG FACELOCK_LEGACY_RPM_SHA256=e8d3858adbf001676cc1d25171702c396e6ed22dd2a8c4f0d064a8c2febb3a0b
 RUN mkdir -p /artifacts \
