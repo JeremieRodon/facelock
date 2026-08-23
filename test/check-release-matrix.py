@@ -537,7 +537,9 @@ for package_assembler in package_assemblers:
         spec_header, separator, _ = assembler.partition("\n%prep\n")
         require(bool(separator), "dist/facelock.spec has no %prep boundary")
         install_section = re.search(r"(?ms)^%install\n(.*?)(?=^%check\n)", assembler)
-        files_section = re.search(r"(?ms)^%files\n(.*?)(?=^%changelog\n)", assembler)
+        # `%files` carries the %%find_lang manifest argument, so the section
+        # header is not a bare directive any more.
+        files_section = re.search(r"(?ms)^%files\b[^\n]*\n(.*?)(?=^%changelog\n)", assembler)
         require(install_section is not None, "dist/facelock.spec has no bounded %install section")
         require(files_section is not None, "dist/facelock.spec has no bounded %files section")
         assembler = spec_header + install_section.group(1) + files_section.group(1)
