@@ -117,8 +117,8 @@
 # Values: "cpu", "cuda", "rocm", "openvino"
 # GPU providers require installing a GPU-enabled ONNX Runtime package:
 #   NVIDIA:  sudo pacman -S onnxruntime-opt-cuda
-#   AMD:     install onnxruntime with ROCm support
-#   Intel:   install openvino runtime
+#   AMD:     sudo pacman -S onnxruntime-opt-rocm
+#   Intel:   no Arch package; build ONNX Runtime with the OpenVINO provider
 # Default: "cpu"
 # execution_provider = "cpu"
 

@@ -70,9 +70,9 @@ GPU support is runtime-only -- no special build flags needed. Install a GPU-enab
 |------------|---------------|--------------|
 | NVIDIA | `onnxruntime-opt-cuda` | `"cuda"` |
 | AMD | `onnxruntime-opt-rocm` | `"rocm"` |
-| Intel | `onnxruntime-opt-openvino` | `"openvino"` |
+| Intel | none packaged | `"openvino"` |
 
-Supports CUDA, ROCm, and OpenVINO execution providers. CPU is the default.
+Supports CUDA, ROCm, and OpenVINO execution providers. CPU is the default. Arch packages no OpenVINO build of ONNX Runtime, in the repositories or the AUR. Build ONNX Runtime with the OpenVINO execution provider yourself to use `execution_provider = "openvino"`. See [GPU acceleration](book/src/gpu.md).
 
 ### Uninstall
 

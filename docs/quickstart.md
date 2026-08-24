@@ -79,8 +79,9 @@ For manual configuration, install a GPU-enabled ONNX Runtime package:
 ```bash
 sudo pacman -S onnxruntime-opt-cuda      # NVIDIA
 sudo pacman -S onnxruntime-opt-rocm      # AMD
-sudo pacman -S onnxruntime-opt-openvino  # Intel
 ```
+
+Arch packages no OpenVINO build of ONNX Runtime, in the repositories or the AUR. Build ONNX Runtime with the OpenVINO execution provider yourself to use `execution_provider = "openvino"`.
 
 Set `execution_provider` in `/etc/facelock/config.toml` to `"cuda"`, `"rocm"`, or `"openvino"`. CPU is the default.
 

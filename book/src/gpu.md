@@ -10,15 +10,16 @@ GPU support in Facelock is **runtime-only** -- no special build flags or recompi
 |------------|-------------------|---------------|
 | NVIDIA | `onnxruntime-opt-cuda` | Install CUDA toolkit + ONNX Runtime with CUDA provider |
 | AMD | `onnxruntime-opt-rocm` | Install ROCm runtime + ONNX Runtime with ROCm provider |
-| Intel | `onnxruntime-opt-openvino` | Install OpenVINO runtime + ONNX Runtime with OpenVINO provider |
+| Intel | none packaged | Install OpenVINO runtime + ONNX Runtime with OpenVINO provider |
 
 On Arch Linux:
 
 ```bash
 sudo pacman -S onnxruntime-opt-cuda      # NVIDIA
 sudo pacman -S onnxruntime-opt-rocm      # AMD
-sudo pacman -S onnxruntime-opt-openvino  # Intel
 ```
+
+Arch packages no OpenVINO build of ONNX Runtime, in the repositories or the AUR. Build ONNX Runtime with the OpenVINO execution provider yourself to use `execution_provider = "openvino"`.
 
 ### 2. Set the execution provider
 
