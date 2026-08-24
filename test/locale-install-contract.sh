@@ -18,26 +18,40 @@ fail() {
     exit 1
 }
 
-# --- static: every install path calls the installer -------------------------
+# --- every install path calls the installer, on a live line -----------------
 
 [ -x "$installer" ] || fail "$installer must exist and be executable"
 
-grep -Fq 'scripts/install-locale-catalogs.sh debian/facelock/usr/share/locale' debian/rules ||
-    fail "debian/rules must install compiled catalogs into the binary package"
-grep -Fq 'scripts/install-locale-catalogs.sh %{buildroot}%{_datadir}/locale' dist/facelock.spec ||
-    fail "dist/facelock.spec must install compiled catalogs into the buildroot"
-# shellcheck disable=SC2016  # the literal $pkgdir/$out are what must appear
-for pkgbuild in dist/PKGBUILD dist/PKGBUILD-bin dist/PKGBUILD-git; do
-    grep -Fq 'scripts/install-locale-catalogs.sh "$pkgdir/usr/share/locale"' "$pkgbuild" ||
-        fail "$pkgbuild must install compiled catalogs into \$pkgdir"
+# Each entry: <file>|<regex anchoring the call to a non-comment line>|<label>.
+#
+# The anchor carries more weight than it looks. A plain `grep -F` for the call
+# matches a commented-out copy just as happily, so the gate stays green while
+# that path installs nothing — the exact silent skip this contract exists to
+# catch. `^[[:space:]]*` cannot match a `#`, in make recipes, shell, spec
+# scriptlets and Nix indented strings alike.
+call_sites=(
+    "debian/rules|^[[:space:]]*scripts/install-locale-catalogs\.sh debian/facelock/usr/share/locale\$|debian/rules must install compiled catalogs into the binary package"
+    "dist/facelock.spec|^[[:space:]]*scripts/install-locale-catalogs\.sh %\{buildroot\}%\{_datadir\}/locale\$|dist/facelock.spec must install compiled catalogs into the buildroot"
+    "dist/PKGBUILD|^[[:space:]]*scripts/install-locale-catalogs\.sh \"\\\$pkgdir/usr/share/locale\"\$|dist/PKGBUILD must install compiled catalogs into \$pkgdir"
+    "dist/PKGBUILD-bin|^[[:space:]]*scripts/install-locale-catalogs\.sh \"\\\$pkgdir/usr/share/locale\"\$|dist/PKGBUILD-bin must install compiled catalogs into \$pkgdir"
+    "dist/PKGBUILD-git|^[[:space:]]*scripts/install-locale-catalogs\.sh \"\\\$pkgdir/usr/share/locale\"\$|dist/PKGBUILD-git must install compiled catalogs into \$pkgdir"
+    "dist/nix/default.nix|^[[:space:]]*bash scripts/install-locale-catalogs\.sh \\\$out/share/locale\$|dist/nix/default.nix must install compiled catalogs into \$out"
+    # The source install is how OpenRC, runit and s6 systems get facelock; there
+    # is no separate packaging path for them. `bash -p` because install-files'
+    # own -p does not reach a child started from its shebang.
+    "justfile|^[[:space:]]*bash -p scripts/install-locale-catalogs\.sh /usr/share/locale\$|justfile install-files must install compiled catalogs"
+)
+
+matched_lines=()
+for entry in "${call_sites[@]}"; do
+    file="${entry%%|*}"
+    rest="${entry#*|}"
+    pattern="${rest%%|*}"
+    label="${rest#*|}"
+    line="$(grep -E -m1 "$pattern" "$file" || true)"
+    [ -n "$line" ] || fail "$label (no live, uncommented call site found)"
+    matched_lines+=("$file|$line")
 done
-# shellcheck disable=SC2016
-grep -Fq 'scripts/install-locale-catalogs.sh $out/share/locale' dist/nix/default.nix ||
-    fail "dist/nix/default.nix must install compiled catalogs into \$out"
-# The source install is how OpenRC, runit and s6 systems get facelock; there is
-# no separate packaging path for them.
-grep -Fq 'scripts/install-locale-catalogs.sh /usr/share/locale' justfile ||
-    fail "justfile install-files must install compiled catalogs"
 
 # %files is exhaustive, so a hand-listed locale path would break the RPM build
 # the moment a new language appears. Only %find_lang generates that list, and
@@ -137,5 +151,31 @@ fi
 # destination is the live /usr/share/locale.
 [ ! -e "$work/broken-dest" ] ||
     fail "installer left output behind for a rejected translation"
+
+# --- functional: each packaging path's own command line reaches the installer
+
+# The anchors above prove a live call site exists; they cannot prove it works.
+# Run the exact line each file carries, with only its destination argument
+# redirected, so a typo'd script path, a dropped `bash` prefix or a wrong flag
+# fails here rather than in a release build.
+for matched in "${matched_lines[@]}"; do
+    file="${matched%%|*}"
+    line="${matched#*|}"
+    probe="$work/probe/${file//\//_}"
+    mkdir -p "$probe"
+    # The destination is always the final argument; keep everything before it
+    # (`bash`, `bash -p`, the script path) exactly as the file spells it.
+    command_prefix="${line% *}"
+    if ! (
+        cd "$repo_root"
+        FACELOCK_PO_DIR="$work/po" eval "$command_prefix \"\$probe\""
+    ) >/dev/null 2>&1; then
+        fail "$file: its own install command failed to run"
+    fi
+    for domain in facelock pam_facelock; do
+        [ -f "$probe/$lang/LC_MESSAGES/$domain.mo" ] ||
+            fail "$file: its own install command placed no $domain.mo"
+    done
+done
 
 echo "locale install contract: ok"

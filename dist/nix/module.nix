@@ -45,8 +45,14 @@ in
     security.polkit.enable = true;
 
     # facelock's compiled-in catalog root is /usr/share/locale, which does not
-    # exist on NixOS. The CLI honours this override; the PAM module has no
-    # equivalent, so its two-entry catalog stays English here.
+    # exist on NixOS, so point it at the package's own tree.
+    #
+    # Read this as partial coverage, not a working translation story. It is a
+    # session variable, so sudo's env_reset strips it, and nearly every verb
+    # needs root: in practice only unprivileged commands see it. The PAM module
+    # has no equivalent override at all, so its catalog stays English here.
+    # Inert while po/ holds only templates. A real NixOS translation needs the
+    # catalog root resolved at build time rather than through the environment.
     environment.sessionVariables.FACELOCK_LOCALEDIR = "${facelockPackage}/share/locale";
 
     # PAM module
