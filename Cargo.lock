@@ -1058,6 +1058,7 @@ dependencies = [
  "signal-hook",
  "smithay-client-toolkit",
  "tempfile",
+ "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1072,8 +1073,10 @@ dependencies = [
 name = "facelock-core"
 version = "0.1.4"
 dependencies = [
+ "libc",
  "serde",
  "subtle",
+ "tempfile",
  "thiserror",
  "toml",
  "tracing",

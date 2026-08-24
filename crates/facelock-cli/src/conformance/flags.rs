@@ -455,6 +455,7 @@ const TOP_LEVEL_COMMANDS: &[&str] = &[
     "pam",
     "hyprlock",
     "audit",
+    "data",
 ];
 
 #[test]
@@ -568,6 +569,7 @@ const JSON_COMMANDS: &[&str] = &[
     "facelock pam add",
     "facelock pam remove",
     "facelock pam status",
+    "facelock data purge",
 ];
 
 /// Pins flag spelling across the whole command tree.
@@ -1189,4 +1191,88 @@ fn all_enumerates_status_or_removal_and_leaves_bare_forms_alone() {
             argv.join(" ")
         );
     }
+}
+
+// -----------------------------------------------------------------------
+// `facelock data purge` (#233)
+// -----------------------------------------------------------------------
+
+fn purge_request(args: &[&str]) -> facelock_cli::commands::data::PurgeRequest {
+    let argv: Vec<&str> = ["facelock", "data", "purge"]
+        .iter()
+        .chain(args)
+        .copied()
+        .collect();
+    let cli = Cli::try_parse_from(argv).expect("expected these args to parse");
+    let Commands::Data { command } = cli.command else {
+        panic!("expected the Data variant");
+    };
+    command.into()
+}
+
+/// **Prompt suppression must never imply destruction authorization.**
+///
+/// The same separation `no_confirm_and_allow_sensitive_are_independent`
+/// pins for `pam add`, for the destructive verb. `--yes` is "do not ask
+/// me"; `--allow-destruction` is "yes, destroy this user's enrollments".
+/// A wrapper that passes `--yes` to every facelock command so scripts run
+/// unattended must not thereby have authorized a purge.
+#[test]
+fn yes_and_allow_destruction_are_independent() {
+    for skip_prompts in [
+        &["--yes"][..],
+        &["--no-confirm"],
+        &["-y"],
+        // `--json` suppresses the prompt too, for the same reason `pam add`
+        // does: a question on stderr while a parser waits on stdout hangs.
+        &["--json"],
+    ] {
+        let request = purge_request(skip_prompts);
+        assert!(request.no_confirm, "{skip_prompts:?} must skip the prompt");
+        assert!(
+            !request.allow_destruction,
+            "{skip_prompts:?} must not authorize destruction"
+        );
+    }
+
+    let request = purge_request(&["--allow-destruction"]);
+    assert!(request.allow_destruction);
+    assert!(
+        !request.no_confirm,
+        "--allow-destruction accepts a risk; it does not skip the question"
+    );
+}
+
+/// A dry run previews and takes no lease, so barring activation afterwards
+/// is a contradiction rather than a no-op — clap rejects the pair instead
+/// of silently ignoring one half.
+#[test]
+fn a_dry_run_cannot_also_bar_activation() {
+    assert!(
+        Cli::try_parse_from(["facelock", "data", "purge", "--dry-run"]).is_ok(),
+        "`data purge --dry-run` must parse"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "facelock",
+            "data",
+            "purge",
+            "--dry-run",
+            "--leave-activation-barred",
+        ])
+        .is_err(),
+        "--dry-run with --leave-activation-barred must be rejected"
+    );
+}
+
+/// `data` is the group; `purge` is the only verb it offers today. A bare
+/// `facelock data` is a usage error rather than an implied purge — unlike
+/// `daemon` and `config`, whose bare forms are load-bearing invocations,
+/// nothing invokes this one and a destructive default would be a trap.
+#[test]
+fn bare_data_is_not_an_implied_purge() {
+    assert!(
+        Cli::try_parse_from(["facelock", "data"]).is_err(),
+        "bare `facelock data` must not resolve to a destructive verb"
+    );
 }

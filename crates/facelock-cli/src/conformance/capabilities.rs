@@ -53,6 +53,33 @@ fn capability_names_are_all_implemented() {
             "daemon-restart" => {
                 sub(sub(&root, "daemon"), "restart");
             }
+            "data-purge" => {
+                sub(sub(&root, "data"), "purge");
+            }
+            // The half that is not a spelling, and the reason this name is
+            // worth promising at all: the authorization is its *own* flag.
+            // An integrator that saw only `data-purge` might assume `--yes`
+            // suffices — the assumption #250 corrected for `pam add` — so
+            // the surface proves `--allow-destruction` exists and that
+            // `--yes` is a separate argument rather than an alias for it.
+            "data-purge-allow-destruction" => {
+                let purge = sub(sub(&root, "data"), "purge");
+                assert_long(purge, "allow_destruction", "allow-destruction");
+                assert_long(purge, "yes", "yes");
+                assert!(
+                    purge.get_arguments().any(|a| a.get_id() == "yes")
+                        && purge
+                            .get_arguments()
+                            .any(|a| a.get_id() == "allow_destruction"),
+                    "`data purge` must offer --yes and --allow-destruction as two arguments"
+                );
+            }
+            "data-purge-dry-run" => {
+                assert_long(sub(sub(&root, "data"), "purge"), "dry_run", "dry-run");
+            }
+            "data-purge-json" => {
+                assert_long(sub(sub(&root, "data"), "purge"), "json", "json");
+            }
             "tpm-decrypt" => {
                 sub(tpm, "decrypt");
             }

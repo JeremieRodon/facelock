@@ -653,6 +653,90 @@ Follow mode: watch for new log entries.
 .B \-l\fR, \fB\-\-lines \fIcount\fR
 Number of recent entries to show (default: 20).
 .RE
+.TP
+.B data purge
+Destroy retained Facelock state inside the compiled roots: enrolled
+embeddings, the database and its sidecars, encryption keys and sealed
+blobs, models, enrollment markers, audit logs, snapshots and upgrade
+backups. Requires root
+.I and
+.BR \-\-allow\-destruction .
+This is the sanctioned way to destroy biometric data before uninstalling;
+package removal deliberately preserves it.
+.RS
+.TP
+.B \-\-allow\-destruction
+Authorize irreversible destruction. Required. Nothing else implies it \(em
+in particular
+.B \-\-yes
+suppresses the confirmation prompt and grants no authorization, and
+.B \-\-json
+does not either.
+.TP
+.B \-y\fR, \fB\-\-yes
+Skip the confirmation prompt (also
+.BR \-\-no\-confirm ).
+.TP
+.B \-\-dry\-run
+Classify the configured paths and remove nothing. Requires root but not
+.BR \-\-allow\-destruction ,
+and takes no lifecycle lease, so it does not stop the daemon. It does
+.I not
+open the compiled roots, so it reports nothing about what is stored in
+them and gives no completeness verdict: in its document
+.I complete
+is null and
+.I roots_examined
+is false. An empty dry run means nothing was checked, not that nothing is
+there.
+.TP
+.B \-\-leave\-activation\-barred
+Keep the daemon stopped and D\-Bus activation barred after purging, for a
+caller that uninstalls next. Face authentication stays off until the
+named barrier file is removed and
+.B systemctl daemon\-reload
+runs, or until the machine reboots. Conflicts with
+.BR \-\-dry\-run .
+.TP
+.B \-\-json
+Emit the machine document instead of the human report. Branch on its
+.I complete
+field: it is false whenever a remnant, an external path, an
+unclassifiable configuration, or an interrupt occurred.
+.RE
+.PP
+Only
+.IR /etc/facelock ,
+.I /var/lib/facelock
+and
+.I /var/log/facelock
+are traversed, and the roots themselves are never removed. Configuration
+cannot add a root; a configured path outside them is reported as an
+external remnant and left untouched. Symbolic links, hard\-linked files,
+non\-regular objects, wrong ownership, group\- or world\-writable modes,
+mount crossings, and anything beyond the depth or entry caps are refused
+and reported rather than worked around.
+.PP
+Purge takes an exclusive lifecycle lock, bars D\-Bus activation and stops
+the daemon for the duration, then restores exactly the prior state \(em on
+success, on error, on panic, and on
+.SM SIGINT ,
+which stops the traversal at a deletion boundary before the daemon is
+allowed back. Repeating a purge is safe.
+.PP
+The exit status is 0 whenever the purge ran and the daemon lifecycle was
+restored, whatever the purge could not remove; the report, not the exit
+code, is the answer. A run that retained anything says so and names every
+remnant. If the lifecycle cannot be restored the full report is printed
+first and the error returned after it, so a nonzero exit following a report
+means the daemon needs attention, not that nothing happened. An interrupted
+run prints no report at all: the signal handler restores the daemon and then
+terminates the process while the command is still waiting on that restore.
+Deletions already made stand, and repeating a purge is safe, so re-run it to
+see what remains.
+.B
+Removing a name is not erasure:
+filesystem deletion does not securely erase SSDs, snapshots, or backups.
 .SH ENVIRONMENT
 .TP
 .B RUST_LOG

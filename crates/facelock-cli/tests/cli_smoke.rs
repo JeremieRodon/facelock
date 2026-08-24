@@ -478,3 +478,35 @@ fn no_args_shows_error_or_help() {
         "stderr should contain usage info, got: {stderr}"
     );
 }
+
+#[test]
+fn data_purge_refuses_before_confirmation_prompt_non_root() {
+    // C6: the root check is the first statement in `commands::data::run`,
+    // ahead of the destruction authorization, the confirmation prompt, and
+    // the lifecycle lease. A non-root caller must never reach the question
+    // "this permanently destroys ..." for an operation that will be refused,
+    // and must never cause the daemon to be stopped on the way to finding
+    // out. The forbidden list therefore covers the prompt, the authorization
+    // refusal, and the report headings.
+    assert_refuses_before_output(
+        &["data", "purge", "--allow-destruction", "--yes"],
+        &[
+            "This permanently destroys",
+            "Refusing to destroy biometric data",
+            "Removed",
+            "were retained",
+            "Removing a name is not erasure",
+        ],
+    );
+}
+
+#[test]
+fn data_purge_dry_run_refuses_before_reporting_non_root() {
+    // The root check runs ahead of `--dry-run` too, the way `pam add`'s
+    // does: a dry run that succeeded unprivileged would be a preview of a
+    // command that cannot run, and it reads root-only state to build it.
+    assert_refuses_before_output(
+        &["data", "purge", "--dry-run"],
+        &["Dry run", "Removing a name is not erasure", "were retained"],
+    );
+}

@@ -5,6 +5,7 @@ pub mod capabilities;
 pub mod clear;
 pub mod config;
 pub mod daemon;
+pub mod data;
 pub mod devices;
 pub mod encrypt;
 pub mod enroll;

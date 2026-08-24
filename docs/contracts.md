@@ -87,6 +87,9 @@ follow it.
 | `facelock tpm unseal-check` | Read-only: verify the sealed key still unseals (PCR policy satisfied) |
 | `facelock audit` | View audit log |
 | `facelock bench` | Benchmarks |
+| `facelock data purge` | Destroy retained Facelock state inside the compiled roots. Root, and additionally `--allow-destruction`. Holds the lifecycle exclusion lease for the duration; reports every remnant and never claims complete destruction (see "Fixed-root purge boundary") |
+| `facelock data purge --dry-run` | Classify configured paths and remove nothing. Root, no authorization flag, no lease — a preview must not stop the daemon as a side effect. Does not traverse the roots, and therefore reports no completeness verdict |
+| `facelock data purge --leave-activation-barred` | Keep the daemon stopped and D-Bus activation barred after purging, for a caller that uninstalls next. Conflicts with `--dry-run` |
 
 **Where a command goes.** A top-level command names a user task and keeps its
 spelling for the life of the binary. A noun group exists when the noun names a
@@ -100,6 +103,19 @@ way its domain spells it, verb or noun: `tpm seal-key` and `tpm pcr-baseline`
 follow tpm2-tools, `bench cold-auth` names a measurement. A new command must
 fit an existing domain before it may claim a top-level name. Commands named by
 `pam_facelock.so` or the service units never move. See ADR 009.
+
+**`data` is the one group that owns a single subcommand, and it is a stated
+exception rather than drift.** The domain is retained state on this machine —
+distinct from `config` (the config file) and from the per-user face models the
+top-level verbs reach. It is spelled as a group because the alternative is
+worse: a top-level `facelock purge` would sit immediately beside `facelock
+clear`, which already means "remove all face models for a user", and the two
+would differ only in blast radius. Naming the object first makes that
+difference the first word a reader sees, which on an irreversible command is
+worth a group that ADR 009's two-subcommand rule would otherwise refuse.
+Bare `facelock data` is a usage error, not an implied `purge`: unlike `daemon`
+and `config`, whose bare forms are load-bearing invocations, nothing invokes
+this one and a destructive default would be a trap.
 
 The top-level set is pinned by the `TOP_LEVEL_COMMANDS` registry in
 `crates/facelock-cli/src/conformance/flags.rs`, checked in both directions against
@@ -1674,6 +1690,10 @@ that is not on this list is not being denied, only not yet promised.
 | `config-edit` | `config edit` exists — the verb ADR 009 split out of the old `--edit` flag |
 | `daemon-processfd-session-gate` | daemon `Authenticate` supports the ProcessFD-backed logind remote-session gate documented under IPC Protocol |
 | `daemon-restart` | `daemon restart` exists — the verb ADR 009 moved under `daemon` from the top-level `restart` |
+| `data-purge` | `data purge` exists — the sanctioned path to destroy retained biometric state, which no removal path provides |
+| `data-purge-allow-destruction` | `data purge --allow-destruction` exists as its own argument beside `--yes`, so a caller can verify that prompt suppression is not the authorization |
+| `data-purge-dry-run` | `data purge --dry-run` |
+| `data-purge-json` | `data purge --json` |
 | `devices-json` | `devices --json` |
 | `is-enrolled` | `is-enrolled` exists — the unprivileged enrollment probe whose exit code is the contract |
 | `is-enrolled-json` | `is-enrolled --json` |
@@ -1727,10 +1747,10 @@ command uses exactly one:
   rather than hang waiting for input that will never arrive
   (`ipc_client::require_root`).
 - **Hard error only.** `facelock daemon run`, `facelock pam add`,
-  `facelock pam remove` and `facelock audit` never offer the interactive
-  prompt at all, even with a TTY attached — each is typically invoked
-  non-interactively or by a wrapper, where a stray confirmation prompt is a
-  hang, not a convenience (`ipc_client::require_root_scripted`).
+  `facelock pam remove`, `facelock audit` and `facelock data purge` never offer
+  the interactive prompt at all, even with a TTY attached — each is typically
+  invoked non-interactively or by a wrapper, where a stray confirmation prompt
+  is a hang, not a convenience (`ipc_client::require_root_scripted`).
 
 `facelock daemon run` is in the hard-error class because every shipped
 service unit invokes it, and a service manager must never be what a
@@ -1743,6 +1763,25 @@ replace was: standalone `setup --pam` bailed from its own root check rather
 than prompting. The check runs **before `--dry-run` is honoured**, so a dry run
 still needs root, and `pam status` is the unprivileged read to reach for
 instead.
+
+`facelock data purge` is in the hard-error class for the same reason and one
+more: it is destructive. Offering to re-exec a purge under `sudo` would ask a
+user who has just been told the command needs root to re-authorize destroying
+their enrollments through a `[Y/n]` that reads like a convenience. Its root
+check also runs before `--dry-run`, before the destruction authorization, and
+before the confirmation prompt, so a non-root invocation refuses without
+having read a file, prompted, or touched the daemon.
+
+**Authorization is separate from prompt suppression.** `facelock data purge`
+requires `--allow-destruction` in addition to root. `--yes`/`--no-confirm`
+suppresses the confirmation prompt and grants nothing; `--json` suppresses the
+prompt for the pipeline reason recorded under "CLI Machine Output" and grants
+nothing either. Neither implies the other, in either direction. This is the
+same split `facelock pam add` draws between `--yes` and `--allow-sensitive`,
+and it exists for the same reason: a wrapper that passes `--yes` to every
+command so scripts run unattended must not thereby have authorized a
+security-relevant or destructive action. `--dry-run` reports and deletes
+nothing, so it requires root but not the authorization.
 
 `facelock auth` is not user-facing — PAM spawns it directly, and it is not
 part of this table.
@@ -2243,6 +2282,21 @@ deletion.** Ordinary `remove` remains preservation-only: removing the package
 must leave a machine reinstallable without losing its biometric or operational
 state.
 
+**`facelock data purge` is the explicit authorized destruction path, and it is
+not a removal path.** It does not weaken the rule above; it is the reason the
+rule can hold. Because ordinary removal preserves biometric state, a user who
+genuinely wants that state gone needs somewhere to say so, and this is the only
+place. The two are separated on every axis: removal is triggered by a package
+transaction, purge by a person typing a verb; removal preserves, purge
+destroys; removal needs no authorization beyond the package manager's, purge
+needs root *and* `--allow-destruction`. No removal path, on any package family,
+may invoke it, imply it, or acquire its authorization on the user's behalf, and
+no packaging script may recommend recursive deletion of retained state in its
+place — `reject_state_purge_command` in
+`test/lifecycle-ownership-contract.sh` fails the build if one does. The
+sanctioned answer to "how do I delete my face data" is this command, and
+nothing else.
+
 The ownership classes are deliberately separate:
 
 | Class | Examples | Ordinary removal |
@@ -2407,6 +2461,52 @@ therefore removes static integration and safely cleaned PAM provenance, while
 preserving biometric state and whatever administrator-configuration artifact
 their package manager retained.
 
+### CLI lifecycle exclusion lease
+
+Destructive CLI maintenance (the `facelock data purge` work, #233) has no
+package transaction to own its exclusion interval, so the `facelock` binary
+establishes one itself through an RAII lifecycle lease. Acquisition takes the
+canonical `/run/facelock/lifecycle.lock` — the same never-unlinked lock the
+source install holds — with a non-blocking exclusive `flock` on a validated
+mode `0600` zero-byte single-link regular file opened without following the
+public path; refuses to proceed without a booted systemd; proves every
+existing `org.facelock.Daemon.service` activation definition delegates
+through `SystemdService=facelock-daemon.service`, because a unit mask cannot
+inhibit direct D-Bus execution; and records the unit's active and enabled
+state, admitting only loaded or not-found, active or inactive state. It then
+creates the owned activation barrier — an empty mode `0600` regular file at
+`/run/systemd/system.control/facelock-daemon.service`, the same mechanism the
+source install uses — reloads the manager and proves `LoadState=masked`
+before stopping the daemon and proving both `ActiveState=inactive` and that
+nothing owns `org.facelock.Daemon` on the system bus. A masked unit without a
+stale barrier, transitional or failed state, a foreign object at the control
+path, and a non-delegating activation definition all fail closed before any
+mutation, and a rejected acquisition rolls back whatever it had staged.
+
+Release restores exactly the recorded state in reverse order — barrier
+removal proven against the held descriptor, manager reload with an unmasking
+proof, restart only if the daemon was active, then lock release by closing
+the descriptor — on normal completion, error return, panic unwind, and
+HUP/INT/TERM, with non-reentrant signal cleanup. A signal-triggered restore
+raises the lease's interrupt flag and then waits, bounded, for the
+operation's acknowledgement that nothing is touching the filesystem any
+more; only then does it unmask and restart. If the acknowledgement never
+arrives, the wait expires and the process dies with activation still barred
+— the recoverable state below — rather than restarting the daemon under an
+operation that may still be mutating the purge roots. An explicit barred
+release instead keeps the barrier and the stopped daemon for a caller that
+uninstalls next. Enablement is never changed on any path.
+
+SIGKILL is the bounded failure mode: the barrier file survives, so face
+authentication stays masked (password PAM fallback is unaffected) while the
+`flock` dies with the process. Both the lock and the barrier live on tmpfs,
+so a reboot fully recovers on its own. Before reboot, the next lease
+acquisition adopts a control-path file matching the exact barrier identity
+(empty, mode `0600`, single-link, expected owner) as a stale barrier and
+removes it on restore; any other object at that path is preserved and
+reported. Manual recovery is removing the barrier file and running
+`systemctl daemon-reload`.
+
 ### Fedora authselect retirement boundary
 
 The RPM does not ship or select an authselect profile, does not edit
@@ -2516,7 +2616,9 @@ inode-conditional `unlinkat` or `rmdirat`: after the quarantine identity's final
 proof, deletion assumes no concurrent process with root or equivalent mutation
 authority is changing names in that root-owned, non-group/world-writable
 parent. The package transaction stops the service and owns this interval;
-ordinary unprivileged users cannot enter it. A separate same-authority process
+ordinary unprivileged users cannot enter it. A user-invoked CLI purge has no
+package transaction and establishes the same interval itself through the CLI
+lifecycle exclusion lease above. A separate same-authority process
 that deliberately mutates those parents is outside the package-purge contract,
 because no maintainer script can both delete a pathname and preserve an object
 that such a process substitutes at the deletion syscall itself.
@@ -2544,6 +2646,84 @@ does not guarantee that data is absent from SSD flash translation layers,
 snapshots, backups, journal history, or remapped blocks. Lifecycle messages may
 say which names were removed and which remnants remain; they must not describe
 purge as forensic destruction of biometric data.
+
+#### The `facelock data purge` entrypoint
+
+Two callers implement this envelope: the Debian `postrm` helper, and
+`facelock data purge`. They share the envelope and differ only in who owns the
+exclusion interval — the package transaction for the first, the CLI lifecycle
+exclusion lease above for the second.
+
+The CLI entrypoint composes the two in a fixed order, and the order is the
+contract. The root check runs first, ahead of `--dry-run`, the authorization,
+the confirmation prompt, and any output or read. A dry run then short-circuits
+to the report-only pass: it deletes nothing, so it takes no lease and must not
+stop the daemon, because a preview with side effects is not a preview. A real
+purge acquires the lease, runs the traversal with the lease's interrupt flag,
+and **acknowledges completion the instant the engine returns, before rendering
+anything** — a signal-triggered restore blocks on that acknowledgement, so any
+work inserted between the two is time a signal handler is held off and, if it
+outlasts the bound, a process that dies with activation barred. Release then
+either restores the recorded daemon state or, with
+`--leave-activation-barred`, keeps the barrier for a caller that uninstalls
+next.
+
+The engine is infallible by construction — every refusal is a reported remnant
+rather than an error — so no failure path exists between acquisition and
+acknowledgement. A panic between them is covered by the lease's `Drop`, which
+raises the acknowledgement itself before restoring.
+
+**What the report may not claim.** The completeness verdict is the engine's
+`PurgeReport::is_complete()` verbatim, never an inference from "deletion did
+not error". A run that retained anything — a remnant inside the roots, a
+configured path outside them, an unclassifiable configuration, or an interrupt
+— states in the negative that Facelock data was not completely destroyed, and
+names every remnant with its reason and every external path with its
+configuration field. Every completed run, complete or not, also states that
+removing a name is not erasure. The `--json` document carries `complete` for a
+script to branch on, plus a constant `secure_erasure: false` so no consumer has
+to infer it.
+
+**Exit status is not the answer.** The command exits 0 whenever the purge ran
+and the lifecycle was restored, whatever the purge could not remove, for the
+same reason the Debian purge returns success after reporting safety refusals: a
+safety refusal is a reported outcome, not a crash, and an install must not be
+strandable in a half-purged state by a caller that treated a refusal as a
+failure. Callers branch on the report, or on `complete` in the document.
+
+**A failed lifecycle restore is reported before it is returned.** The
+destruction is irreversible and the report is its only record, so a release
+that cannot restore the recorded daemon state renders the full report first —
+remnants, external paths, erasure caveat, or the complete `--json` document —
+and only then returns the error. Discarding the report to propagate the restore
+failure would leave a caller unable to distinguish "the purge never ran" from
+"the purge ran and the daemon did not come back", after their biometric state
+was already destroyed. The document therefore carries `lifecycle_restored` and
+`lifecycle_error` beside the purge result, and its mere presence means a pass
+ran. The nonzero exit that follows means the lifecycle needs attention, not
+that nothing happened.
+
+**A dry run gives no completeness verdict.** Report mode classifies the
+configured paths and never opens the compiled roots, so it has examined nothing
+that a completeness claim would be about. It states its scope instead, and its
+document reports `mode: "dry-run"`, `roots_examined: false` and `complete:
+null` — never `true`, which a reader on a machine full of enrollments could
+take for "my biometric data is already gone". That inference from absence of
+evidence is exactly what this section forbids, and it is forbidden of the
+preview as much as of the purge.
+
+**An interrupted run reports nothing, and that is the contract rather than a
+defect to work around.** The report is rendered after the lease is released,
+because the document must carry the lifecycle outcome; release joins the signal
+thread, and that thread terminates the process as soon as its restore completes,
+so a signalled purge exits before it renders. Deletions already made stand.
+Repetition is safe by construction, so a caller learns what remains by running
+the command again, and no partial-report guarantee is offered or implied.
+
+Repeating a purge is safe by construction, and the report is what makes that
+useful: every refusal leaves the object in place with a stated reason, so a
+second run after resolving an ownership or link problem picks up exactly what
+the first could not prove safe.
 
 ## Filesystem Paths
 

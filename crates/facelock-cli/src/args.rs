@@ -14,6 +14,7 @@
 
 use clap::{Args, Subcommand};
 
+use facelock_cli::commands::data::PurgeRequest;
 use facelock_cli::commands::pam::{PamAction, PamRequest};
 use facelock_cli::commands::setup::{
     EncryptionChoice, ExecutionProviderChoice, ModelPreset, SetupArgs,
@@ -338,6 +339,81 @@ impl From<PamCli> for PamRequest {
                 if_present,
                 json: json.json,
                 ..PamRequest::default()
+            },
+        }
+    }
+}
+
+/// `facelock data purge`.
+///
+/// Becomes a [`PurgeRequest`] the way [`PamCli`] becomes a `PamRequest`: the
+/// clap types stay in the binary and the library sees plain data a test can
+/// also construct. The conversion is where `--json`'s implications are
+/// resolved, so no call site re-derives them.
+#[derive(Subcommand)]
+pub enum DataCli {
+    /// Destroy retained Facelock state inside the compiled roots (requires --allow-destruction)
+    #[command(after_help = "\
+--yes/--no-confirm only skips the confirmation prompt. Destroying data \
+additionally requires --allow-destruction; neither flag implies the other. \
+--json implies --no-confirm, since a prompt would block the pipeline reading \
+the document, and never implies --allow-destruction.
+
+--dry-run reports what purge would find and removes nothing, so it needs \
+neither the authorization nor a stopped daemon.
+
+Purge stops the daemon and bars D-Bus activation for the duration, then \
+restores the prior state. --leave-activation-barred keeps the daemon stopped \
+and masked afterwards, for a caller that uninstalls next.
+
+Only /etc/facelock, /var/lib/facelock and /var/log/facelock are traversed. \
+Configured paths outside them are reported and left untouched. Removing a \
+name is not erasure.")]
+    Purge {
+        /// Authorize irreversible destruction of retained biometric state
+        //
+        // Deliberately not folded into `ConfirmArg`. #250 split `setup
+        // --pam`'s `--yes` from `--allow-sensitive` after prompt suppression
+        // had been doing double duty as authorization for a
+        // security-relevant action; this is the same split for a destructive
+        // one. A wrapper that passes `--yes` everywhere to keep scripts
+        // unattended must not thereby have authorized destroying a user's
+        // enrollments.
+        #[arg(long)]
+        allow_destruction: bool,
+        #[command(flatten)]
+        confirm: ConfirmArg,
+        #[command(flatten)]
+        dry_run: DryRunArg,
+        /// Leave the daemon stopped and D-Bus activation barred after purging
+        #[arg(long = "leave-activation-barred", conflicts_with = "dry_run")]
+        leave_activation_barred: bool,
+        #[command(flatten)]
+        json: JsonArg,
+    },
+}
+
+impl From<DataCli> for PurgeRequest {
+    fn from(cli: DataCli) -> Self {
+        match cli {
+            DataCli::Purge {
+                allow_destruction,
+                confirm,
+                dry_run,
+                leave_activation_barred,
+                json,
+            } => PurgeRequest {
+                allow_destruction,
+                // `--json` implies `--no-confirm` and never
+                // `--allow-destruction`, exactly as `pam add` resolves the
+                // same pair: the prompt is on stderr while a parser waits on
+                // stdout, so asking is a hang — but the gate is an
+                // authorization, and a machine caller has not given one by
+                // asking for a document.
+                no_confirm: confirm.yes || json.json,
+                dry_run: dry_run.dry_run,
+                leave_activation_barred,
+                json: json.json,
             },
         }
     }
