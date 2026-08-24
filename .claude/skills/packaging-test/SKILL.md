@@ -21,7 +21,8 @@ All recipes need `podman`. None of the ones in the routing table need a camera.
 | `dist/facelock.spec`, `dist/facelock.install` | `just test-rpm-pkg` |
 | TPM packaging or `facelock-tpm` build features | `just test-deb-trixie-pkg` and `just test-deb-resolute-pkg` |
 | `dist/PKGBUILD*` | `just test-arch-pam`, then a release shell (below) |
-| `.packit.yaml`, or anything COPR consumes | `just test-copr` — slow, opt-in, Packit SRPM plus a mock from-source rebuild |
+| `.packit.yaml` schema only | `just test-packit-config` — real `packit` in a pinned Fedora container, seconds |
+| `.packit.yaml` semantics, or anything COPR consumes | `just test-copr` — slow, opt-in, Packit SRPM plus a mock from-source rebuild |
 | APT repo generation, `publish-apt` workflow | `just test-apt-repo` — needs `reprepro` and `gpg` |
 | `systemd/`, `dbus/`, `polkit/`, install paths | both Debian suite recipes or `just test-rpm-pkg` — all validate under booted systemd |
 | `crates/pam-facelock/**`, `/etc/pam.d` handling | `just test-arch-pam` and `just check-pam-standalone` |

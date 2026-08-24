@@ -280,6 +280,8 @@ cp "$repo_root/test/check-release-matrix.py" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile.rpm-e2e" "$matrix_root/test/"
 cp "$repo_root/test/copr-build.sh" "$matrix_root/test/"
+cp "$repo_root/test/packit-config-validate.sh" "$matrix_root/test/"
+cp "$repo_root/test/Containerfile.packit" "$matrix_root/test/"
 cp "$repo_root/test/run-pkg-validate-systemd.sh" "$matrix_root/test/"
 
 apt_publisher_root="$tmp_root/apt-publisher-root"
@@ -354,6 +356,22 @@ assert_matrix_mutation_rejected \
     "Debian source-contract mutation recipe command" \
     "justfile" \
     's@    python3 test/deb-source-contract-test.py@    python3 test/deb-source-contract-test-disabled.py@'
+assert_matrix_mutation_rejected \
+    "Packit schema gate skipped in preflight" \
+    "justfile" \
+    's@    bash test/packit-config-validate.sh || failed=1@    echo "SKIP: packit CLI not installed"@'
+assert_matrix_mutation_rejected \
+    "Packit schema gate run from the host instead of the pinned container" \
+    "justfile" \
+    's@    bash test/packit-config-validate.sh || failed=1@    packit config validate --offline -c .packit.yaml || failed=1@'
+assert_matrix_mutation_rejected \
+    "Packit schema gate validator command" \
+    "test/packit-config-validate.sh" \
+    's@packit config validate --offline -c .packit.yaml@packit config validate -c .packit.yaml@'
+assert_matrix_mutation_rejected \
+    "Packit schema gate image digest pin" \
+    "test/Containerfile.packit" \
+    's|@sha256:[0-9a-f]*||'
 
 assert_matrix_payload_mutation_rejected_with_diagnostic() {
     local context="$1"

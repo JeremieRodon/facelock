@@ -652,7 +652,28 @@ require(
     packit_schema_command in copr_build_test,
     "COPR-equivalent gate does not run Packit's real offline schema validator",
 )
-require(packit_schema_command in justfile, "release preflight does not run Packit's schema validator when available")
+packit_gate = (ROOT / "test/packit-config-validate.sh").read_text()
+packit_gate_image = (ROOT / "test/Containerfile.packit").read_text()
+require(
+    packit_schema_command in packit_gate,
+    "Packit config gate does not run Packit's real offline schema validator",
+)
+require(
+    re.search(r"(?m)^FROM \S*/fedora:\S*@sha256:[0-9a-f]{64}\s*$", packit_gate_image) is not None,
+    "Packit config gate image is not a digest-pinned Fedora",
+)
+require(
+    "test/packit-config-validate.sh" in justfile,
+    "release preflight does not run the containerized Packit schema gate",
+)
+require(
+    packit_schema_command not in justfile,
+    "release preflight still runs Packit from the host instead of the pinned container",
+)
+require(
+    "SKIP: packit" not in justfile,
+    "release preflight can still skip Packit schema validation",
+)
 
 install_docs = {
     "README.md": (ROOT / "README.md").read_text(),

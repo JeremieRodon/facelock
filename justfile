@@ -995,6 +995,10 @@ test-rpm-pkg: (_require-models "1") build-release
     podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
     test/run-pkg-validate-systemd.sh facelock-rpm-pkg
 
+# Packit config schema gate — runs the real `packit` in a digest-pinned Fedora container
+test-packit-config:
+    bash test/packit-config-validate.sh
+
 # COPR-equivalent build — Packit SRPM + mock from-source rebuild on a Fedora chroot (slow, opt-in)
 test-copr:
     #!/usr/bin/env bash
@@ -1240,11 +1244,9 @@ release-preflight tag='':
         fi
     done
 
-    if command -v packit >/dev/null 2>&1; then
-        packit config validate --offline -c .packit.yaml || failed=1
-    else
-        echo "SKIP: packit CLI not installed; test-copr runs the required schema gate"
-    fi
+    echo ""
+    echo "== Packit config schema (pinned Fedora container) =="
+    bash test/packit-config-validate.sh || failed=1
 
     echo ""
     echo "== Release identity and target contract =="
