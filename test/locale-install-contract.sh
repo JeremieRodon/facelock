@@ -132,5 +132,10 @@ awk '
 if FACELOCK_PO_DIR="$work/broken-po" "$installer" "$work/broken-dest" >/dev/null 2>&1; then
     fail "installer accepted a translation with an invented placeholder"
 fi
+# msgfmt writes its output file even on a fatal --check error, so a rejected
+# translation must never reach the destination — on a source install that
+# destination is the live /usr/share/locale.
+[ ! -e "$work/broken-dest" ] ||
+    fail "installer left output behind for a rejected translation"
 
 echo "locale install contract: ok"

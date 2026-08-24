@@ -195,6 +195,55 @@ run_recipe_case() {
                     fail "fake-manager recipe did not restore the active state"
             fi
             ;;
+        recipe-locale-failure-retry)
+            # A translation msgfmt rejects fails the recipe mid-window, after
+            # the first asset writes but before the activation assets. The
+            # recipe must fail loudly, ship no catalog, lift the activation
+            # barrier, and restore the initially active daemon — never leave
+            # the unit masked.
+            command -v msgfmt >/dev/null ||
+                fail "locale-failure case needs msgfmt in the image"
+            systemctl start facelock-daemon.service
+            owner_is true || fail "locale-failure oracle did not own its D-Bus name"
+            mkdir -p "$root/repository/po/zz"
+            printf '%s\n' \
+                'msgid ""' \
+                'msgstr ""' \
+                '"Content-Type: text/plain; charset=UTF-8\n"' \
+                '' \
+                '#, python-brace-format' \
+                'msgid "Authenticating {user}"' \
+                'msgstr "Authenticating {typoed_placeholder}"' \
+                >"$root/repository/po/zz/facelock.po"
+            binary_before="$(file_identity /usr/bin/facelock)"
+            unit_before="$(file_identity "$unit")"
+            set +e
+            run_install_recipe
+            status=$?
+            set -e
+            [ "$status" -eq 1 ] ||
+                fail "broken-translation recipe exited $status, expected 1"
+            [ "$(file_identity /usr/bin/facelock)" != "$binary_before" ] ||
+                fail "broken-translation recipe never entered the install window"
+            [ "$(file_identity "$unit")" = "$unit_before" ] ||
+                fail "broken-translation recipe reached past the locale step"
+            [ ! -e /usr/share/locale/zz ] ||
+                fail "broken-translation recipe left a rejected catalog installed"
+            [ ! -e "$barrier" ] && [ ! -L "$barrier" ] ||
+                fail "broken-translation recipe left the barrier installed"
+            unit_state_is loaded active "$unit" ||
+                fail "broken-translation recipe left the unit masked or inactive"
+            owner_is true ||
+                fail "broken-translation recipe did not restore the D-Bus owner"
+            rm -rf "$root/repository/po/zz"
+            run_install_recipe || fail "retry after the broken translation failed"
+            cmp -s "$root/repository/systemd/facelock-daemon.service" "$unit" ||
+                fail "retry after the broken translation missed the /usr unit"
+            systemctl is-active --quiet facelock-daemon.service ||
+                fail "retry after the broken translation did not restore the active daemon"
+            owner_is true ||
+                fail "retry after the broken translation did not restore the D-Bus owner"
+            ;;
         recipe-first-install-failure-retry | recipe-first-install-hup-retry)
             rm -f "$unit" "$definition" "$persistent_mask" \
                 /etc/dbus-1/system-services/org.facelock.Daemon.service \
@@ -314,7 +363,7 @@ owner_is false || fail "daemon owned the bus before setup"
 
 case "$case_name" in
     recipe-known-legacy-retired | recipe-admin-overrides-preserved | \
-        recipe-fake-manager-overrides-preserved)
+        recipe-fake-manager-overrides-preserved | recipe-locale-failure-retry)
         run_recipe_case
         echo "source-install real systemd ($case_name): OK"
         exit 0

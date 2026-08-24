@@ -32,6 +32,7 @@ cases=(
     recipe-known-legacy-retired
     recipe-first-install-failure-retry
     recipe-first-install-hup-retry
+    recipe-locale-failure-retry
 )
 if [ "$#" -gt 1 ]; then
     cases=("$2")

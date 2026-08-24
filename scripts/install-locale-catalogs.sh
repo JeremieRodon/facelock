@@ -54,15 +54,28 @@ command -v msgfmt >/dev/null || {
     exit 1
 }
 
+# Compile into a private staging tree first: msgfmt (gettext 1.0) writes its
+# output file even when --check finds a fatal error, so compiling straight
+# into <destdir> would install the very catalog it just rejected — on a source
+# install that is the live /usr/share/locale. Nothing reaches <destdir> until
+# every catalog has passed.
+staging="$(mktemp -d)"
+trap 'rm -rf -- "$staging"' EXIT
+
+for po in "${catalogs[@]}"; do
+    lang="$(basename "$(dirname "$po")")"
+    domain="$(basename "$po" .po)"
+    mkdir -p "$staging/$lang"
+    # --check is what enforces the `{placeholder}` contract (see `just pot`).
+    # Keeping it here means a package build rejects a broken translation too,
+    # not only a translator running `just mo`.
+    msgfmt --check -o "$staging/$lang/$domain.mo" "$po"
+done
+
 for po in "${catalogs[@]}"; do
     lang="$(basename "$(dirname "$po")")"
     domain="$(basename "$po" .po)"
     out="$destdir/$lang/LC_MESSAGES/$domain.mo"
-    mkdir -p "$(dirname "$out")"
-    # --check is what enforces the `{placeholder}` contract (see `just pot`).
-    # Keeping it here means a package build rejects a broken translation too,
-    # not only a translator running `just mo`.
-    msgfmt --check -o "$out" "$po"
-    chmod 0644 "$out"
+    install -Dm644 "$staging/$lang/$domain.mo" "$out"
     echo "  $po -> $out"
 done
