@@ -215,16 +215,22 @@ run_recipe_case() {
                 'msgid "Authenticating {user}"' \
                 'msgstr "Authenticating {typoed_placeholder}"' \
                 >"$root/repository/po/zz/facelock.po"
-            binary_before="$(file_identity /usr/bin/facelock)"
             unit_before="$(file_identity "$unit")"
             set +e
-            run_install_recipe
+            recipe_output="$(run_install_recipe 2>&1)"
             status=$?
             set -e
+            printf '%s\n' "$recipe_output" >&2
             [ "$status" -eq 1 ] ||
                 fail "broken-translation recipe exited $status, expected 1"
-            [ "$(file_identity /usr/bin/facelock)" != "$binary_before" ] ||
-                fail "broken-translation recipe never entered the install window"
+            # The msgfmt failure in the output is what proves the recipe died
+            # at the locale step inside the install window. A reinstalled
+            # /usr/bin/facelock cannot prove it: install recreates the stub
+            # with identical content, owner, mode and size, and the freed
+            # inode number can be recycled, so its identity may not change.
+            printf '%s\n' "$recipe_output" |
+                grep -Fq 'msgfmt: found 1 fatal error' ||
+                fail "broken-translation recipe did not fail at msgfmt"
             [ "$(file_identity "$unit")" = "$unit_before" ] ||
                 fail "broken-translation recipe reached past the locale step"
             [ ! -e /usr/share/locale/zz ] ||
