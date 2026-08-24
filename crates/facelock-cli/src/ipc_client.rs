@@ -54,9 +54,9 @@ pub fn require_root(hint: &str) -> anyhow::Result<()> {
 /// Like [`require_root`], but never offers an interactive re-exec prompt.
 ///
 /// For commands that are typically invoked non-interactively or scripted
-/// (`facelock audit`; `facelock daemon` has its own equivalent check) — a
-/// "Re-run with sudo? [Y/n]" prompt would just hang a script instead of
-/// failing loudly.
+/// (`facelock audit`, `facelock pam add|remove`, and `facelock daemon run` —
+/// which every shipped service unit invokes) — a "Re-run with sudo? [Y/n]"
+/// prompt would just hang a script instead of failing loudly.
 pub fn require_root_scripted(hint: &str) -> anyhow::Result<()> {
     if Uid::current().is_root() {
         return Ok(());

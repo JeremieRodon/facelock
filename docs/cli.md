@@ -472,6 +472,10 @@ Run or restart the persistent authentication daemon. Bare `facelock daemon` is
 Run the daemon in the foreground. Requires root — it opens the camera and the
 face database. Normally managed by systemd, not run manually.
 
+Run as non-root it hard-errors with the `sudo` hint and never offers to
+re-exec, even from a terminal: the service unit that normally invokes it has
+nobody to answer a prompt. `daemon restart` still prompts.
+
 ```bash
 sudo facelock daemon                         # use default config
 sudo facelock daemon run                     # the same, spelled out

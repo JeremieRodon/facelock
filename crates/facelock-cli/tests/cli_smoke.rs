@@ -141,6 +141,112 @@ fn tpm_reseal_refuses_before_root_non_root() {
 }
 
 #[test]
+fn daemon_run_refuses_before_root_non_root() {
+    // The tracing line `run` emits right after the root check is the tightest
+    // ordering witness available: the subscriber is not even installed until
+    // the check has passed.
+    assert_refuses_before_output(&["daemon", "run"], &["facelock daemon starting"]);
+}
+
+/// Open a pty pair, returning `(controller, device)` — the ends historically
+/// called master and slave.
+fn open_pty() -> (std::fs::File, std::fs::File) {
+    let mut controller = -1;
+    let mut device = -1;
+    // SAFETY: both fds are out-params written before `openpty` returns 0, and
+    // the null `name`/`termp`/`winp` arguments each mean "default" per
+    // openpty(3).
+    let rc = unsafe {
+        libc::openpty(
+            &mut controller,
+            &mut device,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+
+    // SAFETY: `openpty` returned 0, so both are fresh owned fds and nothing
+    // else holds them.
+    unsafe {
+        (
+            std::os::fd::FromRawFd::from_raw_fd(controller),
+            std::os::fd::FromRawFd::from_raw_fd(device),
+        )
+    }
+}
+
+/// DEC-6: `daemon run` is the **hard error only** escalation class — it never
+/// offers `Re-run with sudo? [Y/n]`, even with a terminal attached, because
+/// every shipped service unit invokes it and a unit has nobody to answer
+/// (issue #188).
+///
+/// This needs a real pty. The `assert_refuses_before_output` rows above close
+/// stdin, which drives `require_root` down its *non-interactive* branch too —
+/// so they pass under either escalation class and cannot tell them apart. A
+/// regression to `require_root` here does not fail fast: it blocks forever on
+/// a prompt nobody will answer, which is why the wait is bounded and a
+/// timeout is the assertion.
+#[test]
+fn daemon_run_never_prompts_with_a_tty_attached() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!("skipping: as root `daemon run` starts the daemon instead of refusing");
+        return;
+    }
+
+    let (mut controller, device) = open_pty();
+    let mut child = facelock_bin()
+        .args(["daemon", "run"])
+        .stdin(Stdio::from(device.try_clone().expect("dup pty device")))
+        .stdout(Stdio::from(device.try_clone().expect("dup pty device")))
+        // The parent keeps no device fd, so reads on the controller see EOF
+        // once the child exits rather than hanging on an open write end.
+        .stderr(Stdio::from(device))
+        .spawn()
+        .expect("failed to spawn facelock daemon run");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("try_wait on facelock daemon run") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`facelock daemon run` never exited as a non-root user with a TTY \
+                     attached: it is blocked on the interactive sudo prompt, which the \
+                     hard-error class forbids (expected require_root_scripted)"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    // Reading the controller ends in EIO once the last device fd closes;
+    // bytes already read are kept, so the error is the end of the stream.
+    let mut raw = Vec::new();
+    let _ = controller.read_to_end(&mut raw);
+    let out = String::from_utf8_lossy(&raw);
+
+    assert!(!status.success(), "should refuse non-root, got: {status}");
+    assert!(out.contains("Root required"), "got: {out}");
+    // Asserted without the preceding newline: the pty translates it to CRLF.
+    assert!(out.contains("Run: sudo facelock daemon run"), "got: {out}");
+    assert!(
+        !out.contains("Re-run with sudo"),
+        "`daemon run` must not offer the interactive re-exec, got: {out}"
+    );
+    assert!(
+        !out.contains("facelock daemon starting"),
+        "the root check must run before anything else, got: {out}"
+    );
+}
+
+#[test]
 fn list_refuses_before_root_non_root() {
     assert_refuses_before_output(
         &["list", "--user", "nonexistent-test-user"],
