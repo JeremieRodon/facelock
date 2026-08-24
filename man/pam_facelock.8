@@ -1,28 +1,40 @@
-.TH PAM_FACELOCK 8 "2026-03-11" "pam_facelock" "System Administration"
+.TH PAM_FACELOCK 8 "2026-08-23" "pam_facelock" "System Administration"
 .SH NAME
 pam_facelock \- PAM module for face authentication
 .SH SYNOPSIS
 .B pam_facelock.so
 .SH DESCRIPTION
 .B pam_facelock
-is a PAM module that provides face-based authentication for Linux systems.
+is a PAM module that provides face\-based authentication for Linux systems.
 It is a thin client that first attempts to connect to the
 .BR facelock (1)
-daemon via the D-Bus system bus (\fBorg.facelock.Daemon\fR). If the daemon is unavailable, it falls back
+daemon via the D\-Bus system bus (\fBorg.facelock.Daemon\fR). If the daemon is unavailable, it falls back
 to spawning
-.B facelock auth
-as a one-shot process.
+.I /usr/bin/facelock
+.B auth
+as a one\-shot process. That path is not configurable: a config\-selected binary
+would let anyone who can influence the configuration file choose which
+executable a root PAM context runs.
 .PP
 The module is intentionally kept minimal with no heavy dependencies (no ONNX
-runtime, no V4L2, no facelock-core). All inference is delegated to the daemon
+runtime, no V4L2, no facelock\-core). All inference is delegated to the daemon
 or the facelock binary.
 .PP
 All authentication attempts are logged to syslog under the AUTH facility.
 .SH MODULE TYPES PROVIDED
 .TP
 .B auth
-This module performs face-based user authentication. It does not provide
+This module performs face\-based user authentication. It does not provide
 account, session, or password management.
+.SH OPTIONS
+This module parses no module arguments. Everything that varies is read from the
+configuration file described under CONFIGURATION, so a token appended to the
+.I /etc/pam.d
+line \- for example a
+.I timeout
+or
+.I debug
+argument copied from another module \- is silently ignored rather than applied.
 .SH RETURN VALUES
 .TP
 .B PAM_SUCCESS
@@ -30,13 +42,19 @@ The user's face was matched against an enrolled model with sufficient
 confidence.
 .TP
 .B PAM_AUTH_ERR
-Authentication failed. The face did not match any enrolled model, no face
-was detected, or an error occurred during the authentication process.
+Authentication failed. The face did not match any enrolled model, or an error
+occurred during the authentication process.
 .TP
 .B PAM_IGNORE
-The module is configured to be skipped for this authentication context,
-or the user has no enrolled face models. This allows the PAM stack to
-fall through to the next module.
+The module abstained: it is disabled for this authentication context, the user
+has no enrolled face models, no face was seen, or a precondition such as the IR
+camera requirement was not met. The PAM stack falls through to the next module.
+.TP
+.B PAM_AUTHINFO_UNAVAIL
+The user has no enrolled face models and
+.I security.suppress_unknown
+is enabled, so the module declines to reveal whether the user is enrolled and
+hands the decision to the next module in the stack.
 .SH EXAMPLES
 To enable face authentication for
 .BR sudo (8),
@@ -51,7 +69,7 @@ auth    sufficient    pam_facelock.so
 .RE
 .PP
 This allows face authentication to succeed without requiring a password. If
-face authentication fails or returns PAM_IGNORE, the next module in the PAM
+face authentication fails or abstains, the next module in the PAM
 stack (typically
 .BR pam_unix (8))
 will prompt for a password.
@@ -78,63 +96,111 @@ facelock setup --pam --service sudo
 .SS IR Camera Requirement
 By default, facelock requires an infrared (IR) camera for authentication
 .RB ( security.require_ir=true
-in the configuration file). IR cameras are resistant to photo-based spoofing
+in the configuration file). IR cameras are resistant to photo\-based spoofing
 attacks. Do not disable this requirement unless you understand the security
 implications.
-.SS Anti-Spoofing
+.SS Anti\-Spoofing
 Frame variance checks are performed during authentication to detect
 presentation attacks (e.g., holding a photo or video in front of the camera).
 .SS Rate Limiting
 The daemon enforces rate limiting (5 attempts per user per 60 seconds by
-default) to prevent brute-force attacks.
+default) to prevent brute\-force attacks.
 .SS IPC Security
-Communication between the PAM module and daemon uses the D-Bus system bus.
+Communication between the PAM module and the daemon uses the D\-Bus system bus.
 The system bus policy
 .RI ( /usr/share/dbus-1/system.d/org.facelock.Daemon.conf )
-applies a deny-all default, restricting access to root and members of the
-.B facelock
-group. The daemon verifies the caller UID via
+denies the daemon's name and destination by default and then makes exactly one
+exception for unprivileged callers: any local user may send
+.BR Authenticate ,
+which is what lets a screen locker or the polkit agent unlock as the user
+running it. Every other method, and receipt of the daemon's signals, is
+restricted to root. The daemon independently verifies the caller UID via
 .B GetConnectionUnixUser
-before executing any method. Message size limits are enforced by the D-Bus
-daemon.
+before executing any method, and allows a non\-root
+.B Authenticate
+only for the caller's own username. Message size limits are enforced by the
+D\-Bus daemon.
+.SS Fixed Inputs
+Two inputs a PAM module could take from its environment are compiled in
+instead. The configuration file is always
+.IR /etc/facelock/config.toml :
+the module does not honour
+.BR FACELOCK_CONFIG ,
+which the unprivileged
+.BR facelock (1)
+commands do honour, because an environment variable that selects a
+configuration file is an environment variable that selects security policy for
+a root PAM context. The one\-shot fallback binary is likewise the fixed path
+.IR /usr/bin/facelock ,
+and it and its parent directories are checked for root ownership and
+non\-writability before it is spawned.
 .SS Syslog Logging
 All authentication attempts (success, failure, and error) are logged to
 syslog under the AUTH facility with the identifier
 .IR pam_facelock .
 .SH CONFIGURATION
-The module reads its configuration from
-.I /etc/facelock/config.toml
-(or the path specified by the
-.B FACELOCK_CONFIG
-environment variable). Relevant configuration sections:
-.TP
-.B [pam]
-PAM-specific settings including
-.BR timeout_secs ,
-.BR notification_mode ,
-and
-.BR skip_for_ssh .
-.TP
-.B [security]
-Security settings including
-.B require_ir
-(default: true).
+The module parses its own minimal view of the configuration file, independently
+of the daemon. That file is always
+.IR /etc/facelock/config.toml ;
+see Fixed Inputs above for why the path is fixed. Only the tables and keys
+listed here are read by the module; every other key in the file belongs to the
+daemon and has no effect on the PAM stack.
 .TP
 .B [daemon]
-Daemon settings including mode and model directory.
+.BR mode
+.br
+Whether to reach the daemon over D\-Bus ("daemon", the default) or spawn the
+one\-shot binary directly ("oneshot").
+.TP
+.B [security]
+.BR disabled ,
+.BR abort_if_ssh ,
+.BR abort_if_lid_closed ,
+.BR suppress_unknown ,
+.BR pam_policy
+.br
+Whether the module runs at all, the contexts it refuses to run in, and whether
+an unenrolled user is reported as such or hidden behind PAM_AUTHINFO_UNAVAIL.
+.TP
+.B [security.pam_policy]
+.BR allowed_services ,
+.BR denied_services
+.br
+Per\-service allow and deny lists, matched against the PAM service name.
+.TP
+.B [recognition]
+.BR timeout_secs
+.br
+How long the module waits for a decision before abstaining.
+.TP
+.B [notification]
+.BR mode ,
+.BR notify_prompt ,
+.BR notify_on_success
+.br
+What the module writes into the PAM conversation while it waits. Desktop
+delivery is the daemon's job, not the module's.
 .SH FILES
 .TP
 .I /etc/facelock/config.toml
 Main configuration file.
 .TP
+.I /lib/security/pam_facelock.so
+.TP
 .I /usr/lib/security/pam_facelock.so
-The PAM module shared library.
+.TP
+.I /usr/lib64/security/pam_facelock.so
+The PAM module shared library. Which of the three a distribution uses is a
+property of that distribution; facelock probes all three in this order.
+.TP
+.I /usr/bin/facelock
+The binary spawned for one\-shot authentication when the daemon is unavailable.
 .TP
 .I /usr/share/dbus-1/system.d/org.facelock.Daemon.conf
-D-Bus system bus policy file for the facelock daemon.
+D\-Bus system bus policy file for the facelock daemon.
 .TP
 .I /usr/share/dbus-1/system-services/org.facelock.Daemon.service
-D-Bus activation file for the facelock daemon service.
+D\-Bus activation file for the facelock daemon service.
 .TP
 .I /var/lib/facelock/facelock.db
 Face embedding database.
