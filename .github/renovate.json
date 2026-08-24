@@ -23,7 +23,12 @@
     {
       "matchManagers": ["github-actions"],
       "groupName": "github actions",
-      "automerge": true
+      "description": [
+        "Never automerge. Every action is pinned to a commit SHA (#235), and an",
+        "automerged digest bump unpins it again the following Monday without anyone",
+        "reading the diff. Release workflows hold signing secrets, so a human reviews",
+        "the new SHA before it can run."
+      ]
     }
   ],
   "schedule": ["before 9am on monday"]
