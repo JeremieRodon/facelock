@@ -170,7 +170,22 @@ pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
     // the camera-lifecycle work moved that line below the camera open — would
     // have handed every one of them a veto.
     converge_enrollment_marker(&config, &user, listed.as_ref().ok().map(|m| m.len() as u32));
-    let models = listed.unwrap_or_default();
+
+    // A storage failure here must surface as an error, never fold into an
+    // empty model list (C3, issue #105) — the same refusal the daemon
+    // handler makes, in the same words: empty `models` means an empty
+    // device-allowed set, a guaranteed "no match" (exit 1, PAM_AUTH_ERR),
+    // and a rate-limit charge for an attempt the user never got to make —
+    // retries then walk straight into a lockout. Exit under the storage
+    // class instead (2, PAM_IGNORE): the daemon maps the identical failure
+    // to its `-2` error reply, which PAM reads the same way.
+    let models = match listed {
+        Ok(m) => m,
+        Err(e) => {
+            error!(user = %user, "failed to list models: {e}");
+            return oneshot_exit_code(ErrorKind::Storage);
+        }
+    };
 
     // Signals, before anything that turns the camera on. `facelock auth` is a
     // one-shot: exit *is* the release, so the job of a signal is to end the
@@ -235,13 +250,20 @@ pub fn run(user: String, config_path: Option<String>, verbose: u8) -> i32 {
 
     // Load embeddings through the decryption-aware path so the oneshot binary
     // handles encrypted templates (encrypt-by-default, Plan 04) — the bare
-    // `auth::authenticate` helper reads plaintext only. Decrypt failure degrades
-    // to no-match (exit 1 via an empty compare set), never a hard error.
+    // `auth::authenticate` helper reads plaintext only.
+    //
+    // A failed load is a storage fault, not evidence about the face: the
+    // first failing row fails the whole load (see facelock-daemon's
+    // embeddings module), so a TPM unseal broken by rotated PCRs lands here
+    // on every attempt. Exit 1 is frozen as "scanned and not matched" and
+    // would fail a `required` stack against the correct password — a
+    // lockout, not a fallback. Exit under the storage class (2, PAM_IGNORE),
+    // matching the daemon handler's `-2` storage reply for the same failure.
     let mut stored = match crate::direct::load_user_embeddings(&store, &config, &user) {
         Ok(v) => v,
         Err(e) => {
             error!(user = %user, "failed to load embeddings: {e}");
-            return 1;
+            return oneshot_exit_code(ErrorKind::Storage);
         }
     };
 
@@ -806,6 +828,34 @@ mod tests {
         // Compile-time: the suppressed code is a constant, so its half of
         // the invariant needs no runtime assert.
         const { assert!(EXIT_SUPPRESSED >= 2, "suppressed may not claim 0 or 1") }
+    }
+
+    /// `run()`'s failure exits, pinned at the source (the function needs a
+    /// camera, so its literals cannot be pinned by calling it). Exit 1 is
+    /// frozen as "scanned and not matched", so the only site allowed to
+    /// produce it is the no-match arm of the auth-response match — a bare
+    /// return of 1 is an ad-hoc failure exit that once turned a broken TPM
+    /// unseal into PAM_AUTH_ERR on every attempt (a lockout under a
+    /// `required` stack). And a failed model-list read must hard-error like
+    /// the daemon handler (C3, #105), never degrade to an empty compare set
+    /// that guarantees exit 1 and charges the rate limit.
+    #[test]
+    fn run_has_no_ad_hoc_failure_exits() {
+        let src = include_str!("auth.rs");
+        // Needles assembled at runtime so this test's own literals cannot
+        // satisfy them (include_str! sees this file, tests included).
+        let ad_hoc_exit_one = ["return ", "1;"].concat();
+        assert!(
+            !src.contains(&ad_hoc_exit_one),
+            "exit 1 must only come from the no-match arm; storage-shaped \
+             failures exit via oneshot_exit_code(ErrorKind::Storage)"
+        );
+        let folded_list_error = ["listed", ".unwrap_or_default()"].concat();
+        assert!(
+            !src.contains(&folded_list_error),
+            "a failed model-list read must hard-error (C3/#105), not degrade \
+             to an empty compare set"
+        );
     }
 
     /// The suppressed outcome is not an `ErrorKind`, so it has no row in the

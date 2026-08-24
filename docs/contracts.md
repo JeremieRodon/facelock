@@ -1979,14 +1979,23 @@ is governed by three frozen invariants:
    onto a changed meaning of an old one.
 2. **New codes are allocated only from the space an older module already maps
    to `PAM_IGNORE`** (any code ≥ 3 it does not know). Old module + new binary
-   therefore degrades to the pre-split collapse: it loses the class
-   distinction, and regresses nothing.
+   can therefore only move a class's consequence to `PAM_IGNORE` — never to
+   `PAM_SUCCESS` or `PAM_AUTH_ERR`. For rate limited (3) and suppressed (4),
+   which were exit 2 before the split, that is byte-for-byte the pre-split
+   behavior. For all frames dark (5), moved off exit 1, it is a deliberate
+   semantic change the moment the new binary ships: a dark scan stops
+   failing the stack (`PAM_AUTH_ERR`) and abstains — the daemon transport's
+   consequence — under every module generation.
 3. **The module's arm for unknown codes stays `PAM_IGNORE`**, so new module +
    old binary is unchanged too. The same arm absorbs a binary killed by a
    signal (no exit code; the module reads it as 2).
 
-| Code | Class | PAM code (module ≥ 0.2.0) | PAM code (older module) |
-|------|-------|---------------------------|-------------------------|
+The "new module" column below is the module that ships alongside this table
+(the same release as the binary emitting codes 3–5); every earlier module
+maps those codes through its unknown-code arm.
+
+| Code | Class | PAM code (new module) | PAM code (older module) |
+|------|-------|-----------------------|-------------------------|
 | 0 | Face matched | `PAM_SUCCESS` | `PAM_SUCCESS` |
 | 1 | Scanned, no match | `PAM_AUTH_ERR` | `PAM_AUTH_ERR` |
 | 2 | Error / no opinion: disabled, SSH, lid closed, storage, rate-limit check failed, IR required, unverified Y16, internal, cancelled, not enrolled | `PAM_IGNORE` | `PAM_IGNORE` |
@@ -2003,6 +2012,29 @@ silently softened a rate-limited rejection from `PAM_AUTH_ERR` to
 where the daemon abstains. Benign under the recommended `sufficient`
 stacking; wrong under `required`/`requisite` or an `[authinfo_unavail=...]`
 action.
+
+Storage-shaped failures during the attempt — a model list that cannot be
+read, an embedding set that cannot be loaded or decrypted (a TPM unseal
+broken by rotated PCRs lands here on every attempt) — exit 2, the storage
+class, exactly as the daemon's `-2` storage reply does. Neither may fold
+into exit 1: an empty compare set is a guaranteed "no match" that charges
+the rate limit and, under a `required` stack, locks the user out with the
+correct password in hand (the daemon handler refuses the same fold; C3,
+issue #105).
+
+**Residual transport divergence.** With the classes above aligned, one
+divergence remains between a current module's two transports: a non-match
+where **no face was seen** (empty chair, `recognition.no_face_timeout_secs`,
+nothing above the detector threshold). The daemon reply carries that as
+`-1`/no-face and PAM abstains (`PAM_IGNORE`); the oneshot exit code has no
+face-seen channel, so the same attempt exits 1 (`PAM_AUTH_ERR`). Closing it
+needs another additive code under the same three invariants. During the
+upgrade window an older module additionally reads codes 3 and 4 as
+`PAM_IGNORE` (invariant 2) — the daemon transport under that same older
+module already carries both classes in-band, so the two transports keep
+today's divergence until the module updates. Timeouts (`PAM_AUTH_ERR`),
+cancellation (`PAM_IGNORE`), and camera/storage/engine failures
+(`PAM_IGNORE`) agree across transports.
 
 The binary's half of the table is pinned in
 `crates/facelock-cli/src/commands/auth.rs`

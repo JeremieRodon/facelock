@@ -612,7 +612,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the space an older PAM module maps to `PAM_IGNORE`, so a module
   predating the split degrades to the old collapsed behavior instead of
   regressing. The full table and its compatibility invariants are frozen in
-  `docs/contracts.md`.
+  `docs/contracts.md`. Two failure paths that wrongly produced exit 1
+  (`PAM_AUTH_ERR`) now exit 2 as the storage class, matching the daemon: a
+  failed embeddings load or decrypt (a TPM unseal broken by rotated PCRs
+  failed every attempt, locking out a `required` stack with the correct
+  password), and a failed model-list read (which folded into an empty
+  compare set, a guaranteed no-match that charged the rate limit — the
+  hazard the daemon handler refuses per C3/#105).
 - **Debian PAM and daemon package lifecycle is opt-in and state-preserving**
   (#224): direct `pam add`/`setup --pam` now refuses an already-selected exact
   `pam-auth-update` profile before writing, using fixed-root no-follow evidence
