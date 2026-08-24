@@ -1,6 +1,11 @@
 # E2E package test — builds a real .rpm and installs via dnf
 # Uses host-built release binaries (from `just build-release`); no Rust compilation in container.
-FROM registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e90866c488d5d04fc6612284169e20a1bdb
+# Base image comes from dist/release-matrix.json via
+# test/fedora-lane-image.sh, which is where the digest pin and the Fedora
+# EOL gate live. No default: a build without --build-arg must fail, not
+# silently pick a release.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 # dbus-daemon (Fedora ships dbus-broker by default) is needed for the runtime
 # D-Bus tests in pkg-validate.sh, including the polkit agent boundary check.
@@ -44,10 +49,13 @@ COPY .github/workflows/scripts/validate-rpm.sh /validate-rpm.sh
 COPY test/pkg-validate.sh /pkg-validate.sh
 COPY test/polkit-agent-validate.sh /polkit-agent-validate.sh
 COPY test/rpm-service-pam-lifecycle.sh /rpm-service-pam-lifecycle.sh
+COPY test/rpm-config-lifecycle.sh /rpm-config-lifecycle.sh
+COPY test/rpm-runtime-smoke.sh /rpm-runtime-smoke.sh
 COPY test/pam.d/facelock-test /etc/pam.d/facelock-test
 RUN chmod +x /build/test/build-rpm-prebuilt.sh /run-networkless.sh \
     /validate-rpm.sh /pkg-validate.sh /polkit-agent-validate.sh \
-    /rpm-service-pam-lifecycle.sh
+    /rpm-service-pam-lifecycle.sh /rpm-config-lifecycle.sh \
+    /rpm-runtime-smoke.sh
 
 # Fetch and verify the same reviewed CPU-only archive as release.yml. This is a
 # distinct network stage; test/build-rpm-prebuilt.sh performs no downloads.
@@ -86,5 +94,18 @@ RUN /run-networkless.sh bash /build/test/build-rpm-prebuilt.sh "0.0.0" && \
     cp "$RPM_FILE" /facelock-test-package.rpm && \
     dnf install -y ./*.rpm && \
     rm -rf ~/rpmbuild ./*.rpm
+
+# A second, higher-versioned package whose only payload difference is the
+# %config(noreplace) file. /rpm-config-lifecycle.sh upgrades 0.0.0 -> 0.0.1 with
+# the config untouched and again with it edited; both outcomes only exist when
+# the packaged config actually changes between the two versions.
+RUN cp /build/config/facelock.toml /tmp/facelock.toml.baseline && \
+    printf '\n# packaged-only-in-facelock-upgrade-rpm\n' >> /build/config/facelock.toml && \
+    /run-networkless.sh bash /build/test/build-rpm-prebuilt.sh "0.0.1" && \
+    RPM_FILE="$(find . -maxdepth 1 -name '*.rpm' -print -quit)" && \
+    cp "$RPM_FILE" /facelock-test-upgrade.rpm && \
+    cp /tmp/facelock.toml.baseline /build/config/facelock.toml && \
+    rm -rf ~/rpmbuild ./*.rpm /tmp/facelock.toml.baseline && \
+    cmp /build/config/facelock.toml /etc/facelock/config.toml
 
 CMD ["/pkg-validate.sh"]

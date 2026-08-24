@@ -1,5 +1,10 @@
 # Single-stage test image — uses host-built release binaries (from `just build-release`)
-FROM registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e90866c488d5d04fc6612284169e20a1bdb
+# Base image comes from dist/release-matrix.json via
+# test/fedora-lane-image.sh, which is where the digest pin and the Fedora
+# EOL gate live. No default: a build without --build-arg must fail, not
+# silently pick a release.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 RUN dnf -y install pam dbus rpm-build libxkbcommon python3 systemd binutils glibc tpm2-tss && dnf clean all
 

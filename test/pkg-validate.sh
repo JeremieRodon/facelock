@@ -743,8 +743,16 @@ EOF
     run_test "apt wrapper removes the PAM module" \
         "[ ! -f /lib/security/pam_facelock.so ] && [ ! -f /usr/lib/security/pam_facelock.so ] && [ ! -f /usr/lib64/security/pam_facelock.so ]"
 elif [ "$PACKAGE_FORMAT" = rpm ]; then
-    # Modify config so RPM treats it as user-edited and preserves it as .rpmsave
+    # Modify config so RPM treats it as user-edited. The observed
+    # %config(noreplace) erase contract, pinned below: a modified config is
+    # removed from its own path and its exact bytes are kept as .rpmsave, while
+    # an unmodified one is removed outright and leaves nothing behind. Record
+    # the administrator bytes now so the .rpmsave assertion compares content and
+    # not merely existence.
     echo "# modified by test" >> /etc/facelock/config.toml
+    sha256sum /etc/facelock/config.toml |
+        sed 's|/etc/facelock/config.toml$|/etc/facelock/config.toml.rpmsave|' \
+        > /tmp/facelock-modified-config.sha
     run_test "rpm removal aborts on an unmanaged PAM reference" \
         "! rpm -e facelock"
     run_test "rpm keeps the package installed after aborted removal" \
@@ -772,9 +780,21 @@ elif [ "$PACKAGE_FORMAT" = rpm ]; then
     run_test "facelock binary removed after rpm -e" "[ ! -f /usr/bin/facelock ]"
     run_test "PAM module removed after rpm -e" \
         "[ ! -f /lib/security/pam_facelock.so ] && [ ! -f /usr/lib/security/pam_facelock.so ] && [ ! -f /usr/lib64/security/pam_facelock.so ]"
-    run_test "Config preserved after rpm -e (config(noreplace))" "[ -f /etc/facelock/config.toml ] || [ -f /etc/facelock/config.toml.rpmsave ]"
+    run_test "modified config(noreplace) leaves its own path on rpm -e" \
+        "[ ! -e /etc/facelock/config.toml ] && [ ! -L /etc/facelock/config.toml ]"
+    run_test "modified config(noreplace) is retained as .rpmsave on rpm -e" \
+        "[ -f /etc/facelock/config.toml.rpmsave ]"
+    run_test "retained .rpmsave holds the administrator bytes byte-for-byte" \
+        "sha256sum -c --status /tmp/facelock-modified-config.sha"
+    run_test "rpm -e of a modified config writes no .rpmnew" \
+        "[ ! -e /etc/facelock/config.toml.rpmnew ]"
+    # The unmodified-erase half needs a clean slate: consume the .rpmsave just
+    # asserted so the next erase cannot be scored against a stale one.
+    rm -f /etc/facelock/config.toml.rpmsave /tmp/facelock-modified-config.sha
     run_test "facelock reinstalls before dnf wrapper success" \
         "dnf install -y /facelock-test-package.rpm"
+    run_test "reinstall restores config(noreplace) at its own path" \
+        "[ -f /etc/facelock/config.toml ] && ! [ -e /etc/facelock/config.toml.rpmsave ]"
     cat > "$PACKAGE_OWNED_PAM" <<'EOF'
 #%PAM-1.0
 auth      sufficient pam_facelock.so
@@ -787,6 +807,10 @@ EOF
         "[ -f $PACKAGE_OWNED_PAM ] && ! grep -q pam_facelock.so $PACKAGE_OWNED_PAM"
     run_test "dnf wrapper removes the package and PAM module" \
         "! rpm -q facelock && [ ! -f /lib/security/pam_facelock.so ] && [ ! -f /usr/lib/security/pam_facelock.so ] && [ ! -f /usr/lib64/security/pam_facelock.so ]"
+    # Nothing edited the config between the reinstall above and this removal, so
+    # this is the unmodified half of the erase contract: gone, with no .rpmsave.
+    run_test "unmodified config(noreplace) is removed outright on erase" \
+        "[ ! -e /etc/facelock/config.toml ] && [ ! -e /etc/facelock/config.toml.rpmsave ] && [ ! -e /etc/facelock/config.toml.rpmnew ]"
 else
     skip_test "package removal block (removal, binary/PAM module gone, config preserved)" \
         "facelock was not installed by dpkg or rpm here"

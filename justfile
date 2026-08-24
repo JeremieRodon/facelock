@@ -957,18 +957,43 @@ show-paths:
 [private]
 _ort-version := `for ort in /usr/lib/libonnxruntime.so /usr/lib64/libonnxruntime.so; do if [ -e "$ort" ]; then readlink -f "$ort" | grep -oP '\d+\.\d+\.\d+$'; exit; fi; done; echo "1.20.1"`
 
+# Every Fedora recipe below takes a release and resolves its base image through
+# test/fedora-lane-image.sh, which reads the digest pin out of
+# dist/release-matrix.json and refuses a release that is undeclared, that is not
+# a release target (Rawhide), or that has passed its EOL gate. The default stays
+# 44 so bare invocations keep their old meaning. Image tags carry the release so
+# concurrent lanes cannot overwrite each other's image.
+#
+# Resolution runs as the first dependency so an expired or undeclared release is
+# refused before a host release build, not after one.
+
+[private]
+_fedora-lane-image release:
+    @bash test/fedora-lane-image.sh '{{ release }}' >/dev/null
+
 # Test RPM packaging in Fedora container
-test-rpm: build-release
+test-rpm release="44": (_fedora-lane-image release) build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build -t facelock-rpm-test -f test/Containerfile.fedora .
-    podman run --rm facelock-rpm-test
+    image="$(bash test/fedora-lane-image.sh '{{ release }}')"
+    podman build --build-arg "BASE_IMAGE=$image" \
+        -t facelock-rpm-test-f{{ release }} -f test/Containerfile.fedora .
+    podman run --rm facelock-rpm-test-f{{ release }}
 
-# Static and booted, model-free Fedora authselect retirement lifecycle.
-test-rpm-authselect:
+# The upgrade fixture is the released v0.1.4 fc44 RPM, the only build of the
+# retired-profile package that exists. Releases other than 44 are unproven here:
+# an fc44 artifact can fail to install on an older Fedora over a newer glibc or
+# library requirement, and no lane has run 43 or 45 through this recipe.
+
+# Static and booted, model-free Fedora authselect retirement lifecycle
+test-rpm-authselect release="44": (_fedora-lane-image release)
+    #!/usr/bin/env bash
+    set -euo pipefail
     bash test/rpm-authselect-contract.sh
-    podman build -t facelock-rpm-authselect-test -f test/Containerfile.rpm-authselect .
-    bash test/run-rpm-authselect-systemd.sh facelock-rpm-authselect-test
+    image="$(bash test/fedora-lane-image.sh '{{ release }}')"
+    podman build --build-arg "BASE_IMAGE=$image" \
+        -t facelock-rpm-authselect-test-f{{ release }} -f test/Containerfile.rpm-authselect .
+    bash test/run-rpm-authselect-systemd.sh facelock-rpm-authselect-test-f{{ release }}
 
 # Run both exact supported-suite Debian package gates.
 test-deb: test-deb-trixie-pkg test-deb-resolute-pkg
@@ -1006,22 +1031,45 @@ test-deb-resolute-pkg: (_require-models "1")
 # Same model requirement (and same opt-out) as the two Debian suite package gates.
 
 # Package test — build real .rpm, install via dnf, validate under booted systemd
-test-rpm-pkg: (_require-models "1") build-release
+test-rpm-pkg release="44": (_fedora-lane-image release) (_require-models "1") build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
-    test/run-pkg-validate-systemd.sh facelock-rpm-pkg
+    image="$(bash test/fedora-lane-image.sh '{{ release }}')"
+    podman build --build-arg "BASE_IMAGE=$image" --build-arg ORT_VERSION={{ _ort-version }} \
+        -t facelock-rpm-pkg-f{{ release }} -f test/Containerfile.rpm-e2e .
+    test/run-pkg-validate-systemd.sh facelock-rpm-pkg-f{{ release }}
+
+# dist/release-matrix.json gives Fedora 45 a lifecycle depth of build/runtime
+# smoke, so this deliberately stops short of the full lifecycle gate and never
+# substitutes for a Fedora 43 or 44 result.
+
+# Branched-release lane — build the package, then boot it for a runtime smoke
+test-rpm-smoke release="45": (_fedora-lane-image release) build-release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    image="$(bash test/fedora-lane-image.sh '{{ release }}')"
+    podman build --build-arg "BASE_IMAGE=$image" --build-arg ORT_VERSION={{ _ort-version }} \
+        -t facelock-rpm-smoke-f{{ release }} -f test/Containerfile.rpm-e2e .
+    bash test/run-rpm-smoke-systemd.sh facelock-rpm-smoke-f{{ release }}
+
+# Full lifecycle for 43 and 44, build plus runtime smoke for branched 45.
+
+# Every declared Fedora release target at its declared lifecycle depth
+test-rpm-lanes: (test-rpm-pkg "43") (test-rpm-pkg "44") (test-rpm-smoke "45")
 
 # Packit config schema gate — runs the real `packit` in a digest-pinned Fedora container
 test-packit-config:
     bash test/packit-config-validate.sh
 
 # COPR-equivalent build — Packit SRPM + mock from-source rebuild on a Fedora chroot (slow, opt-in)
-test-copr:
+test-copr release="44": (_fedora-lane-image release)
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build -t facelock-copr-test -f test/Containerfile.copr .
-    podman run --privileged --rm -v "$PWD:/repo:ro" facelock-copr-test
+    image="$(bash test/fedora-lane-image.sh '{{ release }}')"
+    podman build --build-arg "BASE_IMAGE=$image" \
+        -t facelock-copr-test-f{{ release }} -f test/Containerfile.copr .
+    podman run --privileged --rm -e COPR_CHROOT=fedora-{{ release }}-x86_64 \
+        -v "$PWD:/repo:ro" facelock-copr-test-f{{ release }}
 
 # Dev shell — interactive .deb container with host models for fast iteration (requires camera)
 test-deb-dev-shell:
@@ -1047,10 +1095,12 @@ test-deb-dev-shell:
         bash -c "/deb-package-lifecycle.sh install; cp /tmp/container-config.toml /etc/facelock/config.toml; cp /tmp/host-models/* /var/lib/facelock/models/ 2>/dev/null; exec bash"
 
 # Dev shell — interactive .rpm container with host models for fast iteration (requires camera)
-test-rpm-dev-shell: build-release
+test-rpm-dev-shell release="44": (_fedora-lane-image release) build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
+    image="$(bash test/fedora-lane-image.sh '{{ release }}')"
+    podman build --build-arg "BASE_IMAGE=$image" --build-arg ORT_VERSION={{ _ort-version }} \
+        -t facelock-rpm-pkg-f{{ release }} -f test/Containerfile.rpm-e2e .
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
@@ -1063,7 +1113,7 @@ test-rpm-dev-shell: build-release
     echo "Starting dev shell (Fedora, .rpm installed, host models). Try:"
     echo "  facelock enroll --user root --label myface"
     echo "  facelock test --user root"
-    podman run --rm -it $devices $mounts facelock-rpm-pkg \
+    podman run --rm -it $devices $mounts facelock-rpm-pkg-f{{ release }} \
         bash -c "cp /tmp/container-config.toml /etc/facelock/config.toml; cp /tmp/host-models/* /var/lib/facelock/models/ 2>/dev/null; exec bash"
 
 # Release shell — clean-room .deb container, real user experience (requires camera)
@@ -1087,10 +1137,12 @@ test-deb-release-shell:
         bash -c "/deb-package-lifecycle.sh install; cp /tmp/container-config.toml /etc/facelock/config.toml; exec bash"
 
 # Release shell — clean-room .rpm container, real user experience (requires camera)
-test-rpm-release-shell: build-release
+test-rpm-release-shell release="44": (_fedora-lane-image release) build-release
     #!/usr/bin/env bash
     set -euo pipefail
-    podman build --build-arg ORT_VERSION={{ _ort-version }} -t facelock-rpm-pkg -f test/Containerfile.rpm-e2e .
+    image="$(bash test/fedora-lane-image.sh '{{ release }}')"
+    podman build --build-arg "BASE_IMAGE=$image" --build-arg ORT_VERSION={{ _ort-version }} \
+        -t facelock-rpm-pkg-f{{ release }} -f test/Containerfile.rpm-e2e .
     devices=""
     for d in /dev/video*; do
         [ -e "$d" ] && devices="$devices --device $d"
@@ -1100,7 +1152,7 @@ test-rpm-release-shell: build-release
     echo "  facelock setup"
     echo "  facelock enroll --user root --label myface"
     echo "  facelock test --user root"
-    podman run --rm -it $devices $mounts facelock-rpm-pkg \
+    podman run --rm -it $devices $mounts facelock-rpm-pkg-f{{ release }} \
         bash -c "cp /tmp/container-config.toml /etc/facelock/config.toml; exec bash"
 
 # Test APT repo generation locally from both exact manifests (requires reprepro + gpg).

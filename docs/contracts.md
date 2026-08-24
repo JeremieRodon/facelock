@@ -2284,7 +2284,8 @@ mechanisms:
 |----------------------|--------------------------------------|
 | Debian `remove` | `/etc/facelock/config.toml` is a Debian conffile and remains at its installed path. Biometric and operational state also remains |
 | Debian `purge` | `dpkg` removes the conffile, and the post-removal purge may then remove only safe remnants inside the compiled roots. Unsafe and external remnants are retained and reported |
-| RPM erase | `/etc/facelock/config.toml` is RPM `%config(noreplace)`. RPM removes an unmodified copy and retains an administrator-modified copy according to RPM semantics, commonly as `config.toml.rpmsave`. A `.rpmsave` is retained state, not evidence of a failed erase and not something a Facelock script deletes |
+| RPM erase | `/etc/facelock/config.toml` is RPM `%config(noreplace)`. An unmodified copy is removed outright and leaves nothing behind. An administrator-modified copy leaves `config.toml` and is retained, byte for byte, as `config.toml.rpmsave`. A `.rpmsave` is retained state, not evidence of a failed erase and not something a Facelock script deletes |
+| RPM upgrade | An unmodified `/etc/facelock/config.toml` is replaced in place by the new packaged file, with no `.rpmnew` and no `.rpmsave`. An administrator-modified one is kept byte for byte at its own path and the new packaged file arrives as `config.toml.rpmnew`, which Facelock never activates or deletes. `.rpmnew` is written only when the packaged config actually changed between the two versions |
 | Arch package removal | the `backup` entry follows pacman's native saved-configuration behavior (including `.pacsave` when applicable). Facelock lifecycle code does not bypass it |
 | `just uninstall` | no package manager owns the config, so the source-install uninstall preserves `/etc/facelock` with the biometric and operational state |
 

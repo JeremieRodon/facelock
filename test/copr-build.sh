@@ -16,6 +16,25 @@ CHROOT="${COPR_CHROOT:-fedora-44-x86_64}"
 RESULT=0
 section() { echo; echo "==== $* ===="; }
 
+# dist/release-matrix.json is the authority for which chroots are staging
+# targets. Refusing anything outside it keeps a lane from silently building
+# against Rawhide, which the matrix marks optional/experimental and which may
+# never stand in for a Fedora 43, 44, or 45 result.
+if ! python3 - "$CHROOT" <<'PY'
+import json
+import sys
+
+with open("/repo/dist/release-matrix.json", encoding="utf-8") as handle:
+    targets = json.load(handle)["fedora"]["staging_copr_targets"]
+if sys.argv[1] not in targets:
+    print(f"COPR_CHROOT {sys.argv[1]!r} is not a declared staging target: {sorted(targets)}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  echo "FAIL: undeclared COPR chroot"
+  exit 1
+fi
+
 section "Copy repo to writable workdir"
 mkdir -p /work
 tar -C /repo --exclude='./target' -cf - . | tar -C /work -xf -
