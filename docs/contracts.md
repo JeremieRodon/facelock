@@ -2033,6 +2033,17 @@ without selecting it. Exact known legacy-copy migration belongs to
 administrator-owned shadow. Package validation requires the installed TPM
 command surface and the suite-native `libtss2` dependency closure.
 
+Two lanes read the same declared `Depends`. One resolves the exact candidate on
+a pristine suite base and requires every declared dependency to be installed
+there. The other installs it into the booted harness image, which also carries
+systemd, a C toolchain, and a software TPM, and requires every declared
+dependency to be shipped by the suite base, named by the harness exemption list
+with its reason, or resolved by the runtime transaction itself. Both directions
+of that list are enforced: an unlisted dependency the harness satisfies fails
+the gate, and so does a listed pattern that no longer matches one. Supplying an
+exact package to a harness image that carries no lifecycle script is a failure,
+not a skipped lane.
+
 Release validation runs lintian on every built binary package and fails on
 error-severity tags. Deliberate deviations are suppressed in
 `.github/workflows/scripts/validate-deb.sh`, each with a recorded reason;
