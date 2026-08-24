@@ -814,6 +814,8 @@ for installed_path in \
     grep -Fq "$installed_path" .github/workflows/scripts/validate-deb.sh ||
         fail "Debian archive validation does not require ORT payload: $installed_path"
 done
+grep -Fq 'lintian --fail-on error' .github/workflows/scripts/validate-deb.sh ||
+    fail "Debian archive validation must gate on error-severity lintian tags"
 grep -Fq 'ORT_LIBRARY_FILE="/usr/lib/facelock/libonnxruntime.so"' test/pkg-validate.sh ||
     fail "installed package validation does not pin the ORT library path"
 grep -Fq 'ORT_DOCUMENT_ROOT="/usr/share/doc/facelock/onnxruntime"' test/pkg-validate.sh ||

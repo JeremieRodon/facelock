@@ -2033,6 +2033,11 @@ without selecting it. Exact known legacy-copy migration belongs to
 administrator-owned shadow. Package validation requires the installed TPM
 command surface and the suite-native `libtss2` dependency closure.
 
+Release validation runs lintian on every built binary package and fails on
+error-severity tags. Deliberate deviations are suppressed in
+`.github/workflows/scripts/validate-deb.sh`, each with a recorded reason;
+warning and lower severities are reported without gating.
+
 Compat 13's generated `dh_installtmpfiles` post-install snippet is the sole
 install-time tmpfiles activation and invokes `systemd-tmpfiles` for
 `facelock.conf` only. The source `postinst` never runs a global tmpfiles create,
