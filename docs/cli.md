@@ -1011,7 +1011,7 @@ facelock data purge --allow-destruction --yes --leave-activation-barred
 |------|---------|-------------|
 | `--allow-destruction` | false | Authorize irreversible destruction. Required; nothing else implies it |
 | `--yes` | false | Skip the confirmation prompt (also `--no-confirm`, `-y`) |
-| `--dry-run` | false | Report what purge would find and remove nothing |
+| `--dry-run` | false | Classify configured paths and remove nothing. Does **not** examine the contents of the roots |
 | `--leave-activation-barred` | false | Keep the daemon stopped and D-Bus activation barred afterwards |
 | `--json` | false | Emit the machine document instead of the human report |
 
@@ -1067,11 +1067,13 @@ data.
 
 #### Reading the report
 
-The exit status is 0 whenever the purge ran, whatever it could not remove — a
-safety refusal is a reported outcome, not a crash, and the same rule the Debian
-purge follows so a failed removal cannot strand a half-purged install. **The
-report, not the exit code, is the answer.** A run that retained anything says
-so in the negative and never claims completeness:
+The exit status is 0 whenever the purge ran and the daemon lifecycle was
+restored, whatever the purge could not remove — a safety refusal is a reported
+outcome, not a crash, and the same rule the Debian purge follows so a failed
+removal cannot strand a half-purged install. A nonzero exit *after* a rendered
+report means the purge ran and the lifecycle needs attention, not that nothing
+happened. **The report, not the exit code, is the answer.** A run that retained
+anything says so in the negative and never claims completeness:
 
 ```
 Removed 14 name(s) from the compiled Facelock roots.
@@ -1088,10 +1090,15 @@ SSDs, snapshots, or backups.
 
 With `--json`, branch on `complete` — it is the engine's own verdict, false
 whenever a remnant, an external path, an unclassifiable configuration or an
-interrupt occurred:
+interrupt occurred. A document is emitted only when a pass actually ran, so its
+presence distinguishes "the purge ran" from "the purge never started", and
+`lifecycle_restored` distinguishes a clean finish from one that needs
+attention:
 
 ```json
 {
+  "mode": "purge",
+  "roots_examined": true,
   "removed": [{"logical": "/var/lib/facelock/enrolled/alice", "kind": "File"}],
   "remnants": [
     {
@@ -1105,12 +1112,49 @@ interrupt occurred:
   "complete": false,
   "interrupted": false,
   "secure_erasure": false,
+  "lifecycle_restored": true,
+  "lifecycle_error": null,
   "activation_barred": false,
   "activation_barrier_path": null
 }
 ```
 
 `secure_erasure` is a constant `false`, present so no consumer has to infer it.
+
+#### What `--dry-run` does and does not tell you
+
+A dry run classifies the **configured paths** and stops. It does not open the
+compiled roots, so it reports nothing about what is stored inside them:
+
+```
+Dry run: nothing will be removed. Reporting what purge would find.
+Scope: configured paths only. The contents of /etc/facelock, /var/lib/facelock
+and /var/log/facelock were NOT examined, so this reports nothing about what is
+stored there. A real purge traverses them and reports what it removed and
+retained.
+```
+
+Its document says the same in `mode` and `roots_examined`, and gives **no**
+completeness verdict — `complete` is `null`, never `true`. An empty dry run
+means "nothing was checked", not "nothing is there":
+
+```json
+{"mode": "dry-run", "roots_examined": false, "complete": null, "removed": []}
+```
+
+Use it to see which configured paths fall outside the roots before authorizing
+a purge, not to confirm that data is gone.
+
+#### If the purge is interrupted
+
+`Ctrl-C` raises the lease's interrupt flag; the engine stops at a deletion
+boundary and the daemon is restored only after it has stopped. The process is
+then terminated by the signal, so an interrupted run may print a partial report
+or none at all — the report is written before the daemon is restored, but the
+signal can still win the race.
+
+**Repeating a purge is always safe**, so the reliable way to see what remains
+after an interrupt is to run it again.
 
 ## User Resolution
 

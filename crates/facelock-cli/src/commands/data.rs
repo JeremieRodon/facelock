@@ -76,6 +76,21 @@ enum Lifecycle {
     Restored,
     /// The barrier is still in place at this path.
     Barred(String),
+    /// Release could not restore the recorded state. The purge still
+    /// happened and is still reported; this names what needs attention.
+    RestoreFailed(String),
+}
+
+/// Which pass produced a report. Report mode does not traverse the roots at
+/// all — the engine classifies configured paths and stops — so the two
+/// modes may not render the same sentences. Claiming "nothing was retained"
+/// after examining nothing is the inference the frozen contract forbids.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// `--dry-run`: configured-path classification only.
+    DryRun,
+    /// A real purge: the roots were traversed.
+    Purge,
 }
 
 pub fn run(request: PurgeRequest) -> anyhow::Result<()> {
@@ -98,7 +113,7 @@ pub fn run(request: PurgeRequest) -> anyhow::Result<()> {
             Terminal.info(&PurgeMessage::DryRunHeader);
         }
         let report = report_remnants(&PurgeOptions::production());
-        render_report(&report, json, None);
+        render_report(&report, Pass::DryRun, json, None);
         return Ok(());
     }
 
@@ -123,37 +138,70 @@ pub fn run(request: PurgeRequest) -> anyhow::Result<()> {
     // between the engine returning and this call.
     lease.mark_operation_finished();
 
+    // Release *after* capturing its outcome, and render before returning it.
+    // The destruction already happened and cannot be undone, so the report
+    // is the only record of what is gone and what survived; propagating a
+    // restore failure with `?` here would discard it and leave a `--json`
+    // consumer unable to tell "the purge never ran" from "the purge ran and
+    // the daemon did not come back". `mark_operation_finished` above already
+    // fences the signal race, so nothing is owed to ordering here.
+    //
+    // Rendering ahead of release also gives an interrupted run its only
+    // chance to say anything: release joins the signal thread, and that
+    // thread terminates the process as soon as its restore finishes.
     let lifecycle = if leave_activation_barred {
-        Lifecycle::Barred(
-            lease
-                .release_leaving_activation_barred()?
-                .display()
-                .to_string(),
-        )
+        match lease.release_leaving_activation_barred() {
+            Ok(path) => Lifecycle::Barred(path.display().to_string()),
+            Err(error) => Lifecycle::RestoreFailed(error.to_string()),
+        }
     } else {
-        lease.release()?;
-        Lifecycle::Restored
+        match lease.release() {
+            Ok(()) => Lifecycle::Restored,
+            Err(error) => Lifecycle::RestoreFailed(error.to_string()),
+        }
+    };
+    let restore_failure = match &lifecycle {
+        Lifecycle::RestoreFailed(reason) => Some(reason.clone()),
+        _ => None,
     };
 
-    render_report(&report, json, Some(lifecycle));
-    Ok(())
+    render_report(&report, Pass::Purge, json, Some(lifecycle));
+
+    // Reported first, then surfaced in the exit status: face authentication
+    // may be off until someone acts on it.
+    match restore_failure {
+        Some(reason) => Err(anyhow::anyhow!("{reason}")),
+        None => Ok(()),
+    }
 }
 
 /// Render one report, honestly.
 ///
 /// `lifecycle` is present only when a lease was held; a dry run holds none.
-fn render_report(report: &PurgeReport, json: bool, lifecycle: Option<Lifecycle>) {
+///
+/// The `pass` argument is what keeps a dry run from overclaiming. Report mode
+/// removes nothing *and examines nothing inside the roots*, so the two
+/// sentences a purge ends with — "removed nothing" and "nothing was
+/// retained" — would both be true statements about work that never happened,
+/// and a reader could conclude their biometric data was already gone. A dry
+/// run therefore states its actual scope instead of a verdict.
+fn render_report(report: &PurgeReport, pass: Pass, json: bool, lifecycle: Option<Lifecycle>) {
     if json {
-        payload(&json_document(report, lifecycle.as_ref()));
+        payload(&json_document(report, pass, lifecycle.as_ref()));
         return;
     }
 
-    if report.removed.is_empty() {
-        Terminal.info(&PurgeMessage::NothingRemoved);
-    } else {
-        Terminal.info(&PurgeMessage::RemovedCount {
-            count: report.removed.len(),
-        });
+    match pass {
+        Pass::DryRun => Terminal.info(&PurgeMessage::DryRunScope),
+        Pass::Purge => {
+            if report.removed.is_empty() {
+                Terminal.info(&PurgeMessage::NothingRemoved);
+            } else {
+                Terminal.info(&PurgeMessage::RemovedCount {
+                    count: report.removed.len(),
+                });
+            }
+        }
     }
 
     if interrupted(report) {
@@ -191,20 +239,27 @@ fn render_report(report: &PurgeReport, json: bool, lifecycle: Option<Lifecycle>)
     }
 
     // The verdict comes from the engine's own refusal to claim completeness,
-    // never from "deletion did not error".
-    if report.is_complete() {
-        Terminal.info(&PurgeMessage::CompleteWithinRoots);
-    } else {
-        Terminal.info(&PurgeMessage::NotComplete);
+    // never from "deletion did not error" — and it is a verdict about a
+    // purge, so a dry run does not render one at all.
+    if pass == Pass::Purge {
+        if report.is_complete() {
+            Terminal.info(&PurgeMessage::CompleteWithinRoots);
+        } else {
+            Terminal.info(&PurgeMessage::NotComplete);
+        }
     }
 
-    // Unconditional: true of a complete run and an incomplete one alike.
+    // Unconditional: true of a complete run and an incomplete one alike, and
+    // worth learning before authorizing one.
     Terminal.info(&PurgeMessage::ErasureCaveat);
 
     match lifecycle {
         Some(Lifecycle::Restored) => Terminal.info(&PurgeMessage::DaemonRestored),
         Some(Lifecycle::Barred(path)) => {
             Terminal.info(&PurgeMessage::ActivationLeftBarred { path })
+        }
+        Some(Lifecycle::RestoreFailed(reason)) => {
+            Terminal.error(&PurgeMessage::LifecycleRestoreFailed { reason })
         }
         None => {}
     }
@@ -217,16 +272,43 @@ fn render_report(report: &PurgeReport, json: bool, lifecycle: Option<Lifecycle>)
 /// status alone would read a partial purge as a finished one, which is the
 /// claim `docs/contracts.md` forbids. `secure_erasure` is a constant `false`
 /// for the same reason: it is there so no consumer has to infer it.
-fn json_document(report: &PurgeReport, lifecycle: Option<&Lifecycle>) -> String {
+fn json_document(report: &PurgeReport, pass: Pass, lifecycle: Option<&Lifecycle>) -> String {
+    // `complete` is a verdict about a purge. In report mode the roots were
+    // never opened, so there is no verdict to give and the field is null —
+    // never `true`, which a consumer would read as "all data is gone".
+    // `roots_examined` says plainly which it was.
+    let complete = match pass {
+        Pass::Purge => serde_json::Value::Bool(report.is_complete()),
+        Pass::DryRun => serde_json::Value::Null,
+    };
     serde_json::json!({
+        "mode": match pass {
+            Pass::Purge => "purge",
+            Pass::DryRun => "dry-run",
+        },
+        "roots_examined": pass == Pass::Purge,
         "removed": report.removed,
         "remnants": report.remnants,
         "external": report.external,
         "config_note": report.config_note,
-        "complete": report.is_complete(),
+        "complete": complete,
         "interrupted": interrupted(report),
         "secure_erasure": false,
-        "activation_barred": matches!(lifecycle, Some(Lifecycle::Barred(_))),
+        "lifecycle_restored": match lifecycle {
+            Some(Lifecycle::Restored) => serde_json::Value::Bool(true),
+            Some(Lifecycle::Barred(_)) | Some(Lifecycle::RestoreFailed(_)) => {
+                serde_json::Value::Bool(false)
+            }
+            None => serde_json::Value::Null,
+        },
+        "lifecycle_error": match lifecycle {
+            Some(Lifecycle::RestoreFailed(reason)) => serde_json::Value::String(reason.clone()),
+            _ => serde_json::Value::Null,
+        },
+        "activation_barred": matches!(
+            lifecycle,
+            Some(Lifecycle::Barred(_)) | Some(Lifecycle::RestoreFailed(_))
+        ),
         "activation_barrier_path": match lifecycle {
             Some(Lifecycle::Barred(path)) => serde_json::Value::String(path.clone()),
             _ => serde_json::Value::Null,
@@ -277,7 +359,11 @@ mod tests {
     }
 
     fn document(report: &PurgeReport, lifecycle: Option<&Lifecycle>) -> serde_json::Value {
-        serde_json::from_str(&json_document(report, lifecycle)).expect("valid JSON")
+        serde_json::from_str(&json_document(report, Pass::Purge, lifecycle)).expect("valid JSON")
+    }
+
+    fn dry_run_document(report: &PurgeReport) -> serde_json::Value {
+        serde_json::from_str(&json_document(report, Pass::DryRun, None)).expect("valid JSON")
     }
 
     #[test]
@@ -369,5 +455,68 @@ mod tests {
             sanitize_for_display("/etc/facelock/\x1b[31mevil"),
             "/etc/facelock/\\x1b[31mevil"
         );
+    }
+
+    /// A dry run examines nothing inside the roots, so it must not report a
+    /// completeness verdict. Reporting `complete: true` on a machine full of
+    /// enrollments would let a user conclude their biometric data was
+    /// already gone — the "claim inferred from absence of evidence" the
+    /// frozen contract forbids.
+    #[test]
+    fn a_dry_run_never_claims_completeness() {
+        // Exactly what `report_remnants` returns on a machine with a clean
+        // config: no externals, no note, and no traversal behind it.
+        let empty = report_with(&[], vec![], vec![]);
+        assert!(
+            empty.is_complete(),
+            "the engine's own verdict is vacuously true here, which is the trap"
+        );
+
+        let dry = dry_run_document(&empty);
+        assert!(
+            dry["complete"].is_null(),
+            "a dry run must give no verdict, got {}",
+            dry["complete"]
+        );
+        assert_eq!(dry["mode"], "dry-run");
+        assert_eq!(dry["roots_examined"], serde_json::json!(false));
+
+        // The same report through a real purge does carry the verdict.
+        let purged = document(&empty, None);
+        assert_eq!(purged["complete"], serde_json::json!(true));
+        assert_eq!(purged["roots_examined"], serde_json::json!(true));
+    }
+
+    /// A failed restore is reported, not swallowed: the destruction already
+    /// happened, so the document must still say what was removed and must
+    /// let a consumer tell this apart from "the purge never ran".
+    #[test]
+    fn a_failed_restore_still_reports_the_purge() {
+        let report = report_with(&["/var/lib/facelock/facelock.db"], vec![], vec![]);
+        let failed = Lifecycle::RestoreFailed("could not restart facelock-daemon.service".into());
+        let document = document(&report, Some(&failed));
+
+        assert_eq!(document["mode"], "purge");
+        assert_eq!(
+            document["removed"][0]["logical"],
+            "/var/lib/facelock/facelock.db"
+        );
+        assert_eq!(document["complete"], serde_json::json!(true));
+        assert_eq!(document["lifecycle_restored"], serde_json::json!(false));
+        assert_eq!(
+            document["lifecycle_error"],
+            "could not restart facelock-daemon.service"
+        );
+        assert_eq!(document["activation_barred"], serde_json::json!(true));
+    }
+
+    /// A clean run says the lifecycle came back, and carries no error.
+    #[test]
+    fn a_restored_lifecycle_is_reported_as_such() {
+        let report = report_with(&[], vec![], vec![]);
+        let document = document(&report, Some(&Lifecycle::Restored));
+        assert_eq!(document["lifecycle_restored"], serde_json::json!(true));
+        assert!(document["lifecycle_error"].is_null());
+        assert_eq!(document["activation_barred"], serde_json::json!(false));
     }
 }

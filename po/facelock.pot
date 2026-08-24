@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: facelock\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-23 18:48-0700\n"
+"POT-Creation-Date: 2026-08-23 20:06-0700\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -726,80 +726,91 @@ msgstr ""
 msgid "No directory on the search path could be read: {dirs}."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:52
+#: crates/facelock-cli/src/message/purge.rs:54
 msgid ""
 "Refusing to destroy biometric data without explicit authorization.\n"
 "  Re-run with --allow-destruction. --yes only skips the prompt; it does not authorize destruction.\n"
 "  Use --dry-run to see what would be removed."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:55
+#: crates/facelock-cli/src/message/purge.rs:57
 msgid "This permanently destroys every enrolled face and all retained Facelock state in /etc/facelock, /var/lib/facelock and /var/log/facelock. Continue?"
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:57
+#: crates/facelock-cli/src/message/purge.rs:59
 msgid "Cancelled. Nothing was removed."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:59
+#: crates/facelock-cli/src/message/purge.rs:61
 msgid "Dry run: nothing will be removed. Reporting what purge would find."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:62
+#: crates/facelock-cli/src/message/purge.rs:69
+msgid "Scope: configured paths only. The contents of /etc/facelock, /var/lib/facelock and /var/log/facelock were NOT examined, so this reports nothing about what is stored there. A real purge traverses them and reports what it removed and retained."
+msgstr ""
+
+#: crates/facelock-cli/src/message/purge.rs:72
 #, python-brace-format
 msgid "Removed {count} name(s) from the compiled Facelock roots."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:65
+#: crates/facelock-cli/src/message/purge.rs:75
 msgid "Removed nothing: there was no retained state to remove."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:67
+#: crates/facelock-cli/src/message/purge.rs:77
 #, python-brace-format
 msgid "{count} object(s) inside the roots were retained:"
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:71
+#: crates/facelock-cli/src/message/purge.rs:81
 #, python-brace-format
 msgid "  {logical} — {detail}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:76
+#: crates/facelock-cli/src/message/purge.rs:86
 #, python-brace-format
 msgid "{count} configured path(s) lie outside the compiled roots and were left untouched by design:"
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:81
+#: crates/facelock-cli/src/message/purge.rs:91
 #, python-brace-format
 msgid "  {field} = {path}"
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:86
+#: crates/facelock-cli/src/message/purge.rs:96
 #, python-brace-format
 msgid "The configuration could not be fully classified ({reason}), so external state may exist that this report does not name."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:91
+#: crates/facelock-cli/src/message/purge.rs:101
 msgid "Interrupted: the purge stopped at a deletion boundary before finishing."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:96
+#: crates/facelock-cli/src/message/purge.rs:106
 msgid "Facelock data was NOT completely destroyed. The remnants above are still present; re-run after resolving them, or remove the external paths yourself."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:99
+#: crates/facelock-cli/src/message/purge.rs:109
 msgid "Nothing was retained inside the compiled roots, and no configured path lies outside them."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:104
+#: crates/facelock-cli/src/message/purge.rs:114
 msgid "Removing a name is not erasure. Filesystem deletion does not securely erase SSDs, snapshots, or backups."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:106
+#: crates/facelock-cli/src/message/purge.rs:116
 msgid "Daemon lifecycle restored to its prior state."
 msgstr ""
 
-#: crates/facelock-cli/src/message/purge.rs:109
+#: crates/facelock-cli/src/message/purge.rs:121
+#, python-brace-format
+msgid ""
+"The purge finished and is reported above, but the daemon lifecycle could not be restored: {reason}\n"
+"Face authentication may stay off until this is resolved. Check `systemctl status facelock-daemon.service` and /run/systemd/system.control."
+msgstr ""
+
+#: crates/facelock-cli/src/message/purge.rs:127
 #, python-brace-format
 msgid "Daemon activation is still barred by {path}. Face authentication stays off until you remove that file and run `systemctl daemon-reload`, or reboot."
 msgstr ""

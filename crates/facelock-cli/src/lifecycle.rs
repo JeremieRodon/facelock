@@ -742,7 +742,11 @@ fn restore(state: RestoreState, mode: RestoreMode) -> Result<(), LifecycleError>
         }
         RestoreMode::LeaveBarred => {
             if let Some(barrier) = barrier {
-                tracing::info!(
+                // `warn`, not `info`: the CLI's default `facelock=warn`
+                // filter drops info, and this is the only place the user is
+                // told where the barrier is and how to undo it. Face
+                // authentication stays off until they act on it.
+                tracing::warn!(
                     "leaving activation barred at {}; remove it and run \
                      `systemctl daemon-reload` (or reboot) to restore face \
                      authentication",
@@ -1099,8 +1103,12 @@ fn admit(props: &UnitProperties, adopted_stale_barrier: bool) -> Result<(), Life
             return Err(LifecycleError::UnitStateNotAdmissible {
                 state: "masked".to_string(),
                 advice: "the unit is masked outside facelock's control; \
-                         remove the mask (see `systemctl cat` and \
-                         `systemctl unmask`), then retry"
+                         inspect /run/systemd/system.control and \
+                         /etc/systemd/system.control for a foreign \
+                         control-tier file and remove it, then run \
+                         `systemctl daemon-reload` and retry (`systemctl \
+                         unmask` clears an /etc mask symlink, not a \
+                         control-tier mask)"
                     .to_string(),
             });
         }

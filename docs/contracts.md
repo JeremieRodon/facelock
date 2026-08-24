@@ -88,7 +88,7 @@ follow it.
 | `facelock audit` | View audit log |
 | `facelock bench` | Benchmarks |
 | `facelock data purge` | Destroy retained Facelock state inside the compiled roots. Root, and additionally `--allow-destruction`. Holds the lifecycle exclusion lease for the duration; reports every remnant and never claims complete destruction (see "Fixed-root purge boundary") |
-| `facelock data purge --dry-run` | Report what purge would find and remove nothing. Root, no authorization flag, no lease — a preview must not stop the daemon as a side effect |
+| `facelock data purge --dry-run` | Classify configured paths and remove nothing. Root, no authorization flag, no lease — a preview must not stop the daemon as a side effect. Does not traverse the roots, and therefore reports no completeness verdict |
 | `facelock data purge --leave-activation-barred` | Keep the daemon stopped and D-Bus activation barred after purging, for a caller that uninstalls next. Conflicts with `--dry-run` |
 
 **Where a command goes.** A top-level command names a user task and keeps its
@@ -2660,12 +2660,40 @@ removing a name is not erasure. The `--json` document carries `complete` for a
 script to branch on, plus a constant `secure_erasure: false` so no consumer has
 to infer it.
 
-**Exit status is not the answer.** The command exits 0 whenever the purge ran,
-whatever it could not remove, for the same reason the Debian purge returns
-success after reporting safety refusals: a safety refusal is a reported outcome,
-not a crash, and an install must not be strandable in a half-purged state by a
-caller that treated a refusal as a failure. Callers branch on the report, or on
-`complete` in the document.
+**Exit status is not the answer.** The command exits 0 whenever the purge ran
+and the lifecycle was restored, whatever the purge could not remove, for the
+same reason the Debian purge returns success after reporting safety refusals: a
+safety refusal is a reported outcome, not a crash, and an install must not be
+strandable in a half-purged state by a caller that treated a refusal as a
+failure. Callers branch on the report, or on `complete` in the document.
+
+**A failed lifecycle restore is reported before it is returned.** The
+destruction is irreversible and the report is its only record, so a release
+that cannot restore the recorded daemon state renders the full report first —
+remnants, external paths, erasure caveat, or the complete `--json` document —
+and only then returns the error. Discarding the report to propagate the restore
+failure would leave a caller unable to distinguish "the purge never ran" from
+"the purge ran and the daemon did not come back", after their biometric state
+was already destroyed. The document therefore carries `lifecycle_restored` and
+`lifecycle_error` beside the purge result, and its mere presence means a pass
+ran. The nonzero exit that follows means the lifecycle needs attention, not
+that nothing happened.
+
+**A dry run gives no completeness verdict.** Report mode classifies the
+configured paths and never opens the compiled roots, so it has examined nothing
+that a completeness claim would be about. It states its scope instead, and its
+document reports `mode: "dry-run"`, `roots_examined: false` and `complete:
+null` — never `true`, which a reader on a machine full of enrollments could
+take for "my biometric data is already gone". That inference from absence of
+evidence is exactly what this section forbids, and it is forbidden of the
+preview as much as of the purge.
+
+**An interrupted run may report nothing.** The report is rendered before the
+lease is released, which gives an interrupt its only chance to be heard, but the
+signal thread terminates the process as soon as its restore completes and can
+still win that race. Repetition is safe by construction, so the contract is that
+a caller re-runs to learn what remains rather than that an interrupted run is
+guaranteed to explain itself.
 
 Repeating a purge is safe by construction, and the report is what makes that
 useful: every refusal leaves the object in place with a stated reason, so a

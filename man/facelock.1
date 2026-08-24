@@ -678,9 +678,17 @@ Skip the confirmation prompt (also
 .BR \-\-no\-confirm ).
 .TP
 .B \-\-dry\-run
-Report what purge would find and remove nothing. Requires root but not
+Classify the configured paths and remove nothing. Requires root but not
 .BR \-\-allow\-destruction ,
-and takes no lifecycle lease, so it does not stop the daemon.
+and takes no lifecycle lease, so it does not stop the daemon. It does
+.I not
+open the compiled roots, so it reports nothing about what is stored in
+them and gives no completeness verdict: in its document
+.I complete
+is null and
+.I roots_examined
+is false. An empty dry run means nothing was checked, not that nothing is
+there.
 .TP
 .B \-\-leave\-activation\-barred
 Keep the daemon stopped and D\-Bus activation barred after purging, for a
@@ -716,9 +724,14 @@ success, on error, on panic, and on
 which stops the traversal at a deletion boundary before the daemon is
 allowed back. Repeating a purge is safe.
 .PP
-The exit status is 0 whenever the purge ran, whatever it could not remove;
-the report, not the exit code, is the answer. A run that retained anything
-says so and names every remnant.
+The exit status is 0 whenever the purge ran and the daemon lifecycle was
+restored, whatever the purge could not remove; the report, not the exit
+code, is the answer. A run that retained anything says so and names every
+remnant. If the lifecycle cannot be restored the full report is printed
+first and the error returned after it, so a nonzero exit following a report
+means the daemon needs attention, not that nothing happened. An interrupted
+run may print a partial report or none at all; repeating a purge is safe, so
+re-run it to see what remains.
 .B
 Removing a name is not erasure:
 filesystem deletion does not securely erase SSDs, snapshots, or backups.

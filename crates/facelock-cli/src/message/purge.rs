@@ -23,6 +23,7 @@ pub enum PurgeMessage {
 
     // -- what the run did --
     DryRunHeader,
+    DryRunScope,
     RemovedCount { count: usize },
     NothingRemoved,
 
@@ -40,6 +41,7 @@ pub enum PurgeMessage {
     // -- lifecycle outcome --
     DaemonRestored,
     ActivationLeftBarred { path: String },
+    LifecycleRestoreFailed { reason: String },
 }
 
 impl Message for PurgeMessage {
@@ -58,6 +60,14 @@ impl Message for PurgeMessage {
             DryRunHeader => {
                 translate("Dry run: nothing will be removed. Reporting what purge would find.")
             }
+            // The scope sentence, not a verdict. Report mode classifies the
+            // configured paths and stops; it never opens the roots. Saying
+            // "removed nothing" or "nothing was retained" here would be a
+            // claim about work that did not happen, and a reader could take
+            // it for "my biometric data is already gone".
+            DryRunScope => translate(
+                "Scope: configured paths only. The contents of /etc/facelock, /var/lib/facelock and /var/log/facelock were NOT examined, so this reports nothing about what is stored there. A real purge traverses them and reports what it removed and retained.",
+            ),
             RemovedCount { count } => fill(
                 translate("Removed {count} name(s) from the compiled Facelock roots."),
                 &[("count", count.to_string())],
@@ -104,6 +114,14 @@ impl Message for PurgeMessage {
                 "Removing a name is not erasure. Filesystem deletion does not securely erase SSDs, snapshots, or backups.",
             ),
             DaemonRestored => translate("Daemon lifecycle restored to its prior state."),
+            // The purge is already done and already reported above; this is
+            // about the daemon, and it needs someone to act.
+            LifecycleRestoreFailed { reason } => fill(
+                translate(
+                    "The purge finished and is reported above, but the daemon lifecycle could not be restored: {reason}\nFace authentication may stay off until this is resolved. Check `systemctl status facelock-daemon.service` and /run/systemd/system.control.",
+                ),
+                &[("reason", reason.clone())],
+            ),
             ActivationLeftBarred { path } => fill(
                 translate(
                     "Daemon activation is still barred by {path}. Face authentication stays off until you remove that file and run `systemctl daemon-reload`, or reboot.",
@@ -117,7 +135,7 @@ impl Message for PurgeMessage {
 /// One sample per variant, in enum order, for the sweeps in [`super::Samples`].
 #[cfg(test)]
 impl super::Samples for PurgeMessage {
-    const VARIANT_COUNT: usize = 17;
+    const VARIANT_COUNT: usize = 19;
 
     fn samples() -> Vec<Self> {
         use PurgeMessage::*;
@@ -126,6 +144,7 @@ impl super::Samples for PurgeMessage {
             ConfirmPurge,
             Cancelled,
             DryRunHeader,
+            DryRunScope,
             RemovedCount { count: 3 },
             NothingRemoved,
             RemnantsHeader { count: 2 },
@@ -147,6 +166,7 @@ impl super::Samples for PurgeMessage {
             ActivationLeftBarred {
                 path: s("/run/systemd/system.control/facelock-daemon.service"),
             },
+            LifecycleRestoreFailed { reason: s("r") },
         ]
     }
 }

@@ -235,10 +235,19 @@ fn require_root_for(command: &Commands) -> anyhow::Result<()> {
         // Dispatched ahead of the shared parse — or, for `status`, returned
         // before this gate is consulted. Each owns its privilege decision:
         // `status` checks root before its first line of output, `config
-        // edit` / `daemon` / `setup` / `pam` check inside the command, and
-        // the rest are unprivileged by design (DEC-6). Reaching this arm is
-        // a dispatch bug, same as the `unreachable!` group at the bottom of
-        // `main`.
+        // edit` / `daemon` / `setup` / `pam` / `data` check inside the
+        // command, and the rest are unprivileged by design (DEC-6).
+        // Reaching this arm is a dispatch bug, same as the `unreachable!`
+        // group at the bottom of `main`.
+        //
+        // `data purge` is root-only and hard-error class, but its check
+        // cannot live here: this gate runs only for commands that reach the
+        // shared config parse, and `data` is deliberately dispatched ahead
+        // of it so a missing or broken `config.toml` cannot stop someone
+        // destroying their biometric state. Moving the check here would mean
+        // moving the dispatch after the parse and losing that property, so
+        // the check stays first in `commands::data::run` — ahead of the
+        // authorization, the prompt and the lease (C6).
         Commands::Setup(..)
         | Commands::IsEnrolled { .. }
         | Commands::Capabilities { .. }
@@ -246,6 +255,7 @@ fn require_root_for(command: &Commands) -> anyhow::Result<()> {
         | Commands::Hyprlock { .. }
         | Commands::Config { .. }
         | Commands::Daemon { .. }
+        | Commands::Data { .. }
         | Commands::Auth { .. }
         | Commands::Status { .. } => unreachable!("not dispatched through the root gate"),
     }
