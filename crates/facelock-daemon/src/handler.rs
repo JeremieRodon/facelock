@@ -4,7 +4,7 @@ use facelock_camera::MMAP_BUFFERS;
 use facelock_core::config::{Config, DeviceConfig, EncryptionMethod};
 use facelock_core::ipc::PreviewFace;
 use facelock_core::traits::{CameraSource, FaceProcessor};
-use facelock_core::types::best_match;
+use facelock_core::types::{FaceEmbedding, Wiped, best_match};
 use facelock_store::FaceStore;
 use image::codecs::jpeg::JpegEncoder;
 use tracing::{debug, info, warn};
@@ -550,6 +550,28 @@ impl<C: CameraSource> CameraLease<C> {
             self.camera = None;
         }
     }
+
+    /// Whether a camera stream is currently open — in flight or held warm.
+    /// The preview embedding cache lives no longer than this is true.
+    fn holds_camera(&self) -> bool {
+        self.camera.is_some()
+    }
+}
+
+/// Decrypted embeddings held for the active preview stream.
+///
+/// `PreviewDetectFrame` is one D-Bus request per frame at roughly 10 fps, and
+/// loading through [`Handler::load_user_embeddings`] decrypts the stored
+/// templates — on a TPM-sealed store, a TPM round-trip — so a per-frame load
+/// is both a performance bug and a per-frame plaintext exposure that nothing
+/// ever wiped (#141). The set is loaded once per preview session instead and
+/// zeroized ([`Wiped`]) when the session ends: the camera closes (warm hold
+/// expired, released, shutdown), the daemon's own store mutates, or a frame
+/// arrives for a different user.
+struct PreviewEmbeddings {
+    /// The user the set was loaded for; a request for anyone else drops it.
+    user: String,
+    embeddings: Wiped<Vec<(u32, FaceEmbedding)>>,
 }
 
 pub struct Handler<C: CameraSource, E: FaceProcessor> {
@@ -576,6 +598,9 @@ pub struct Handler<C: CameraSource, E: FaceProcessor> {
     /// encryption method. `Some` means enroll must fail CLOSED rather than
     /// silently downgrade to plaintext biometric storage (auth is unaffected).
     sealer_init_error: Option<String>,
+    /// Per-preview-session compare set (see [`PreviewEmbeddings`]). `None`
+    /// between preview sessions; setting it back to `None` zeroizes the set.
+    preview_embeddings: Option<PreviewEmbeddings>,
 }
 
 impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
@@ -695,14 +720,23 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             tpm_sealer,
             software_sealer,
             sealer_init_error,
+            preview_embeddings: None,
         })
     }
 
     /// Close the camera if its warm hold has run out. Called from the
     /// daemon's [`CAMERA_POLL_INTERVAL`] tick; a tick that finds the handler
     /// locked simply misses, because the deadline is absolute.
+    ///
+    /// This tick is also the backstop that ends a preview session no other
+    /// arm noticed ending: whenever the camera turns out to be closed —
+    /// however it closed — the preview compare set is zeroized with it, at
+    /// most one poll interval later.
     pub fn expire_camera(&mut self, now: Instant) {
         self.lease.expire(now);
+        if !self.lease.holds_camera() {
+            self.preview_embeddings = None;
+        }
     }
 
     /// Load user embeddings, decrypting TPM-sealed or software-encrypted blobs
@@ -769,12 +803,16 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             DaemonRequest::Shutdown => {
                 info!("shutdown requested via IPC");
                 self.lease.release();
+                self.preview_embeddings = None;
                 self.shutdown_requested = true;
                 DaemonResponse::Ok
             }
 
             DaemonRequest::ReleaseCamera => {
+                // The CLI sends this when a preview exits; the session's
+                // decrypted compare set goes out with the camera.
                 self.lease.release();
+                self.preview_embeddings = None;
                 DaemonResponse::Ok
             }
 
@@ -829,6 +867,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                     cancel,
                 );
                 self.lease.finish(Outcome::from(&result), &self.config);
+                // The store may have gained a template; drop (and zeroize)
+                // any preview compare set so the next frame sees it.
+                self.preview_embeddings = None;
                 result.into()
             }
 
@@ -840,6 +881,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             },
 
             DaemonRequest::RemoveModel { user, model_id } => {
+                // A deleted template must not live on — matchable — in the
+                // preview cache; the next preview frame reloads.
+                self.preview_embeddings = None;
                 match self.store.remove_model(&user, model_id) {
                     Ok(_) => DaemonResponse::Removed,
                     Err(e) => DaemonResponse::Error {
@@ -848,12 +892,17 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
                 }
             }
 
-            DaemonRequest::ClearModels { user } => match self.store.clear_user(&user) {
-                Ok(_) => DaemonResponse::Removed,
-                Err(e) => DaemonResponse::Error {
-                    message: format!("storage error: {e}"),
-                },
-            },
+            DaemonRequest::ClearModels { user } => {
+                // Same as RemoveModel: the cached copy of a cleared user's
+                // templates is zeroized with the rows.
+                self.preview_embeddings = None;
+                match self.store.clear_user(&user) {
+                    Ok(_) => DaemonResponse::Removed,
+                    Err(e) => DaemonResponse::Error {
+                        message: format!("storage error: {e}"),
+                    },
+                }
+            }
 
             DaemonRequest::ListDevices => {
                 use facelock_camera::{IrSource, QuirksDb, classify_ir_sources, list_devices};
@@ -1134,13 +1183,39 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             }
         };
 
-        let stored = self.load_user_embeddings(user).unwrap_or_default();
+        // Load the compare set once per preview session, not per frame (see
+        // [`PreviewEmbeddings`]). A load failure is not cached: this frame
+        // compares against nothing (every face unrecognized, as before) and
+        // the next frame retries.
+        if self
+            .preview_embeddings
+            .as_ref()
+            .is_none_or(|cached| cached.user != user)
+        {
+            // The RHS loads first, so another user's outgoing set and the new
+            // one are briefly both resident; completing the assignment then
+            // drops — and thereby zeroizes — the old one.
+            self.preview_embeddings = match self.load_user_embeddings(user) {
+                Ok(embeddings) => Some(PreviewEmbeddings {
+                    user: user.to_string(),
+                    embeddings: Wiped::new(embeddings),
+                }),
+                Err(e) => {
+                    debug!("could not load embeddings for preview: {e:?}");
+                    None
+                }
+            };
+        }
+        let stored: &[(u32, FaceEmbedding)] = match self.preview_embeddings.as_ref() {
+            Some(cached) => &cached.embeddings,
+            None => &[],
+        };
         let threshold = self.config.recognition.threshold;
 
         detections
             .into_iter()
             .map(|(det, embedding)| {
-                let (best_sim, _) = best_match(&embedding, &stored);
+                let (best_sim, _) = best_match(&embedding, stored);
                 PreviewFace {
                     x: det.bbox.x,
                     y: det.bbox.y,

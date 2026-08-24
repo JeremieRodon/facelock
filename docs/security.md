@@ -549,6 +549,15 @@ plaintext biometric templates unless `security.allow_plaintext = true`, and warn
 when it does. This never affects auth — a decrypt failure degrades to the password fallback,
 never a lockout.
 
+**In memory**, the long-lived compare sets are held in a drop guard (`Wiped` in
+`facelock-core`) that zeroizes them on every exit path, unwind included: the authentication
+loop's caller buffer and device-filtered compare set, the daemon's preview compare set
+(loaded once per preview session — not once per frame — and wiped when the camera closes,
+the store changes through the daemon, or the user changes), and the sets held by the
+`facelock bench` and `facelock-bench` benchmark paths. This covers the sets that persist
+across frames; transient copies elsewhere in the load and decrypt paths are not all
+guarded yet.
+
 **Hard device binding (opt-in, `security.bind_device_aad`).** When enabled, the enrolling
 camera's `device_id` is folded into the AES-GCM Additional Authenticated Data, so a template
 sealed under one camera cannot be decrypted under another — the cryptographic complement to

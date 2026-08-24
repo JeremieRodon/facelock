@@ -60,6 +60,53 @@ pub fn zeroize_stored_embeddings(stored: &mut [(u32, FaceEmbedding)]) {
     }
 }
 
+/// Plaintext embeddings wiped when the guard leaves scope — on every return
+/// path *and* on an unwind, which hand-written per-return-site wipes cannot
+/// cover (D11).
+///
+/// Generic over how the plaintext is held so the one guard covers every
+/// holder in the workspace: a caller's buffer (`&mut [_]`, borrowed) and an
+/// owned set (`Vec<_>`). `zeroize`'s own `Zeroizing` cannot: it needs
+/// `T: Zeroize`, which `(u32, FaceEmbedding)` is not.
+///
+/// The plaintext is reachable only through `Deref` to a shared slice: a
+/// holder can compare against the embeddings but cannot move them back out
+/// from under the wipe.
+pub struct Wiped<T>(T)
+where
+    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>;
+
+impl<T> Wiped<T>
+where
+    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+{
+    /// Take ownership of `inner`; every embedding in it is zeroized when the
+    /// guard drops.
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T> std::ops::Deref for Wiped<T>
+where
+    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+{
+    type Target = [(u32, FaceEmbedding)];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl<T> Drop for Wiped<T>
+where
+    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+{
+    fn drop(&mut self) {
+        zeroize_stored_embeddings(self.0.as_mut());
+    }
+}
+
 /// A stored face model (metadata only, without embedding)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaceModelInfo {
@@ -774,6 +821,60 @@ mod tests {
                     "embedding for model {id} at [{i}] should be zeroed"
                 );
             }
+        }
+    }
+
+    /// The guard is readable while alive and the plaintext is gone once it
+    /// drops — the borrowed-buffer form, where the caller's own allocation
+    /// can be inspected after the guard is gone.
+    #[test]
+    fn wiped_zeroizes_the_borrowed_buffer_on_drop() {
+        let mut stored = vec![(1u32, [1.0f32; 512]), (2u32, [2.0f32; 512])];
+
+        {
+            let guard = Wiped::new(stored.as_mut_slice());
+            assert_eq!(guard.len(), 2);
+            assert_eq!(guard[0].1[0], 1.0, "guard must deref to the plaintext");
+        }
+
+        for (id, emb) in &stored {
+            assert!(
+                emb.iter().all(|&v| v == 0.0),
+                "embedding for model {id} must be zeroized after the guard drops"
+            );
+        }
+    }
+
+    /// The owned form (`Wiped<Vec<_>>`) that compare sets and caches use.
+    /// Its wipe runs through the same `Drop` impl the borrowed-slice tests
+    /// observe; freed memory cannot be inspected, so this pins the part the
+    /// owned form adds — the guard takes ownership and still derefs.
+    #[test]
+    fn wiped_owns_a_vec_and_derefs_to_it() {
+        let guard = Wiped::new(vec![(7u32, [3.0f32; 512])]);
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].0, 7);
+        assert_eq!(guard[0].1[511], 3.0);
+    }
+
+    /// The reason the guard exists (D11): a panic between load and wipe must
+    /// still zeroize. Hand-written per-return-site wipes cannot cover this
+    /// path.
+    #[test]
+    fn wiped_zeroizes_on_unwind() {
+        let mut stored = vec![(1u32, [1.0f32; 512]), (2u32, [-4.0f32; 512])];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = Wiped::new(stored.as_mut_slice());
+            panic!("simulated failure while holding plaintext embeddings");
+        }));
+        assert!(result.is_err(), "the closure must have panicked");
+
+        for (id, emb) in &stored {
+            assert!(
+                emb.iter().all(|&v| v == 0.0),
+                "embedding for model {id} must be zeroized on the unwind path"
+            );
         }
     }
 
