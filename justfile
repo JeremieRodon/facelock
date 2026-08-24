@@ -738,15 +738,25 @@ pot:
     # *scanner language* knows, and --language=C knows only c-format — the flag
     # is accepted and silently dropped (verified against gettext 1.0). The seam
     # uses exactly one placeholder syntax (`{lower_snake}`, see `fill` in
-    # message/mod.rs), so matching it here is precise, and the check below
-    # makes gettext itself confirm every flag we wrote is truthful.
+    # message/mod.rs), so matching it here is precise, and the two checks below
+    # confirm the flags and the placeholders agree in both directions.
+    #
+    # An entry's msgid can span several physical lines: gettext splits a
+    # template at every embedded newline into a bare `msgid ""` opener plus one
+    # continuation string per line. The scan therefore reassembles each msgid
+    # before matching — testing the opener alone silently skips every
+    # multi-line template, which is what it did until #186.
     awk '
         { buf[NR] = $0 }
         END {
             for (i = 2; i <= NR; i++)
-                if (buf[i] ~ /^msgid "/ && buf[i] ~ /\{[a-z_][a-z0-9_]*\}/) {
-                    if (buf[i-1] ~ /^#,/) sub(/$/, ", python-brace-format", buf[i-1])
-                    else buf[i-1] = buf[i-1] "\n#, python-brace-format"
+                if (buf[i] ~ /^msgid "/) {
+                    text = buf[i]
+                    for (j = i + 1; j <= NR && buf[j] ~ /^"/; j++) text = text buf[j]
+                    if (text ~ /\{[a-z_][a-z0-9_]*\}/) {
+                        if (buf[i-1] ~ /^#,/) sub(/$/, ", python-brace-format", buf[i-1])
+                        else buf[i-1] = buf[i-1] "\n#, python-brace-format"
+                    }
                 }
             for (i = 1; i <= NR; i++) print buf[i]
         }
@@ -758,6 +768,27 @@ pot:
     # with an unbalanced brace in prose would fail here rather than in a
     # translator's catalog.
     msgen po/facelock.pot | msgfmt --check-format -o /dev/null -
+
+    # That check is one-directional: it proves the flags we wrote are truthful,
+    # never that we wrote them all, and a missing flag is silent — the
+    # placeholders just go unvalidated forever. Assert the other direction
+    # here, streaming the entries rather than reusing the pass above so a bug
+    # in one is not a bug in both.
+    awk '
+        BEGIN      { bad = 0 }
+        /^$/       { flagged = 0 }
+        /^#,/      { flagged = ($0 ~ /python-brace-format/) }
+        /^msgid "/ { in_msgid = 1; braced = 0; start = NR }
+        /^msgstr/  {
+            if (in_msgid && braced && !flagged) {
+                printf "error: msgid at line %d carries a {placeholder} but no python-brace-format flag\n", start > "/dev/stderr"
+                bad = 1
+            }
+            in_msgid = 0
+        }
+        in_msgid && /\{[a-z_][a-z0-9_]*\}/ { braced = 1 }
+        END { exit bad }
+    ' po/facelock.pot
 
     xgettext --language=C --keyword=gettext --from-code=UTF-8 --no-wrap \
         --package-name=pam_facelock --copyright-holder="Facelock Contributors" \
