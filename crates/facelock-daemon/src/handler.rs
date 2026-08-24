@@ -1192,8 +1192,9 @@ impl<C: CameraSource, E: FaceProcessor> Handler<C, E> {
             .as_ref()
             .is_none_or(|cached| cached.user != user)
         {
-            // Assigning drops — and thereby zeroizes — any other user's set
-            // before the new one is loaded.
+            // The RHS loads first, so another user's outgoing set and the new
+            // one are briefly both resident; completing the assignment then
+            // drops — and thereby zeroizes — the old one.
             self.preview_embeddings = match self.load_user_embeddings(user) {
                 Ok(embeddings) => Some(PreviewEmbeddings {
                     user: user.to_string(),

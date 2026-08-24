@@ -1426,3 +1426,49 @@ fn preview_for_a_different_user_swaps_the_compare_set() {
         "switching back must reload the first user's set"
     );
 }
+
+#[test]
+fn removing_a_model_through_the_handler_ends_the_preview_session() {
+    let mut handler = preview_handler();
+
+    assert!(preview_frame_recognized(&mut handler, "previewuser"));
+
+    // Deleting one template through the handler must not leave a matchable
+    // cached copy resident — the ClearModels twin, for the single-model arm.
+    let models = handler.store.list_models("previewuser").unwrap();
+    assert_eq!(models.len(), 1, "sanity: exactly one enrolled template");
+    let resp = handler.handle(DaemonRequest::RemoveModel {
+        user: "previewuser".into(),
+        model_id: models[0].id,
+    });
+    assert!(matches!(resp, DaemonResponse::Removed));
+
+    assert!(
+        !preview_frame_recognized(&mut handler, "previewuser"),
+        "a removed template must not keep matching from the preview cache"
+    );
+}
+
+#[test]
+fn a_failed_compare_set_load_is_not_cached() {
+    let mut handler = preview_handler();
+
+    // A wrong-size blob fails the whole load (a partial compare set would
+    // silently narrow matching), so this frame compares against nothing...
+    let bad = handler
+        .store
+        .add_model_raw("previewuser", "corrupt", &[0u8; 16], false, "")
+        .unwrap();
+    assert!(
+        !preview_frame_recognized(&mut handler, "previewuser"),
+        "a failed load must degrade to an empty compare set"
+    );
+
+    // ...and the failure is not cached as the session's result: once the
+    // corrupt row is gone the next frame retries the load.
+    assert!(handler.store.remove_model("previewuser", bad).unwrap());
+    assert!(
+        preview_frame_recognized(&mut handler, "previewuser"),
+        "the frame after the store is repaired must reload, not serve a cached failure"
+    );
+}
