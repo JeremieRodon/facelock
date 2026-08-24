@@ -3,7 +3,12 @@
 //! Two different questions, two types:
 //!
 //! - [`ConfigLoad`] — **what the file says.** `main` performs the one read and
-//!   parse for the process and hands every command a `&Config`. Commands do
+//!   parse for the process and hands every command a `&Config`. For
+//!   root-required commands the read runs *after* `main`'s `require_root_for`
+//!   gate (C6, issue #191), so a non-root caller is refused before the file
+//!   is even read — config state never answers ahead of "Root required";
+//!   `status` reads ahead of its own root check so a load failure renders as
+//!   a finding, and the read alone has no user-visible effect. Commands do
 //!   not re-read the file mid-flow; the deliberate exceptions each carry a
 //!   comment at their load site (`daemon` reloads on mtime change, `auth` is
 //!   its own one-shot process, `setup` bootstraps and edits the file,
@@ -605,18 +610,26 @@ mod tests {
     /// `Config::load()` and `load_from(config_path())` are pinned above, and
     /// neither matches the canonical read — so a command that reaches for
     /// `ConfigLoad::read()` passes both pins silently, which is exactly what
-    /// happened when `pam` grew a config read of its own. Per file, with the
-    /// reason beside it, so the next one is a decision someone makes here.
+    /// happened when `pam` grew a config read of its own. Per file *and per
+    /// count*, with the reason beside it, so the next one is a decision
+    /// someone makes here. The count matters in `main`, where placement is
+    /// load-bearing: both sites sit in one dispatch whose ordering is the C6
+    /// guarantee, and a third site would be a read the root gate does not
+    /// precede.
     #[test]
     fn canonical_config_reads_are_pinned() {
-        let allowed: &[(&str, &str)] = &[
-            // The one read for the process (D7).
-            ("main.rs", "the parse every other command consumes"),
+        let allowed: &[(&str, usize)] = &[
+            // The dispatch owns two sites — exclusive branches of one match,
+            // so still one parse per process (D7): `status` reads ahead of
+            // its own root check so a load failure renders as a finding, and
+            // every other root-required command reaches the second read only
+            // through the `require_root_for` gate (C6, issue #191).
+            ("main.rs", 2),
             // Dispatched ahead of main's parse and must survive a missing or
             // broken file: `[pam] config_dirs` decides where a service name
             // resolves, and the default list is the answer when the read
             // fails. See `commands::pam::PamDirs::system`.
-            ("commands/pam.rs", "the PAM search path, best-effort"),
+            ("commands/pam.rs", 1),
         ];
 
         // Assembled at runtime so this test's own prose does not count.
@@ -628,15 +641,19 @@ mod tests {
                 .last()
                 .unwrap()
                 .to_string();
-            if count_code_occurrences(&content, &needle) == 0 {
-                continue;
-            }
-            assert!(
-                allowed.iter().any(|(p, _)| *p == rel),
-                "{rel}: reads the config through {needle}), which only the \
-                 files listed in this test may do. Commands receive &Config \
-                 from main (see resolved::ConfigLoad); a second read is a D7 \
-                 exception and belongs in that list with its reason."
+            let count = count_code_occurrences(&content, &needle);
+            let expected = allowed
+                .iter()
+                .find(|(p, _)| *p == rel)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            assert_eq!(
+                count, expected,
+                "{rel}: found {count} canonical config read(s) ({needle})), \
+                 expected {expected}. Commands receive &Config from main (see \
+                 resolved::ConfigLoad); a new read site is a D7/C6 decision \
+                 and belongs in this list with its reason — in main, the root \
+                 gate must precede it."
             );
         }
     }

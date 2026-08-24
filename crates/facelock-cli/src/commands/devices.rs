@@ -2,11 +2,10 @@ use facelock_core::Config;
 use facelock_core::ipc::IpcDeviceInfo;
 
 use crate::backend::Backend;
-use crate::ipc_client;
 
 pub fn run(config: &Config, json: bool) -> anyhow::Result<()> {
-    // DEC-6/N13: `ListDevices` is root-only now (was facelock-group).
-    ipc_client::require_root("sudo facelock devices")?;
+    // DEC-6/N13: `ListDevices` is root-only now (was facelock-group); root
+    // is established by `main`'s `require_root_for` gate (C6).
 
     // One selection, one enumeration (D1); both transports render here. The
     // renderers used to live twice — this one and a direct copy that printed

@@ -13,8 +13,8 @@ use crate::message::{AccessMessage, Terminal};
 pub fn run(config: &Config, json: bool, user: Option<String>) -> anyhow::Result<()> {
     // DEC-6/N13: `PreviewDetectFrame` is root-only now — it was the last
     // unprivileged consumer of a per-frame similarity score (the
-    // hill-climbing oracle N12/N13 close by construction).
-    ipc_client::require_root("sudo facelock preview")?;
+    // hill-climbing oracle N12/N13 close by construction). Root is
+    // established by `main`'s `require_root_for` gate (C6).
 
     // One user-resolution implementation (C5, issue #105). The local
     // getpwuid-only version this replaces resolved `sudo facelock preview`

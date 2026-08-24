@@ -37,8 +37,8 @@ fn obtain_sealer(config: &Config) -> Result<facelock_tpm::SoftwareSealer> {
 }
 
 pub fn run_encrypt(config: &Config, generate_key: bool) -> Result<()> {
-    crate::ipc_client::require_root("sudo facelock tpm encrypt")?;
-
+    // Root is established by `main`'s `require_root_for` gate (C6) before
+    // `tpm::run` dispatches here.
     if generate_key {
         match config.encryption.method {
             EncryptionMethod::Tpm => {
@@ -144,8 +144,8 @@ pub fn run_encrypt(config: &Config, generate_key: bool) -> Result<()> {
 }
 
 pub fn run_decrypt(config: &Config) -> Result<()> {
-    crate::ipc_client::require_root("sudo facelock tpm decrypt")?;
-
+    // Root is established by `main`'s `require_root_for` gate (C6) before
+    // `tpm::run` dispatches here.
     // `open_existing`, never `create`: nothing to encrypt or decrypt means a
     // missing database is an error to report, not a file to bring into being
     // at whatever path a typo'd config names.

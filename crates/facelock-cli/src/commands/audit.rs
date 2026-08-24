@@ -5,9 +5,10 @@ use anyhow::{Context, Result};
 use facelock_core::config::Config;
 
 pub fn run(config: &Config, tail: bool, lines: usize) -> Result<()> {
-    // DEC-6: `audit` is typically invoked scripted/non-interactively, so it
-    // hard-errors rather than offering the usual sudo re-exec prompt.
-    crate::ipc_client::require_root_scripted("sudo facelock audit")?;
+    // DEC-6: `audit` is typically invoked scripted/non-interactively, so
+    // its row in `main`'s `require_root_for` gate (C6) is the hard-error
+    // class (`require_root_scripted`) — a refusal, never a sudo re-exec
+    // prompt.
 
     if !config.audit.enabled {
         println!("Audit logging is not enabled.");

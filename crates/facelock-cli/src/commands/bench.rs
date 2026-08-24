@@ -61,8 +61,9 @@ pub enum BenchCommand {
 pub fn run(config: &Config, command: BenchCommand) -> Result<()> {
     // DEC-6: `bench` is root by default (direct-mode access needs the 0600
     // root:root database regardless of subcommand, and auth benchmarks may
-    // need TPM access besides). Supersedes the old TPM-only conditional check.
-    crate::ipc_client::require_root("sudo facelock bench <subcommand>")?;
+    // need TPM access besides); root is established by `main`'s
+    // `require_root_for` gate (C6). Supersedes the old TPM-only conditional
+    // check.
 
     match command {
         BenchCommand::ColdAuth => cmd_cold_auth(config),

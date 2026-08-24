@@ -7,12 +7,11 @@ use crate::backend::Backend;
 use crate::ipc_client;
 
 pub fn run(config: &Config, user: Option<String>, json: bool) -> anyhow::Result<()> {
-    // DEC-6/N4: `ListModels` is root-only now (was facelock-group). The
-    // direct fallback needs read access to the 0600 root:root database;
-    // checking up front here gives the same interactive escalation prompt on
-    // the D-Bus path too, instead of a bare AccessDenied.
-    ipc_client::require_root("sudo facelock list")?;
-
+    // DEC-6/N4: `ListModels` is root-only now (was facelock-group) — the
+    // direct fallback needs read access to the 0600 root:root database.
+    // Root is established by `main`'s `require_root_for` gate, ahead of the
+    // config parse (C6, issue #191), so escalation — or refusal — has
+    // already happened by the time this runs.
     let user = ipc_client::resolve_user(user.as_deref());
 
     // One selection, one list operation (D1). The seam's direct read opens

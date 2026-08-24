@@ -1755,10 +1755,22 @@ runs an interactive question runs its root check **first**, before that
 prompt or any other output or side effect. `remove` and `clear` both ask a
 Y/N confirmation before deleting a face model; historically `remove`'s root
 check ran *after* that confirmation, so a non-root user would confirm a
-destructive action and only then discover it was refused — this is fixed. The same ordering applies to `status`, `devices`,
-`preview`, `test`, `audit`, `bench`, and `config edit`: the root check is
-the first statement in each command's entry point, before `Config::load()`
-or any `println!`.
+destructive action and only then discover it was refused — this is fixed.
+
+The check also precedes the config parse. For the commands dispatched
+through the shared config load (`enroll`, `remove`, `clear`, `list`, `test`,
+`preview`, `devices`, `bench`, `tpm …`, `audit`), `main` runs the root gate
+(`require_root_for`) before `ConfigLoad::read()`, so a non-root caller is
+refused before the config file is read at all — a missing or broken config
+answers ("no config file at …") only to a caller that has already passed
+the root check, never ahead of `Root required` (issue #191). Commands
+dispatched ahead of that load (`config edit`, `daemon run`,
+`daemon restart`, `setup`, `pam add`, `pam remove`) keep the root check as
+the first statement in the command's entry point, before any `println!`.
+`status` is the one exception to gate *placement*, not to ordering: it
+holds the unresolved load so a broken config renders as a finding in its
+report, and its own root check still runs before its first line of output —
+the read alone has no user-visible effect ahead of the refusal.
 
 **AccessDenied hint.** A D-Bus `AccessDenied` reply carries one actionable
 hint (`ipc_client::add_access_denied_hint`): root is required. Since almost

@@ -16,9 +16,9 @@ pub fn run(config: &Config, user: Option<String>) -> anyhow::Result<()> {
     // from rate-limit consumption (root already has unrestricted access to
     // the rate-limit table). On the daemon transport that exemption is the
     // root-only `TestAuthenticate` method, asked for explicitly, rather than
-    // something the daemon infers from this process being root. Must run
-    // before any prompt or output (C6).
-    ipc_client::require_root("sudo facelock test")?;
+    // something the daemon infers from this process being root. Root is
+    // established by `main`'s `require_root_for` gate, before any prompt,
+    // output, or the config parse itself (C6).
 
     // Check models exist — offer to run setup if missing
     if !crate::resolved::ModelFiles::probe(config).all_present() {

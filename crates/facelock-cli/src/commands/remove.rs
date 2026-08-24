@@ -5,12 +5,12 @@ use crate::ipc_client;
 use crate::message::{FaceMessage, Terminal};
 
 pub fn run(config: &Config, model_id: u32, user: Option<String>, yes: bool) -> anyhow::Result<()> {
-    // C6: root check must run before the confirmation prompt below — a group
-    // member confirming a destructive action only to then hit AccessDenied
-    // is exactly the bug this ordering fixes. RemoveModel is root-only on the
-    // daemon side too, so this applies regardless of transport.
-    ipc_client::require_root(&format!("sudo facelock remove {model_id}"))?;
-
+    // C6: the root check runs before the confirmation prompt below — a user
+    // confirming a destructive action only to then hit AccessDenied is
+    // exactly the bug this ordering fixes. The check lives in `main`'s
+    // `require_root_for` gate, ahead of the config parse (issue #191);
+    // RemoveModel is root-only on the daemon side too, so it applies
+    // regardless of transport.
     let user = ipc_client::resolve_user(user.as_deref());
 
     // One selection for the whole command (D1), before the unbounded prompt.

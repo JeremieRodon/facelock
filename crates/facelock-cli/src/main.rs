@@ -23,7 +23,7 @@ use facelock_cli::commands::daemon::DaemonCommand;
 use facelock_cli::commands::hyprlock::HyprlockCommand;
 use facelock_cli::commands::setup::{SetupArgs, resolve_setup_plan};
 use facelock_cli::logging::Program;
-use facelock_cli::{commands, logging, message, notifications, resolved};
+use facelock_cli::{commands, ipc_client, logging, message, notifications, resolved};
 
 use args::{ConfirmArg, JsonArg, PamCli, SetupCli, UserArg};
 
@@ -185,6 +185,59 @@ enum Commands {
     },
 }
 
+/// The DEC-6 root gate for every command dispatched through the shared
+/// config parse in `main` (C6): privilege is decided *before*
+/// `resolved::ConfigLoad::read()`, so a non-root caller is refused — or
+/// offered the sudo re-exec — regardless of config state. A missing or
+/// broken config file must never answer ahead of "Root required"
+/// (issue #191).
+///
+/// Exhaustive on `Commands` with no wildcard, so a new post-config command
+/// does not compile until it is assigned a privilege class here. Two classes
+/// exist (DEC-6), and each arm names its own escalation hint, which is why
+/// this cannot collapse into a single call.
+fn require_root_for(command: &Commands) -> anyhow::Result<()> {
+    match command {
+        // Hard-error class: `audit` is typically invoked scripted or
+        // non-interactively, where a re-exec prompt is a hang, not a
+        // convenience — it refuses without ever prompting.
+        Commands::Audit { .. } => ipc_client::require_root_scripted("sudo facelock audit"),
+
+        // Interactive class: prompt + sudo re-exec on a TTY, hard error off
+        // one. Each hint reproduces the command's own spelling.
+        Commands::Enroll {
+            skip_setup_check, ..
+        } => ipc_client::require_root(commands::enroll::sudo_hint(*skip_setup_check)),
+        Commands::Remove { model_id, .. } => {
+            ipc_client::require_root(&format!("sudo facelock remove {model_id}"))
+        }
+        Commands::Clear { .. } => ipc_client::require_root("sudo facelock clear"),
+        Commands::List { .. } => ipc_client::require_root("sudo facelock list"),
+        Commands::Test { .. } => ipc_client::require_root("sudo facelock test"),
+        Commands::Preview { .. } => ipc_client::require_root("sudo facelock preview"),
+        Commands::Devices { .. } => ipc_client::require_root("sudo facelock devices"),
+        Commands::Bench { .. } => ipc_client::require_root("sudo facelock bench <subcommand>"),
+        Commands::Tpm { command } => ipc_client::require_root(command.sudo_hint()),
+
+        // Dispatched ahead of the shared parse — or, for `status`, returned
+        // before this gate is consulted. Each owns its privilege decision:
+        // `status` checks root before its first line of output, `config
+        // edit` / `daemon` / `setup` / `pam` check inside the command, and
+        // the rest are unprivileged by design (DEC-6). Reaching this arm is
+        // a dispatch bug, same as the `unreachable!` group at the bottom of
+        // `main`.
+        Commands::Setup(..)
+        | Commands::IsEnrolled { .. }
+        | Commands::Capabilities { .. }
+        | Commands::Pam { .. }
+        | Commands::Hyprlock { .. }
+        | Commands::Config { .. }
+        | Commands::Daemon { .. }
+        | Commands::Auth { .. }
+        | Commands::Status { .. } => unreachable!("not dispatched through the root gate"),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Localization first: user-facing text (D10) may render before any
     // subcommand dispatch. Log/tracing output is unaffected by design (D2).
@@ -307,16 +360,28 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 other => {
-                    // The one parse for this process (D7): every remaining
-                    // command consumes this Config and none re-reads the file.
-                    let loaded = resolved::ConfigLoad::read();
-
                     // `status` reports on the config file itself, so a load
-                    // failure is a finding to render, not an exit.
+                    // failure is a finding to render, not an exit. It reads
+                    // ahead of the gate below and runs its own root check
+                    // before its first line of output — the read has no
+                    // user-visible effect ahead of that refusal.
                     if let Commands::Status { json } = &other {
-                        return commands::status::run(loaded, json.json);
+                        return commands::status::run(resolved::ConfigLoad::read(), json.json);
                     }
-                    let config = loaded.require()?;
+
+                    // Root gate (C6): decided before the config file is
+                    // read, so a non-root caller learns "Root required" —
+                    // never the state of a file only root may act on
+                    // (issue #191).
+                    require_root_for(&other)?;
+
+                    // The one parse for this process (D7): every remaining
+                    // command consumes this Config and none re-reads the
+                    // file. This read and `status`'s above are exclusive
+                    // branches of one dispatch — still one read per process;
+                    // both sites are pinned by
+                    // `resolved::canonical_config_reads_are_pinned`.
+                    let config = resolved::ConfigLoad::read().require()?;
 
                     match other {
                         Commands::Enroll {

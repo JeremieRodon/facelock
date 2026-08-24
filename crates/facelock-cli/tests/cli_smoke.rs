@@ -127,8 +127,9 @@ fn tpm_decrypt_refuses_before_root_non_root() {
 
 #[test]
 fn tpm_reseal_refuses_before_root_non_root() {
-    // The method check is the first thing `run_reseal` does after the root
-    // check, so its refusal text is the tightest ordering witness available.
+    // The method check is the first thing `run_reseal` does (the root check
+    // runs in main's dispatch gate, before the config parse), so its refusal
+    // text is the tightest ordering witness available.
     assert_refuses_before_output(
         &["tpm", "reseal"],
         &[
