@@ -224,6 +224,10 @@ assert_harness_preinstall_contract() {
             continue
         fi
         exempt=""
+        # Stop at the first installed alternative. A second installed one in the
+        # same element goes unexamined, and can: one exempt alternative already
+        # satisfies the element, so the element is exempt either way and no
+        # declared dependency escapes a bucket.
         for name in $group; do
             dependency_installed "$name" || continue
             match="$(harness_presatisfied_entry "$name")" ||

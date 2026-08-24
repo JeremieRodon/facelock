@@ -2040,7 +2040,10 @@ systemd, a C toolchain, and a software TPM, and requires every declared
 dependency to be shipped by the suite base, named by the harness exemption list
 with its reason, or resolved by the runtime transaction itself. Both directions
 of that list are enforced: an unlisted dependency the harness satisfies fails
-the gate, and so does a listed pattern that no longer matches one. Supplying an
+the gate, and so does a listed pattern that no longer matches one. The
+suite-base record that verdict rests on is taken before its stage installs
+anything, held there by a static read of the harness Containerfile, and
+compared at run time against that stage's own package database. Supplying an
 exact package to a harness image that carries no lifecycle script is a failure,
 not a skipped lane.
 

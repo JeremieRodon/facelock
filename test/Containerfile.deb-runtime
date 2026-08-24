@@ -3,11 +3,14 @@ FROM ${BASE_IMAGE} AS dependency-closure
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# First instruction in the stage, so this record is exactly what the suite base
-# image ships. The runtime harness carries it in to tell a dependency the suite
-# already provides from one the harness installed, and deb-dependency-closure.sh
-# compares it against its own live dpkg database, which catches any later
-# instruction added here that would make the record a lie.
+# Recorded before the stage's first RUN, COPY, or ADD, so this is exactly what
+# the suite base image ships. The runtime harness carries it in to tell a
+# dependency the suite already provides from one the harness installed.
+#
+# Both halves of that are checked rather than trusted. deb-runtime-image-contract.sh
+# reads this file and fails if anything that can change the package set precedes
+# the record; deb-dependency-closure.sh compares the record against its own live
+# dpkg database and fails if anything after it did.
 RUN dpkg-query -W -f='${Package}\n' | LC_ALL=C sort -u \
         > /facelock-suite-base-packages
 
