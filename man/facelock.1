@@ -730,8 +730,10 @@ code, is the answer. A run that retained anything says so and names every
 remnant. If the lifecycle cannot be restored the full report is printed
 first and the error returned after it, so a nonzero exit following a report
 means the daemon needs attention, not that nothing happened. An interrupted
-run may print a partial report or none at all; repeating a purge is safe, so
-re-run it to see what remains.
+run prints no report at all: the signal handler restores the daemon and then
+terminates the process while the command is still waiting on that restore.
+Deletions already made stand, and repeating a purge is safe, so re-run it to
+see what remains.
 .B
 Removing a name is not erasure:
 filesystem deletion does not securely erase SSDs, snapshots, or backups.

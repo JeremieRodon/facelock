@@ -873,13 +873,16 @@ a purge, not to confirm that data is gone.
 #### If the purge is interrupted
 
 `Ctrl-C` raises the lease's interrupt flag; the engine stops at a deletion
-boundary and the daemon is restored only after it has stopped. The process is
-then terminated by the signal, so an interrupted run may print a partial report
-or none at all — the report is written before the daemon is restored, but the
-signal can still win the race.
+boundary, and the daemon is restored only after it has stopped, so an interrupt
+never leaves the daemon racing a live traversal.
 
-**Repeating a purge is always safe**, so the reliable way to see what remains
-after an interrupt is to run it again.
+**An interrupted run prints no report at all.** The signal handler restores the
+daemon and then terminates the process, which happens while the command is still
+waiting on that restore — before it reaches the point where it would print
+anything. Whatever was deleted stays deleted.
+
+**Repeating a purge is always safe**, so the way to see what remains after an
+interrupt is to run it again. A second run reports what the first one left.
 
 ## User Resolution
 

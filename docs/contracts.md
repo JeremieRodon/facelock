@@ -2688,12 +2688,13 @@ take for "my biometric data is already gone". That inference from absence of
 evidence is exactly what this section forbids, and it is forbidden of the
 preview as much as of the purge.
 
-**An interrupted run may report nothing.** The report is rendered before the
-lease is released, which gives an interrupt its only chance to be heard, but the
-signal thread terminates the process as soon as its restore completes and can
-still win that race. Repetition is safe by construction, so the contract is that
-a caller re-runs to learn what remains rather than that an interrupted run is
-guaranteed to explain itself.
+**An interrupted run reports nothing, and that is the contract rather than a
+defect to work around.** The report is rendered after the lease is released,
+because the document must carry the lifecycle outcome; release joins the signal
+thread, and that thread terminates the process as soon as its restore completes,
+so a signalled purge exits before it renders. Deletions already made stand.
+Repetition is safe by construction, so a caller learns what remains by running
+the command again, and no partial-report guarantee is offered or implied.
 
 Repeating a purge is safe by construction, and the report is what makes that
 useful: every refusal leaves the object in place with a stated reason, so a

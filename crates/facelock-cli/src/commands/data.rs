@@ -146,9 +146,14 @@ pub fn run(request: PurgeRequest) -> anyhow::Result<()> {
     // the daemon did not come back". `mark_operation_finished` above already
     // fences the signal race, so nothing is owed to ordering here.
     //
-    // Rendering ahead of release also gives an interrupted run its only
-    // chance to say anything: release joins the signal thread, and that
-    // thread terminates the process as soon as its restore finishes.
+    // This does *not* rescue an interrupted run. Release joins the signal
+    // thread, and that thread terminates the process as soon as its restore
+    // completes, so a signalled purge never reaches the render below and
+    // prints nothing at all. Rendering the human body before release would
+    // save only that half: the document has to carry the lifecycle fields,
+    // so it cannot be emitted until release has returned. The contract is
+    // therefore that an interrupted run reports nothing and the caller
+    // re-runs, which is safe by construction.
     let lifecycle = if leave_activation_barred {
         match lease.release_leaving_activation_barred() {
             Ok(path) => Lifecycle::Barred(path.display().to_string()),
