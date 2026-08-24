@@ -3,6 +3,18 @@ FROM ${BASE_IMAGE} AS dependency-closure
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Recorded before the stage's first RUN, COPY, or ADD, so this is exactly what
+# the suite base image ships. The runtime harness carries it in to tell a
+# dependency the suite already provides from one the harness installed.
+#
+# Both halves of that are checked rather than trusted. deb-runtime-image-contract.sh
+# reads this file and fails if anything that can change the package set precedes
+# the record; deb-dependency-closure.sh compares the record against its own live
+# dpkg database and fails if anything after it did.
+RUN dpkg-query -W -f='${Package}\n' | LC_ALL=C sort -u \
+        > /facelock-suite-base-packages
+
+COPY test/deb-declared-depends.sh /deb-declared-depends.sh
 COPY test/deb-dependency-closure.sh /deb-dependency-closure.sh
 RUN chmod +x /deb-dependency-closure.sh
 
@@ -10,11 +22,18 @@ FROM ${BASE_IMAGE} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Harness tooling only: a booted init, a C toolchain for pamtester, python3 for
+# the lifecycle fixtures, and a software TPM for the PCR gate. None of the
+# candidate's own declared dependencies belong here. deb-package-lifecycle.sh
+# holds this list to that rule and names the exact overlap it tolerates.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        binutils build-essential ca-certificates curl dbus libpam0g-dev \
-        libpam-runtime python3 swtpm swtpm-tools systemd tpm2-tools && \
+        binutils build-essential ca-certificates curl libpam0g-dev \
+        python3 swtpm swtpm-tools systemd tpm2-tools && \
     rm -rf /var/lib/apt/lists/*
+
+COPY --from=dependency-closure /facelock-suite-base-packages \
+    /facelock-suite-base-packages
 
 COPY test/install-pamtester.sh /tmp/install-pamtester.sh
 RUN sh /tmp/install-pamtester.sh && rm -f /tmp/install-pamtester.sh
@@ -29,6 +48,7 @@ RUN printf '%s\n' \
         > /etc/dpkg/dpkg.cfg.d/zz-facelock-test-docs
 
 COPY test/pkg-validate.sh /pkg-validate.sh
+COPY test/deb-declared-depends.sh /deb-declared-depends.sh
 COPY test/deb-package-lifecycle.sh /deb-package-lifecycle.sh
 COPY test/polkit-agent-validate.sh /polkit-agent-validate.sh
 COPY test/tpm-pcr-e2e.sh /tpm-pcr-e2e.sh

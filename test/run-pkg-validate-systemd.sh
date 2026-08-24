@@ -101,6 +101,14 @@ if [ "${#onnx[@]}" -gt 0 ]; then
     '
 fi
 
+# The presence test below is the deb/rpm switch, so it is also the one place a
+# dropped COPY would turn the whole Debian lifecycle into silence and still let
+# the gate finish green. An exact package means the Debian lanes must run.
+if [ -n "$PACKAGE" ] && ! podman exec "$cid" test -x /deb-package-lifecycle.sh; then
+    echo "ERROR: exact Debian package supplied but the image carries no lifecycle harness" >&2
+    exit 1
+fi
+
 if podman exec "$cid" test -x /deb-package-lifecycle.sh; then
     [ -n "$PACKAGE" ] || {
         echo "ERROR: Debian lifecycle image requires an exact package argument" >&2

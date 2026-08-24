@@ -11,7 +11,27 @@ PAM_RETAINED=/var/lib/facelock/pam-backups/lifecycle-retained-provenance
 EXTERNAL_SENTINEL=/srv/facelock-lifecycle-external
 COMMON_AUTH=/etc/pam.d/common-auth
 APT_LOG=/tmp/facelock-deb-lifecycle-apt.log
+SUITE_BASE_PACKAGES=/facelock-suite-base-packages
 DB_HOLDER_PID=
+
+# Declared dependencies this harness image is allowed to satisfy before the
+# candidate is installed, each with the reason it has to be there first.
+#
+# The booted image is not a clean suite base. It also carries systemd, a C
+# toolchain for pamtester, and the swtpm/tpm2-tools software TPM the PCR gate
+# drives, and that TPM stack pulls the whole TSS runtime in with it. Wherever
+# harness tooling arrives ahead of a declared dependency, this lane cannot
+# prove APT resolves it, so deb-dependency-closure.sh resolves the same
+# candidate on a pristine suite base instead.
+#
+# The entries below are the exact extent of that blind spot, and both
+# directions are checked: a declared dependency that neither the suite base
+# ships nor a pattern here names fails the gate, so a new one cannot ride in on
+# harness tooling, and a pattern that matches nothing fails too, so the list
+# cannot rot into a comment about a dependency that moved on.
+HARNESS_PRESATISFIED=(
+    'libtss2-*|swtpm and tpm2-tools carry the TSS runtime for the TPM/PCR gate'
+)
 
 phase="${1:-}"
 case "$phase" in
@@ -26,6 +46,9 @@ fail() {
     echo "FAIL [Debian $phase lifecycle]: $*" >&2
     exit 1
 }
+
+# shellcheck source=/dev/null
+. /deb-declared-depends.sh
 
 pass() {
     printf 'TEST: Debian %s ... PASS\n' "$1"
@@ -150,6 +173,109 @@ assert_not_installed() {
         grep -qx installed; then
         fail "facelock was installed before the runtime transaction"
     fi
+}
+
+suite_base_ships() {
+    local name
+    for name in $1; do
+        if grep -qxF "$name" "$SUITE_BASE_PACKAGES"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Report which HARNESS_PRESATISFIED entry covers a package name, as
+# "<index> <reason>". The index lets the caller prove the entry is still live.
+harness_presatisfied_entry() {
+    local name="$1" entry pattern index=0
+    for entry in "${HARNESS_PRESATISFIED[@]}"; do
+        pattern="${entry%%|*}"
+        # shellcheck disable=SC2254 # the pattern is a deliberate glob
+        case "$name" in
+            $pattern) printf '%s %s\n' "$index" "${entry#*|}"; return 0 ;;
+        esac
+        index=$((index + 1))
+    done
+    return 1
+}
+
+# Bound what the harness preinstall is allowed to hide, by name.
+#
+# Read against the pristine suite manifest the image build recorded, so a
+# dependency the suite itself ships is never confused with one the harness
+# installed. Every declared dependency lands in exactly one of three buckets:
+# shipped by the suite base, named by HARNESS_PRESATISFIED, or left for the
+# runtime transaction to resolve. Anything else fails, and so does an
+# exemption pattern that no longer matches a declared dependency.
+assert_harness_preinstall_contract() {
+    local group name entry match exempt exempted=0 resolvable=0 index
+    local -a pattern_hits=()
+
+    [ -s "$SUITE_BASE_PACKAGES" ] ||
+        fail "harness image recorded no pristine suite package set"
+    for entry in "${HARNESS_PRESATISFIED[@]}"; do
+        pattern_hits+=(0)
+    done
+
+    while IFS= read -r group; do
+        [ -n "$group" ] || continue
+        if suite_base_ships "$group"; then
+            continue
+        fi
+        exempt=""
+        # Stop at the first installed alternative. A second installed one in the
+        # same element goes unexamined, and can: one exempt alternative already
+        # satisfies the element, so the element is exempt either way and no
+        # declared dependency escapes a bucket.
+        for name in $group; do
+            dependency_installed "$name" || continue
+            match="$(harness_presatisfied_entry "$name")" ||
+                fail "harness preinstall hides declared dependency '$name': drop it from test/Containerfile.deb-runtime, or add it to HARNESS_PRESATISFIED with the reason it must stay"
+            index="${match%% *}"
+            pattern_hits[index]=1
+            exempt="$name (${match#* })"
+            break
+        done
+        if [ -n "$exempt" ]; then
+            echo "NOTE: harness pre-satisfies declared dependency $exempt"
+            exempted=$((exempted + 1))
+        else
+            resolvable=$((resolvable + 1))
+        fi
+    done < <(declared_dependency_groups "$PACKAGE")
+
+    [ "$resolvable" -gt 0 ] ||
+        fail "the harness satisfies every declared dependency; this lane resolves nothing"
+    index=0
+    for entry in "${HARNESS_PRESATISFIED[@]}"; do
+        [ "${pattern_hits[index]}" -eq 1 ] ||
+            fail "harness dependency exemption '${entry%%|*}' matches no declared dependency"
+        index=$((index + 1))
+    done
+    pass "harness preinstall satisfies only recorded declared dependencies ($exempted exempt, $resolvable left to resolve)"
+}
+
+unsatisfied_declared_dependencies() {
+    local group
+    while IFS= read -r group; do
+        [ -n "$group" ] || continue
+        dependency_group_satisfied "$group" || printf '%s\n' "$group"
+    done < <(declared_dependency_groups "$PACKAGE")
+}
+
+# Debian container images ship a policy-rc.d that refuses service starts, so
+# the bus the candidate depends on stays down after APT unpacks it. Bringing it
+# up here, instead of baking dbus into the image, is what lets this lane
+# resolve its own D-Bus dependency and still reach an active daemon.
+assert_system_bus_available() {
+    [ -d /run/systemd/system ] || return 0
+    systemctl start dbus.socket ||
+        fail "the D-Bus runtime installed with the candidate did not start"
+    systemctl is-active --quiet dbus.socket ||
+        fail "system bus socket is inactive after the candidate install"
+    [ -S /run/dbus/system_bus_socket ] ||
+        fail "system bus socket is missing after the candidate install"
 }
 
 assert_installed_candidate() {
@@ -670,15 +796,20 @@ assert_password_fallback() {
 }
 
 fresh_install() {
-    local common_hash common_metadata before_hash
+    local common_hash common_metadata before_hash unresolved
     assert_exact_artifact_mount
     assert_not_installed
+    assert_harness_preinstall_contract
+    unresolved="$(unsatisfied_declared_dependencies)"
     before_hash="$(artifact_hash)"
     common_hash="$(sha256sum "$COMMON_AUTH" | cut -d' ' -f1)"
     common_metadata="$(stat -c '%a:%u:%g' "$COMMON_AUTH")"
 
     apt_transaction install -y --no-install-recommends "$PACKAGE"
 
+    printf '%s\n' "$unresolved" |
+        assert_dependency_groups_satisfied "runtime transaction"
+    assert_system_bus_available
     assert_installed_candidate
     assert_installed_payload_metadata
     assert_eq "$before_hash" "$(artifact_hash)" "candidate artifact digest after install"

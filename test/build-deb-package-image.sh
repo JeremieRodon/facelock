@@ -15,6 +15,12 @@ case "$suite" in
     *) echo "unsupported Debian package suite: $suite" >&2; exit 2 ;;
 esac
 
+# Read the harness Containerfile before building anything from it. The suite
+# package record the lifecycle gate reasons about can only be trusted if it is
+# taken before that stage installs anything, and no run-time check can prove
+# that about an instruction placed above the record.
+"$repo_root/test/deb-runtime-image-contract.sh"
+
 package_parent="$(dirname "$package_output")"
 [ -d "$package_parent" ] || {
     echo "package output parent does not exist: $package_parent" >&2

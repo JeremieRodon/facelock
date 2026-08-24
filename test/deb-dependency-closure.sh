@@ -5,11 +5,15 @@ set -euo pipefail
 
 PACKAGE=/facelock-test-package.deb
 APT_LOG=/tmp/facelock-dependency-closure-apt.log
+SUITE_BASE_PACKAGES=/facelock-suite-base-packages
 
 fail() {
     echo "FAIL [Debian dependency closure]: $*" >&2
     exit 1
 }
+
+# shellcheck source=/dev/null
+. /deb-declared-depends.sh
 
 [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] ||
     fail "candidate package is not a regular file"
@@ -25,6 +29,18 @@ if dpkg-query -W -f='${db:Status-Status}\n' facelock 2>/dev/null |
     grep -qx installed; then
     fail "clean dependency stage already contains Facelock"
 fi
+
+# The booted lifecycle gate decides which of its declared dependencies the test
+# harness pre-satisfied by reading the suite manifest recorded during the image
+# build. That verdict is only as good as the record, so prove it here, on the
+# one stage that is supposed to be nothing but the suite base.
+[ -s "$SUITE_BASE_PACKAGES" ] ||
+    fail "image build recorded no pristine suite package set"
+dpkg-query -W -f='${Package}\n' | LC_ALL=C sort -u >/tmp/facelock-live-packages
+cmp -s "$SUITE_BASE_PACKAGES" /tmp/facelock-live-packages || {
+    diff -u "$SUITE_BASE_PACKAGES" /tmp/facelock-live-packages >&2 || true
+    fail "recorded suite package set does not match this pristine stage"
+}
 
 candidate_hash="$(sha256sum "$PACKAGE" | cut -d' ' -f1)"
 before_packages="$(dpkg-query -W -f='${binary:Package}\n' | wc -l)"
@@ -49,6 +65,8 @@ candidate_version="$(dpkg-deb --field "$PACKAGE" Version)"
 after_packages="$(dpkg-query -W -f='${binary:Package}\n' | wc -l)"
 [ "$after_packages" -gt "$((before_packages + 1))" ] ||
     fail "clean-base transaction did not install any dependency package"
+declared_dependency_groups "$PACKAGE" |
+    assert_dependency_groups_satisfied "pristine suite base"
 [ -z "$(dpkg --audit)" ] || fail "dpkg reports an incomplete transaction"
 apt-get check >>"$APT_LOG" 2>&1 || {
     cat "$APT_LOG" >&2
