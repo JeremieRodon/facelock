@@ -1,10 +1,17 @@
 //! Smoke tests for the facelock CLI binary.
 
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 fn facelock_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_facelock"))
 }
+
+/// The uid/gid a root test runner drops the child to. `setuid`/`setgid` do
+/// not consult `/etc/passwd`, so the account need not exist inside a CI
+/// container; 65534 is `nobody` on the distributions where it does.
+const NOBODY_UID: u32 = 65534;
+const NOBODY_GID: u32 = 65534;
 
 /// DEC-6/C6 contract: every root-required command must refuse *before*
 /// emitting any prompt text or touching state, when invoked non-root with no
@@ -13,20 +20,43 @@ fn facelock_bin() -> Command {
 /// pipe, so it hard-errors instead of offering to re-exec with sudo — which
 /// would otherwise hang waiting for input that never arrives.
 ///
-/// Skips (rather than failing) under an actual root test runner: these
-/// commands may proceed past the root check and then fail for unrelated
-/// reasons, and this contract has nothing to assert in that case.
+/// Closing stdin is also the limit of what these rows witness: they prove a
+/// refusal preceded the output, not *which* escalation class produced it.
+/// `require_root` and `require_root_scripted` take that same non-interactive
+/// branch and are indistinguishable here. Pinning the prompt-versus-hard-error
+/// split needs a row that allocates a real pty, which is a separate concern.
+///
+/// The child always runs unprivileged, whatever the test runner's own uid is:
+/// under a root runner it drops to `nobody` before `exec`. The row used to
+/// return early there instead, which is how this contract ended up with no CI
+/// coverage at all — both CI test jobs run `cargo test` as root in a
+/// container, so all 18 rows were no-ops that reported as passes (issue
+/// #189). Dropping cannot regress the way skipping did: `setuid(2)` from root
+/// replaces the saved uid as well, and the standard library clears root's
+/// supplementary groups ahead of it, so a row that runs at all ran
+/// unprivileged. No environment variable, workflow step, or runner user
+/// decides that.
 fn assert_refuses_before_output(args: &[&str], forbidden_substrings: &[&str]) {
-    if nix::unistd::Uid::effective().is_root() {
-        eprintln!("skipping {args:?}: non-root refusal cannot be tested as root");
-        return;
+    let mut command = facelock_bin();
+    command.args(args).stdin(Stdio::null());
+
+    let dropped_privileges = nix::unistd::Uid::effective().is_root();
+    if dropped_privileges {
+        command.uid(NOBODY_UID).gid(NOBODY_GID);
     }
 
-    let output = facelock_bin()
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap_or_else(|e| panic!("failed to execute facelock {args:?}: {e}"));
+    let output = command.output().unwrap_or_else(|e| {
+        let hint = if dropped_privileges {
+            format!(
+                "\nA root test runner runs this row as uid {NOBODY_UID}, so the built \
+                 binary and every directory above it must be traversable and executable \
+                 by other users — mode 0755, not 0700."
+            )
+        } else {
+            String::new()
+        };
+        panic!("failed to execute facelock {args:?}: {e}{hint}");
+    });
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
