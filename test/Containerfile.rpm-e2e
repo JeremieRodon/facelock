@@ -4,7 +4,10 @@ FROM registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e9
 
 # dbus-daemon (Fedora ships dbus-broker by default) is needed for the runtime
 # D-Bus tests in pkg-validate.sh, including the polkit agent boundary check.
-RUN dnf -y install pam authselect dbus dbus-daemon rpm-build systemd binutils glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 util-linux && dnf clean all
+# gettext supplies msgfmt for the spec's compiled translation catalogs. The
+# spec BuildRequires it; this build runs rpmbuild --nodeps, so the package has
+# to bring the tool itself.
+RUN dnf -y install pam authselect dbus dbus-daemon rpm-build systemd binutils gettext glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 util-linux && dnf clean all
 
 # Build pamtester from source (not in Fedora repos)
 COPY test/install-pamtester.sh /tmp/install-pamtester.sh
@@ -28,6 +31,9 @@ COPY config/ /build/config/
 COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/
 COPY dist/ /build/dist/
+# Translation sources and the shared installer the spec's %install calls
+COPY po/ /build/po/
+COPY scripts/install-locale-catalogs.sh /build/scripts/install-locale-catalogs.sh
 COPY LICENSE-MIT /build/LICENSE-MIT
 COPY LICENSE-APACHE /build/LICENSE-APACHE
 

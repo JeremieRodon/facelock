@@ -1,7 +1,7 @@
 FROM registry.fedoraproject.org/fedora:44@sha256:fc3ec3da3ce49de0da0bab5a33223e90866c488d5d04fc6612284169e20a1bdb
 
 RUN dnf -y install --setopt=install_weak_deps=False \
-        authselect coreutils findutils grep python3 util-linux-core rpm-build rpm \
+        authselect coreutils findutils gettext grep python3 util-linux-core rpm-build rpm \
         pam pam-devel gcc gcc-c++ make curl systemd dbus dbus-daemon \
         tpm2-tss onnxruntime libxkbcommon \
     && dnf clean all
@@ -25,6 +25,9 @@ COPY config/ /build/config/
 COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/
 COPY dist/ /build/dist/
+# Translation sources and the shared installer the spec's %install calls
+COPY po/ /build/po/
+COPY scripts/install-locale-catalogs.sh /build/scripts/install-locale-catalogs.sh
 COPY test/build-rpm-prebuilt.sh /build/test/build-rpm-prebuilt.sh
 COPY .github/workflows/scripts/run-networkless.sh /run-networkless.sh
 COPY .github/workflows/scripts/validate-rpm.sh /build/.github/workflows/scripts/validate-rpm.sh

@@ -35,6 +35,9 @@ COPY target/release/libpam_facelock.so /build/target/release/libpam_facelock.so
 COPY justfile /build/justfile
 COPY scripts/source-install-daemon-lifecycle.sh /build/scripts/source-install-daemon-lifecycle.sh
 COPY scripts/migrate-legacy-system-assets.sh /build/scripts/migrate-legacy-system-assets.sh
+# base-devel supplies msgfmt, so install-files takes its translation path here
+COPY scripts/install-locale-catalogs.sh /build/scripts/install-locale-catalogs.sh
+COPY po/ /build/po/
 COPY config/ /build/config/
 COPY systemd/ /build/systemd/
 COPY dbus/ /build/dbus/
@@ -82,6 +85,10 @@ COPY test/source-install-daemon-test.service /source-install-lifecycle/test/sour
 COPY justfile /source-install-lifecycle/repository/justfile
 COPY scripts/source-install-daemon-lifecycle.sh /source-install-lifecycle/repository/scripts/source-install-daemon-lifecycle.sh
 COPY scripts/migrate-legacy-system-assets.sh /source-install-lifecycle/repository/scripts/migrate-legacy-system-assets.sh
+# The recipe-* cases run the real install-files from this tree, and base-devel
+# supplies msgfmt, so the recipe takes its translation path here too.
+COPY scripts/install-locale-catalogs.sh /source-install-lifecycle/repository/scripts/install-locale-catalogs.sh
+COPY po/ /source-install-lifecycle/repository/po/
 COPY dist/legacy-system-assets.sha256 /source-install-lifecycle/repository/dist/legacy-system-assets.sha256
 COPY config/ /source-install-lifecycle/repository/config/
 COPY systemd/ /source-install-lifecycle/repository/systemd/

@@ -9,6 +9,9 @@ arch=('x86_64')
 url="https://github.com/tyvsmith/facelock"
 license=('MIT OR Apache-2.0')
 depends=('glibc' 'dbus' 'pam' 'gcc-libs' 'tpm2-tss' 'libxkbcommon' 'onnxruntime')
+# The binaries are prebuilt, but the translation catalogs are still compiled
+# here from the source tarball's po/ tree.
+makedepends=('gettext')
 optdepends=(
     'onnxruntime-opt-cuda: NVIDIA GPU acceleration (replaces onnxruntime)'
     'onnxruntime-opt-rocm: AMD GPU acceleration (replaces onnxruntime)'
@@ -41,6 +44,10 @@ package() {
     install -Dm644 dbus/org.facelock.Daemon.service "$pkgdir/usr/share/dbus-1/system-services/org.facelock.Daemon.service"
     install -Dm644 dist/facelock.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/facelock.conf"
     install -Dm644 dist/facelock-pam-remove.hook "$pkgdir/usr/share/libalpm/hooks/facelock-pam-remove.hook"
+
+    # Compiled translation catalogs, both gettext domains. Installs nothing
+    # while po/ holds only .pot templates, and creates no empty locale root.
+    scripts/install-locale-catalogs.sh "$pkgdir/usr/share/locale"
 
     install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
     install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"

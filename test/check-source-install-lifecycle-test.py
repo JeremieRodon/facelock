@@ -503,7 +503,8 @@ class SourceInstallLifecycleCheckerTests(unittest.TestCase):
         )
         route = (
             "recipe-known-legacy-retired | recipe-admin-overrides-preserved | \\\n"
-            "        recipe-fake-manager-overrides-preserved)"
+            "        recipe-fake-manager-overrides-preserved | "
+            "recipe-locale-failure-retry)"
         )
         top_level = top_level_dispatch.group("body")
         self.assertEqual(top_level.count(route), 1)
@@ -511,7 +512,8 @@ class SourceInstallLifecycleCheckerTests(unittest.TestCase):
         comment_mutation = top_level.replace(
             route,
             "recipe-admin-overrides-preserved | \\\n"
-            "        recipe-fake-manager-overrides-preserved)\n"
+            "        recipe-fake-manager-overrides-preserved | "
+            "recipe-locale-failure-retry)\n"
             "    # recipe-known-legacy-retired",
             1,
         )

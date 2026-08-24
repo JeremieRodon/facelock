@@ -279,6 +279,12 @@ jobs:
           just pot
           git diff --exit-code -I '^"POT-Creation-Date: ' po/
 
+      # `just check` runs this too, but skips its compile step where gettext is
+      # absent. This job is the one place gettext is guaranteed, so it is where
+      # a catalog is actually built and checked into a locale root.
+      - name: Verify every install path ships compiled catalogs
+        run: just test-locale-install-contract
+
   container-pam-test:
     name: Container PAM Smoke Test
     runs-on: ubuntu-latest

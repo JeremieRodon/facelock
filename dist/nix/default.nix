@@ -2,6 +2,7 @@
 , rustPlatform
 , pkg-config
 , clang
+, gettext
 , pam
 , v4l-utils
 , openssl
@@ -24,6 +25,8 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     pkg-config
     clang
+    # msgfmt, for the compiled translation catalogs in postInstall
+    gettext
   ];
 
   buildInputs = [
@@ -58,6 +61,13 @@ rustPlatform.buildRustPackage {
     # Quirks database
     install -dm755 $out/share/facelock/quirks.d
     install -Dm644 -t $out/share/facelock/quirks.d/ config/quirks.d/*.toml
+
+    # Compiled translation catalogs, both gettext domains. Installs nothing
+    # while po/ holds only .pot templates, and creates no empty locale root.
+    # The binary looks in /usr/share/locale, which does not exist here, so
+    # module.nix points FACELOCK_LOCALEDIR at this tree. Invoked through bash
+    # because the sandbox has no /usr/bin/env for the script's own shebang.
+    bash scripts/install-locale-catalogs.sh $out/share/locale
 
     # systemd units
     install -Dm644 systemd/facelock-daemon.service $out/lib/systemd/system/facelock-daemon.service

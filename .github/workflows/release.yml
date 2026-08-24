@@ -174,6 +174,7 @@ jobs:
             curl \
             debhelper \
             dpkg-dev \
+            gettext \
             just \
             libpam0g-dev \
             libssl-dev \
@@ -296,6 +297,7 @@ jobs:
             rust cargo clang-devel \
             pam-devel libv4l-devel \
             rpm-build systemd-rpm-macros \
+            gettext \
             util-linux python3 \
             gcc gcc-c++ \
             wayland-devel libxkbcommon-devel \

@@ -9,6 +9,13 @@ Source1:        facelock-authselect-retirement-guard
 
 %bcond_with bundled_ort
 
+# The only -f manifest in this spec is the %%find_lang language list, and it is
+# legitimately empty: po/ ships .pot templates and no translation. Fedora's
+# default promotes an empty manifest to a build error, which would make an
+# untranslated facelock unbuildable. Downgrading it to a warning is what lets
+# the catalog wiring exist before the first translation does.
+%global _empty_manifest_terminate_build 0
+
 # The direct bundle contains reviewed, already-stripped upstream ORT bytes.
 # Fedora's generic strip hooks rewrite those bytes even when `file` reports
 # them stripped, invalidating the pinned library checksum. Rust release
@@ -22,6 +29,7 @@ BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
+BuildRequires:  gettext
 BuildRequires:  clang-devel
 BuildRequires:  pam-devel
 BuildRequires:  libv4l-devel
@@ -77,6 +85,21 @@ install -Dm644 config/facelock.toml %{buildroot}%{_sysconfdir}/facelock/config.t
 # Quirks database
 install -dm755 %{buildroot}%{_datadir}/facelock/quirks.d
 install -Dm644 -t %{buildroot}%{_datadir}/facelock/quirks.d/ config/quirks.d/*.toml
+
+# Compiled translation catalogs, both gettext domains. Installs nothing while
+# po/ holds only .pot templates, and creates no empty locale root.
+#
+# %%files is exhaustive, so the catalogs cannot be hand-listed: their language
+# subdirectories only exist once a translation lands. %%find_lang generates the
+# list instead, per domain — `facelock` (CLI) and `pam_facelock` (PAM module)
+# are separate catalogs and stay separate. Both invocations exit 1 while there
+# is nothing to find, which is the normal state today, so neither is fatal and
+# an empty list file is what %%files consumes.
+scripts/install-locale-catalogs.sh %{buildroot}%{_datadir}/locale
+%find_lang %{name} || :
+%find_lang pam_facelock || :
+touch %{name}.lang pam_facelock.lang
+cat pam_facelock.lang >> %{name}.lang
 
 # systemd units
 install -Dm644 systemd/facelock-daemon.service %{buildroot}%{_unitdir}/facelock-daemon.service
@@ -181,7 +204,7 @@ if [ $1 -eq 0 ]; then
     echo "Filesystem deletion does not securely erase SSDs, snapshots, or backups."
 fi
 
-%files
+%files -f %{name}.lang
 %license LICENSE-MIT LICENSE-APACHE
 %doc config/facelock.toml
 %{_bindir}/facelock
