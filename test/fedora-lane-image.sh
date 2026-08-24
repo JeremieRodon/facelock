@@ -15,6 +15,11 @@
 # RELEASE_MATRIX_TODAY override that test/check-release-matrix.py already reads.
 # Fedora 43 goes EOL on 2026-12-02, and on that date this stops the lane with a
 # message rather than letting it quietly rot against an unmaintained release.
+#
+# Known gap: 43 is the only release the matrix gives a gate. The lookup is
+# generic, so a `44_eol_gate` or `45_eol_gate` key gates those lanes the moment
+# it is added, but until someone adds one the 44 and 45 lanes keep running past
+# their own end of life without complaint.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

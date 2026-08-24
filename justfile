@@ -963,9 +963,16 @@ _ort-version := `for ort in /usr/lib/libonnxruntime.so /usr/lib64/libonnxruntime
 # a release target (Rawhide), or that has passed its EOL gate. The default stays
 # 44 so bare invocations keep their old meaning. Image tags carry the release so
 # concurrent lanes cannot overwrite each other's image.
+#
+# Resolution runs as the first dependency so an expired or undeclared release is
+# refused before a host release build, not after one.
+
+[private]
+_fedora-lane-image release:
+    @bash test/fedora-lane-image.sh '{{ release }}' >/dev/null
 
 # Test RPM packaging in Fedora container
-test-rpm release="44": build-release
+test-rpm release="44": (_fedora-lane-image release) build-release
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -973,8 +980,13 @@ test-rpm release="44": build-release
         -t facelock-rpm-test-f{{ release }} -f test/Containerfile.fedora .
     podman run --rm facelock-rpm-test-f{{ release }}
 
-# Static and booted, model-free Fedora authselect retirement lifecycle.
-test-rpm-authselect release="44":
+# The upgrade fixture is the released v0.1.4 fc44 RPM, the only build of the
+# retired-profile package that exists. Releases other than 44 are unproven here:
+# an fc44 artifact can fail to install on an older Fedora over a newer glibc or
+# library requirement, and no lane has run 43 or 45 through this recipe.
+
+# Static and booted, model-free Fedora authselect retirement lifecycle
+test-rpm-authselect release="44": (_fedora-lane-image release)
     #!/usr/bin/env bash
     set -euo pipefail
     bash test/rpm-authselect-contract.sh
@@ -1019,7 +1031,7 @@ test-deb-resolute-pkg: (_require-models "1")
 # Same model requirement (and same opt-out) as the two Debian suite package gates.
 
 # Package test — build real .rpm, install via dnf, validate under booted systemd
-test-rpm-pkg release="44": (_require-models "1") build-release
+test-rpm-pkg release="44": (_fedora-lane-image release) (_require-models "1") build-release
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -1032,7 +1044,7 @@ test-rpm-pkg release="44": (_require-models "1") build-release
 # substitutes for a Fedora 43 or 44 result.
 
 # Branched-release lane — build the package, then boot it for a runtime smoke
-test-rpm-smoke release="45": build-release
+test-rpm-smoke release="45": (_fedora-lane-image release) build-release
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -1050,7 +1062,7 @@ test-packit-config:
     bash test/packit-config-validate.sh
 
 # COPR-equivalent build — Packit SRPM + mock from-source rebuild on a Fedora chroot (slow, opt-in)
-test-copr release="44":
+test-copr release="44": (_fedora-lane-image release)
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -1083,7 +1095,7 @@ test-deb-dev-shell:
         bash -c "/deb-package-lifecycle.sh install; cp /tmp/container-config.toml /etc/facelock/config.toml; cp /tmp/host-models/* /var/lib/facelock/models/ 2>/dev/null; exec bash"
 
 # Dev shell — interactive .rpm container with host models for fast iteration (requires camera)
-test-rpm-dev-shell release="44": build-release
+test-rpm-dev-shell release="44": (_fedora-lane-image release) build-release
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -1125,7 +1137,7 @@ test-deb-release-shell:
         bash -c "/deb-package-lifecycle.sh install; cp /tmp/container-config.toml /etc/facelock/config.toml; exec bash"
 
 # Release shell — clean-room .rpm container, real user experience (requires camera)
-test-rpm-release-shell release="44": build-release
+test-rpm-release-shell release="44": (_fedora-lane-image release) build-release
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"

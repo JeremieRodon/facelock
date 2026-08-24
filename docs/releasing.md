@@ -239,6 +239,15 @@ stops with a message instead of quietly testing an unmaintained release. Set
 `test/check-release-matrix.py` reads. Retiring the lane means retiring its
 matrix rows, and moving the date is a deliberate matrix edit.
 
+Fedora 43 is the only release carrying a gate today. The lookup is generic on
+`fedora.<release>_eol_gate`, so adding a `44_eol_gate` or `45_eol_gate` key
+gates those lanes immediately; until one exists, 44 and 45 run past their own
+end of life without complaint.
+
+`just test-rpm-lanes` runs each release through the recipe its matrix
+`lifecycle_depth` names, and `test/check-release-matrix.py` requires that exact
+pairing, so a full lifecycle lane cannot be quietly downgraded to a smoke lane.
+
 The full lifecycle lane also pins `%config(noreplace)`: an unmodified
 `/etc/facelock/config.toml` is replaced in place on upgrade, a modified one
 survives byte for byte with the new file diverted to `.rpmnew`, and erase
