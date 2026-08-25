@@ -141,11 +141,11 @@ authenticate_diagnostics() {
         rm -f /etc/pam.d/facelock-rpm-control
         echo "--- leaf replay under strace ---"
         if command -v strace >/dev/null 2>&1; then
-            printf 'test\n' | strace -f -qq -e trace=execve,exit_group \
+            printf 'test\n' | strace -f -qq -e trace=%file,exit_group \
                 -o /tmp/facelock-pam-diag.strace \
                 pamtester "$local_service" testuser authenticate
             echo "strace replay: rc=$?"
-            grep -E 'unix_chkpwd|exit_group' /tmp/facelock-pam-diag.strace 2>&1 | head -20
+            grep -E 'shadow|passwd|chkpwd|exit_group' /tmp/facelock-pam-diag.strace 2>&1 | head -40
             rm -f /tmp/facelock-pam-diag.strace
         else
             echo "(strace not installed)"

@@ -25,8 +25,18 @@ RUN dnf -y install gcc gcc-c++ pam-devel make curl && \
     rm -f /tmp/install-pamtester.sh && \
     dnf -y remove gcc gcc-c++ pam-devel make && dnf clean all
 
-# Create test user for PAM tests
-RUN useradd -m testuser && echo "testuser:test" | chpasswd
+# Create test user for PAM tests.
+#
+# The chmod is a container-fixture accommodation, not a Fedora default (which
+# is 0000). pam_unix 1.7+ verifies every shadowed password through its setuid
+# unix_chkpwd helper, and on the CI runner's rootless podman that helper
+# cannot see the shadow entry behind a mode-0000 file even though a plain
+# root shell in the same container reads it fine (getent rc=0, full CapEff,
+# NoNewPrivs=0 — the diagnostics in rpm-service-pam-lifecycle.sh captured all
+# of it). Every correct password then dies as AUTHINFO_UNAVAIL. Owner-read
+# needs no capability at all, so 0400 keeps the real helper path working in
+# any container runtime while changing nothing the lifecycle asserts.
+RUN useradd -m testuser && echo "testuser:test" | chpasswd && chmod 0400 /etc/shadow
 
 WORKDIR /build
 
