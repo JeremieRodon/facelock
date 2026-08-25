@@ -1808,6 +1808,14 @@ holds the unresolved load so a broken config renders as a finding in its
 report, and its own root check still runs before its first line of output —
 the read alone has no user-visible effect ahead of the refusal.
 
+`enroll` carries the check in **both** places. `main`'s gate is what
+enforces the ordering above — root decided before the config parse — and
+`enroll::run` re-checks on entry, as a hard error, because `setup` calls it
+directly and `run_with_plan`'s precheck is conditional on a base flow
+running. The second check is unreachable on every path that exists today; it
+is there so a future setup path that enrolls cannot do so unprivileged by
+omission (issue #288).
+
 The rows in `crates/facelock-cli/tests/cli_smoke.rs` pin this ordering per
 gated command. They run the binary unprivileged even under a root test
 runner: both CI test jobs are root in a container, and a row that skipped

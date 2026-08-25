@@ -6,10 +6,11 @@ use crate::backend::Backend;
 use crate::ipc_client;
 use crate::message::{FaceMessage, Terminal, fail};
 
-/// The escalation hint `main`'s root gate (C6) names for `enroll`. When the
-/// setup marker is absent (and `--skip-setup-check` not given), the remedy
-/// the refusal names is `setup` — the command [`run`] will offer to execute
-/// it — rather than `enroll` itself.
+/// The escalation hint `enroll`'s two root checks name — `main`'s gate (C6)
+/// and [`run`]'s own backstop. When the setup marker is absent (and
+/// `--skip-setup-check` not given), the remedy the refusal names is `setup`
+/// — the command [`run`] will offer to execute it — rather than `enroll`
+/// itself.
 pub fn sudo_hint(skip_setup_check: bool) -> &'static str {
     if !skip_setup_check && !std::path::Path::new(super::setup::SETUP_COMPLETE_MARKER).exists() {
         "sudo facelock setup"
@@ -24,10 +25,23 @@ pub fn run(
     label: Option<String>,
     skip_setup_check: bool,
 ) -> anyhow::Result<()> {
-    // Root is established by `main`'s `require_root_for` gate, ahead of the
-    // config parse (C6, issue #191); `sudo_hint` below picks the spelling
-    // that gate escalates with.
+    // Belt and braces on `main`'s `require_root_for` gate, which establishes
+    // root ahead of the config parse and owns the interactive escalation
+    // (C6, issue #191). This second check is for the callers that never
+    // reach that gate: `setup` invokes `run` directly, from the wizard's
+    // step 7 and from `--enroll`. Those are covered today only by
+    // `run_with_plan`'s precheck, which is conditional on
+    // `plan.base.is_some()` — a future standalone plan that enrolled would
+    // walk straight past it, and the gate would never see the command at
+    // all. Under root, which is every path that exists now, this costs one
+    // `getuid` (issue #288).
     //
+    // Hard-error class deliberately, where the gate's is interactive: the
+    // gate already offered the sudo re-exec for the CLI spelling, and
+    // re-execing `facelock enroll` from inside a half-finished `setup` would
+    // resume the wrong command.
+    ipc_client::require_root_scripted(sudo_hint(skip_setup_check))?;
+
     // Setup gate: prompt user if setup hasn't been run.
     // Setup includes model downloads, encryption, and face enrollment,
     // so if setup runs successfully we're done — no need to enroll again.
@@ -168,6 +182,46 @@ mod tests {
         let mut config = Config::parse("[daemon]\nmode = \"oneshot\"\n").expect("config parses");
         config.storage.db_path = db_path.to_string_lossy().into_owned();
         config
+    }
+
+    /// Issue #288: the backstop at the top of [`run`] is the whole defense
+    /// for callers that bypass `main`'s gate, and `setup` is one — it calls
+    /// `run` directly, behind a precheck that is conditional on
+    /// `plan.base.is_some()`. Nothing about the gate's exhaustive match
+    /// would notice a future standalone plan enrolling unprivileged.
+    ///
+    /// The store path is a temp dir that must survive untouched: the refusal
+    /// has to land ahead of every read `run` would otherwise do.
+    #[test]
+    fn run_refuses_a_non_root_caller_on_its_own() {
+        if nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping: as root the backstop passes, which is its job");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("facelock.db");
+        let config = oneshot_config_with_db(&db_path);
+
+        // `skip_setup_check: true` takes the branch with no prompt in it, so
+        // a regression that dropped the check runs on to a file read rather
+        // than blocking on stdin.
+        let err = run(
+            &config,
+            Some("nonexistent-test-user".to_string()),
+            None,
+            true,
+        )
+        .expect_err("enroll::run must refuse a non-root caller without help from main");
+
+        assert!(
+            err.to_string().contains("Root required"),
+            "expected the root refusal, got: {err}"
+        );
+        assert!(
+            !db_path.exists(),
+            "the refusal must precede every store access"
+        );
     }
 
     /// `Absent` vs everything else at the pre-enrollment reads: a fresh
