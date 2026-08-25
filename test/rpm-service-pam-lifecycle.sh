@@ -11,6 +11,7 @@ vendor_path="/usr/lib/pam.d/$vendor_service"
 vendor_override="/etc/pam.d/$vendor_service"
 symlink_path="/etc/pam.d/$symlink_service"
 snapshot_dir="$(mktemp -d /tmp/facelock-rpm-pam.XXXXXX)"
+pam_log="$snapshot_dir/pamtester.log"
 outside_path="$snapshot_dir/outside-pam"
 pass_count=0
 
@@ -57,6 +58,37 @@ snapshot_file() {
     local path="$1"
     stat -c '%F|%u|%g|%a|%h|%s' -- "$path"
     sha256sum -- "$path" | awk '{print $1}'
+}
+
+# pamtester's own output used to go to /dev/null, so an unexpected result was a
+# one-line FAIL with nothing behind it. That is where the Fedora lifecycle lane
+# stopped the first time CI ran it (#229): a rejection two seconds in, with no
+# way to tell a refused password from a module that never reached the daemon.
+# Keep the output, and dump the state the module depends on, whenever a case
+# does not go the way it should.
+authenticate() {
+    printf '%s\n' "$1" |
+        timeout --foreground 30 pamtester "$local_service" testuser authenticate \
+            >"$pam_log" 2>&1
+}
+
+authenticate_diagnostics() {
+    {
+        echo "--- pamtester output ---"
+        cat -- "$pam_log" 2>/dev/null || echo "(nothing captured)"
+        echo "--- $local_path ---"
+        cat -- "$local_path" 2>/dev/null || echo "(absent)"
+        echo "--- facelock-daemon.service ---"
+        systemctl --no-pager --full status facelock-daemon.service 2>&1 || true
+        echo "--- facelock-daemon.service journal ---"
+        journalctl --no-pager --full -u facelock-daemon.service -n 60 2>&1 || true
+        echo "--- failed units ---"
+        systemctl --no-pager --full --failed 2>&1 || true
+        echo "--- org.facelock.Daemon bus name ---"
+        busctl --system status org.facelock.Daemon 2>&1 || true
+        echo "--- /var/lib/facelock/models ---"
+        ls -l /var/lib/facelock/models 2>&1 || true
+    } >&2
 }
 
 authselect_is_unchanged() {
@@ -114,13 +146,12 @@ if ! grep -q '^path\s*=' /etc/facelock/config.toml; then
     sed -i '/^\[device\]/a path = "/dev/video0"' /etc/facelock/config.toml
 fi
 
-printf '%s\n' test |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1 || \
+authenticate test || {
+    authenticate_diagnostics
     fail "correct password did not fall through after Facelock rejection"
-if printf '%s\n' wrong-password |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1; then
+}
+if authenticate wrong-password; then
+    authenticate_diagnostics
     fail "wrong password authenticated through the configured leaf"
 fi
 pass "correct password falls through after Facelock rejection"
@@ -134,13 +165,12 @@ snapshot_file "$local_path" | cmp -s - "$snapshot_dir/local.before" || \
     fail "local leaf was not restored byte-for-byte with its metadata"
 authselect_is_unchanged || fail "local leaf removal changed authselect state"
 pass "service-scoped PAM removal restores the requested leaf"
-printf '%s\n' test |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1 || \
+authenticate test || {
+    authenticate_diagnostics
     fail "correct password failed after service-scoped PAM removal"
-if printf '%s\n' wrong-password |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1; then
+}
+if authenticate wrong-password; then
+    authenticate_diagnostics
     fail "wrong password authenticated after service-scoped PAM removal"
 fi
 pass "service-scoped PAM removal preserves password success and rejection"
