@@ -277,6 +277,132 @@ fn daemon_run_never_prompts_with_a_tty_attached() {
 }
 
 #[test]
+fn enroll_refuses_before_setup_prompt_non_root() {
+    // C6: `enroll` was the one gated spelling with no row at all — its
+    // ordering rested entirely on the gate's exhaustive match in `main`, so
+    // nothing failed if the arm went missing (issue #288).
+    //
+    // `--config` at a path that does not exist is what makes this row bite,
+    // and it is the one difference from the rows above. `enroll::run` now
+    // re-checks root itself, as a backstop for the callers inside `setup`
+    // that never reach the gate — so with a readable config on the machine,
+    // a deleted gate arm would still produce "Root required", just one parse
+    // too late. Pointing at nothing means only the gate can answer first:
+    // reaching the parse renders a config error instead (issue #191).
+    //
+    // Which branch `enroll` opens with depends on `/etc/facelock/.setup-complete`,
+    // a property of the machine running the test, so the forbidden list
+    // covers both: the marker-absent branch prints "Setup has not been
+    // completed." and asks to run setup, the marker-present one goes to the
+    // encryption posture check and the model probe.
+    assert_refuses_before_output(
+        &[
+            "--config",
+            "/nonexistent/facelock-enroll-c6.toml",
+            "enroll",
+            "--user",
+            "nonexistent-test-user",
+        ],
+        &[
+            "Setup has not been completed",
+            "Run setup now?",
+            "WARNING: encryption.method",
+            "Face recognition models not found",
+            "Enrolling face for user",
+        ],
+    );
+}
+
+/// DEC-6: `enroll` is the **interactive** escalation class — with a terminal
+/// attached it offers `Re-run with sudo? [Y/n]` before it refuses, the
+/// opposite of `daemon run` above.
+///
+/// The stdin-closed rows cannot witness that. `require_root` and
+/// `require_root_scripted` share the non-interactive branch, so silently
+/// downgrading `enroll`'s arm to the hard-error class passes every one of
+/// them. Only a real pty separates the two (issue #288).
+///
+/// `--skip-setup-check` pins the hint: without it `sudo_hint` names `setup`
+/// or `enroll` depending on whether the setup marker exists on the machine
+/// running the test, and the assertion below would be reading the host
+/// rather than the code.
+///
+/// `--config` points at nothing for the same reason the row above does: the
+/// backstop inside `enroll::run` must not be able to answer for the gate.
+///
+/// The child is given an empty `PATH` so this row can never escalate for
+/// real. The answer written to the pty is "n", but if the parser ever read
+/// that as consent, `Command::new("sudo")` fails to spawn instead of
+/// enrolling a face as root — and the assertions below fail loudly rather
+/// than the row passing by accident.
+#[test]
+fn enroll_offers_the_sudo_re_exec_with_a_tty_attached() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!("skipping: as root `enroll` opens the camera instead of refusing");
+        return;
+    }
+
+    let (mut controller, device) = open_pty();
+    // Queued in the tty's input buffer before the child exists, so the prompt
+    // cannot race ahead of the answer and read EOF — which
+    // `confirm_default_yes` would take as the default *yes*.
+    controller.write_all(b"n\n").expect("write answer to pty");
+
+    let mut child = facelock_bin()
+        .args([
+            "--config",
+            "/nonexistent/facelock-enroll-c6.toml",
+            "enroll",
+            "--user",
+            "nonexistent-test-user",
+            "--skip-setup-check",
+        ])
+        .env("PATH", "")
+        .stdin(Stdio::from(device.try_clone().expect("dup pty device")))
+        .stdout(Stdio::from(device.try_clone().expect("dup pty device")))
+        .stderr(Stdio::from(device))
+        .spawn()
+        .expect("failed to spawn facelock enroll");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("try_wait on facelock enroll") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`facelock enroll` never exited as a non-root user with a TTY attached");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    let mut raw = Vec::new();
+    let _ = controller.read_to_end(&mut raw);
+    let out = String::from_utf8_lossy(&raw);
+
+    assert!(!status.success(), "should refuse non-root, got: {status}");
+    assert!(
+        out.contains("Re-run with sudo"),
+        "`enroll` must offer the interactive re-exec on a TTY (expected \
+         require_root, not require_root_scripted), got: {out}"
+    );
+    // Asserted without the preceding newline: the pty translates it to CRLF.
+    assert!(out.contains("Run: sudo facelock enroll"), "got: {out}");
+    assert!(
+        !out.contains("failed to execute sudo"),
+        "declining the prompt must refuse, never escalate, got: {out}"
+    );
+    assert!(
+        !out.contains("Enrolling face for user"),
+        "the root check must run before anything else, got: {out}"
+    );
+}
+
+#[test]
 fn list_refuses_before_root_non_root() {
     assert_refuses_before_output(
         &["list", "--user", "nonexistent-test-user"],

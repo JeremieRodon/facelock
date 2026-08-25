@@ -1823,7 +1823,12 @@ there reported as a pass while asserting nothing (issue #189). They close
 stdin, so what they witness is that the refusal preceded the output, not
 which of DEC-6's two escalation classes produced it; `require_root` and
 `require_root_scripted` share one non-interactive branch and are
-indistinguishable to them.
+indistinguishable to them. Two commands carry a second row that allocates a
+real pty and does pin the class: `daemon run` must never print the prompt
+with a terminal attached (issue #188), and `enroll` must always print it
+(issue #288). `enroll`'s rows also pass `--config` at a path that does not
+exist, so its own backstop cannot answer in the gate's place and pass a row
+that the gate should have failed.
 
 **AccessDenied hint.** A D-Bus `AccessDenied` reply carries one actionable
 hint (`ipc_client::add_access_denied_hint`): root is required. Since almost
