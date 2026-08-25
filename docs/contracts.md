@@ -2240,10 +2240,15 @@ and a normal relative path beneath it. One descriptor-held component walker is
 used on every kernel, with no alternate or weaker kernel-version path. The
 loader:
 
-- requires the trust root, each ancestor, and every traversed directory to be
-  root-owned and not group- or world-writable; a linked trust root is rejected,
-  and the fixed root is opened and retained with
-  `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK`
+- resolves a symlinked trust root by path before any open — merged-/usr
+  distributions ship `/usr/lib64` as a link to `lib` — following only
+  root-owned, single-link symlinks with confined relative targets; an absolute
+  or escaping target is rejected even when it names an approved location
+- requires the resolved trust root, each ancestor, and every traversed
+  directory to be root-owned and not group- or world-writable; the resolved
+  root is opened and retained with
+  `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK`, still refusing a link at open
+  time
 - inspects every relative component and link through a held parent descriptor
   using `O_PATH|O_NOFOLLOW|O_NONBLOCK`; directory links, absolute targets,
   non-normal targets such as `.` or `..`, and paths that escape and later
