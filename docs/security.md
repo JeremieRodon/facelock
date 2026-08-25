@@ -347,15 +347,20 @@ package manager's `/usr/lib64/libonnxruntime.so.1` and
 bundle uses the stable SONAME filename. Existing Debian bundles retain a
 package-owned unversioned compatibility name at the end of the same category.
 
-For every privileged system or bundle candidate, the loader opens the fixed
-approved root without following a link, then walks each relative component by
-held descriptor with `O_NOFOLLOW|O_NONBLOCK`. Directory links, absolute link
-targets, `..`, escape-and-return targets, untrusted link owners, and linked
-trust roots are rejected. A package SONAME symlink is allowed only as a
-root-owned, single-link, relative chain beneath the held root; every traversed
-directory must be root-owned and not group- or world-writable. One descriptor
-walker is used on kernels both with and without `openat2`, so an `ENOSYS` path
-cannot receive weaker checks.
+For every privileged system or bundle candidate, the loader first resolves a
+symlinked approved root by path — merged-/usr distributions ship `/usr/lib64`
+as a link to `lib` — under the same rules as SONAME links: a root-owned,
+single-link chain of confined relative targets, every traversed directory
+root-owned and not group- or world-writable. Absolute and escaping targets are
+rejected even when they name an approved location. The loader then opens the
+resolved real directory without following a link and walks each relative
+component by held descriptor with `O_NOFOLLOW|O_NONBLOCK`. Directory links
+beneath the root, absolute link targets, `..`, escape-and-return targets, and
+untrusted link owners are rejected. A package SONAME symlink is allowed only as
+a root-owned, single-link, relative chain beneath the held root; every
+traversed directory must be root-owned and not group- or world-writable. One
+descriptor walker is used on kernels both with and without `openat2`, so an
+`ENOSYS` path cannot receive weaker checks.
 
 Before `dlopen`, the final descriptor must name a bounded regular file with
 exactly one hard link, root ownership, no group/world write bits, no

@@ -599,6 +599,99 @@ fn confined_components(path: &Path) -> std::result::Result<VecDeque<OsString>, S
         .collect())
 }
 
+/// Resolve a trusted root below `base` by path, following only approved-owner
+/// directory symlinks with confined relative targets.
+///
+/// Merged-/usr distributions ship `/usr/lib64` as a symlink to `lib`, so an
+/// approved root can be a link whose resolution is a root-owned real
+/// directory. A symlink's own mode carries no trust on Linux — it is always
+/// 0o777 and never consulted — so the facts that make a link as trustworthy
+/// as a real directory are the ones `validate_symlink_owner` already demands
+/// of SONAME links: the link is owned by the approved uid, has a single name,
+/// and every directory that could rename or retarget it is owned by the
+/// approved uid and not group- or world-writable. Under those facts only the
+/// approved uid chooses where the link points, exactly as only the approved
+/// uid chooses a real directory's entries.
+///
+/// Link targets must be confined relative paths — the same rule the
+/// descriptor walker applies beneath an opened root — so resolution only
+/// descends from `base` through components this walk has validated and can
+/// never leave the approved ancestry through `..` or an absolute target. An
+/// absolute target stays rejected even when it names an approved location;
+/// fail-closed beats a second list of approved spellings.
+///
+/// This is a by-path pre-check, like `validate_root_ancestors`. The
+/// load-bearing gate remains `open_privileged_candidate`: an `O_NOFOLLOW`
+/// open of the resolved root followed by metadata checks on the held
+/// descriptor. Retargeting any component between this walk and that open
+/// requires ownership of a validated ancestor — the approved uid itself — so
+/// resolving adds no attacker capability over today's unresolved pre-checks.
+fn resolve_trusted_dir(
+    base: &Path,
+    relative: &Path,
+    required_uid: u32,
+) -> std::result::Result<PathBuf, String> {
+    let mut components = confined_components(relative).map_err(|_| {
+        format!(
+            "trusted root {} has an unconfined component",
+            base.join(relative).display()
+        )
+    })?;
+    let mut resolved = base.to_path_buf();
+    let mut followed_links = 0_u8;
+
+    while let Some(component) = components.pop_front() {
+        let candidate = resolved.join(&component);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+            format!(
+                "cannot examine trusted directory {}: {error}",
+                candidate.display()
+            )
+        })?;
+
+        if metadata.file_type().is_symlink() {
+            validate_symlink_owner(&candidate, &metadata, required_uid)?;
+            followed_links = followed_links.saturating_add(1);
+            if followed_links > 16 {
+                return Err(format!(
+                    "symbolic link chain for {} is too deep",
+                    candidate.display()
+                ));
+            }
+            let target = fs::read_link(&candidate).map_err(|error| {
+                format!("cannot read symbolic link {}: {error}", candidate.display())
+            })?;
+            let mut target_components = confined_components(&target).map_err(|_| {
+                format!(
+                    "symbolic link {} has an escaping or absolute target {}",
+                    candidate.display(),
+                    target.display()
+                )
+            })?;
+            target_components.append(&mut components);
+            components = target_components;
+            continue;
+        }
+
+        if !metadata.is_dir() {
+            return Err(format!(
+                "trusted path {} is not a directory",
+                candidate.display()
+            ));
+        }
+        validate_owner_and_mode(&candidate, &metadata, required_uid)?;
+        resolved.push(&component);
+    }
+    Ok(resolved)
+}
+
+fn resolve_trusted_root(root: &Path, required_uid: u32) -> std::result::Result<PathBuf, String> {
+    let relative = root
+        .strip_prefix("/")
+        .map_err(|_| format!("trusted root {} is not absolute", root.display()))?;
+    resolve_trusted_dir(Path::new("/"), relative, required_uid)
+}
+
 /// Resolve one package-owned candidate entirely by held descriptors.
 ///
 /// Directory symlinks, absolute link targets, `..`, and links with an
@@ -893,8 +986,14 @@ fn initialize_ort(provider: RuntimeProvider) -> std::result::Result<(), String> 
                 candidate.trust_root.as_deref(),
                 candidate.relative_path.as_deref(),
             ) {
-                (Some(trust_root), Some(relative_path)) => validate_root_ancestors(trust_root, 0)
-                    .and_then(|()| open_privileged_candidate(trust_root, relative_path, 0)),
+                // Resolve a symlinked trust root (merged-/usr `/usr/lib64 ->
+                // lib`) first, then run the unchanged strict checks — real
+                // directory, owner, mode — on the resolved path.
+                (Some(trust_root), Some(relative_path)) => resolve_trusted_root(trust_root, 0)
+                    .and_then(|resolved| {
+                        validate_root_ancestors(&resolved, 0)
+                            .and_then(|()| open_privileged_candidate(&resolved, relative_path, 0))
+                    }),
                 _ => Err("trusted ONNX Runtime candidate has no confinement root".into()),
             }
         };
@@ -1650,6 +1749,149 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    // -- trusted-root symlink resolution (issue #295) ----------------------
+
+    #[test]
+    fn resolves_symlinked_trusted_root_to_validated_real_directory() {
+        let parent = scratch_dir("resolve-merged-usr");
+        let actual = parent.join("lib");
+        fs::create_dir(&actual).unwrap();
+        fs::create_dir(actual.join("rocm")).unwrap();
+        symlink("lib", parent.join("lib64")).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+
+        let resolved = resolve_trusted_dir(&parent, Path::new("lib64"), uid).unwrap();
+        assert_eq!(resolved, actual);
+        // A component after the link keeps resolving beneath the target,
+        // covering roots like /usr/lib64/rocm/lib with a symlinked /usr/lib64.
+        let resolved = resolve_trusted_dir(&parent, Path::new("lib64/rocm"), uid).unwrap();
+        assert_eq!(resolved, actual.join("rocm"));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn symlinked_trusted_root_resolves_through_to_the_elf_gate() {
+        let parent = scratch_dir("resolve-open");
+        let actual = parent.join("lib");
+        fs::create_dir(&actual).unwrap();
+        fs::copy(
+            std::env::current_exe().unwrap(),
+            actual.join("libonnxruntime.so.1"),
+        )
+        .unwrap();
+        symlink("lib", parent.join("lib64")).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+
+        let resolved = resolve_trusted_dir(&parent, Path::new("lib64"), uid).unwrap();
+        let error = open_privileged_candidate(&resolved, Path::new("libonnxruntime.so.1"), uid)
+            .unwrap_err();
+
+        // Every directory, owner, and mode check passed on the resolved root;
+        // only the ELF identity gate (the executable has no ORT SONAME) fires.
+        assert!(error.contains("SONAME"), "{error}");
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlinked_root_resolving_to_writable_directory() {
+        let parent = scratch_dir("resolve-writable");
+        let actual = parent.join("lib");
+        fs::create_dir(&actual).unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o777)).unwrap();
+        symlink("lib", parent.join("lib64")).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+
+        let error = resolve_trusted_dir(&parent, Path::new("lib64"), uid).unwrap_err();
+        assert!(error.contains("group- or world-writable"), "{error}");
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlinked_root_with_escaping_or_absolute_target() {
+        let parent = scratch_dir("resolve-escape");
+        let outside = parent.with_extension("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, parent.join("absolute")).unwrap();
+        symlink("../escape", parent.join("relative")).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+
+        for link in ["absolute", "relative"] {
+            let error = resolve_trusted_dir(&parent, Path::new(link), uid).unwrap_err();
+            assert!(error.contains("escaping or absolute"), "{link}: {error}");
+        }
+
+        fs::remove_dir_all(parent).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn rejects_dangling_symlinked_trusted_root() {
+        let parent = scratch_dir("resolve-dangling");
+        symlink("missing", parent.join("lib64")).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+
+        let error = resolve_trusted_dir(&parent, Path::new("lib64"), uid).unwrap_err();
+        assert!(error.contains("cannot examine"), "{error}");
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlink_loop_in_trusted_root() {
+        let parent = scratch_dir("resolve-loop");
+        symlink("lib64", parent.join("lib64")).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+
+        let error = resolve_trusted_dir(&parent, Path::new("lib64"), uid).unwrap_err();
+        assert!(error.contains("too deep"), "{error}");
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlinked_root_owned_by_unapproved_uid() {
+        let parent = scratch_dir("resolve-owner");
+        fs::create_dir(parent.join("lib")).unwrap();
+        symlink("lib", parent.join("lib64")).unwrap();
+        let uid = fs::metadata(&parent).unwrap().uid();
+
+        let error = resolve_trusted_dir(&parent, Path::new("lib64"), uid + 1).unwrap_err();
+        assert!(
+            error.contains("symbolic link") && error.contains("owned"),
+            "{error}"
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn relative_trusted_root_is_rejected_before_resolution() {
+        let error = resolve_trusted_root(Path::new("usr/lib64"), 0).unwrap_err();
+        assert!(error.contains("not absolute"), "{error}");
+    }
+
+    /// Live regression check for issue #295: on a merged-/usr host
+    /// (`/usr/lib64 -> lib`, the common Arch layout) the package-manager
+    /// trust root must resolve rather than be rejected. Skips on split
+    /// layouts — Fedora ships a real `/usr/lib64` directory.
+    #[test]
+    fn merged_usr_lib64_trust_root_resolves_on_this_host() {
+        let root = Path::new("/usr/lib64");
+        let Ok(metadata) = fs::symlink_metadata(root) else {
+            return;
+        };
+        if !metadata.file_type().is_symlink() {
+            return;
+        }
+
+        let resolved = resolve_trusted_root(root, 0).unwrap();
+        let resolved_metadata = fs::symlink_metadata(&resolved).unwrap();
+        assert!(resolved_metadata.is_dir());
+        validate_root_ancestors(&resolved, 0).unwrap();
     }
 
     #[test]
