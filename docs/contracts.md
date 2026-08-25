@@ -1830,6 +1830,16 @@ with a terminal attached (issue #188), and `enroll` must always print it
 exist, so its own backstop cannot answer in the gate's place and pass a row
 that the gate should have failed.
 
+**Dropping, never skipping.** Every one of those rows drops the process it
+spawns to uid 65534 under a root runner, the pty rows included: a pty is
+opened by the parent before the fork, so the child inherits descriptors the
+kernel has already granted and can still read its own queued input after the
+drop. The backstop test in `commands::enroll` calls `run` in-process, where
+there is no child to drop, so it re-executes the test binary at itself and
+drops that. None of these return early under root. A test that skips on the
+one configuration CI runs is a test that asserts nothing while reporting a
+pass, which is how this contract lost its coverage twice (issues #189, #303).
+
 **AccessDenied hint.** A D-Bus `AccessDenied` reply carries one actionable
 hint (`ipc_client::add_access_denied_hint`): root is required. Since almost
 every D-Bus method is root-only (see IPC Protocol below) and, under ADR 010,

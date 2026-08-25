@@ -13,6 +13,48 @@ fn facelock_bin() -> Command {
 const NOBODY_UID: u32 = 65534;
 const NOBODY_GID: u32 = 65534;
 
+/// Make `command` run unprivileged whatever the test runner's own uid is:
+/// under a root runner it drops to `nobody` before `exec`. Returns whether
+/// the drop was applied, which only the failure hint needs.
+///
+/// Every row in this file that spawns a process goes through here, including
+/// the two pty rows. Rows used to return early under a root runner instead,
+/// which is how this contract ended up with no CI coverage at all — both CI
+/// test jobs run `cargo test` as root in a container, so a skipping row was a
+/// no-op that reported as a pass (issues #189, #303).
+///
+/// Dropping cannot regress the way skipping did: `setuid(2)` from root
+/// replaces the saved uid as well, and the standard library clears root's
+/// supplementary groups ahead of it, so a row that runs at all ran
+/// unprivileged. No environment variable, workflow step, or runner user
+/// decides that.
+///
+/// A pty survives the drop. Both ends are opened by the parent, before the
+/// fork, so the kernel's permission check on the device is already done and
+/// the child inherits open descriptors rather than reopening them by path.
+/// `openpty` chowning the device to the invoking user therefore does not
+/// keep the dropped child from reading its own queued input.
+fn run_unprivileged(command: &mut Command) -> bool {
+    if nix::unistd::Uid::effective().is_root() {
+        command.uid(NOBODY_UID).gid(NOBODY_GID);
+        return true;
+    }
+    false
+}
+
+/// What to add to a spawn failure when the drop was applied: at uid 65534 the
+/// child must be able to reach and execute the binary it was pointed at.
+fn spawn_hint(dropped_privileges: bool) -> String {
+    if !dropped_privileges {
+        return String::new();
+    }
+    format!(
+        "\nA root test runner runs this row as uid {NOBODY_UID}, so the built \
+         binary and every directory above it must be traversable and executable \
+         by other users — mode 0755, not 0700."
+    )
+}
+
 /// DEC-6/C6 contract: every root-required command must refuse *before*
 /// emitting any prompt text or touching state, when invoked non-root with no
 /// TTY attached. Closing stdin (rather than leaving it inherited) forces
@@ -27,35 +69,18 @@ const NOBODY_GID: u32 = 65534;
 /// split needs a row that allocates a real pty, which is a separate concern.
 ///
 /// The child always runs unprivileged, whatever the test runner's own uid is:
-/// under a root runner it drops to `nobody` before `exec`. The row used to
-/// return early there instead, which is how this contract ended up with no CI
-/// coverage at all — both CI test jobs run `cargo test` as root in a
-/// container, so all 18 rows were no-ops that reported as passes (issue
-/// #189). Dropping cannot regress the way skipping did: `setuid(2)` from root
-/// replaces the saved uid as well, and the standard library clears root's
-/// supplementary groups ahead of it, so a row that runs at all ran
-/// unprivileged. No environment variable, workflow step, or runner user
-/// decides that.
+/// see [`run_unprivileged`], which every spawning row in this file goes
+/// through.
 fn assert_refuses_before_output(args: &[&str], forbidden_substrings: &[&str]) {
     let mut command = facelock_bin();
     command.args(args).stdin(Stdio::null());
-
-    let dropped_privileges = nix::unistd::Uid::effective().is_root();
-    if dropped_privileges {
-        command.uid(NOBODY_UID).gid(NOBODY_GID);
-    }
+    let dropped_privileges = run_unprivileged(&mut command);
 
     let output = command.output().unwrap_or_else(|e| {
-        let hint = if dropped_privileges {
-            format!(
-                "\nA root test runner runs this row as uid {NOBODY_UID}, so the built \
-                 binary and every directory above it must be traversable and executable \
-                 by other users — mode 0755, not 0700."
-            )
-        } else {
-            String::new()
-        };
-        panic!("failed to execute facelock {args:?}: {e}{hint}");
+        panic!(
+            "failed to execute facelock {args:?}: {e}{}",
+            spawn_hint(dropped_privileges)
+        );
     });
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -218,26 +243,37 @@ fn open_pty() -> (std::fs::File, std::fs::File) {
 /// regression to `require_root` here does not fail fast: it blocks forever on
 /// a prompt nobody will answer, which is why the wait is bounded and a
 /// timeout is the assertion.
+///
+/// Like every other row here it drops to `nobody` under a root runner rather
+/// than returning early. As root `daemon run` would start the daemon instead
+/// of refusing, so skipping was the only alternative — and skipping is what
+/// left this row with no CI coverage (issue #303).
 #[test]
 fn daemon_run_never_prompts_with_a_tty_attached() {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
-    if nix::unistd::Uid::effective().is_root() {
-        eprintln!("skipping: as root `daemon run` starts the daemon instead of refusing");
-        return;
-    }
-
     let (mut controller, device) = open_pty();
-    let mut child = facelock_bin()
+    let mut command = facelock_bin();
+    command
         .args(["daemon", "run"])
         .stdin(Stdio::from(device.try_clone().expect("dup pty device")))
         .stdout(Stdio::from(device.try_clone().expect("dup pty device")))
-        // The parent keeps no device fd, so reads on the controller see EOF
-        // once the child exits rather than hanging on an open write end.
-        .stderr(Stdio::from(device))
-        .spawn()
-        .expect("failed to spawn facelock daemon run");
+        .stderr(Stdio::from(device));
+    let dropped_privileges = run_unprivileged(&mut command);
+
+    let spawned = command.spawn();
+    // Drop the parent's copies of the device fds now that the child holds
+    // them. `Command` owns its `Stdio` handles until it is itself dropped, so
+    // a `Command` that outlives the spawn keeps a write end of the device
+    // open here and `read_to_end` on the controller below never sees EOF.
+    drop(command);
+    let mut child = spawned.unwrap_or_else(|e| {
+        panic!(
+            "failed to spawn facelock daemon run: {e}{}",
+            spawn_hint(dropped_privileges)
+        )
+    });
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
@@ -330,6 +366,10 @@ fn enroll_refuses_before_setup_prompt_non_root() {
 /// `--config` points at nothing for the same reason the row above does: the
 /// backstop inside `enroll::run` must not be able to answer for the gate.
 ///
+/// Under a root runner it drops to `nobody` like every other row rather than
+/// returning early: as root `enroll` opens the camera instead of refusing,
+/// and skipping is what left this row with no CI coverage (issue #303).
+///
 /// The child is given an empty `PATH` so this row can never escalate for
 /// real. The answer written to the pty is "n", but if the parser ever read
 /// that as consent, `Command::new("sudo")` fails to spawn instead of
@@ -340,18 +380,14 @@ fn enroll_offers_the_sudo_re_exec_with_a_tty_attached() {
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    if nix::unistd::Uid::effective().is_root() {
-        eprintln!("skipping: as root `enroll` opens the camera instead of refusing");
-        return;
-    }
-
     let (mut controller, device) = open_pty();
     // Queued in the tty's input buffer before the child exists, so the prompt
     // cannot race ahead of the answer and read EOF — which
     // `confirm_default_yes` would take as the default *yes*.
     controller.write_all(b"n\n").expect("write answer to pty");
 
-    let mut child = facelock_bin()
+    let mut command = facelock_bin();
+    command
         .args([
             "--config",
             "/nonexistent/facelock-enroll-c6.toml",
@@ -363,9 +399,21 @@ fn enroll_offers_the_sudo_re_exec_with_a_tty_attached() {
         .env("PATH", "")
         .stdin(Stdio::from(device.try_clone().expect("dup pty device")))
         .stdout(Stdio::from(device.try_clone().expect("dup pty device")))
-        .stderr(Stdio::from(device))
-        .spawn()
-        .expect("failed to spawn facelock enroll");
+        .stderr(Stdio::from(device));
+    let dropped_privileges = run_unprivileged(&mut command);
+
+    let spawned = command.spawn();
+    // Drop the parent's copies of the device fds now that the child holds
+    // them. `Command` owns its `Stdio` handles until it is itself dropped, so
+    // a `Command` that outlives the spawn keeps a write end of the device
+    // open here and `read_to_end` on the controller below never sees EOF.
+    drop(command);
+    let mut child = spawned.unwrap_or_else(|e| {
+        panic!(
+            "failed to spawn facelock enroll: {e}{}",
+            spawn_hint(dropped_privileges)
+        )
+    });
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
