@@ -4,6 +4,7 @@ paths:
   - "justfile"
   - "crates/**/tests/**"
   - ".github/workflows/**"
+  - ".github/actions/**"
 ---
 
 # Testing Strategy
@@ -28,6 +29,34 @@ paths:
 Fedora recipes take a release and default to 44 (`just test-rpm-pkg 43`). Tier 3e
 covers all three declared targets at the depth `dist/release-matrix.json` gives
 each; Rawhide is experimental and never a lane.
+
+## What CI runs, and when
+
+`.github/workflows/ci.yml` gates every pull request: build, test, clippy, audit,
+the PAM standalone surface, agent docs, translation catalogs, and tier 3/3a in
+`container-pam-test`.
+
+`.github/workflows/packaging.yml` gates the packaged artifacts: tiers 3d and 3e,
+both Debian suite lanes, and the native version-ordering matrix. It runs on three
+schedules:
+
+| When | What | Filter |
+|---|---|---|
+| Pull request | every lane | only when the diff reaches a package |
+| Nightly (07:00 UTC) | every lane | none |
+| `just release-preflight` | evidence of a green run at HEAD | none |
+
+The pull-request filter is a `changes` job running
+`.github/workflows/scripts/classify-changes.sh`, plain bash over a merge-base
+diff. It is not GitHub's `paths:`, which strands a required check as pending
+forever, and not a third-party filter action, which would be another pinned SHA
+to review. Add a path there when a new file can reach a built package.
+
+So a green pull request is **not** packaging-verified unless the packaging jobs
+actually ran on it. A Rust-only change that breaks the packaged runtime is caught
+by the nightly matrix within a day, and by the release gate before it ships.
+`just test-packaging-matrix` runs every lane locally and records the commit, for
+a maintainer without CI in reach.
 
 ## Which E2E tier a new assertion belongs in
 

@@ -7,3 +7,4 @@ dev/*.db
 .claude/worktrees/
 docs/superpowers/
 /.hardware-tiers-verified
+/.packaging-matrix-verified

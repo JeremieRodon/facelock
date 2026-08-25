@@ -1,0 +1,70 @@
+name: Fetch ONNX models
+description: >-
+  Download the required ONNX models named by models/manifest.toml, verify them
+  against the checksums the manifest declares, and leave them in models/.
+
+# models/*.onnx are gitignored (~170MB of downloaded weights), so a runner
+# never has them -- and `facelock daemon` verifies them at startup and refuses
+# to run without them. Every gate that starts a daemon needs this first, or it
+# degrades to FACELOCK_ALLOW_MISSING_MODELS=1, which turns the daemon-start
+# assertions into *skips* rather than failures (#229 forbids that).
+#
+# Names, URLs and checksums come from the manifest, not from this file, so
+# adding or rotating a model needs no change here. Only the non-optional models
+# are fetched: det_10g.onnx and glintr100.onnx are alternate higher-accuracy
+# weights no test tier selects, and they would more than double the download.
+
+inputs:
+  cache-prefix:
+    description: Cache key prefix, so a caller can partition its own cache.
+    required: false
+    default: facelock-models
+
+runs:
+  using: composite
+  steps:
+    - name: Derive the required models from the manifest
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY' > "$RUNNER_TEMP/required-models.txt"
+        import tomllib
+
+        with open("models/manifest.toml", "rb") as fh:
+            manifest = tomllib.load(fh)
+        for model in manifest["models"]:
+            if not model.get("optional"):
+                print(model["filename"], model["sha256"], model["url"])
+        PY
+        cat "$RUNNER_TEMP/required-models.txt"
+
+    # Keyed on the manifest, which carries the checksums, so a rotated model is
+    # a new key and a stale entry can never be served for a new manifest.
+    # Cached outside the checkout: restoring into models/ would overwrite the
+    # tracked manifest.toml and NOTICE.md with whatever the cache held.
+    - name: Restore the model cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/facelock-models
+        key: ${{ inputs.cache-prefix }}-${{ hashFiles('models/manifest.toml') }}
+
+    - name: Fetch and verify the required models
+      shell: bash
+      run: |
+        set -euo pipefail
+        cache="$HOME/.cache/facelock-models"
+        mkdir -p "$cache" models
+        while read -r name sha url; do
+          # Re-checksum the cached copy rather than trusting its presence: it
+          # was restored from an archive, and a truncated model fails much
+          # later, deep inside a container run.
+          if ! echo "$sha  $cache/$name" | sha256sum -c - >/dev/null 2>&1; then
+            curl -fsSL --retry 3 -o "$cache/$name.part" "$url"
+            echo "$sha  $cache/$name.part" | sha256sum -c -
+            mv -- "$cache/$name.part" "$cache/$name"
+          fi
+          cp -- "$cache/$name" "models/$name"
+        done < "$RUNNER_TEMP/required-models.txt"
+
+        # Verify what landed in models/, which is what every gate reads.
+        awk '{print $2 "  models/" $1}' "$RUNNER_TEMP/required-models.txt" | sha256sum -c -

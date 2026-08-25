@@ -312,23 +312,10 @@ jobs:
       # is what kept the camera-free assertions below out of CI even though
       # none of them opens a camera (#139). Fetched from the same `assets`
       # release `facelock setup` uses and verified against the checked-in
-      # manifest, before the image is built.
+      # manifest, before the image is built. The packaging gates need the same
+      # models for the same reason, so the fetch is a shared action (#229).
       - name: Fetch required ONNX models
-        run: |
-          python3 - <<'PY' > /tmp/required-models.txt
-          import tomllib
-
-          with open("models/manifest.toml", "rb") as fh:
-              manifest = tomllib.load(fh)
-          for model in manifest["models"]:
-              if not model.get("optional"):
-                  print(model["filename"], model["sha256"], model["url"])
-          PY
-          mkdir -p models
-          while read -r name sha url; do
-            curl -fsSL --retry 3 -o "models/$name" "$url"
-            echo "$sha  models/$name" | sha256sum -c -
-          done < /tmp/required-models.txt
+        uses: ./.github/actions/fetch-models
 
       - name: Build test container
         run: |

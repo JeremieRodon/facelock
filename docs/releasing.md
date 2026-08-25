@@ -268,23 +268,56 @@ uninstall runs only the scriptlets already installed from v0.1.4. Users must
 install a guarded release before a later uninstall so the guarded upgrade can
 retire the old authselect payload first.
 
+### Packaging gates in CI
+
+`.github/workflows/packaging.yml` runs the lanes above in CI: both Debian suite
+gates, every declared Fedora lane, the Arch package built from the real
+`dist/PKGBUILD`, and the native version-ordering matrix. It downloads and
+checksum-verifies the ONNX models first, through `.github/actions/fetch-models`,
+so the daemon-start assertions execute instead of being counted as skipped.
+
+Three schedules, because the full matrix is 30-60+ minutes and most pull
+requests touch no packaging:
+
+| When | Lanes | Filtered |
+|---|---|---|
+| Pull request | all | yes, only when the diff reaches a package |
+| Nightly, 07:00 UTC | all | no |
+| `just release-preflight` | evidence of a green run at HEAD | no |
+
+The pull-request filter is a `changes` job running
+`.github/workflows/scripts/classify-changes.sh`, which classifies the merge-base
+diff in plain bash. It covers `debian/`, `dist/`, `systemd/`, `dbus/`,
+`config/`, `scripts/`, the packaging halves of `test/`, the justfile,
+`.packit.yaml`, `.github/workflows/`, and the Rust the maintainer scripts
+execute. `facelock pam remove --all` runs from `%preun`, from Arch's
+`pre_remove` and from Debian's `prerm`, so a change to that command can abort a
+package removal without touching a packaging file. Each lane then gates on
+`if: needs.changes.outputs.packaging == 'true'`, which reports a real "skipped"
+conclusion; GitHub's own `paths:` filter would leave a required check pending
+forever instead.
+
+**Residual risk.** Path filtering means a change that touches no packaging path
+can still break the *packaged* runtime. A Rust change to daemon startup, a new
+runtime dependency, a file the spec does not ship: each of those leaves its own
+pull request green with every packaging job reported as skipped. Do not read
+that as packaging-verified. The nightly matrix catches it within a day, and the
+release gate below catches it before anything ships. When a change is
+packaging-relevant in a way the filter cannot see, run the lane by hand or add
+the path to `classify-changes.sh`.
+
 ### Release preflight (recommended)
 
 Run this before creating/pushing a release tag:
 
 ```bash
-just test-arch-camera-required      # camera + a person in frame; records the commit
-just release-preflight              # stable release checks
-just release-preflight v0.2.0-rc.1 # prerelease checks; no stable secret access
-just test-release-matrix            # converters, matrix drift, native ordering
+just test-arch-camera-required        # camera + a person in frame; records the commit
+gh workflow run packaging.yml --ref main   # the packaging matrix, at this commit
+just release-preflight                # stable release checks
+just release-preflight v0.2.0-rc.1   # prerelease checks; no stable secret access
 just check
 just test-arch-pam
 just test-arch-camera-free
-just test-rpm
-just test-deb
-just test-deb-trixie-pkg
-just test-deb-resolute-pkg
-just test-rpm-pkg
 ```
 
 `just test-arch-camera-required` comes first because it is the only step a
@@ -300,6 +333,13 @@ one-shot path PAM falls back to. Nothing else ran them, and three of their
 assertions rotted undetected as a result (#139). If they were already run by
 hand at this exact commit, acknowledge that by naming it:
 `FACELOCK_HARDWARE_TIERS_ACK=<sha> just release-preflight`.
+
+Preflight also refuses to pass without a packaging matrix result for HEAD. It
+accepts a successful `packaging.yml` run at that exact commit (looked up with
+`gh`), or the record `just test-packaging-matrix` writes to
+`.packaging-matrix-verified` after running every lane locally. A nightly run
+does not satisfy it: nightly builds whatever `main` was at 07:00 UTC, and a
+release commit is a version bump nobody has built a package from yet.
 
 `just release-preflight` checks local tools, required packaging files (including
 `.packit.yaml`), and whether `AUR_SSH_KEY`, `APT_GPG_PRIVATE_KEY`, and

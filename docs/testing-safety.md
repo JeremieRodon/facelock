@@ -140,9 +140,19 @@ require_frame_variance = true
 
 ## CI
 
-GitHub Actions at `.github/workflows/ci.yml`:
+GitHub Actions runs two workflows on a pull request.
+
+`.github/workflows/ci.yml`:
 - Build + test + clippy + fmt check
-- Container PAM smoke tests
+- Container PAM smoke tests and the camera-free E2E tier
+
+`.github/workflows/packaging.yml`:
+- Both Debian suite package gates, every declared Fedora lane, the Arch package
+  built from `dist/PKGBUILD`, and the native version-ordering matrix
+- Path-filtered on a pull request, so these lanes run only when the diff reaches
+  a package. They run unfiltered nightly, and `just release-preflight` refuses
+  to pass without a green run at HEAD. `docs/releasing.md` covers the filter and
+  the residual risk it leaves.
 
 Local full CI: `bash test/run-tests.sh`
 

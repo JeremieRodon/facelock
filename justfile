@@ -98,7 +98,15 @@ check-package-names-live:
     python3 test/check-package-names-live.py
 
 # Run all checks (test + lint + format + audit + PAM standalone surface + agent docs)
-check: test lint fmt-check audit check-pam-standalone check-agent-docs test-source-install-daemon-lifecycle test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test test-legacy-system-assets test-locale-install-contract
+check: test lint fmt-check audit check-pam-standalone check-agent-docs test-source-install-daemon-lifecycle test-cargo-vendor-contract test-deb-source-contract test-deb-package-contract-test test-legacy-system-assets test-locale-install-contract test-classify-changes
+
+# The path filter that decides whether the packaging gates run on a pull
+# request. A pattern that stops matching fails nothing: it reports every deb,
+# rpm and Arch lane as skipped and the pull request goes green having built no
+# package. Cheap enough to sit in `just check`; the git work is a dozen
+# one-line commits in a temporary directory.
+test-classify-changes:
+    bash test/classify-changes-test.sh
 
 # Prove every install path ships compiled gettext catalogs. Static checks run
 # everywhere; the compile check needs gettext and skips without it, so that
@@ -1049,8 +1057,40 @@ _ort-version := `for ort in /usr/lib/libonnxruntime.so /usr/lib64/libonnxruntime
 _fedora-lane-image release:
     @bash test/fedora-lane-image.sh '{{ release }}' >/dev/null
 
+# The Fedora lanes stage host-built binaries into the image: build-rpm-prebuilt.sh
+# no-ops the spec's cargo lines and tars target/release/ into the source. So the
+# lane needs those binaries present, not necessarily built by this machine.
+#
+# That distinction matters because `just build-release` cannot run everywhere.
+# Its second command builds facelock-cli with the tpm feature, and tss-esapi-sys
+# now demands tss2 4.1.3 or newer; Ubuntu 24.04 ships 4.0.1, so the build panics
+# on the GitHub runner (#229). CI builds them in the same digest-pinned Arch
+# container ci.yml uses, and says so with FACELOCK_RELEASE_BINARIES_PREBUILT=1.
+#
+# The declaration is checked, not trusted: a missing binary is an error, never a
+# quietly skipped stage. Without it, this builds exactly as before.
+
+[private]
+_require-release-binaries:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${FACELOCK_RELEASE_BINARIES_PREBUILT:-0}" != "1" ]; then
+        exec {{ just_executable() }} build-release
+    fi
+    missing=()
+    for binary in target/release/facelock target/release/facelock-polkit-agent target/release/libpam_facelock.so; do
+        [ -f "$binary" ] || missing+=("$binary")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "error: FACELOCK_RELEASE_BINARIES_PREBUILT=1 names binaries that are not here:" >&2
+        printf '         %s\n' "${missing[@]}" >&2
+        echo "       Either stage them first or unset the variable and let this build them." >&2
+        exit 1
+    fi
+    echo "staging pre-built release binaries (FACELOCK_RELEASE_BINARIES_PREBUILT=1)"
+
 # Test RPM packaging in Fedora container
-test-rpm release="44": (_fedora-lane-image release) build-release
+test-rpm release="44": (_fedora-lane-image release) _require-release-binaries
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -1109,7 +1149,7 @@ test-deb-resolute-pkg: (_require-models "1")
 # Same model requirement (and same opt-out) as the two Debian suite package gates.
 
 # Package test — build real .rpm, install via dnf, validate under booted systemd
-test-rpm-pkg release="44": (_fedora-lane-image release) (_require-models "1") build-release
+test-rpm-pkg release="44": (_fedora-lane-image release) (_require-models "1") _require-release-binaries
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -1122,7 +1162,7 @@ test-rpm-pkg release="44": (_fedora-lane-image release) (_require-models "1") bu
 # substitutes for a Fedora 43 or 44 result.
 
 # Branched-release lane — build the package, then boot it for a runtime smoke
-test-rpm-smoke release="45": (_fedora-lane-image release) build-release
+test-rpm-smoke release="45": (_fedora-lane-image release) _require-release-binaries
     #!/usr/bin/env bash
     set -euo pipefail
     image="$(bash test/fedora-lane-image.sh '{{ release }}')"
@@ -1481,13 +1521,47 @@ release-preflight tag='':
     fi
 
     echo ""
+    echo "== Packaging gate evidence =="
+    # #229: the deb, rpm and Arch gates are path-filtered on pull requests, so
+    # a release commit can be green on every check and still never have had a
+    # package built from it. The nightly matrix does not close that either: it
+    # runs against whatever main was at 07:00 UTC, not against this commit.
+    # A tag ships to four channels; this is the last place to find out.
+    PACKAGING_RUN=""
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        PACKAGING_RUN="$(gh run list --workflow packaging.yml --commit "$HEAD_SHA" \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || true)"
+    fi
+    PACKAGING_RECORDED=""
+    if [ -f .packaging-matrix-verified ]; then
+        PACKAGING_RECORDED="$(head -1 .packaging-matrix-verified)"
+    fi
+    if [ -n "$PACKAGING_RUN" ]; then
+        echo "OK: packaging workflow run $PACKAGING_RUN succeeded at $HEAD_SHA"
+    elif [ "$PACKAGING_RECORDED" = "$HEAD_SHA" ]; then
+        echo "OK: packaging matrix recorded green at $HEAD_SHA"
+    else
+        if [ -z "$PACKAGING_RECORDED" ]; then
+            echo "MISSING: no packaging matrix result for $HEAD_SHA"
+        else
+            echo "STALE: packaging matrix recorded at $PACKAGING_RECORDED, HEAD is $HEAD_SHA"
+        fi
+        echo "  Run the matrix in CI against this commit, then re-run preflight:"
+        echo "    gh workflow run packaging.yml --ref $(git rev-parse --abbrev-ref HEAD)"
+        echo "  Or run every lane locally (30-60+ minutes, needs podman):"
+        echo "    just test-packaging-matrix"
+        failed=1
+    fi
+
+    echo ""
     if [ "$failed" -ne 0 ]; then
         echo "Release preflight: FAILED"
         exit 1
     fi
 
     echo "Release preflight: OK"
-    echo "Next: run 'just check', 'just test-release-matrix', 'just test-arch-pam', 'just test-arch-camera-free', 'just test-rpm', and 'just test-deb' before tagging."
+    echo "Next: run 'just check', 'just test-arch-pam' and 'just test-arch-camera-free' before tagging."
+    echo "      The packaging matrix (deb, rpm, Arch, version ordering) is the gate above."
 
 # Fast release contract tests that do not require distro package tools.
 test-release-contract:
@@ -1502,3 +1576,25 @@ test-release-native-ordering:
 
 # Complete Track V version/matrix gate.
 test-release-matrix: test-release-contract test-release-native-ordering
+
+# The same lanes `.github/workflows/packaging.yml` runs, in one command, for a
+# maintainer without CI in reach (#229). It is 30-60+ minutes and needs podman
+# plus the ONNX models; CI is the faster path, and `just release-preflight`
+# accepts a green run of that workflow at HEAD instead of this record.
+#
+# Clean tree first, for the same reason the camera tiers demand one: a record
+# that names a commit the lanes did not actually build is worse than no record.
+
+# Every packaging lane the release gate requires, recorded for release-preflight
+test-packaging-matrix: _require-clean-tree test-release-matrix test-arch-pkg test-deb test-rpm-lanes
+    #!/usr/bin/env bash
+    set -euo pipefail
+    commit="$(git rev-parse HEAD)"
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "error: the tree changed while the lanes ran; not recording." >&2
+        exit 1
+    fi
+    printf '%s\n' "$commit" > .packaging-matrix-verified
+    echo ""
+    echo "Recorded: packaging matrix passed at $commit"
+    echo "'just release-preflight' accepts this until HEAD moves."
