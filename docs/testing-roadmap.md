@@ -230,18 +230,16 @@ and Fedora package gates it needs no ONNX models and no booted systemd, and can
 run unattended. It is also the slowest recipe in the tree: the recipe compiles
 the workspace twice, release for `build()` and debug for `check()`.
 
-What this tier does not cover is integrity. `dist/PKGBUILD` carries
-`sha256sums=('SKIP')` (#283), so `makepkg --verifysource` checks no digest at
-all: it proves only that the declared file name resolved without touching the
-network. The staged tarball is this working tree, so what the sum would cover is
-a repack the lane produced itself. The declared `source=` URL is never fetched
-either, which means a wrong or dead URL still passes here.
-
-That also makes #283 a forward conflict. The moment a real digest replaces
-`SKIP`, the staged tarball cannot match it and this lane fails on every run. The
-intended path is `makepkg --skipchecksums` for the staged build, with the real
-sum checked by a separate assertion that reads `sha256sums` directly rather than
-by handing makepkg a tarball it was never going to accept.
+Integrity is exercised the way the shipped recipe gets it. `dist/PKGBUILD`
+declares a fail-closed `__SRC_SHA256__` placeholder that `publish-aur.sh`
+replaces with the release tarball's digest at publish time (#283); a tarball
+repacked from the working tree can never match a published sum, so the lane
+applies the same transformation to the staged tarball — it refuses a recipe
+that declares `SKIP`, proves `makepkg --verifysource` rejects a wrong digest,
+then writes the staged file's real digest and requires verification to pass.
+What remains uncovered: the declared `source=` URL is never fetched, so a wrong
+or dead URL still passes here, and the published tarball's true digest is
+computed by CI at publish time rather than asserted in this lane.
 
 Historical note: the first run of this lane caught a genuine shipping bug.
 `check()` runs `cargo test --workspace`, and the `*_non_root` cases in

@@ -50,7 +50,7 @@ It rewrites **six** files with `sed -i`:
 | File | Note |
 |---|---|
 | `Cargo.toml` | workspace version, inherited by all crates |
-| `dist/PKGBUILD` | |
+| `dist/PKGBUILD` | the source sha256 placeholder is filled in by CI at publish, not here |
 | `dist/PKGBUILD-bin` | per-binary sha256sums are filled in by CI, not here |
 | `dist/PKGBUILD-git` | the runtime `pkgver()` computes the real version; this is the fallback |
 | `dist/facelock.spec` | |

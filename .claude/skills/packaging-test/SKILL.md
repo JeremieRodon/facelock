@@ -67,17 +67,18 @@ hook that cleans PAM up on removal. It also resolves every dependency name all
 three PKGBUILDs declare, including `PKGBUILD-git`, which is what Omarchy's
 `omarchy-pkg-aur-add facelock-git` pulls.
 
-Three things it does not do. It does not boot systemd, so unit runtime
-behaviour stays with the deb and rpm gates. It checks no source digest:
-`sha256sums` is `SKIP` (#283), the staged tarball is a repack of the working
-tree, and the `source=` URL is never fetched, so a wrong URL passes. And it
-compiles the workspace twice, release for `build()` and debug for `check()`, so
-it is the slowest recipe here. Reach for `test-arch-pam` while iterating and run
-this before pushing a packaging change.
+It also exercises integrity the way the shipped recipe gets it: `dist/PKGBUILD`
+carries a fail-closed `__SRC_SHA256__` placeholder that `publish-aur.sh`
+finalizes at release time (#283), so the lane refuses a recipe declaring
+`SKIP`, proves a wrong digest is rejected, then substitutes the staged
+tarball's real digest and lets `makepkg` verify it.
 
-When #283 replaces `SKIP` with a real digest, this lane breaks: a staged tarball
-cannot match a published sum. Move the staged build to `--skipchecksums` and
-assert the real digest separately.
+Two things it does not do. It does not boot systemd, so unit runtime
+behaviour stays with the deb and rpm gates. And it compiles the workspace
+twice, release for `build()` and debug for `check()`, so it is the slowest
+recipe here. Reach for `test-arch-pam` while iterating and run this before
+pushing a packaging change. The `source=` URL is still never fetched, so a
+wrong URL passes.
 
 ## Camera-gated tests
 

@@ -367,7 +367,8 @@ jobs:
       - name: Compute source tarball checksum
         id: checksum
         run: |
-          CHECKSUM=$(curl -sL "https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz" | sha256sum | cut -d' ' -f1)
+          set -o pipefail
+          CHECKSUM=$(curl -fsSL "https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz" | sha256sum | cut -d' ' -f1)
           echo "SHA256=${CHECKSUM}" >> "$GITHUB_OUTPUT"
 
       - name: Publish to AUR
