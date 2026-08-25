@@ -15,6 +15,19 @@ use crate::message::{AccessMessage, explain};
 /// If stdin is a TTY, prompts the user and re-execs. Otherwise bails
 /// with an actionable error message.
 pub fn require_root(hint: &str) -> anyhow::Result<()> {
+    require_root_preserving(hint, &[])
+}
+
+/// Like [`require_root`], but the sudo re-exec keeps the named environment
+/// variables (`sudo --preserve-env=A,B`).
+///
+/// This is not a general passthrough: the list is chosen at compile time by
+/// the caller's arm in `require_root_for`, and today only the preview uses
+/// it, for `WAYLAND_DISPLAY` — so a session running several compositors
+/// previews on the one that launched the command. The preview validates the
+/// carried value down to a bare socket name inside the invoking uid's
+/// runtime directory (see `preview::wayland_socket`); nothing else reads it.
+pub fn require_root_preserving(hint: &str, preserve_env: &[&str]) -> anyhow::Result<()> {
     use crate::message::{Terminal, fail};
 
     if Uid::current().is_root() {
@@ -43,12 +56,30 @@ pub fn require_root(hint: &str) -> anyhow::Result<()> {
 
     // Re-exec with sudo, preserving all arguments
     let args: Vec<String> = std::env::args().collect();
+    let argv = sudo_argv(preserve_env, |var| std::env::var_os(var).is_some(), &args);
     let status = std::process::Command::new("sudo")
-        .args(&args)
+        .args(&argv)
         .status()
         .context("failed to execute sudo")?;
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The argument vector for the sudo re-exec: a `--preserve-env=` list for
+/// the requested variables that are actually set, then the original argv.
+///
+/// Split out so the shape is testable without exec'ing sudo. Unset
+/// variables are dropped from the list rather than passed through — naming
+/// them anyway would be harmless today, but the flag must never grow beyond
+/// what the run demonstrably carries.
+fn sudo_argv(preserve_env: &[&str], is_set: impl Fn(&str) -> bool, args: &[String]) -> Vec<String> {
+    let keep: Vec<&str> = preserve_env.iter().copied().filter(|v| is_set(v)).collect();
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    if !keep.is_empty() {
+        argv.push(format!("--preserve-env={}", keep.join(",")));
+    }
+    argv.extend(args.iter().cloned());
+    argv
 }
 
 /// Like [`require_root`], but never offers an interactive re-exec prompt.
@@ -453,6 +484,26 @@ mod tests {
         let msg_before = format!("{err:#}");
         let hinted = add_access_denied_hint(err);
         assert_eq!(format!("{hinted:#}"), msg_before);
+    }
+
+    /// The default re-exec shape: no preservation flag at all. Every command
+    /// except the preview goes through this arm, so their sudo environment
+    /// stays exactly what it was before `require_root_preserving` existed.
+    #[test]
+    fn sudo_argv_without_preserve_list_is_just_the_args() {
+        let args = vec!["facelock".to_string(), "enroll".to_string()];
+        assert_eq!(sudo_argv(&[], |_| true, &args), args);
+    }
+
+    #[test]
+    fn sudo_argv_preserves_only_set_variables() {
+        let args = vec!["facelock".to_string(), "preview".to_string()];
+        let argv = sudo_argv(&["WAYLAND_DISPLAY"], |v| v == "WAYLAND_DISPLAY", &args);
+        assert_eq!(argv[0], "--preserve-env=WAYLAND_DISPLAY");
+        assert_eq!(&argv[1..], &args[..]);
+
+        // Unset variables drop out of the flag entirely.
+        assert_eq!(sudo_argv(&["WAYLAND_DISPLAY"], |_| false, &args), args);
     }
 
     #[test]

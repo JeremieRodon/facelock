@@ -227,7 +227,14 @@ fn require_root_for(command: &Commands) -> anyhow::Result<()> {
         Commands::Clear { .. } => ipc_client::require_root("sudo facelock clear"),
         Commands::List { .. } => ipc_client::require_root("sudo facelock list"),
         Commands::Test { .. } => ipc_client::require_root("sudo facelock test"),
-        Commands::Preview { .. } => ipc_client::require_root("sudo facelock preview"),
+        // Preview alone carries `WAYLAND_DISPLAY` across the re-exec, so a
+        // session with several compositors previews on the one that ran the
+        // command. The value is a display *name*, validated by the preview
+        // to a bare socket inside the invoking uid's runtime directory —
+        // never a path, and never `XDG_RUNTIME_DIR`.
+        Commands::Preview { .. } => {
+            ipc_client::require_root_preserving("sudo facelock preview", &["WAYLAND_DISPLAY"])
+        }
         Commands::Devices { .. } => ipc_client::require_root("sudo facelock devices"),
         Commands::Bench { .. } => ipc_client::require_root("sudo facelock bench <subcommand>"),
         Commands::Tpm { command } => ipc_client::require_root(command.sudo_hint()),

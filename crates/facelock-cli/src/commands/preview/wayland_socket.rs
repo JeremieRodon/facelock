@@ -17,10 +17,20 @@
 //!
 //! Environment influence is bounded to one choice: a `WAYLAND_DISPLAY` that
 //! is a bare socket name selects among sockets *inside* that directory. A
-//! value carrying a path separator is ignored, and whatever is resolved must
-//! be a non-symlink socket owned by the invoking uid — so the worst a
-//! hostile value achieves is picking a different compositor socket the user
-//! already owns, or a failed connect and the text-only fallback.
+//! value carrying a path separator is ignored. (The name survives the sudo
+//! re-exec via `--preserve-env=WAYLAND_DISPLAY` — see
+//! `require_root_preserving` — so a session running several compositors
+//! previews on the one that launched the command.)
+//!
+//! The authority on *what* root then talks to is the connected peer, not the
+//! path. `/run/user/<uid>` is writable by the invoking user, so any pathname
+//! check races against a swap before `connect(2)` — which follows symlinks.
+//! The pre-connect lstat is therefore only a fast, clearer-error filter;
+//! after connecting, `SO_PEERCRED` must show a peer process running as the
+//! invoking uid or the connection is dropped before a byte of protocol is
+//! spoken. The worst a hostile session achieves is steering root's bare
+//! `connect()`+close at a path of its choosing, or handing root a Wayland
+//! endpoint the user could already run themselves.
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -113,9 +123,13 @@ fn is_wayland_socket_name(name: &str) -> bool {
     name.starts_with("wayland-") && !name.ends_with(".lock")
 }
 
-/// Connect to `path` after checking it is a non-symlink socket owned by
-/// `uid`. The symlink refusal means a link planted in the runtime dir cannot
-/// point root at another service's socket.
+/// Connect to `path` and authenticate the connected peer as `uid`.
+///
+/// The lstat checks are a fast filter with clearer errors, not the security
+/// boundary: the runtime dir is writable by the invoking user, so the path
+/// can be swapped — including for a symlink, which `connect(2)` follows —
+/// between the check and the connect. The boundary is [`verify_peer_uid`]
+/// on the connected stream, which no rename can race.
 fn connect_owned(path: &Path, uid: u32) -> anyhow::Result<Connection> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("no Wayland socket at {}", path.display()))?;
@@ -132,7 +146,28 @@ fn connect_owned(path: &Path, uid: u32) -> anyhow::Result<Connection> {
     }
     let stream = UnixStream::connect(path)
         .with_context(|| format!("failed to connect to {}", path.display()))?;
+    verify_peer_uid(&stream, uid)
+        .with_context(|| format!("refusing Wayland socket {}", path.display()))?;
     Connection::from_socket(stream).context("failed to connect to Wayland display")
+}
+
+/// Refuse a connected socket whose peer process does not run as `uid`.
+///
+/// `SO_PEERCRED` reports the credentials of the process that bound the
+/// listening socket, read from the kernel on the already-established
+/// connection — the one identity in this module a pathname swap cannot
+/// forge. Nothing is written to the stream before this check.
+fn verify_peer_uid(stream: &UnixStream, uid: u32) -> anyhow::Result<()> {
+    let cred = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .context("failed to read peer credentials")?;
+    if cred.uid() != uid {
+        anyhow::bail!(
+            "peer runs as uid {}, not the invoking uid {}",
+            cred.uid(),
+            uid
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -245,5 +280,32 @@ mod tests {
         let err = connect_owned(&path, not_us).unwrap_err();
         assert!(format!("{err:#}").contains("not the invoking uid"));
         drop(listener);
+    }
+
+    #[test]
+    fn connect_accepts_a_listener_running_as_the_invoking_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wayland-1");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        connect_owned(&path, nix::unistd::Uid::current().as_raw()).unwrap();
+    }
+
+    #[test]
+    fn peer_running_as_the_invoking_uid_is_accepted() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        verify_peer_uid(&a, nix::unistd::Uid::current().as_raw()).unwrap();
+    }
+
+    /// The race the lstat checks cannot close: the runtime dir is writable
+    /// by the invoking user, so the path can be swapped between the check
+    /// and `connect(2)`, which follows symlinks. This check runs on the
+    /// established connection itself, where no rename can reach — a peer
+    /// not running as the invoking uid is refused whatever the path said.
+    #[test]
+    fn peer_running_as_another_uid_is_refused() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let not_us = nix::unistd::Uid::current().as_raw() + 1;
+        let err = verify_peer_uid(&a, not_us).unwrap_err();
+        assert!(format!("{err:#}").contains("not the invoking uid"));
     }
 }
