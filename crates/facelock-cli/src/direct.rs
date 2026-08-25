@@ -189,10 +189,15 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
     let models = store
         .list_models(user)
         .context("storage error listing face models")?;
-    // Load embeddings with encryption support, matching the daemon handler
-    // path — and matching its ordering: the plaintext load comes LAST, after
-    // every other fallible call, so no `?` between here and the wiping callee
-    // below can drop the decrypted set unwiped (#293).
+    // Load embeddings with encryption support (the daemon handler's own
+    // decrypt path), and load them LAST, after every other fallible call, so
+    // no `?` between here and the wiping callee below can drop the decrypted
+    // set unwiped (#293). The daemon deliberately orders this the other way:
+    // it loads *before* opening the camera so every LED-on millisecond goes
+    // to analyzed frames (ADR 008 §1), and pays for that with a hand-wipe on
+    // its camera-acquire error path (`handle_authenticate_prechecked`). This
+    // path already holds the camera, so it takes the ordering that needs no
+    // hand-wipe — do not "align" it with the daemon without adding one.
     let mut stored = load_user_embeddings(&store, config, user)?;
 
     // Shared with daemon mode (crates/facelock-daemon/src/auth.rs). A local copy
