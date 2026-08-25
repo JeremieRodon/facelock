@@ -88,6 +88,27 @@ authenticate_diagnostics() {
         busctl --system status org.facelock.Daemon 2>&1 || true
         echo "--- /var/lib/facelock/models ---"
         ls -l /var/lib/facelock/models 2>&1 || true
+        # pam_unix's side of the stack. AUTHINFO_UNAVAIL with the correct
+        # password means pam_unix could not retrieve the shadow entry, not
+        # that a password was refused -- reproduced exactly by deleting
+        # testuser's shadow row. Show whether the entry is reachable (never
+        # the hash), what storage the file sits on, and what pam_unix logged.
+        echo "--- pam_unix credential sources ---"
+        ls -ln /etc/passwd /etc/shadow 2>&1 || true
+        stat -f -c 'fstype=%T' /etc/shadow 2>&1 || true
+        cat /proc/self/uid_map 2>&1 || true
+        getent shadow testuser >/dev/null 2>&1; echo "getent shadow testuser: rc=$?"
+        grep -E '^Cap(Inh|Prm|Eff|Bnd)' /proc/self/status 2>&1 || true
+        dd if=/etc/shadow of=/dev/null bs=1 count=1 2>&1 | tail -1 || true
+        printf 'testuser shadow rows: '; grep -c '^testuser:' /etc/shadow 2>&1 || true
+        # Probe: does loosening the 0000 mode make the entry readable? Only
+        # reached on the way to fail(), so the mutation dies with the
+        # container; restore anyway.
+        chmod 0400 /etc/shadow 2>/dev/null || true
+        getent shadow testuser >/dev/null 2>&1; echo "getent after chmod 0400: rc=$?"
+        chmod 0000 /etc/shadow 2>/dev/null || true
+        echo "--- pamtester journal (pam_unix) ---"
+        journalctl --no-pager --full -n 40 -t pamtester 2>&1 || true
     } >&2
 }
 
