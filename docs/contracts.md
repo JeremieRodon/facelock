@@ -1966,11 +1966,88 @@ and never a correct one.
 
 ### facelock auth Exit Codes
 
-| Code | Meaning | PAM Code |
-|------|---------|----------|
-| 0 | Face matched | PAM_SUCCESS |
-| 1 | No match / timeout / dark | PAM_AUTH_ERR |
-| 2 | Error / no enrolled faces | PAM_IGNORE |
+The exit code is the only thing the PAM module learns from the oneshot
+fallback, and the two sides upgrade at different moments: a package update
+replaces `/usr/bin/facelock` on disk while every long-lived PAM host (a screen
+locker, `sshd`) keeps the `pam_facelock.so` it already loaded. There is no
+version handshake — the module maps the number and nothing else — so the table
+is governed by three frozen invariants:
+
+1. **Exit 0, 1 and 2 keep their meanings permanently.** 0 = matched, 1 =
+   scanned and not matched, 2 = error / no opinion. They are never redefined
+   or repurposed; a class that leaves one of them moves to a *new* code, never
+   onto a changed meaning of an old one.
+2. **New codes are allocated only from the space an older module already maps
+   to `PAM_IGNORE`** (any code ≥ 3 it does not know). Old module + new binary
+   can therefore only move a class's consequence to `PAM_IGNORE` — never to
+   `PAM_SUCCESS` or `PAM_AUTH_ERR`. For rate limited (3) and suppressed (4),
+   which were exit 2 before the split, that is byte-for-byte the pre-split
+   behavior. For all frames dark (5), moved off exit 1, it is a deliberate
+   semantic change the moment the new binary ships: a dark scan stops
+   failing the stack (`PAM_AUTH_ERR`) and abstains — the daemon transport's
+   consequence — under every module generation.
+3. **The module's arm for unknown codes stays `PAM_IGNORE`**, so new module +
+   old binary is unchanged too. The same arm absorbs a binary killed by a
+   signal (no exit code; the module reads it as 2).
+
+The "new module" column below is the module that ships alongside this table
+(the same release as the binary emitting codes 3–5); every earlier module
+maps those codes through its unknown-code arm.
+
+| Code | Class | PAM code (new module) | PAM code (older module) |
+|------|-------|-----------------------|-------------------------|
+| 0 | Face matched | `PAM_SUCCESS` | `PAM_SUCCESS` |
+| 1 | Scanned, no match | `PAM_AUTH_ERR` | `PAM_AUTH_ERR` |
+| 2 | Error / no opinion: disabled, SSH, lid closed, storage, rate-limit check failed, IR required, unverified Y16, internal, cancelled, not enrolled | `PAM_IGNORE` | `PAM_IGNORE` |
+| 3 | Rate limited | `PAM_AUTH_ERR` | `PAM_IGNORE` |
+| 4 | Suppressed (no enrolled models + `suppress_unknown`) | `PAM_AUTHINFO_UNAVAIL` | `PAM_IGNORE` |
+| 5 | All frames dark | `PAM_IGNORE` | `PAM_IGNORE` |
+
+Codes 3–5 exist so the oneshot fallback carries the same PAM consequence per
+class as the daemon transport: rate limited → `PAM_AUTH_ERR`, suppressed
+(`-3`) → `PAM_AUTHINFO_UNAVAIL`, dark scan → `PAM_IGNORE`. Before the split
+every pre-flight rejection collapsed to exit 2, so daemon unavailability
+silently softened a rate-limited rejection from `PAM_AUTH_ERR` to
+`PAM_IGNORE`; a dark scan diverged the other way, exiting 1 (`PAM_AUTH_ERR`)
+where the daemon abstains. Benign under the recommended `sufficient`
+stacking; wrong under `required`/`requisite` or an `[authinfo_unavail=...]`
+action.
+
+Storage-shaped failures during the attempt — a model list that cannot be
+read, an embedding set that cannot be loaded or decrypted (a TPM unseal
+broken by rotated PCRs lands here on every attempt) — exit 2, the storage
+class, exactly as the daemon's `-2` storage reply does. Neither may fold
+into exit 1: an empty compare set is a guaranteed "no match" that charges
+the rate limit and, under a `required` stack, locks the user out with the
+correct password in hand (the daemon handler refuses the same fold; C3,
+issue #105).
+
+**Residual transport divergence.** With the classes above aligned, one
+divergence remains between a current module's two transports: a non-match
+where **no face was seen** (empty chair, `recognition.no_face_timeout_secs`,
+nothing above the detector threshold). The daemon reply carries that as
+`-1`/no-face and PAM abstains (`PAM_IGNORE`); the oneshot exit code has no
+face-seen channel, so the same attempt exits 1 (`PAM_AUTH_ERR`). Closing it
+needs another additive code under the same three invariants. During the
+upgrade window an older module additionally reads codes 3 and 4 as
+`PAM_IGNORE` (invariant 2) — the daemon transport under that same older
+module already carries both classes in-band, so the two transports keep
+today's divergence until the module updates. Timeouts (`PAM_AUTH_ERR`),
+cancellation (`PAM_IGNORE`), and camera/storage/engine failures
+(`PAM_IGNORE`) agree across transports.
+
+The binary's half of the table is pinned in
+`crates/facelock-cli/src/commands/auth.rs`
+(`every_rejection_class_pins_its_message_audit_label_and_exit_code`,
+`rejection_classes_never_claim_the_match_codes`,
+`the_preflight_short_circuit_pins_its_non_error_codes`). The module's half
+lives in `crates/pam-facelock/src/oneshot_exit.rs`, a dependency-free file
+that `facelock-cli`'s test suite `include!`s to pin the two halves against
+each other class for class
+(`oneshot_exit_codes_map_to_the_daemon_transports_pam_codes`) — the module
+cannot be linked there, so sharing the source is what couples them. The
+live module is exercised per code by the `facelock-map-*` fixtures in
+`test/run-container-tests.sh`.
 
 ## Release Channels and APT Paths
 
@@ -3305,6 +3382,7 @@ the module falls through (oneshot fallback / password), never `PAM_SUCCESS`.
 | IR required / unverified Y16 texture scale / internal daemon error (model_id -2) | `PAM_IGNORE` (25) — no oneshot fallback |
 | Suppressed (model_id -3) | `PAM_AUTHINFO_UNAVAIL` (9) |
 | Daemon unavailable / untrusted (non-root) peer | oneshot fallback, else `PAM_IGNORE` (25) |
+| Oneshot fallback (and `mode = "oneshot"`) | per the `facelock auth` exit-code table above: 0 → `PAM_SUCCESS`, 1/3 → `PAM_AUTH_ERR`, 4 → `PAM_AUTHINFO_UNAVAIL`, 2/5/unknown/signal death → `PAM_IGNORE` |
 | Config missing, unparseable, or untrusted (not root-owned / group- or world-writable, incl. parents) | `PAM_IGNORE` (25) |
 | Timeout (structured zbus timeout or overall deadline) | `PAM_AUTH_ERR` (7) |
 

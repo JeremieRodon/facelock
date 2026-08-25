@@ -805,6 +805,12 @@ PAM still matches the message because it cannot link the daemon crate, so the
 two strings it matches (`rate limited`, `IR camera required`) are frozen
 protocol — see docs/contracts.md, "Rejection classes".
 
+The oneshot transport carries the same classes in the exit code (3 = rate
+limited, 4 = suppressed, 5 = all frames dark; docs/contracts.md, "facelock
+auth Exit Codes"), and the module maps them to the same PAM consequences it
+gives the daemon's replies. Daemon unavailability therefore no longer softens
+a rate-limited rejection to `PAM_IGNORE` on the fallback path.
+
 A non-match reply also states explicitly whether a face was detected
 (`model_id == -4`). PAM used to infer that from `similarity == 0.0`, which is
 wrong for any non-root caller because the score is redacted to `0.0` for all of

@@ -12,14 +12,22 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+// The oneshot exit-code -> PAM mapping, in its own dependency-free file so
+// `facelock-cli`'s test suite can `include!` the same source and pin it
+// against the binary's emission table (see the file header).
+mod oneshot_exit;
+
 // ---------------------------------------------------------------------------
 // PAM constants
 // ---------------------------------------------------------------------------
 
-const PAM_SUCCESS: libc::c_int = 0;
-const PAM_AUTH_ERR: libc::c_int = 7;
-const PAM_AUTHINFO_UNAVAIL: libc::c_int = 9;
-const PAM_IGNORE: libc::c_int = 25;
+// Aliased from `oneshot_exit` rather than redeclared: the values live once,
+// and a target where `libc::c_int` is not `i32` would fail to compile here
+// instead of silently forking the two files.
+const PAM_SUCCESS: libc::c_int = oneshot_exit::PAM_SUCCESS;
+const PAM_AUTH_ERR: libc::c_int = oneshot_exit::PAM_AUTH_ERR;
+const PAM_AUTHINFO_UNAVAIL: libc::c_int = oneshot_exit::PAM_AUTHINFO_UNAVAIL;
+const PAM_IGNORE: libc::c_int = oneshot_exit::PAM_IGNORE;
 
 // PAM conversation message styles
 const PAM_TEXT_INFO: libc::c_int = 4;
@@ -896,7 +904,12 @@ fn terminate_oneshot_child<T: Terminable>(
 }
 
 /// Run facelock auth as a subprocess for daemonless authentication.
-/// Exit codes: 0 = matched, 1 = no match, 2+ = error.
+///
+/// The child's exit code carries the rejection class and is mapped by
+/// [`oneshot_exit::classify`], class for class with the daemon transport:
+/// 0 = matched, 1 = no match, 2 = error / no opinion, 3 = rate limited,
+/// 4 = suppressed, 5 = all frames dark, anything else = no opinion. The
+/// table is frozen in docs/contracts.md ("facelock auth Exit Codes").
 fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_int {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
@@ -997,26 +1010,22 @@ fn run_oneshot_auth(service: &str, user: &str, config: &PamConfig) -> libc::c_in
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // A child killed by a signal has no exit code; read it as 2
+                // ("error / no opinion"), the frozen catch-all — an abandoned
+                // attempt is not a decision about this face.
                 let code = status.code().unwrap_or(2);
-                return match code {
-                    0 => {
-                        log_auth(service, "success (oneshot)", user, LOG_INFO);
-                        PAM_SUCCESS
-                    }
-                    1 => {
-                        log_auth(service, "no_match (oneshot)", user, LOG_INFO);
-                        PAM_AUTH_ERR
-                    }
-                    _ => {
-                        log_auth(
-                            service,
-                            &format!("error: oneshot_exit={code}"),
-                            user,
-                            LOG_WARNING,
-                        );
-                        PAM_IGNORE
-                    }
-                };
+                let exit = oneshot_exit::classify(code);
+                let severity = if exit.warn { LOG_WARNING } else { LOG_INFO };
+                match exit.label {
+                    Some(label) => log_auth(service, label, user, severity),
+                    None => log_auth(
+                        service,
+                        &format!("error: oneshot_exit={code}"),
+                        user,
+                        severity,
+                    ),
+                }
+                return exit.pam_code;
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
@@ -1282,6 +1291,54 @@ pub unsafe extern "C" fn pam_sm_setcred(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The oneshot table, row for row (docs/contracts.md, "facelock auth
+    /// Exit Codes"). The cross-crate half — that each code a rejection class
+    /// makes the binary emit lands on the daemon transport's PAM code — is
+    /// pinned in `facelock-cli`'s commands/auth.rs, which `include!`s this
+    /// crate's `oneshot_exit.rs`.
+    #[test]
+    fn oneshot_exit_mapping_is_the_contract_table() {
+        assert_eq!(oneshot_exit::classify(0).pam_code, PAM_SUCCESS);
+        assert_eq!(oneshot_exit::classify(1).pam_code, PAM_AUTH_ERR);
+        assert_eq!(oneshot_exit::classify(2).pam_code, PAM_IGNORE);
+        assert_eq!(oneshot_exit::classify(3).pam_code, PAM_AUTH_ERR);
+        assert_eq!(oneshot_exit::classify(4).pam_code, PAM_AUTHINFO_UNAVAIL);
+        assert_eq!(oneshot_exit::classify(5).pam_code, PAM_IGNORE);
+    }
+
+    /// Invariant 3 of the exit-code contract: a code this build does not
+    /// know abstains, so a binary newer than the module (and a signal death,
+    /// which the caller reads as 2) degrades to fall-through and can never
+    /// harden or soften the stack. The label is `None` so the syslog line
+    /// names the raw code.
+    #[test]
+    fn unknown_oneshot_exit_codes_abstain() {
+        for code in [-1, 6, 7, 9, 25, 42, 101, 255] {
+            let exit = oneshot_exit::classify(code);
+            assert_eq!(exit.pam_code, PAM_IGNORE, "exit {code}");
+            assert!(exit.label.is_none(), "exit {code} must log its raw value");
+        }
+    }
+
+    /// Never PAM_SUCCESS except exit 0: an exit *status* is attacker-visible
+    /// but not attacker-choosable (the binary's trust is verified before the
+    /// spawn); still, the mapping itself must make a wrong success
+    /// impossible.
+    #[test]
+    fn only_exit_zero_authenticates() {
+        for code in -128..=512 {
+            let exit = oneshot_exit::classify(code);
+            if code == 0 {
+                assert_eq!(exit.pam_code, PAM_SUCCESS);
+            } else {
+                assert_ne!(
+                    exit.pam_code, PAM_SUCCESS,
+                    "exit {code} may not authenticate"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_is_ssh_session_fallback() {

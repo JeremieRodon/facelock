@@ -1,0 +1,12 @@
+# Fixture for the oneshot exit-code mapping tests (#141, run-container-tests.sh):
+# the stack succeeds if and only if pam_facelock.so returned success.
+#
+# The jump (=1) skips pam_deny; any other return marks failure (bad) and
+# pam_deny (requisite) ends the stack. The jump acts as "ok", which records a
+# failure-valued return (auth_err, authinfo_unavail) as the stack's status, so
+# the first pam_permit resets that memory and the second supplies the success
+# pamtester reports.
+auth  [success=1 default=bad]  pam_facelock.so
+auth  requisite  pam_deny.so
+auth  [success=reset default=bad]  pam_permit.so
+auth  required  pam_permit.so

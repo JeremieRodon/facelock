@@ -306,6 +306,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y podman
 
+      # test/Containerfile bakes in models/*.onnx, which are gitignored, so CI
+      # has always built the image without them -- and `facelock daemon`
+      # verifies them at startup and refuses to run when they are absent. That
+      # is what kept the camera-free assertions below out of CI even though
+      # none of them opens a camera (#139). Fetched from the same `assets`
+      # release `facelock setup` uses and verified against the checked-in
+      # manifest, before the image is built.
+      - name: Fetch required ONNX models
+        run: |
+          python3 - <<'PY' > /tmp/required-models.txt
+          import tomllib
+
+          with open("models/manifest.toml", "rb") as fh:
+              manifest = tomllib.load(fh)
+          for model in manifest["models"]:
+              if not model.get("optional"):
+                  print(model["filename"], model["sha256"], model["url"])
+          PY
+          mkdir -p models
+          while read -r name sha url; do
+            curl -fsSL --retry 3 -o "models/$name" "$url"
+            echo "$sha  models/$name" | sha256sum -c -
+          done < /tmp/required-models.txt
+
       - name: Build test container
         run: |
           if [ ! -f test/Containerfile ]; then
@@ -321,6 +345,14 @@ jobs:
           else
             echo "No Containerfile, skipping"
           fi
+
+      # The camera-free half of the two end-to-end tiers (#139). Everything
+      # here reaches its subject before any capture -- bus policy, ADR 010
+      # authorization, pre-flight exit codes, schema migrations -- so it is
+      # gated on every pull request instead of only when someone remembers to
+      # sit in front of a camera. `just test-arch-camera-free` is the same run.
+      - name: Run camera-free E2E tests
+        run: podman run --rm facelock-pam-test /run-camera-free-tests.sh
 
       - name: Verify source-install lifecycle under systemd
         run: test/run-source-install-daemon-lifecycle-systemd.sh facelock-pam-test

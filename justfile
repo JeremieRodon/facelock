@@ -157,6 +157,29 @@ test-arch-pam: _build-test-container
 test-arch-layout: _build-test-container
     podman run --rm facelock-pam-test /run-layout-tests.sh
 
+# The half of `test-arch-integration` and `test-arch-oneshot` that never opens
+# a camera (#139): D-Bus authorization, the AuthAttempted broadcast's audience
+# and payload, the rate-limit reply encoding, schema migrations, pre-flight
+# exit codes, and the shape of the status document. CI runs this on every pull
+# request, which is what the two camera-required tiers below cannot be.
+#
+# The ONNX models are still needed and are not a camera dependency: `facelock
+# daemon` verifies them at startup and refuses to run without them, and half
+# of what moved here is daemon-side authorization. The package tiers' opt-out
+# is honoured — FACELOCK_ALLOW_MISSING_MODELS=1 downgrades the daemon block to
+# a loud skip and runs only the one-shot half.
+#
+
+# Automated camera-free E2E tests (Arch container, no camera needed)
+test-arch-camera-free: (_require-models "1") _build-test-container
+    #!/usr/bin/env bash
+    set -euo pipefail
+    env_args=()
+    if [ "${FACELOCK_ALLOW_MISSING_MODELS:-0}" = "1" ]; then
+        env_args+=(-e "FACELOCK_ALLOW_MISSING_MODELS=1")
+    fi
+    podman run --rm "${env_args[@]}" facelock-pam-test /run-camera-free-tests.sh
+
 # models/*.onnx is gitignored and never tracked, so a fresh clone — and every
 # `git worktree add`, which is how this repo is normally worked in — starts
 # with an empty models/, while the camera and package test tiers all need the
@@ -471,6 +494,42 @@ test-arch-oneshot: _require-models _build-test-container
         echo "live steps time out after $FACELOCK_LIVE_TIMEOUT (default 90s)"
     fi
     podman run --rm $devices "${env_args[@]}" facelock-pam-test /run-oneshot-tests.sh
+
+# Refuse to record a hardware run against a tree that is not what will ship.
+_require-clean-tree:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "error: the working tree is dirty, so a recorded run would name a commit" >&2
+        echo "       that is not what was tested. Commit first, then re-run." >&2
+        git status --short >&2
+        exit 1
+    fi
+
+# `just release-preflight` refuses to pass without that record (#139). These
+# two tiers are the only automated evidence that face authentication works end
+# to end — real D-Bus activation, the real PAM stack, real capture, the
+# one-shot fallback — and nothing else runs them, which is how three of their
+# assertions rotted undetected. They need a camera and someone sitting in
+# front of it, so this is the one gate a human has to perform.
+#
+# FACELOCK_LIVE_TIMEOUT is forwarded by each tier; relax it here too when the
+# stock 90s per live step is not enough time to get into frame.
+#
+
+# Both camera-required E2E tiers, recorded for release-preflight (requires camera)
+test-arch-camera-required: _require-clean-tree test-arch-integration test-arch-oneshot
+    #!/usr/bin/env bash
+    set -euo pipefail
+    commit="$(git rev-parse HEAD)"
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "error: the tree changed while the tiers ran; not recording." >&2
+        exit 1
+    fi
+    printf '%s\n' "$commit" > .hardware-tiers-verified
+    echo ""
+    echo "Recorded: camera-required tiers passed at $commit"
+    echo "'just release-preflight' accepts this until HEAD moves."
 
 # Dev shell — interactive Arch container with host models for fast iteration (requires camera)
 test-arch-dev-shell: _build-test-container
@@ -1370,13 +1429,46 @@ release-preflight tag='':
     fi
 
     echo ""
+    echo "== Camera-required tier evidence =="
+    # #139: `just test-arch-integration` and `just test-arch-oneshot` are the
+    # only automated evidence that face authentication works end to end, and
+    # they need a camera and a person in frame — so preflight cannot run them.
+    # It can refuse to pass while nobody has. `just test-arch-camera-required`
+    # runs both and records the commit they passed at; the omission used to be
+    # invisible, which is how three of their assertions rotted.
+    HEAD_SHA="$(git rev-parse HEAD)"
+    RECORDED=""
+    if [ -f .hardware-tiers-verified ]; then
+        RECORDED="$(head -1 .hardware-tiers-verified)"
+    fi
+    ACK="${FACELOCK_HARDWARE_TIERS_ACK:-}"
+    if [ "$RECORDED" = "$HEAD_SHA" ]; then
+        echo "OK: camera-required tiers recorded green at $HEAD_SHA"
+    elif [ "${#ACK}" -ge 7 ] && [ "${HEAD_SHA#"$ACK"}" != "$HEAD_SHA" ]; then
+        # The acknowledgement has to name this commit, so it cannot be a habit
+        # the way a bare =1 would become.
+        echo "OK: camera-required tiers acknowledged by hand at $HEAD_SHA"
+    else
+        if [ -z "$RECORDED" ]; then
+            echo "MISSING: no camera-required tier run recorded for any commit"
+        else
+            echo "STALE: camera-required tiers recorded at $RECORDED, HEAD is $HEAD_SHA"
+        fi
+        echo "  Run both tiers against this commit, with someone in front of the camera:"
+        echo "    just test-arch-camera-required"
+        echo "  If they were already run by hand at this exact commit, say so:"
+        echo "    FACELOCK_HARDWARE_TIERS_ACK=$HEAD_SHA just release-preflight"
+        failed=1
+    fi
+
+    echo ""
     if [ "$failed" -ne 0 ]; then
         echo "Release preflight: FAILED"
         exit 1
     fi
 
     echo "Release preflight: OK"
-    echo "Next: run 'just check', 'just test-release-matrix', 'just test-arch-pam', 'just test-rpm', and 'just test-deb' before tagging."
+    echo "Next: run 'just check', 'just test-release-matrix', 'just test-arch-pam', 'just test-arch-camera-free', 'just test-rpm', and 'just test-deb' before tagging."
 
 # Fast release contract tests that do not require distro package tools.
 test-release-contract:

@@ -73,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clears on its own. Enablement
   is never changed, and acquisition fails closed without systemd, without the
   lock, or without a confirmed-stopped daemon.
+- **Camera-free end-to-end test tier** (#139): the assertions in the two
+  camera-required E2E suites that never open a camera now live in
+  `just test-arch-camera-free`, which CI runs on every pull request. That
+  covers D-Bus authorization, the `AuthAttempted` broadcast's audience and
+  payload, the rate-limit reply encoding and its no-fallback guarantee, schema
+  migrations, and the one-shot pre-flight exit codes. The two hardware tiers
+  keep what needs a live frame and are now gated at release time:
+  `just test-arch-camera-required` runs both and records the commit they
+  passed at, and `just release-preflight` fails until that record names HEAD.
 - **Explicit authorization for sensitive `setup --pam` writes** (#207):
   `--yes` and its `--no-confirm` alias now suppress only the ordinary per-file
   confirmation. Adding Facelock to a shared or login PAM stack requires the
@@ -601,6 +610,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its hard-error (never-prompt) class, and `status` still renders a broken
   config as a finding, after its own root check.
 
+- **Oneshot exit codes carry the rejection class** (#141): `facelock auth`
+  now exits 3 for a rate-limited rejection, 4 for a suppressed attempt (no
+  enrolled models with `security.suppress_unknown`), and 5 when every
+  captured frame was dark; every other pre-flight rejection keeps exit 2.
+  Previously all of them collapsed to 2, so daemon unavailability silently
+  softened a rate-limited rejection from `PAM_AUTH_ERR` to `PAM_IGNORE`, and
+  a dark scan exited 1 (`PAM_AUTH_ERR`) where the daemon transport abstains.
+  Exit 0, 1 and 2 keep their historical meanings; the new codes come only
+  from the space an older PAM module maps to `PAM_IGNORE`, so a module
+  predating the split degrades to the old collapsed behavior instead of
+  regressing. The full table and its compatibility invariants are frozen in
+  `docs/contracts.md`. Two failure paths that wrongly produced exit 1
+  (`PAM_AUTH_ERR`) now exit 2 as the storage class, matching the daemon: a
+  failed embeddings load or decrypt (a TPM unseal broken by rotated PCRs
+  failed every attempt, locking out a `required` stack with the correct
+  password), and a failed model-list read (which folded into an empty
+  compare set, a guaranteed no-match that charged the rate limit — the
+  hazard the daemon handler refuses per C3/#105).
+
+- **PAM oneshot fallback matches the daemon transport class for class**
+  (#141): `pam_facelock.so` now maps `facelock auth` exit 3 (rate limited) to
+  `PAM_AUTH_ERR` and exit 4 (suppressed) to `PAM_AUTHINFO_UNAVAIL`, the same
+  consequences the daemon transport gives those classes, so daemon
+  unavailability no longer softens rate limiting under `required`/`requisite`
+  stacks. Exit 5 (all frames dark), unknown codes, and a signal-killed binary
+  abstain (`PAM_IGNORE`). The module's table and the binary's are pinned
+  against each other by a cross-crate test, and each code is exercised
+  end-to-end through libpam in the container tier.
 - **Debian PAM and daemon package lifecycle is opt-in and state-preserving**
   (#224): direct `pam add`/`setup --pam` now refuses an already-selected exact
   `pam-auth-update` profile before writing, using fixed-root no-follow evidence

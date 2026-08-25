@@ -128,6 +128,13 @@ wait_for_daemon() {
 
 echo "=== Integration Tests (with camera) ==="
 echo ""
+# Camera-bound half of the daemon E2E suite. Everything that reached its
+# subject before any capture — the status document's shape, the schema
+# migration, ADR 010 authorization, the AuthAttempted broadcast, the
+# rate-limit reply encoding — moved to test/run-camera-free-tests.sh (#139),
+# which CI runs on every pull request. Add a row here only when it needs a
+# real frame; anything else belongs in the camera-free tier where it will
+# actually be gated.
 
 # Use the installed config (written by Containerfile), override db path
 # to a writable location since default may not be writable in containers
@@ -176,34 +183,9 @@ sleep 2
 run_test "Daemon responds to ping" \
     "wait_for_daemon" || exit 1
 
-# The report a person reads still says it, in the words it has always used.
-# `wait_for_daemon` parses the document now, so without this row nothing here
-# would exercise the human renderer at all.
-run_test_contains "Status report still names a responding daemon" \
-    "facelock status" \
-    "\[ok\] responding"
-
-# Every section answers with one of the three verdict words. The filters live in
-# files rather than inline so the quoting survives `run_test`'s `eval`.
-cat > /tmp/status-sections.jq <<'EOF'
-[.config, .daemon, .oneshot_fallback, .camera, .models, .execution_provider,
- .encryption, .enrollment, .security, .notifications, .pam]
-| length == 11
-  and (map(.state) | all(. == "ok" or . == "problem" or . == "unknown"))
-EOF
-run_test "Status --json carries a verdict for every section" \
-    "facelock status --json | jq -e -f /tmp/status-sections.jq > /dev/null"
-
-# The payoff a setup script wants: the PAM scan as data, with "could not look"
-# distinguishable from "nothing configured" without reading prose.
-cat > /tmp/status-pam.jq <<'EOF'
-.pam.services
-| (.state == "ok" or .state == "unknown")
-  and (.configured | type) == "array"
-  and (.not_checked | type) == "array"
-EOF
-run_test "Status --json enumerates the PAM scan as data" \
-    "facelock status --json | jq -e -f /tmp/status-pam.jq > /dev/null"
+# The status document's shape and the human renderer's "[ok] responding" line
+# are asserted in run-camera-free-tests.sh: neither reads anything a camera
+# produces.
 
 # Test device listing
 run_test_contains "Device listing works" \
@@ -242,9 +224,8 @@ run_test "Authenticate enrolled face (PAM)" \
 DB="$({ grep -E '^[[:space:]]*db_path[[:space:]]*=' /etc/facelock/config.toml 2>/dev/null || true; } | tail -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
 [ -n "$DB" ] || DB="/var/lib/facelock/facelock.db"
 
-SCHEMA_VER="$(sqlite3 "$DB" 'SELECT MAX(version) FROM schema_version' 2>/dev/null || echo 0)"
-run_test "V6 schema migration applied on daemon startup (db=$DB)" \
-    "[ \"$SCHEMA_VER\" -ge 6 ]" 0
+# The V6 migration itself runs at daemon startup, before any request, and is
+# asserted in run-camera-free-tests.sh.
 
 # --- Encryption at rest (Plan 04, finding #8) ---
 # Encryption defaults to keyfile, so the daemon enroll above must have stored
@@ -283,143 +264,13 @@ run_test_contains "facelock test matches again on legacy NULL device_id (daemon)
     "timeout --foreground $LIVE_TIMEOUT facelock test --user testuser" \
     "Matched"
 
-# --- Plan 05: rate-limited daemon state must never escalate to a fresh oneshot ---
-
-# Resolve the database the daemon actually uses (config db_path or default).
-FACELOCK_DB="$(sed -n 's/^[[:space:]]*db_path[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' /etc/facelock/config.toml | head -1)"
-FACELOCK_DB="${FACELOCK_DB:-/var/lib/facelock/facelock.db}"
-
-# Force a rate-limited state by inserting failed attempts directly into the
-# shared SQLite window (default: 5 attempts / 60s). Requires enrolled models
-# (rate limiting is checked after the has-models pre-check).
-run_test "Rate limit: seed failed attempts" \
-    "sqlite3 $FACELOCK_DB \"INSERT INTO rate_limit (user, attempt_time) SELECT 'testuser', strftime('%s','now') FROM (VALUES (1),(2),(3),(4),(5),(6));\""
-
-run_test_contains "Rate limit: daemon encodes recoverable error in-band (model_id=-2)" \
-    "dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:testuser" \
-    "int32 -2"
-
-# With the in-band encoding the PAM module classifies the error itself
-# (rate limited -> PAM_AUTH_ERR) instead of retrying as a root oneshot.
-# Swapping a marker stub in at /usr/bin/facelock proves no oneshot child is
-# ever spawned (the module spawns that fixed path; an auth_bin config
-# redirect would be ignored and make this test vacuous). The daemon keeps
-# answering from its already-exec'd binary while the file is swapped.
-run_test "Rate limit: PAM fails without oneshot escalation" \
-    "printf '#!/bin/bash\ntouch /tmp/oneshot-invoked\nexit 2\n' > /usr/local/bin/oneshot-marker && chmod 755 /usr/local/bin/oneshot-marker && rm -f /tmp/oneshot-invoked && mv /usr/bin/facelock /usr/bin/facelock.orig && install -m 755 /usr/local/bin/oneshot-marker /usr/bin/facelock; timeout 30 pamtester facelock-test testuser authenticate < /dev/null; rc=\$?; mv -f /usr/bin/facelock.orig /usr/bin/facelock; test \$rc -ne 0 && test ! -f /tmp/oneshot-invoked"
-
-run_test "Rate limit: clear seeded attempts" \
-    "sqlite3 $FACELOCK_DB \"DELETE FROM rate_limit WHERE user = 'testuser';\""
-
-# --- D-Bus hardening assertions (security plan 06) ---
-
-# ADR 010 left no groups: testuser is just an enrolled local user and
-# sigwatcher an unenrolled one, and neither is a member of anything facelock
-# knows about. Both may call Authenticate for themselves and nothing else;
-# only root receives AuthAttempted.
-useradd -m sigwatcher 2>/dev/null || true
-
-# (a) Signal hardening — needs the daemon up plus one auth attempt to emit
-# the signal. Unprivileged users must not receive AuthAttempted, and the
-# payload must carry no similarity score (no 'double' argument).
-runuser -u sigwatcher -- dbus-monitor --system \
-    "type='signal',interface='org.facelock.Daemon'" > /tmp/sig-unpriv.log 2>&1 &
-UNPRIV_MON_PID=$!
-dbus-monitor --system \
-    "type='signal',interface='org.facelock.Daemon'" > /tmp/sig-root.log 2>&1 &
-ROOT_MON_PID=$!
-sleep 2
-timeout --foreground "$LIVE_TIMEOUT" facelock test --user testuser > /dev/null 2>&1 || true
-sleep 2
-kill "$UNPRIV_MON_PID" "$ROOT_MON_PID" 2>/dev/null || true
-wait "$UNPRIV_MON_PID" "$ROOT_MON_PID" 2>/dev/null || true
-
-run_test "AuthAttempted signal visible to root monitor" \
-    "grep -q 'member=AuthAttempted' /tmp/sig-root.log"
-
-run_test "AuthAttempted payload carries no similarity score" \
-    "! grep -A3 'member=AuthAttempted' /tmp/sig-root.log | grep -q 'double'"
-
-run_test "Unprivileged user receives no AuthAttempted signal" \
-    "! grep -q 'member=AuthAttempted' /tmp/sig-unpriv.log"
-
-# (a2) ADR 010: Authenticate is open to every local user for its own username
-# and nothing else is. sigwatcher is not enrolled, so its own Authenticate is
-# answered by the enrollment pre-check (model_id -1, or -3 under
-# suppress_unknown) without opening the camera; naming another user is refused
-# by the daemon; Ping is refused by the bus.
-run_test_contains "A plain local user's Authenticate for its own user reaches the daemon (no model)" \
-    "runuser -u sigwatcher -- dbus-send --system --print-reply --reply-timeout=30000 --dest=org.facelock.Daemon /org/facelock/Daemon org.facelock.Daemon.Authenticate string:sigwatcher" \
-    "int32 -[13]"
-
-check_denied_as() {
-    # $1 = user, $2 = method, $3.. = dbus-send args
-    local user="$1" method="$2"
-    shift 2
-    local out rc
-    set +e
-    out=$(runuser -u "$user" -- dbus-send --system --print-reply --reply-timeout=30000 \
-        --dest=org.facelock.Daemon /org/facelock/Daemon "org.facelock.Daemon.$method" "$@" 2>&1)
-    rc=$?
-    set -e
-    echo "$out"
-    [ "$rc" -ne 0 ] || { echo "$method unexpectedly succeeded for $user"; return 1; }
-    echo "$out" | grep -qi "AccessDenied" || return 1
-    return 0
-}
-run_test "A plain local user's Authenticate for another user is denied by the daemon" \
-    "check_denied_as sigwatcher Authenticate string:testuser"
-run_test "A plain local user's Ping is denied by the bus" \
-    "check_denied_as sigwatcher Ping"
-
-# Policy: the default context explicitly denies owning the daemon name —
-# only root may own org.facelock.Daemon.
-check_own_denied() {
-    local out rc
-    set +e
-    out=$(runuser -u sigwatcher -- dbus-send --system --print-reply \
-        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
-        org.freedesktop.DBus.RequestName string:org.facelock.Daemon uint32:0 2>&1)
-    rc=$?
-    set -e
-    echo "$out"
-    [ "$rc" -ne 0 ] || { echo "RequestName unexpectedly succeeded"; return 1; }
-    echo "$out" | grep -qiE "not allowed to own|AccessDenied" || return 1
-    return 0
-}
-run_test "Unprivileged user cannot own org.facelock.Daemon" \
-    "check_own_denied"
-
-# (b) PreviewDetectFrame authz parity — the intent here has always been that a
-# non-root caller obtains no imagery. Under N13 the method became root-only, so
-# the way that holds changed: a non-root caller is now denied outright, before
-# the method reaches the camera, rather than receiving a reply with jpeg_data
-# stripped. This asserts the denial AND that the error reply carries no frame
-# bytes (dbus-send renders non-empty byte arrays as hex; a JPEG starts with
-# ff d8).
-check_preview_detect_frame_denied() {
-    local out rc
-    set +e
-    out=$(runuser -u testuser -- dbus-send --system --print-reply \
-        --reply-timeout=60000 \
-        --dest=org.facelock.Daemon /org/facelock/Daemon \
-        org.facelock.Daemon.PreviewDetectFrame string:testuser 2>&1)
-    rc=$?
-    set -e
-    echo "$out"
-    [ "$rc" -ne 0 ] || {
-        echo "PreviewDetectFrame unexpectedly succeeded for a non-root caller"
-        return 1
-    }
-    echo "$out" | grep -qi "AccessDenied" || return 1
-    if echo "$out" | grep -qi "ff d8"; then
-        echo "denial reply contains JPEG frame bytes (ff d8)"
-        return 1
-    fi
-    return 0
-}
-run_test "PreviewDetectFrame denies non-root caller (no raw frame)" \
-    "check_preview_detect_frame_denied"
+# Everything the daemon answers before it acquires the camera moved to
+# run-camera-free-tests.sh (#139): the rate-limit reply encoding and its
+# no-oneshot-escalation guarantee, the AuthAttempted broadcast's audience
+# and payload, ADR 010's per-user Authenticate authorization, the bus's own
+# deny rules, and PreviewDetectFrame's root-only refusal. Two of those are
+# the checks #139 records as having rotted here undetected; none of them
+# ever needed a frame.
 
 # Release the preview camera session before the concurrency test
 dbus-send --system --print-reply --dest=org.facelock.Daemon /org/facelock/Daemon \

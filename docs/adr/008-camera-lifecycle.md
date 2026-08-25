@@ -190,6 +190,14 @@ Invariant (tested): **every exit from `Active` either sets a deadline or drops t
 
 **Bench**: `facelock bench camera-reopen` — N × (drop → open → warmup → first frame), open/`STREAMON`/warmup split. Decides 3 s vs 2 s and replaces the "~600 ms cold" doc line.
 
+**Gating** — the two container tiers above run on a machine with a camera and
+nothing schedules them, which is how three of their assertions rotted
+undetected (#139). Their camera-free assertions now live in
+`just test-arch-camera-free`, which CI runs on every pull request; what remains
+in `test-arch-integration` and `test-arch-oneshot` is gated at release time by
+`just test-arch-camera-required`, which records the commit they passed at and
+without which `just release-preflight` fails.
+
 **Acceptance**: (1) LED off ≤ one frame + 250 ms after Success/Cancel; (2) off at `release_secs ± 250 ms` after Failure; (3) warm retry: no `open()`/`STREAMON`, first analyzed frame is fresh; (4) no `facelock auth` outlives its PAM host by > 500 ms; (5) `release_secs = 0` never holds; (6) invariant in §8.
 
 ## 10. Delivery

@@ -6,3 +6,4 @@ dev/*.db
 /.internal/
 .claude/worktrees/
 docs/superpowers/
+/.hardware-tiers-verified

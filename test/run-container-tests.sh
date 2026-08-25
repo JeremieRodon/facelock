@@ -732,6 +732,66 @@ run_test "env_clear: oneshot child PATH pinned to /usr/bin:/bin" \
     "grep -qx 'PATH=/usr/bin:/bin' /tmp/oneshot-child-env" \
     0
 
+# --- #141: oneshot exit-code -> PAM mapping, per code ---
+#
+# `facelock auth`'s exit code carries the rejection class; the module's
+# oneshot arm must give each class the same PAM consequence the daemon
+# transport does (docs/contracts.md, "facelock auth Exit Codes"). Each
+# facelock-map-* service (test/pam.d/) converts exactly one PAM return into
+# stack success via a jump action, so pamtester's own exit code reports
+# whether the module produced that return. A root-owned stub stands in for
+# /usr/bin/facelock (the same swap as the env_clear fixture above) and reads
+# the exit code to emit from a root-owned file, so every code can be forced
+# without a camera.
+# The service fixtures are staged outside /etc/pam.d (see test/Containerfile:
+# a resident copy would block the Arch package-removal hook) and installed
+# only for this block.
+install -m 644 /facelock-map-pam.d/facelock-map-* /etc/pam.d/
+printf '#!/bin/bash\ncode=$(cat /etc/facelock/test-exit-code)\nif [ "$code" = signal ]; then kill -9 $$; fi\nexit "$code"\n' \
+    > /usr/local/bin/facelock-exit-stub
+chmod 755 /usr/local/bin/facelock-exit-stub
+sed -i '/^\[daemon\]/a mode = "oneshot"' /etc/facelock/config.toml
+mv /usr/bin/facelock /usr/bin/facelock.orig
+install -m 755 /usr/local/bin/facelock-exit-stub /usr/bin/facelock
+
+map_case() {
+    local code="$1" service="$2" verdict="$3"
+    echo "$code" > /etc/facelock/test-exit-code
+    if [ "$verdict" = pass ]; then
+        run_test "oneshot exit $code: module returns the $service code" \
+            "pamtester $service testuser authenticate < /dev/null" 0
+    else
+        run_test "oneshot exit $code: module does not return the $service code" \
+            "! pamtester $service testuser authenticate < /dev/null" 0
+    fi
+}
+
+# Exit 0/1/2 keep their permanent meanings (contract invariant 1).
+map_case 0 facelock-map-success pass
+map_case 1 facelock-map-autherr pass
+map_case 2 facelock-map-ignore pass
+# Exit 3 (rate limited) fails like the daemon transport -- and no longer
+# abstains, which is the #141 hardening.
+map_case 3 facelock-map-autherr pass
+map_case 3 facelock-map-ignore fail
+# Exit 4 (suppressed): the daemon transport's -3 sentinel consequence.
+map_case 4 facelock-map-authinfo pass
+# Exit 5 (all frames dark) abstains, matching the daemon transport.
+map_case 5 facelock-map-ignore pass
+# An unknown code abstains (invariant 3: a newer binary degrades to
+# fall-through under this module, never to a harder or softer answer).
+map_case 42 facelock-map-ignore pass
+# A signal-killed child has no exit code; the module reads it as 2 (abstain).
+map_case signal facelock-map-ignore pass
+# Only exit 0 may authenticate.
+map_case 1 facelock-map-success fail
+
+mv -f /usr/bin/facelock.orig /usr/bin/facelock
+sed -i '/^mode = "oneshot"/d' /etc/facelock/config.toml
+rm -f /etc/facelock/test-exit-code /usr/local/bin/facelock-exit-stub \
+    /etc/pam.d/facelock-map-success /etc/pam.d/facelock-map-autherr \
+    /etc/pam.d/facelock-map-authinfo /etc/pam.d/facelock-map-ignore
+
 # (c) Bus policy (ADR 010): the default context may call Authenticate and
 # nothing else. There is no group policy — signals are root-only. A fake
 # daemon owned by ROOT stands in for the real one — the real daemon needs a
