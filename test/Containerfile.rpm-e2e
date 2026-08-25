@@ -12,7 +12,11 @@ FROM ${BASE_IMAGE}
 # gettext supplies msgfmt for the spec's compiled translation catalogs. The
 # spec BuildRequires it; this build runs rpmbuild --nodeps, so the package has
 # to bring the tool itself.
-RUN dnf -y install pam authselect dbus dbus-daemon rpm-build systemd binutils gettext glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 util-linux && dnf clean all
+# strace is diagnostics-only: rpm-service-pam-lifecycle.sh replays a failing
+# pamtester under it to name the syscall and errno behind a PAM verdict that
+# differs between hosts (pam_unix 1.7+ always execs unix_chkpwd, and that
+# child exits AUTHINFO_UNAVAIL without a log line when execve fails).
+RUN dnf -y install pam authselect dbus dbus-daemon rpm-build systemd binutils gettext glibc libxkbcommon tpm2-tss ca-certificates openssl-libs python3 util-linux strace && dnf clean all
 
 # Build pamtester from source (not in Fedora repos)
 COPY test/install-pamtester.sh /tmp/install-pamtester.sh

@@ -73,6 +73,13 @@ authenticate() {
 }
 
 authenticate_diagnostics() {
+    # This runs as the command after a final `||`, where bash keeps errexit
+    # ACTIVE inside the compound -- a probe that exits nonzero (getent on a
+    # missing entry, the deliberately failing replays below) would otherwise
+    # kill the dump mid-flight and steal the script's exit code. Scope the
+    # opt-out to this function.
+    local -
+    set +e
     {
         echo "--- pamtester output ---"
         cat -- "$pam_log" 2>/dev/null || echo "(nothing captured)"
@@ -109,6 +116,40 @@ authenticate_diagnostics() {
         chmod 0000 /etc/shadow 2>/dev/null || true
         echo "--- pamtester journal (pam_unix) ---"
         journalctl --no-pager --full -n 40 -t pamtester 2>&1 || true
+        # The module logs under its own ident, not the application's, and
+        # pam_unix 1.7+ verifies every shadowed password through an exec of
+        # unix_chkpwd — whose pre-exec failures exit AUTHINFO_UNAVAIL without
+        # logging. Cover both witnesses, then take the stack apart: the
+        # helper alone, pam_unix alone, and the full leaf under strace so a
+        # failing execve names its errno.
+        echo "--- module and helper journal ---"
+        journalctl --no-pager --full -n 40 -t pam_facelock -t unix_chkpwd 2>&1 || true
+        echo "--- process security state ---"
+        grep -E 'NoNewPrivs|Seccomp' /proc/self/status 2>&1 || true
+        echo "--- unix_chkpwd direct ---"
+        # The helper reads a NUL-terminated password from stdin.
+        printf 'test\0' | /usr/sbin/unix_chkpwd testuser nonull
+        echo "unix_chkpwd direct: rc=$?"
+        echo "--- pam_unix-only control ---"
+        printf '%s\n' \
+            '#%PAM-1.0' \
+            'auth      required pam_unix.so' \
+            'account   required pam_permit.so' \
+            >/etc/pam.d/facelock-rpm-control
+        printf 'test\n' | pamtester facelock-rpm-control testuser authenticate
+        echo "pam_unix-only control: rc=$?"
+        rm -f /etc/pam.d/facelock-rpm-control
+        echo "--- leaf replay under strace ---"
+        if command -v strace >/dev/null 2>&1; then
+            printf 'test\n' | strace -f -qq -e trace=execve,exit_group \
+                -o /tmp/facelock-pam-diag.strace \
+                pamtester "$local_service" testuser authenticate
+            echo "strace replay: rc=$?"
+            grep -E 'unix_chkpwd|exit_group' /tmp/facelock-pam-diag.strace 2>&1 | head -20
+            rm -f /tmp/facelock-pam-diag.strace
+        else
+            echo "(strace not installed)"
+        fi
     } >&2
 }
 
