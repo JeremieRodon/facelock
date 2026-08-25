@@ -279,10 +279,15 @@ cp "$repo_root/website/index.html" "$matrix_root/website/"
 cp "$repo_root/test/check-release-matrix.py" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile.rpm-e2e" "$matrix_root/test/"
+# Every Fedora lane Containerfile the checker reads, not just the e2e one. The
+# other three were added to check-release-matrix.py without reaching this
+# staging list, so the checker died on a missing file here long before it could
+# assert anything (#229 wired this recipe into CI, which is how that surfaced).
 cp "$repo_root/test/Containerfile.rpm-authselect" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile.copr" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile.fedora" "$matrix_root/test/"
 cp "$repo_root/test/fedora-lane-image.sh" "$matrix_root/test/"
+cp "$repo_root/.github/workflows/packaging.yml" "$matrix_root/.github/workflows/"
 cp "$repo_root/test/copr-build.sh" "$matrix_root/test/"
 cp "$repo_root/test/packit-config-validate.sh" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile.packit" "$matrix_root/test/"
