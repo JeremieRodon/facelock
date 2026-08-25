@@ -11,6 +11,7 @@ vendor_path="/usr/lib/pam.d/$vendor_service"
 vendor_override="/etc/pam.d/$vendor_service"
 symlink_path="/etc/pam.d/$symlink_service"
 snapshot_dir="$(mktemp -d /tmp/facelock-rpm-pam.XXXXXX)"
+pam_log="$snapshot_dir/pamtester.log"
 outside_path="$snapshot_dir/outside-pam"
 pass_count=0
 
@@ -57,6 +58,99 @@ snapshot_file() {
     local path="$1"
     stat -c '%F|%u|%g|%a|%h|%s' -- "$path"
     sha256sum -- "$path" | awk '{print $1}'
+}
+
+# pamtester's own output used to go to /dev/null, so an unexpected result was a
+# one-line FAIL with nothing behind it. That is where the Fedora lifecycle lane
+# stopped the first time CI ran it (#229): a rejection two seconds in, with no
+# way to tell a refused password from a module that never reached the daemon.
+# Keep the output, and dump the state the module depends on, whenever a case
+# does not go the way it should.
+authenticate() {
+    printf '%s\n' "$1" |
+        timeout --foreground 30 pamtester "$local_service" testuser authenticate \
+            >"$pam_log" 2>&1
+}
+
+authenticate_diagnostics() {
+    # This runs as the command after a final `||`, where bash keeps errexit
+    # ACTIVE inside the compound -- a probe that exits nonzero (getent on a
+    # missing entry, the deliberately failing replays below) would otherwise
+    # kill the dump mid-flight and steal the script's exit code. Scope the
+    # opt-out to this function.
+    local -
+    set +e
+    {
+        echo "--- pamtester output ---"
+        cat -- "$pam_log" 2>/dev/null || echo "(nothing captured)"
+        echo "--- $local_path ---"
+        cat -- "$local_path" 2>/dev/null || echo "(absent)"
+        echo "--- facelock-daemon.service ---"
+        systemctl --no-pager --full status facelock-daemon.service 2>&1 || true
+        echo "--- facelock-daemon.service journal ---"
+        journalctl --no-pager --full -u facelock-daemon.service -n 60 2>&1 || true
+        echo "--- failed units ---"
+        systemctl --no-pager --full --failed 2>&1 || true
+        echo "--- org.facelock.Daemon bus name ---"
+        busctl --system status org.facelock.Daemon 2>&1 || true
+        echo "--- /var/lib/facelock/models ---"
+        ls -l /var/lib/facelock/models 2>&1 || true
+        # pam_unix's side of the stack. AUTHINFO_UNAVAIL with the correct
+        # password means pam_unix could not retrieve the shadow entry, not
+        # that a password was refused -- reproduced exactly by deleting
+        # testuser's shadow row. Show whether the entry is reachable (never
+        # the hash), what storage the file sits on, and what pam_unix logged.
+        echo "--- pam_unix credential sources ---"
+        ls -ln /etc/passwd /etc/shadow 2>&1 || true
+        stat -f -c 'fstype=%T' /etc/shadow 2>&1 || true
+        cat /proc/self/uid_map 2>&1 || true
+        getent shadow testuser >/dev/null 2>&1; echo "getent shadow testuser: rc=$?"
+        grep -E '^Cap(Inh|Prm|Eff|Bnd)' /proc/self/status 2>&1 || true
+        dd if=/etc/shadow of=/dev/null bs=1 count=1 2>&1 | tail -1 || true
+        printf 'testuser shadow rows: '; grep -c '^testuser:' /etc/shadow 2>&1 || true
+        # Probe: does loosening the 0000 mode make the entry readable? Only
+        # reached on the way to fail(), so the mutation dies with the
+        # container; restore anyway.
+        chmod 0400 /etc/shadow 2>/dev/null || true
+        getent shadow testuser >/dev/null 2>&1; echo "getent after chmod 0400: rc=$?"
+        chmod 0000 /etc/shadow 2>/dev/null || true
+        echo "--- pamtester journal (pam_unix) ---"
+        journalctl --no-pager --full -n 40 -t pamtester 2>&1 || true
+        # The module logs under its own ident, not the application's, and
+        # pam_unix 1.7+ verifies every shadowed password through an exec of
+        # unix_chkpwd — whose pre-exec failures exit AUTHINFO_UNAVAIL without
+        # logging. Cover both witnesses, then take the stack apart: the
+        # helper alone, pam_unix alone, and the full leaf under strace so a
+        # failing execve names its errno.
+        echo "--- module and helper journal ---"
+        journalctl --no-pager --full -n 40 -t pam_facelock -t unix_chkpwd 2>&1 || true
+        echo "--- process security state ---"
+        grep -E 'NoNewPrivs|Seccomp' /proc/self/status 2>&1 || true
+        echo "--- unix_chkpwd direct ---"
+        # The helper reads a NUL-terminated password from stdin.
+        printf 'test\0' | /usr/sbin/unix_chkpwd testuser nonull
+        echo "unix_chkpwd direct: rc=$?"
+        echo "--- pam_unix-only control ---"
+        printf '%s\n' \
+            '#%PAM-1.0' \
+            'auth      required pam_unix.so' \
+            'account   required pam_permit.so' \
+            >/etc/pam.d/facelock-rpm-control
+        printf 'test\n' | pamtester facelock-rpm-control testuser authenticate
+        echo "pam_unix-only control: rc=$?"
+        rm -f /etc/pam.d/facelock-rpm-control
+        echo "--- leaf replay under strace ---"
+        if command -v strace >/dev/null 2>&1; then
+            printf 'test\n' | strace -f -qq -e trace=%file,exit_group \
+                -o /tmp/facelock-pam-diag.strace \
+                pamtester "$local_service" testuser authenticate
+            echo "strace replay: rc=$?"
+            grep -E 'shadow|passwd|chkpwd|exit_group' /tmp/facelock-pam-diag.strace 2>&1 | head -40
+            rm -f /tmp/facelock-pam-diag.strace
+        else
+            echo "(strace not installed)"
+        fi
+    } >&2
 }
 
 authselect_is_unchanged() {
@@ -114,13 +208,12 @@ if ! grep -q '^path\s*=' /etc/facelock/config.toml; then
     sed -i '/^\[device\]/a path = "/dev/video0"' /etc/facelock/config.toml
 fi
 
-printf '%s\n' test |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1 || \
+authenticate test || {
+    authenticate_diagnostics
     fail "correct password did not fall through after Facelock rejection"
-if printf '%s\n' wrong-password |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1; then
+}
+if authenticate wrong-password; then
+    authenticate_diagnostics
     fail "wrong password authenticated through the configured leaf"
 fi
 pass "correct password falls through after Facelock rejection"
@@ -134,13 +227,12 @@ snapshot_file "$local_path" | cmp -s - "$snapshot_dir/local.before" || \
     fail "local leaf was not restored byte-for-byte with its metadata"
 authselect_is_unchanged || fail "local leaf removal changed authselect state"
 pass "service-scoped PAM removal restores the requested leaf"
-printf '%s\n' test |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1 || \
+authenticate test || {
+    authenticate_diagnostics
     fail "correct password failed after service-scoped PAM removal"
-if printf '%s\n' wrong-password |
-    timeout --foreground 30 pamtester "$local_service" testuser authenticate \
-        >/dev/null 2>&1; then
+}
+if authenticate wrong-password; then
+    authenticate_diagnostics
     fail "wrong password authenticated after service-scoped PAM removal"
 fi
 pass "service-scoped PAM removal preserves password success and rejection"

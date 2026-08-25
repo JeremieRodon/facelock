@@ -578,6 +578,43 @@ for fedora_release in sorted(declared_fedora_releases):
         f"{lanes_by_release[fedora_release]}, but its declared lifecycle depth "
         f"{lane_depth!r} requires {lane_recipe_by_depth[lane_depth]}",
     )
+# The packaging workflow runs the same Fedora lanes as `just test-rpm-lanes`,
+# one job each so they run in parallel rather than end to end. That parallelism
+# is the only reason CI restates the list, so it has to restate it exactly --
+# otherwise a new Fedora target lands in the matrix and the justfile and is
+# quietly absent from the gate that actually runs before a release.
+packaging_workflow = (ROOT / ".github/workflows/packaging.yml").read_text()
+workflow_fedora_lanes = {
+    release: recipe
+    for recipe, release in re.findall(
+        r"(?m)^\s+recipe: (test-rpm-[a-z-]+) (\d+)\s*$", packaging_workflow
+    )
+}
+require(
+    workflow_fedora_lanes == lanes_by_release,
+    f"packaging workflow Fedora lanes {workflow_fedora_lanes} differ from "
+    f"just test-rpm-lanes {lanes_by_release}",
+)
+workflow_deb_lanes = set(re.findall(r"(?m)^\s+recipe: test-deb-([a-z]+)-pkg\s*$", packaging_workflow))
+require(
+    workflow_deb_lanes == expected_suites,
+    f"packaging workflow Debian lanes {sorted(workflow_deb_lanes)} are not the "
+    f"declared APT suites {sorted(expected_suites)}",
+)
+require(
+    "rawhide" not in packaging_workflow.lower(),
+    "packaging workflow declares a Rawhide lane; Rawhide is experimental and never a gate",
+)
+# GitHub's own path filter skips the whole workflow, and a required check that
+# never runs reports "pending" forever, so the gate classifies in a job instead.
+require(
+    re.search(r"(?m)^\s+paths(?:-ignore)?:", packaging_workflow) is None,
+    "packaging workflow uses GitHub's paths: filter; a skipped required check never reports",
+)
+require(
+    "classify-changes.sh" in packaging_workflow,
+    "packaging workflow does not derive its path filter from classify-changes.sh",
+)
 require(
     platforms_by_id.get("fedora-43", {}).get("eol_gate") == matrix["fedora"]["43_eol_gate"],
     "Fedora 43 platform row EOL gate disagrees with the matrix-wide gate",

@@ -1,0 +1,230 @@
+name: Packaging
+
+# Every .deb, .rpm and Arch gate used to be local-only, invoked by hand, for a
+# release that ships through four channels (#229). This is where they run.
+#
+# Three schedules, because the full matrix is 30-60+ minutes and most pull
+# requests touch no packaging:
+#
+#   pull request   path-filtered by the `changes` job below
+#   nightly        the whole matrix, unfiltered
+#   release        `just release-preflight` refuses to pass without a green
+#                  run of this workflow at the release commit
+#
+# The residual risk that buys -- a Rust-only change that breaks the *packaged*
+# runtime is not caught by its own pull request -- is written down in
+# docs/releasing.md so a green PR is not misread as packaging-verified.
+
+on:
+  pull_request:
+  schedule:
+    # 07:00 UTC, after the day's merges and before the maintainer's morning.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: packaging-${{ github.event.pull_request.number || github.ref }}
+  # Supersede a pull request's older run, but never an unfiltered one: a
+  # nightly starting at 07:00 must not cancel the dispatch a maintainer is
+  # waiting on to tag a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Classify Changed Paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      packaging: ${{ steps.classify.outputs.packaging }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The classifier diffs against the merge base, which a shallow
+          # checkout does not have.
+          fetch-depth: 0
+
+      - name: Classify the diff
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: .github/workflows/scripts/classify-changes.sh
+
+  deb:
+    name: Debian ${{ matrix.suite }} Package Lifecycle
+    runs-on: ubuntu-latest
+    needs: changes
+    # Not GitHub's `paths:` filter: a workflow skipped that way leaves a
+    # required check pending forever. A job-level `if:` reports "skipped",
+    # which branch protection accepts. See classify-changes.sh.
+    if: needs.changes.outputs.packaging == 'true'
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: trixie
+            recipe: test-deb-trixie-pkg
+          - suite: resolute
+            recipe: test-deb-resolute-pkg
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reclaim runner disk space
+        run: .github/workflows/scripts/reclaim-runner-disk.sh
+
+      - name: Install packaging test dependencies
+        run: .github/workflows/scripts/install-packaging-test-deps.sh
+
+      - name: Fetch required ONNX models
+        uses: ./.github/actions/fetch-models
+
+      # The suite gate builds the exact candidate .deb from source, rebuilds
+      # the .dsc, proves the dependency closure, then boots it under systemd
+      # for the install/upgrade/remove/purge lifecycle.
+      - name: Run the ${{ matrix.suite }} package gate
+        run: just ${{ matrix.recipe }}
+
+  # The Fedora lanes stage host-built binaries into the image rather than
+  # compiling in it, and `just build-release` cannot run on the runner: its TPM
+  # build needs tss2 4.1.3+, and Ubuntu 24.04 ships 4.0.1. Build them once in
+  # the same digest-pinned Arch container ci.yml uses, and hand them to all
+  # three lanes.
+  binaries:
+    name: Release Binaries (Arch)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.packaging == 'true'
+    timeout-minutes: 60
+    container: docker.io/library/archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
+    steps:
+      - name: Install system dependencies
+        run: |
+          printf '%s\n' 'Server = https://archive.archlinux.org/repos/2026/08/18/$repo/os/$arch' > /etc/pacman.d/mirrorlist
+          pacman -Syu --noconfirm \
+            git \
+            just \
+            rust \
+            clang \
+            v4l-utils \
+            libxkbcommon \
+            wayland \
+            pam \
+            tpm2-tss
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Through the recipe, so the Fedora lanes stage what a local run stages.
+      - name: Build release binaries
+        run: just build-release
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packaging-release-binaries
+          path: |
+            target/release/facelock
+            target/release/facelock-polkit-agent
+            target/release/libpam_facelock.so
+          retention-days: 1
+
+  rpm:
+    name: Fedora ${{ matrix.release }} ${{ matrix.depth }}
+    runs-on: ubuntu-latest
+    needs: [changes, binaries]
+    if: needs.changes.outputs.packaging == 'true'
+    timeout-minutes: 90
+    env:
+      # Checked, not trusted: the lane fails if the artifact did not land.
+      FACELOCK_RELEASE_BINARIES_PREBUILT: "1"
+    strategy:
+      fail-fast: false
+      # One lane per release dist/release-matrix.json declares, at the
+      # lifecycle depth it declares -- `just test-rpm-lanes` is the same set,
+      # run sequentially. test/check-release-matrix.py fails if this list and
+      # the matrix ever disagree, so a new Fedora target cannot land here
+      # silently or be forgotten.
+      matrix:
+        include:
+          - release: "43"
+            depth: Package Lifecycle
+            recipe: test-rpm-pkg 43
+          - release: "44"
+            depth: Package Lifecycle
+            recipe: test-rpm-pkg 44
+          - release: "45"
+            depth: Runtime Smoke
+            recipe: test-rpm-smoke 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reclaim runner disk space
+        run: .github/workflows/scripts/reclaim-runner-disk.sh
+
+      - name: Install packaging test dependencies
+        run: .github/workflows/scripts/install-packaging-test-deps.sh
+
+      - name: Download release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: packaging-release-binaries
+          path: target/release
+
+      # upload-artifact does not carry the executable bit.
+      - name: Make binaries executable
+        run: chmod +x target/release/facelock target/release/facelock-polkit-agent target/release/libpam_facelock.so
+
+      - name: Fetch required ONNX models
+        uses: ./.github/actions/fetch-models
+
+      - name: Run the Fedora ${{ matrix.release }} gate
+        run: just ${{ matrix.recipe }}
+
+  arch:
+    name: Arch Package From dist/PKGBUILD
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.packaging == 'true'
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reclaim runner disk space
+        run: .github/workflows/scripts/reclaim-runner-disk.sh
+
+      - name: Install packaging test dependencies
+        run: .github/workflows/scripts/install-packaging-test-deps.sh
+
+      # No models: this lane never starts a daemon. It executes the real
+      # dist/PKGBUILD -- source=, depends, prepare(), build(), check() -- with
+      # makepkg, installs the result with pacman, and validates the inventory,
+      # the .install scriptlet and the PAM removal hook. It compiles the
+      # workspace twice inside the container, which is why it is the slow one.
+      - name: Run the Arch package gate
+        run: just test-arch-pkg
+
+  release-matrix:
+    name: Release Version Ordering Matrix
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.packaging == 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install packaging test dependencies
+        run: .github/workflows/scripts/install-packaging-test-deps.sh
+
+      # The native half is what CI never had: dpkg --compare-versions,
+      # rpmdev-vercmp and vercmp deciding the documented upgrade order inside
+      # digest-pinned containers, rather than a Python model of it.
+      # test-deb-source-contract and check-release-matrix.py are deliberately
+      # absent here -- ci.yml's agent-docs job already runs both unfiltered, on
+      # every pull request.
+      - name: Run the release version and ordering gate
+        run: just test-release-matrix

@@ -5,13 +5,21 @@ description: Pick and run the right facelock packaging or container test for a c
 
 # Packaging and container tests
 
-CI runs exactly one container job, `container-pam-test` in `ci.yml`. It runs
-the PAM smoke tier and the camera-free E2E tier. Every `.deb`, `.rpm`, COPR and
-APT-repo path is **local only**. If you changed packaging and did not run one of
-these yourself, it is untested until a release tag fires `release.yml`, which is
-the worst place to find out.
+CI runs the packaging lanes in `.github/workflows/packaging.yml`: both Debian
+suite gates, every declared Fedora lane, the Arch package built from the real
+`dist/PKGBUILD`, and the native version-ordering matrix. On a pull request they
+run **only when the diff reaches a package**. A `changes` job classifies the
+merge-base diff, and every lane sits behind
+`if: needs.changes.outputs.packaging == 'true'`. Unfiltered runs happen nightly
+and at `just release-preflight`, which refuses to pass without a green matrix at
+HEAD.
 
-All recipes need `podman`. None of the ones in the routing table need a camera.
+Two consequences for you. A green pull request says nothing about packaging
+unless those jobs ran on it, so check rather than assume. COPR and the APT repo
+are still local-only: nothing gates them until a release tag fires `release.yml`.
+
+Running the right recipe yourself is still the fast way to find out. All of them
+need `podman`; none in the routing table needs a camera.
 
 ## Routing — what you touched, what to run
 
@@ -108,6 +116,8 @@ the question is "does a fresh install work", a dev shell when iterating.
 - `just check` covers test, lint, format, audit and the PAM standalone surface — it does **not** cover packaging
 - Name which packaging recipe you ran; if none, say so
 - Report camera-gated tests as not run, never as passed
+- A green pull request only proves packaging if the `packaging.yml` jobs ran rather than reporting skipped
+- `just test-packaging-matrix` is the whole gate in one command (30-60+ minutes), and it records the commit for `just release-preflight`
 
 ## Cost
 
