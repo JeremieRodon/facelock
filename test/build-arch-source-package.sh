@@ -20,18 +20,22 @@
 # Source retrieval runs under the same fail-closed network sandbox the Debian
 # lane uses, so "it did not download" is enforced rather than asserted.
 #
+# ## Integrity
+#
+# dist/PKGBUILD declares a fail-closed placeholder that publish-aur.sh replaces
+# with the release tarball's digest at publish time (#283). A tarball repacked
+# from the working tree can never match a published sum, so this lane applies
+# the same transformation to the staged tarball: it computes the staged file's
+# digest, writes it into the build copy of the recipe, and lets makepkg verify
+# it for real. Before that it proves the check can fail at all, by offering a
+# wrong digest and requiring rejection, and it refuses a recipe that declares
+# SKIP, which is the hole #283 closed.
+#
 # ## What this does NOT verify
 #
-# Integrity. sha256sums is ('SKIP') today (#283), so --verifysource checks no
-# digest: it proves the declared file name resolved offline and nothing more.
-# The declared URL is never fetched either, so a wrong or dead source URL passes
-# here.
-#
-# When #283 replaces SKIP with a real digest this breaks, because a tarball
-# repacked from the working tree cannot match a published sum. The fix is to add
-# --skipchecksums to the staged build below and assert the real digest
-# separately, reading sha256sums directly rather than asking makepkg to validate
-# a tarball it was never going to accept.
+# The declared source URL is never fetched, so a wrong or dead URL passes here.
+# The digest of the published release tarball is computed and substituted by CI
+# at publish time, not asserted here.
 set -euo pipefail
 
 STAGED=${FACELOCK_STAGED_SOURCE:-/staged-source}
@@ -80,6 +84,15 @@ case "$url" in
     *) fail "source is not fetched over https: $url" ;;
 esac
 
+# The recipe must pin its one source: SKIP is the fail-open state #283 removed.
+# The __SRC_SHA256__ placeholder and a real digest are both acceptable here,
+# because either one is replaced with the staged tarball's digest below.
+mapfile -t declared_sums < <(printf '%s\n' "$srcinfo" | sed -n -E 's/^[[:space:]]*sha256sums = //p')
+[ "${#declared_sums[@]}" -eq 1 ] ||
+    fail "expected dist/PKGBUILD to declare exactly one sha256sum, got ${#declared_sums[@]}"
+[ "${declared_sums[0]}" != "SKIP" ] ||
+    fail "dist/PKGBUILD declares sha256sums=('SKIP'); a fixed release tarball must be pinned (#283)"
+
 # A GitHub archive of v<tag> unpacks to <pkgname>-<tag>/, which is what every
 # recipe function cds into. Deriving it from the rename target rather than
 # restating _tag keeps this honest if the recipe's naming changes.
@@ -91,6 +104,28 @@ cp -a -- "$STAGED" "$BUILD/$topdir"
 chown -R "$BUILDER:$BUILDER" "$BUILD/$topdir"
 runuser -u "$BUILDER" -- tar -C "$BUILD" -czf "$BUILD/$tarball" "$topdir"
 rm -rf -- "$BUILD/${topdir:?}"
+
+staged_sum="$(sha256sum "$BUILD/$tarball" | cut -d' ' -f1)"
+
+# Prove the integrity gate bites before relying on it: a digest that cannot
+# match the staged tarball must make --verifysource fail. Flipping the first
+# nibble keeps the value well-formed while guaranteeing a mismatch.
+case "$staged_sum" in
+    0*) wrong_sum="f${staged_sum:1}" ;;
+    *) wrong_sum="0${staged_sum:1}" ;;
+esac
+echo "==> verifying a wrong digest is rejected"
+sed -i "s/^sha256sums=.*/sha256sums=('${wrong_sum}')/" "$BUILD/PKGBUILD"
+chown "$BUILDER:$BUILDER" "$BUILD/PKGBUILD"
+if runuser -u "$BUILDER" -- /run-networkless.sh \
+    bash -c "cd '$BUILD' && makepkg --verifysource --nodeps --noconfirm" >/dev/null 2>&1; then
+    fail "makepkg accepted a tarball whose digest does not match sha256sums"
+fi
+
+# Finalize the staged digest exactly as publish-aur.sh finalizes the shipped
+# recipe, so the verification below checks the sum for real.
+sed -i "s/^sha256sums=.*/sha256sums=('${staged_sum}')/" "$BUILD/PKGBUILD"
+chown "$BUILDER:$BUILDER" "$BUILD/PKGBUILD"
 
 # Refresh the sync database once as root. makepkg --syncdeps below resolves the
 # recipe's own depends and makedepends through pacman against this snapshot.

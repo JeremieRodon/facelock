@@ -17,7 +17,10 @@ backup=('etc/facelock/config.toml')
 install=facelock.install
 options=(!lto)
 source=("$pkgname-$_tag.tar.gz::$url/archive/v$_tag.tar.gz")
-sha256sums=('SKIP')
+# Filled in by publish-aur.sh at release time, like PKGBUILD-bin's sums: the
+# tagged tree cannot carry its own tarball's digest. The placeholder fails
+# closed — makepkg refuses to build until a real digest replaces it.
+sha256sums=('__SRC_SHA256__')
 
 prepare() {
     cd "$pkgname-$_tag"

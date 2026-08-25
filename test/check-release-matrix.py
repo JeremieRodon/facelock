@@ -588,6 +588,26 @@ for pkgbuild_name in ("PKGBUILD", "PKGBUILD-bin"):
     require(re.search(r"^_tag=", pkgbuild, re.MULTILINE) is not None, f"dist/{pkgbuild_name} has no upstream _tag")
     require("v$_tag" in pkgbuild, f"dist/{pkgbuild_name} does not fetch the upstream _tag")
 
+# Every Arch recipe installs a binary that dlopens libonnxruntime at runtime
+# (ort's load-dynamic feature), and nothing else in the declared dependency
+# closure provides it, so each must name it in depends (#284).
+for pkgbuild_name in ("PKGBUILD", "PKGBUILD-bin", "PKGBUILD-git"):
+    pkgbuild = (ROOT / "dist" / pkgbuild_name).read_text()
+    depends = re.search(r"^depends=\(([^)]*)\)", pkgbuild, re.MULTILINE)
+    require(depends is not None, f"dist/{pkgbuild_name} has no depends array")
+    require(
+        "'onnxruntime'" in depends.group(1),
+        f"dist/{pkgbuild_name} does not declare the onnxruntime runtime dependency",
+    )
+
+# dist/PKGBUILD fetches a fixed release tarball, so its digest line must be
+# the publish-time placeholder or a pinned digest — never fail-open SKIP (#283).
+pkgbuild_source = (ROOT / "dist" / "PKGBUILD").read_text()
+require(
+    re.search(r"^sha256sums=\('(?:__SRC_SHA256__|[0-9a-f]{64})'\)$", pkgbuild_source, re.MULTILINE) is not None,
+    "dist/PKGBUILD does not pin its source tarball digest",
+)
+
 package_assemblers = (
     "dist/PKGBUILD",
     "dist/PKGBUILD-bin",

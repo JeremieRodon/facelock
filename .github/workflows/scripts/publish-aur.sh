@@ -11,6 +11,14 @@ if release_is_prerelease "$VERSION"; then
   echo "refusing to publish prerelease $VERSION to stable AUR packages" >&2
   exit 1
 fi
+# The checksum pins the source tarball for every AUR consumer. A malformed
+# value, or the digest of empty input (what `curl -sL | sha256sum` yields when
+# the download silently fails), must never reach a published recipe.
+EMPTY_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+if ! [[ "$CHECKSUM" =~ ^[0-9a-f]{64}$ ]] || [ "$CHECKSUM" = "$EMPTY_SHA256" ]; then
+  echo "refusing to publish: CHECKSUM is not a plausible source tarball digest: $CHECKSUM" >&2
+  exit 1
+fi
 ARCH_VERSION="$(release_arch_pkgver "$VERSION")"
 
 echo "=== Publishing to AUR ==="
@@ -112,7 +120,14 @@ publish_facelock() {
   cp dist/PKGBUILD "$dir/PKGBUILD"
   cp dist/facelock.install "$dir/facelock.install"
   sed -i "s/^_tag=.*/_tag=${VERSION}/; s/^pkgver=.*/pkgver=${ARCH_VERSION}/" "$dir/PKGBUILD"
-  sed -i "s/sha256sums=('SKIP')/sha256sums=('${CHECKSUM}')/" "$dir/PKGBUILD"
+  # dist/PKGBUILD carries a fail-closed placeholder, never SKIP (#283). If the
+  # placeholder is missing the recipe has drifted; stop rather than publish a
+  # recipe whose integrity line was never finalized.
+  if ! grep -Fq "sha256sums=('__SRC_SHA256__')" "$dir/PKGBUILD"; then
+    echo "ERROR: dist/PKGBUILD does not carry the __SRC_SHA256__ placeholder" >&2
+    exit 1
+  fi
+  sed -i "s/__SRC_SHA256__/${CHECKSUM}/" "$dir/PKGBUILD"
   generate_srcinfo "$dir"
   commit_and_push "$dir" "Update to v${VERSION}"
 }
