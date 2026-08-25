@@ -60,50 +60,132 @@ pub fn zeroize_stored_embeddings(stored: &mut [(u32, FaceEmbedding)]) {
     }
 }
 
+/// Slice elements the [`Wiped`] guard knows how to zeroize in place.
+///
+/// Exists because `zeroize::Zeroize` cannot cover `(u32, FaceEmbedding)` — a
+/// foreign tuple whose id half is not secret. Implement it only for embedding
+/// shapes; a buffer whose element type already implements `Zeroize` (raw
+/// template bytes, say) belongs in `zeroize::Zeroizing`, not here.
+pub trait WipeElement {
+    /// Zeroize the sensitive part of this element in place.
+    fn wipe(&mut self);
+}
+
+/// A stored-template entry: the model id stays readable, the embedding wipes.
+impl WipeElement for (u32, FaceEmbedding) {
+    fn wipe(&mut self) {
+        self.1.zeroize();
+    }
+}
+
+/// A bare embedding — live-capture probe sets hold these (#269).
+impl WipeElement for FaceEmbedding {
+    fn wipe(&mut self) {
+        self.zeroize();
+    }
+}
+
 /// Plaintext embeddings wiped when the guard leaves scope — on every return
 /// path *and* on an unwind, which hand-written per-return-site wipes cannot
 /// cover (D11).
 ///
 /// Generic over how the plaintext is held so the one guard covers every
 /// holder in the workspace: a caller's buffer (`&mut [_]`, borrowed) and an
-/// owned set (`Vec<_>`). `zeroize`'s own `Zeroizing` cannot: it needs
-/// `T: Zeroize`, which `(u32, FaceEmbedding)` is not.
+/// owned set (`Vec<_>`) — and over the element ([`WipeElement`]) so stored
+/// `(u32, FaceEmbedding)` sets (the default) and bare live-capture
+/// `FaceEmbedding` sets share the one guard. `zeroize`'s own `Zeroizing`
+/// cannot: it needs `T: Zeroize`, which `(u32, FaceEmbedding)` is not.
 ///
 /// The plaintext is reachable only through `Deref` to a shared slice: a
 /// holder can compare against the embeddings but cannot move them back out
-/// from under the wipe.
-pub struct Wiped<T>(T)
+/// from under the wipe. The only mutation is [`Wiped::push`], which adds —
+/// never exposes or extracts — and wipes the outgrown allocation when the
+/// buffer must grow.
+pub struct Wiped<T, E = (u32, FaceEmbedding)>(T, std::marker::PhantomData<E>)
 where
-    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>;
+    T: AsRef<[E]> + AsMut<[E]>,
+    E: WipeElement;
 
-impl<T> Wiped<T>
+impl<T, E> Wiped<T, E>
 where
-    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+    T: AsRef<[E]> + AsMut<[E]>,
+    E: WipeElement,
 {
     /// Take ownership of `inner`; every embedding in it is zeroized when the
     /// guard drops.
     pub fn new(inner: T) -> Self {
-        Self(inner)
+        Self(inner, std::marker::PhantomData)
     }
 }
 
-impl<T> std::ops::Deref for Wiped<T>
+/// Wipe-aware append shared by the owned and borrowed `push` impls: when the
+/// buffer is full, growth is done by hand — copy into a larger allocation,
+/// zeroize the outgrown one in place, then let it free — because `Vec`'s own
+/// reallocation frees the plaintext-bearing buffer unwiped (#293).
+fn push_wiping<E: WipeElement + Clone>(buf: &mut Vec<E>, element: E) {
+    if buf.len() == buf.capacity() {
+        let mut grown = Vec::with_capacity((buf.capacity() * 2).max(4));
+        grown.extend_from_slice(buf);
+        for old in buf.iter_mut() {
+            old.wipe();
+        }
+        *buf = grown;
+    }
+    buf.push(element);
+}
+
+impl<E> Wiped<Vec<E>, E>
 where
-    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+    E: WipeElement + Clone,
 {
-    type Target = [(u32, FaceEmbedding)];
+    /// An empty guard whose buffer holds `capacity` elements before growing.
+    /// Size it to the exact count (or a cheap upper bound) so [`Self::push`]
+    /// never has to grow.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::new(Vec::with_capacity(capacity))
+    }
+
+    /// Append an element. The plaintext enters the guard directly — there is
+    /// never an unguarded buffer to wrap afterwards — and growth wipes the
+    /// outgrown allocation instead of freeing it live.
+    pub fn push(&mut self, element: E) {
+        push_wiping(&mut self.0, element);
+    }
+}
+
+impl<E> Wiped<&mut Vec<E>, E>
+where
+    E: WipeElement + Clone,
+{
+    /// [`Wiped::push`] for a guard over a caller's buffer — the accumulation
+    /// form a fallible producer uses so a mid-loop failure wipes everything
+    /// already produced into the caller's allocation.
+    pub fn push(&mut self, element: E) {
+        push_wiping(self.0, element);
+    }
+}
+
+impl<T, E> std::ops::Deref for Wiped<T, E>
+where
+    T: AsRef<[E]> + AsMut<[E]>,
+    E: WipeElement,
+{
+    type Target = [E];
 
     fn deref(&self) -> &Self::Target {
         self.0.as_ref()
     }
 }
 
-impl<T> Drop for Wiped<T>
+impl<T, E> Drop for Wiped<T, E>
 where
-    T: AsRef<[(u32, FaceEmbedding)]> + AsMut<[(u32, FaceEmbedding)]>,
+    T: AsRef<[E]> + AsMut<[E]>,
+    E: WipeElement,
 {
     fn drop(&mut self) {
-        zeroize_stored_embeddings(self.0.as_mut());
+        for element in self.0.as_mut() {
+            element.wipe();
+        }
     }
 }
 
@@ -876,6 +958,91 @@ mod tests {
                 "embedding for model {id} must be zeroized on the unwind path"
             );
         }
+    }
+
+    /// The bare-embedding element (#269): a `Vec<FaceEmbedding>` of
+    /// live-capture probes is guarded by the same `Wiped`, not a second
+    /// implementation.
+    #[test]
+    fn wiped_covers_bare_embedding_sets() {
+        let mut live: Vec<FaceEmbedding> = vec![[1.0; 512], [2.0; 512]];
+
+        {
+            let guard = Wiped::new(live.as_mut_slice());
+            assert_eq!(guard.len(), 2);
+            assert_eq!(guard[0][0], 1.0, "guard must deref to the plaintext");
+        }
+
+        assert!(
+            live.iter().all(|e| e.iter().all(|&v| v == 0.0)),
+            "bare embeddings must be zeroized after the guard drops"
+        );
+    }
+
+    /// The borrowed push form: a fallible producer accumulates into a
+    /// caller's buffer through the guard, and dropping the guard (the
+    /// producer's error path) leaves the caller's rows zeroized in place.
+    #[test]
+    fn wiped_borrowed_push_wipes_the_callers_buffer_on_drop() {
+        let mut out: Vec<(u32, FaceEmbedding)> = Vec::new();
+
+        {
+            let mut guard = Wiped::new(&mut out);
+            guard.push((1, [1.0; 512]));
+            guard.push((2, [2.0; 512]));
+            assert_eq!(guard.len(), 2);
+        }
+
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter().all(|(_, e)| e.iter().all(|&v| v == 0.0)),
+            "rows pushed through the borrowed guard must be wiped on drop"
+        );
+    }
+
+    /// Counts wipes instead of holding an embedding, so the growth tests can
+    /// observe the wipe of the outgrown allocation — which no real-element
+    /// test can see after the free.
+    #[derive(Clone)]
+    struct CountedElem(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl WipeElement for CountedElem {
+        fn wipe(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn wiped_push_within_capacity_never_wipes_early() {
+        let wipes = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        {
+            let mut guard = Wiped::with_capacity(2);
+            guard.push(CountedElem(wipes.clone()));
+            guard.push(CountedElem(wipes.clone()));
+            assert_eq!(wipes.get(), 0, "no growth, so nothing wipes before drop");
+            assert_eq!(guard.len(), 2);
+        }
+
+        assert_eq!(wipes.get(), 2, "drop wipes every element exactly once");
+    }
+
+    /// The reason `push` exists at all: `Vec`'s own reallocation frees the
+    /// old plaintext-bearing buffer unwiped (#293's compare-set gap), so
+    /// growth through the guard must wipe the outgrown allocation first.
+    #[test]
+    fn wiped_push_growth_wipes_the_outgrown_allocation() {
+        let wipes = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let mut guard = Wiped::with_capacity(1);
+        guard.push(CountedElem(wipes.clone()));
+        // Second push exceeds capacity: the copy into the grown buffer must
+        // be followed by a wipe of the outgrown allocation before it frees.
+        guard.push(CountedElem(wipes.clone()));
+        assert_eq!(wipes.get(), 1, "growth must wipe the outgrown allocation");
+
+        drop(guard);
+        assert_eq!(wipes.get(), 3, "both live elements wiped on drop as well");
     }
 
     #[test]

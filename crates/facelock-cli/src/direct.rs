@@ -183,14 +183,17 @@ pub fn authenticate(config: &Config, user: &str) -> anyhow::Result<MatchResult> 
     let mut camera = open_resolved_camera(config, resolved, CameraPurpose::Authentication)?;
     let mut engine = load_engine(config)?;
 
-    // Load embeddings with encryption support, matching the daemon handler path.
-    let mut stored = load_user_embeddings(&store, config, user)?;
     // Same shape as the daemon's `handle_authenticate` (C3): a storage failure
     // is an error, not an empty model list that guarantees "no match". No
     // rate-limit charge exists on this path, but the falsehood is the same.
     let models = store
         .list_models(user)
         .context("storage error listing face models")?;
+    // Load embeddings with encryption support, matching the daemon handler
+    // path — and matching its ordering: the plaintext load comes LAST, after
+    // every other fallible call, so no `?` between here and the wiping callee
+    // below can drop the decrypted set unwiped (#293).
+    let mut stored = load_user_embeddings(&store, config, user)?;
 
     // Shared with daemon mode (crates/facelock-daemon/src/auth.rs). A local copy
     // of this loop previously lived here and silently drifted — do not re-fork it.
