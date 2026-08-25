@@ -67,17 +67,7 @@ fi
 # --security-opt unmask=ALL: leave /proc unmasked so systemd can set up
 #   ProtectProc=/ProcSubset= (they need a fresh procfs mount, which the
 #   kernel refuses when parts of /proc are overmounted).
-# --cap-add DAC_OVERRIDE: pam_unix reads Fedora's mode-0000 /etc/shadow as
-#   root through CAP_DAC_OVERRIDE (Debian's 640 root:shadow never needs it,
-#   which is why only the Fedora lanes care). A podman whose configured
-#   default_capabilities omit the cap — the CI runner's does — hands the PAM
-#   lifecycle a root that cannot read shadow, and every correct-password case
-#   dies as AUTHINFO_UNAVAIL. Ask for the cap explicitly instead of trusting
-#   the host's defaults; where the default already grants it this is a no-op.
-#   The daemon stays clamped either way: the unit's CapabilityBoundingSet=
-#   does not include it.
 cid=$(podman run -d --rm --systemd=always --security-opt unmask=ALL \
-    --cap-add DAC_OVERRIDE \
     "${mounts[@]}" "${package_mount[@]}" "$IMAGE" /lib/systemd/systemd)
 trap 'podman rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
