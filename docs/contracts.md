@@ -1808,6 +1808,14 @@ holds the unresolved load so a broken config renders as a finding in its
 report, and its own root check still runs before its first line of output —
 the read alone has no user-visible effect ahead of the refusal.
 
+`enroll` carries the check in **both** places. `main`'s gate is what
+enforces the ordering above — root decided before the config parse — and
+`enroll::run` re-checks on entry, as a hard error, because `setup` calls it
+directly and `run_with_plan`'s precheck is conditional on a base flow
+running. The second check is unreachable on every path that exists today; it
+is there so a future setup path that enrolls cannot do so unprivileged by
+omission (issue #288).
+
 The rows in `crates/facelock-cli/tests/cli_smoke.rs` pin this ordering per
 gated command. They run the binary unprivileged even under a root test
 runner: both CI test jobs are root in a container, and a row that skipped
@@ -1815,7 +1823,22 @@ there reported as a pass while asserting nothing (issue #189). They close
 stdin, so what they witness is that the refusal preceded the output, not
 which of DEC-6's two escalation classes produced it; `require_root` and
 `require_root_scripted` share one non-interactive branch and are
-indistinguishable to them.
+indistinguishable to them. Two commands carry a second row that allocates a
+real pty and does pin the class: `daemon run` must never print the prompt
+with a terminal attached (issue #188), and `enroll` must always print it
+(issue #288). `enroll`'s rows also pass `--config` at a path that does not
+exist, so its own backstop cannot answer in the gate's place and pass a row
+that the gate should have failed.
+
+**Dropping, never skipping.** Every one of those rows drops the process it
+spawns to uid 65534 under a root runner, the pty rows included: a pty is
+opened by the parent before the fork, so the child inherits descriptors the
+kernel has already granted and can still read its own queued input after the
+drop. The backstop test in `commands::enroll` calls `run` in-process, where
+there is no child to drop, so it re-executes the test binary at itself and
+drops that. None of these return early under root. A test that skips on the
+one configuration CI runs is a test that asserts nothing while reporting a
+pass, which is how this contract lost its coverage twice (issues #189, #303).
 
 **AccessDenied hint.** A D-Bus `AccessDenied` reply carries one actionable
 hint (`ipc_client::add_access_denied_hint`): root is required. Since almost
