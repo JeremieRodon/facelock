@@ -279,6 +279,10 @@ cp "$repo_root/website/index.html" "$matrix_root/website/"
 cp "$repo_root/test/check-release-matrix.py" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile.rpm-e2e" "$matrix_root/test/"
+cp "$repo_root/test/Containerfile.rpm-authselect" "$matrix_root/test/"
+cp "$repo_root/test/Containerfile.copr" "$matrix_root/test/"
+cp "$repo_root/test/Containerfile.fedora" "$matrix_root/test/"
+cp "$repo_root/test/fedora-lane-image.sh" "$matrix_root/test/"
 cp "$repo_root/test/copr-build.sh" "$matrix_root/test/"
 cp "$repo_root/test/packit-config-validate.sh" "$matrix_root/test/"
 cp "$repo_root/test/Containerfile.packit" "$matrix_root/test/"
@@ -372,6 +376,14 @@ assert_matrix_mutation_rejected \
     "Packit schema gate image digest pin" \
     "test/Containerfile.packit" \
     's|@sha256:[0-9a-f]*||'
+assert_matrix_mutation_rejected \
+    "PKGBUILD-git dropping the onnxruntime runtime dependency" \
+    "dist/PKGBUILD-git" \
+    "s/ 'onnxruntime'//"
+assert_matrix_mutation_rejected \
+    "PKGBUILD source digest skipped" \
+    "dist/PKGBUILD" \
+    "s/^sha256sums=.*/sha256sums=('SKIP')/"
 
 assert_matrix_payload_mutation_rejected_with_diagnostic() {
     local context="$1"
@@ -807,6 +819,12 @@ case "$apt_guard_output" in
 esac
 
 assert_rejected bash "$repo_root/.github/workflows/scripts/publish-aur.sh" 0.2.0-alpha.1 unused
+# A stable version with an implausible source digest must be refused before any
+# publish step: a malformed value or the sha256 of empty input is what a silent
+# download failure produces, and neither may become the published pin (#283).
+assert_rejected bash "$repo_root/.github/workflows/scripts/publish-aur.sh" 0.2.0 not-a-digest
+assert_rejected bash "$repo_root/.github/workflows/scripts/publish-aur.sh" 0.2.0 \
+    e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 
 apt_recipe_root="$tmp_root/apt-recipe-root"
 mkdir -p \
@@ -1000,6 +1018,9 @@ assert_file_line "$release_repo/Cargo.toml" 'version = "0.2.0-alpha.1"'
 assert_file_line "$release_repo/dist/PKGBUILD" '_tag=0.2.0-alpha.1'
 assert_file_line "$release_repo/dist/PKGBUILD" 'pkgver=0.2.0alpha1'
 assert_file_line "$release_repo/dist/PKGBUILD" 'pkgrel=1'
+# The release bump must leave the source digest placeholder for publish-aur.sh
+# to finalize — never SKIP, never a stale digest for the old tag (#283).
+assert_file_line "$release_repo/dist/PKGBUILD" "sha256sums=('__SRC_SHA256__')"
 assert_file_line "$release_repo/dist/PKGBUILD-bin" '_tag=0.2.0-alpha.1'
 assert_file_line "$release_repo/dist/PKGBUILD-bin" 'pkgver=0.2.0alpha1'
 assert_file_line "$release_repo/dist/facelock.spec" 'Version:        0.2.0'
