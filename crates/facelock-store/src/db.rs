@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::params;
 
 use facelock_core::fs_security::ensure_mode;
-use facelock_core::types::{FaceEmbedding, FaceModelInfo};
+use facelock_core::types::{FaceEmbedding, FaceModelInfo, Wiped};
 
 use crate::error::{Result, StoreError};
 use crate::migrations::run_migrations;
@@ -286,7 +286,13 @@ impl FaceStore {
             })
             .map_err(|e| self.err(e))?;
 
+        // Accumulated through [`Wiped`]'s borrowed form, the shape the
+        // decrypt path uses (#293): a corrupt row mid-loop zeroizes the
+        // embeddings already collected, and growth wipes the outgrown
+        // allocation instead of letting `Vec`'s reallocation free the
+        // plaintext live.
         let mut results = Vec::new();
+        let mut guarded = Wiped::new(&mut results);
         for row in rows {
             let (id, blob) = row.map_err(|e| self.err(e))?;
             if blob.len() != 512 * 4 {
@@ -304,8 +310,12 @@ impl FaceStore {
             let floats: &[f32] = bytemuck::cast_slice(&blob);
             let mut embedding = [0f32; 512];
             embedding.copy_from_slice(floats);
-            results.push((id, embedding));
+            guarded.push((id, embedding));
         }
+        // Every row collected: the caller takes the plaintext over.
+        // Forgetting the guard skips its wipe without leaking — it owns only
+        // the borrow.
+        std::mem::forget(guarded);
         Ok(results)
     }
 

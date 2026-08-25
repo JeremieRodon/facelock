@@ -551,13 +551,15 @@ pub fn authenticate_with_embeddings<C: CameraSource, E: FaceProcessor>(
     // a lockout. Fail SOFT by construction.
     let policy = config.security.device_binding_policy();
     let allowed = device_allowed_model_ids(models, &live_fingerprint, &policy);
-    let compare_set = Wiped::new(
-        stored
-            .iter()
-            .filter(|(id, _)| allowed.contains(id))
-            .cloned()
-            .collect::<Vec<(u32, FaceEmbedding)>>(),
-    );
+    // Built through the guard at exact capacity: `collect()` on a filtered
+    // iterator has a zero lower size-hint, so it grew by reallocation and
+    // freed intermediate buffers of decrypted embeddings unwiped (#293).
+    // `stored.len()` is a hard upper bound, so `push` never grows — and if it
+    // ever had to, the guard wipes the outgrown allocation instead.
+    let mut compare_set = Wiped::with_capacity(stored.len());
+    for entry in stored.iter().filter(|(id, _)| allowed.contains(id)) {
+        compare_set.push(*entry);
+    }
     if policy.enabled && compare_set.len() != stored.len() {
         let skipped = stored.len() - compare_set.len();
         warn!(

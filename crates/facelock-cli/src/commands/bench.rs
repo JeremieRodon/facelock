@@ -381,7 +381,11 @@ fn cmd_calibrate(config: &Config) -> Result<()> {
     let num_test_frames = 10u32;
     println!("Capturing {} test frames from camera...", num_test_frames);
 
-    let mut live_embeddings: Vec<FaceEmbedding> = Vec::new();
+    // Live-capture probe embeddings are biometric data like the stored set
+    // above: accumulated inside the guard, zeroized when it drops — bails,
+    // panics and buffer growth included (#269).
+    let mut live_embeddings: Wiped<Vec<FaceEmbedding>, FaceEmbedding> =
+        Wiped::with_capacity(num_test_frames as usize);
     for _ in 0..num_test_frames {
         let frame = camera.capture().context("Failed to capture frame")?;
         let faces = engine.process(&frame)?;
@@ -402,7 +406,7 @@ fn cmd_calibrate(config: &Config) -> Result<()> {
 
     // Compute all similarities between live and enrolled embeddings
     let mut similarities: Vec<f32> = Vec::new();
-    for live_emb in &live_embeddings {
+    for live_emb in live_embeddings.iter() {
         for (_, enrolled_emb) in enrolled.iter() {
             similarities.push(cosine_similarity(live_emb, enrolled_emb));
         }

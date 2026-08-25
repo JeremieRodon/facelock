@@ -20,7 +20,7 @@
 //! machine-facing (they cross D-Bus and land in logs) and must not localize.
 
 use facelock_core::config::Config;
-use facelock_core::types::FaceEmbedding;
+use facelock_core::types::{FaceEmbedding, Wiped};
 
 /// How the decrypt loop reaches a TPM sealer when a TPM-sealed row appears.
 ///
@@ -83,9 +83,28 @@ pub fn decrypt_user_embeddings(
     raw_rows: &[(u32, Vec<u8>, bool, Option<String>)],
     config: &Config,
     software_sealer: Option<&facelock_tpm::SoftwareSealer>,
-    mut tpm: TpmAccess<'_>,
+    tpm: TpmAccess<'_>,
 ) -> Result<Vec<(u32, FaceEmbedding)>, String> {
     let mut results = Vec::with_capacity(raw_rows.len());
+    decrypt_rows_into(raw_rows, config, software_sealer, tpm, &mut results)?;
+    Ok(results)
+}
+
+/// The decrypt loop, accumulating into `out` through [`Wiped`]'s borrowed
+/// form. On any exit before the last row — a failing row (AAD mismatch, TPM
+/// unseal failure) or an unwind — every embedding already decrypted is
+/// zeroized in place, so a mid-loop failure never strands rows 1..N
+/// plaintext in freed heap (#293). On success the rows are handed back live:
+/// from there the caller owns the plaintext, and every caller either wraps
+/// it or passes it to the wiping auth loop (D11).
+fn decrypt_rows_into(
+    raw_rows: &[(u32, Vec<u8>, bool, Option<String>)],
+    config: &Config,
+    software_sealer: Option<&facelock_tpm::SoftwareSealer>,
+    mut tpm: TpmAccess<'_>,
+    out: &mut Vec<(u32, FaceEmbedding)>,
+) -> Result<(), String> {
+    let mut guarded = Wiped::new(&mut *out);
     for (id, blob, sealed, device_id) in raw_rows {
         let embedding = if *sealed && facelock_tpm::is_software_encrypted(blob) {
             // Software-encrypted (version byte 0x02)
@@ -115,9 +134,12 @@ pub fn decrypt_user_embeddings(
             emb.copy_from_slice(floats);
             emb
         };
-        results.push((*id, embedding));
+        guarded.push((*id, embedding));
     }
-    Ok(results)
+    // Every row decrypted: the caller takes the plaintext over. Forgetting
+    // the guard skips its wipe without leaking — it owns only the borrow.
+    std::mem::forget(guarded);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -212,6 +234,86 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("TPM unseal failed for embedding 6"), "{err}");
         assert!(err.contains("without TPM support"), "{err}");
+    }
+
+    /// The #293 auth-path case: a row failing mid-loop must not strand the
+    /// rows already decrypted before it. The borrowed accumulation makes the
+    /// wipe observable — without the guard, `out` holds rows 1-2 plaintext.
+    #[test]
+    fn mid_loop_failure_wipes_rows_already_decrypted() {
+        let config = Config::parse("").unwrap();
+        let mut rows = vec![plaintext_row(1, 0.25), plaintext_row(2, 0.75)];
+        // Row 3 fails: software-encrypted with no key configured.
+        let mut blob = vec![0x02u8];
+        blob.extend_from_slice(&[0u8; 64]);
+        rows.push((3u32, blob, true, None));
+
+        let mut out = Vec::new();
+        let err =
+            decrypt_rows_into(&rows, &config, None, TpmAccess::Held(None), &mut out).unwrap_err();
+        assert!(err.contains("software-encrypted"), "{err}");
+
+        assert_eq!(out.len(), 2, "rows 1-2 were decrypted before row 3 failed");
+        for (id, emb) in &out {
+            assert!(
+                emb.iter().all(|&v| v == 0.0),
+                "row {id} must be zeroized when a later row fails the load"
+            );
+        }
+    }
+
+    /// The reproduction shape from #293: encrypted store with
+    /// `bind_device_aad` and a replaced camera. Row 3's stored device id no
+    /// longer matches the AAD it was sealed under, so its GCM check fails
+    /// after rows 1-2 are already decrypted — and they must not sit
+    /// plaintext in freed daemon heap.
+    #[test]
+    fn aad_mismatch_mid_loop_wipes_the_partial_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("facelock.key");
+        facelock_tpm::SoftwareSealer::generate_key_file(&key_path).unwrap();
+        let sealer = facelock_tpm::SoftwareSealer::from_key_file(&key_path).unwrap();
+
+        let config = Config::parse("[security]\nbind_device_aad = true\n").unwrap();
+        let enrolled = "046d:085e:REAL";
+        let aad = config.security.device_aad(Some(enrolled));
+
+        let row = |id: u32, value: f32, device_id: &str| {
+            let emb: FaceEmbedding = [value; 512];
+            let blob = sealer
+                .seal_embedding_with_aad(&emb, aad.as_deref())
+                .unwrap();
+            (id, blob, true, Some(device_id.to_string()))
+        };
+        // Rows 1-2 decrypt fine; row 3's recorded device id derives a
+        // different AAD than it was sealed under.
+        let rows = vec![
+            row(1, 0.25, enrolled),
+            row(2, 0.75, enrolled),
+            row(3, 0.5, "ffff:ffff:OTHER"),
+        ];
+
+        let mut out = Vec::new();
+        let err = decrypt_rows_into(
+            &rows,
+            &config,
+            Some(&sealer),
+            TpmAccess::Held(None),
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("software decryption failed for embedding 3"),
+            "{err}"
+        );
+
+        assert_eq!(out.len(), 2);
+        for (id, emb) in &out {
+            assert!(
+                emb.iter().all(|&v| v == 0.0),
+                "row {id} must be zeroized on the AAD-mismatch path"
+            );
+        }
     }
 
     /// `needs_raw_rows` forces the slow path whenever sealed rows may exist,

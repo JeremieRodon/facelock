@@ -184,9 +184,14 @@ pub fn run_decrypt(config: &Config) -> Result<()> {
         );
 
         for (id, _user, blob, _sealed) in &sw_encrypted {
-            let raw = sealer
-                .unseal_bytes(blob)
-                .with_context(|| format!("failed to decrypt software-encrypted embedding {id}"))?;
+            // Unsealed plaintext template bytes, zeroized when `raw` drops —
+            // the store-update error path included (#293). `Zeroizing`, not
+            // `Wiped`: that guard is typed for embedding sets, and raw byte
+            // buffers already implement `Zeroize`.
+            let raw =
+                zeroize::Zeroizing::new(sealer.unseal_bytes(blob).with_context(|| {
+                    format!("failed to decrypt software-encrypted embedding {id}")
+                })?);
 
             store
                 .update_embedding_sealed(*id, &raw, false)
@@ -206,9 +211,11 @@ pub fn run_decrypt(config: &Config) -> Result<()> {
                 .context("failed to initialize TPM for unsealing")?;
 
             for (id, _user, blob, _sealed) in &tpm_sealed {
-                let raw = tpm
-                    .unseal_bytes(blob)
-                    .with_context(|| format!("failed to unseal TPM embedding {id}"))?;
+                // Same wipe-on-drop as the software branch above (#293).
+                let raw = zeroize::Zeroizing::new(
+                    tpm.unseal_bytes(blob)
+                        .with_context(|| format!("failed to unseal TPM embedding {id}"))?,
+                );
 
                 store
                     .update_embedding_sealed(*id, &raw, false)
