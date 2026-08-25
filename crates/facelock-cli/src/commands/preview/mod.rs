@@ -3,6 +3,8 @@ mod render;
 mod text_only;
 #[cfg(feature = "wayland")]
 mod wayland_preview;
+#[cfg(feature = "wayland")]
+mod wayland_socket;
 
 use facelock_core::Config;
 

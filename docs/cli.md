@@ -355,6 +355,13 @@ facelock preview --json                 # one JSON object per frame on stdout
 facelock preview --user alice           # match against specific user
 ```
 
+The window opens on the invoking user's Wayland session even though the
+command runs as root: the compositor socket is resolved from the invoking
+uid's `/run/user/<uid>` directory (via `SUDO_UID`/`DOAS_USER`), never from
+inherited `XDG_RUNTIME_DIR`. A bare-name `WAYLAND_DISPLAY` picks among the
+sockets in that directory; a value carrying a path is ignored. Without a
+reachable compositor the preview falls back to text-only mode.
+
 `--json` shipped as `--text-only`, which stays a hidden alias and keeps
 parsing; the payload is unchanged. One object per line, one per frame:
 

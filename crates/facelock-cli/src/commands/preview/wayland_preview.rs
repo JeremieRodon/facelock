@@ -43,7 +43,10 @@ pub fn run(user: &str) -> anyhow::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, std::sync::Arc::clone(&stop))
         .context("failed to register SIGINT handler")?;
 
-    let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
+    // Resolved from the invoking user's identity, not `connect_to_env()`:
+    // the preview runs as root and sudo's `env_reset` had stripped the
+    // variables that function needs, so it never connected (issue #297).
+    let conn = super::wayland_socket::connect()?;
 
     let (globals, mut event_queue) =
         registry_queue_init(&conn).context("failed to initialize Wayland registry")?;
