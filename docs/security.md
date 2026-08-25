@@ -556,12 +556,14 @@ loop's caller buffer and device-filtered compare set, the daemon's preview compa
 the store changes through the daemon, or the user changes), and the sets held by the
 `facelock bench` and `facelock-bench` benchmark paths, and the live-capture probe sets both
 `calibrate` implementations accumulate from the camera. The transient copies in the load and
-decrypt paths are guarded too (#293): the decrypt loop accumulates inside the guard, so a row
-failing mid-load (AAD mismatch, TPM unseal failure) zeroizes the rows already decrypted; the
-compare set is built through the guard at exact capacity, so no reallocation frees live
-embeddings; and `facelock tpm decrypt` holds each row's unsealed bytes in `zeroize::Zeroizing`.
-Still unguarded: the per-frame embeddings inference returns before they are consumed, and the
-raw-row snapshot `facelock tpm encrypt` reads from a plaintext store before sealing it.
+decrypt paths are guarded too (#293): the decrypt loop and the store's plaintext fast load
+accumulate inside the guard, so a row failing mid-load (AAD mismatch, TPM unseal failure,
+corrupt row) zeroizes the rows already collected, and buffer growth wipes the outgrown
+allocation; the compare set is built through the guard at exact capacity; and `facelock tpm
+decrypt` holds each row's unsealed bytes in `zeroize::Zeroizing`. Still unguarded: the
+per-frame embeddings inference returns before they are consumed, the per-row blob buffers
+SQLite hands back while a plaintext store loads, and the raw-row snapshot `facelock tpm
+encrypt` reads before sealing one.
 
 **Hard device binding (opt-in, `security.bind_device_aad`).** When enabled, the enrolling
 camera's `device_id` is folded into the AES-GCM Additional Authenticated Data, so a template
