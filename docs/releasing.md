@@ -338,10 +338,14 @@ Automated after setup. The release workflow publishes to AUR when `AUR_SSH_KEY` 
    cp "$REPO_ROOT/dist/PKGBUILD" .
    cp "$REPO_ROOT/dist/facelock.install" .
    # dist/PKGBUILD ships a __SRC_SHA256__ placeholder; substitute the real
-   # tarball digest before pushing or the recipe refuses to build:
+   # tarball digest before pushing or the recipe refuses to build. Download
+   # first, hash the file after: piping curl into sha256sum hashes empty
+   # input when the download fails, and that digest must never be published.
    TAG="$(sed -n 's/^_tag=//p' PKGBUILD)"
-   SUM="$(curl -fsSL "https://github.com/tyvsmith/facelock/archive/v${TAG}.tar.gz" | sha256sum | cut -d' ' -f1)"
-   sed -i "s/__SRC_SHA256__/${SUM}/" PKGBUILD
+   curl -fSsL -o "/tmp/facelock-v${TAG}.tar.gz" \
+     "https://github.com/tyvsmith/facelock/archive/v${TAG}.tar.gz" &&
+     SUM="$(sha256sum "/tmp/facelock-v${TAG}.tar.gz" | cut -d' ' -f1)" &&
+     sed -i "s/__SRC_SHA256__/${SUM}/" PKGBUILD
    makepkg --printsrcinfo > .SRCINFO
    git add PKGBUILD facelock.install .SRCINFO
    git commit -m "Initial commit"
@@ -494,9 +498,13 @@ The APT repo is hosted at `https://tysmith.me/facelock/apt/` alongside the docs 
 
 If CI is not configured or fails:
 
-1. Download the release tarball and compute the checksum:
+1. Download the release tarball, then compute the checksum from the file.
+   Piping curl into sha256sum prints the digest of empty input when the
+   download fails; downloading first prints no digest at all:
    ```bash
-   curl -sL https://github.com/tyvsmith/facelock/archive/v$VERSION.tar.gz | sha256sum
+   curl -fSsL -o "facelock-v$VERSION.tar.gz" \
+     "https://github.com/tyvsmith/facelock/archive/v$VERSION.tar.gz" &&
+     sha256sum "facelock-v$VERSION.tar.gz"
    ```
 2. Clone the AUR repo (first time only):
    ```bash
