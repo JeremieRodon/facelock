@@ -10,6 +10,7 @@
 , onnxruntime
 , tpm2-tss
 , dbus
+, libxkbcommon
 }:
 
 rustPlatform.buildRustPackage {
@@ -37,6 +38,7 @@ rustPlatform.buildRustPackage {
     onnxruntime
     tpm2-tss
     dbus
+    libxkbcommon
   ];
 
   # Tests require camera hardware
