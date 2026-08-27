@@ -12,7 +12,9 @@
 , dbus
 , libxkbcommon
 }:
-
+let
+  target = "x86_64-unknown-linux-gnu";
+in
 rustPlatform.buildRustPackage {
   pname = "facelock";
   version = "0.1.0";
@@ -50,13 +52,13 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     ls -lR target
     # Polkit agent
-    if [ -f target/release/facelock-polkit-agent ]; then
-      install -Dm755 target/release/facelock-polkit-agent $out/bin/facelock-polkit-agent
+    if [ -f target/${target}/release/facelock-polkit-agent ]; then
+      install -Dm755 target/${target}/release/facelock-polkit-agent $out/bin/facelock-polkit-agent
     fi
 
     # PAM module
     mkdir -p $out/lib/security
-    cp target/release/libpam_facelock.so $out/lib/security/pam_facelock.so
+    cp target/${target}/release/libpam_facelock.so $out/lib/security/pam_facelock.so
 
     # Configuration
     install -Dm644 config/facelock.toml $out/etc/facelock/config.toml
