@@ -48,6 +48,7 @@ rustPlatform.buildRustPackage {
   LIBCLANG_PATH = "${clang.cc.lib}/lib";
 
   postInstall = ''
+    ls -lR target
     # Polkit agent
     if [ -f target/release/facelock-polkit-agent ]; then
       install -Dm755 target/release/facelock-polkit-agent $out/bin/facelock-polkit-agent
