@@ -66,21 +66,21 @@ in
 
     # Configuration file
     environment.etc."facelock/config.toml".source = configFile;
-    environment.etc."dbus-1/system.d/org.facelock.Daemon.conf".source =
-      "${facelockPackage}/share/dbus-1/system.d/org.facelock.Daemon.conf";
-    environment.etc."dbus-1/system-services/org.facelock.Daemon.service".text = ''
-      [D-BUS Service]
-      Name=org.facelock.Daemon
-      Exec=${facelockPackage}/bin/facelock daemon
-      User=root
-      SystemdService=facelock-daemon.service
-    '';
+
+    # D-Bus policy and activation service. On NixOS both live in the read-only
+    # store under /etc/dbus-1, so they cannot be written through
+    # environment.etc. services.dbus.packages links the package's
+    # share/dbus-1/{system.d,system-services} trees into place. The activation
+    # file's Exec= path is rewritten to the store binary in default.nix.
+    services.dbus.packages = [ facelockPackage ];
 
     # systemd units
     systemd.services.facelock-daemon = {
       description = "Facelock Face Authentication Daemon";
       after = [ "local-fs.target" ];
       wantedBy = [ "multi-user.target" ];
+      # Kept in parity with systemd/facelock-daemon.service. Any change to the
+      # hardening there must be mirrored here.
       serviceConfig = {
         Type = "dbus";
         BusName = "org.facelock.Daemon";
@@ -91,11 +91,17 @@ in
         RestartSec = 3;
         LimitNOFILE = 1024;
         UMask = "0027";
+
+        # Phase 1: Filesystem isolation. ProtectHome is deliberately not used
+        # (it hides /run/user/, breaking desktop notifications); InaccessiblePaths
+        # protects /home and /root instead.
         ProtectSystem = "strict";
         InaccessiblePaths = [ "/home" "/root" ];
         ReadWritePaths = [ "/var/lib/facelock" "/var/log/facelock" ];
         PrivateTmp = true;
         NoNewPrivileges = true;
+
+        # Phase 2: Kernel hardening.
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;
@@ -103,6 +109,22 @@ in
         LockPersonality = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
+
+        # Phase 3: Capabilities, seccomp, and network lockdown. CAP_SETUID and
+        # CAP_SETGID are empirically required (runuser for notifications);
+        # CAP_CHOWN is startup-only (state-layout and enrollment-marker chowns).
+        CapabilityBoundingSet = "CAP_SETUID CAP_SETGID CAP_CHOWN";
+        AmbientCapabilities = "CAP_SETUID CAP_SETGID";
+        RestrictAddressFamilies = "AF_UNIX AF_NETLINK";
+        IPAddressDeny = "any";
+        SystemCallFilter = "@system-service";
+        SystemCallErrorNumber = "EPERM";
+        SystemCallArchitectures = "native";
+
+        # Hide other processes' /proc entries and non-PID /proc contents.
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        ProtectHostname = true;
       };
     };
 

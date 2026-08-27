@@ -77,9 +77,16 @@ rustPlatform.buildRustPackage {
     # systemd units
     install -Dm644 systemd/facelock-daemon.service $out/lib/systemd/system/facelock-daemon.service
 
-    # D-Bus policy and activation service
+    # D-Bus policy and activation service. The activation file ships with
+    # Exec=/usr/bin/facelock, which does not exist on NixOS. Exec= is mandatory
+    # per the D-Bus spec (the file is rejected without it) even though
+    # SystemdService= makes systemd authoritative, so rewrite it to the store
+    # binary rather than dropping it. module.nix links this tree via
+    # services.dbus.packages.
     install -Dm644 dbus/org.facelock.Daemon.conf $out/share/dbus-1/system.d/org.facelock.Daemon.conf
     install -Dm644 dbus/org.facelock.Daemon.service $out/share/dbus-1/system-services/org.facelock.Daemon.service
+    substituteInPlace $out/share/dbus-1/system-services/org.facelock.Daemon.service \
+      --replace-fail /usr/bin/facelock $out/bin/facelock
 
     # tmpfiles.d
     install -Dm644 dist/facelock.tmpfiles $out/lib/tmpfiles.d/facelock.conf
